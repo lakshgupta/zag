@@ -11,9 +11,12 @@ pub const TokenTag = enum {
     var_kw,
     const_kw,
     defer_kw,
+    errdefer_kw,
+    unsafe_kw,
     new,
     free,
     print,
+    as_kw,
     return_kw,
     true_kw,
     false_kw,
@@ -630,6 +633,12 @@ pub const Lexer = struct {
             .const_kw
         else if (std.mem.eql(u8, text, "defer"))
             .defer_kw
+        else if (std.mem.eql(u8, text, "errdefer"))
+            .errdefer_kw
+        else if (std.mem.eql(u8, text, "unsafe"))
+            .unsafe_kw
+        else if (std.mem.eql(u8, text, "as"))
+            .as_kw
         else if (std.mem.eql(u8, text, "new"))
             .new
         else if (std.mem.eql(u8, text, "free"))

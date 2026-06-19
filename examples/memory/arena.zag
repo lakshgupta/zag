@@ -1,0 +1,20 @@
+## Arena allocator sugar — Pattern 3 from docs/19-memory.md
+##
+## `new(<arena>, T(value))` allocates via `<arena>.create(T)` instead
+## of the global page allocator. Useful for scoped lifetimes
+## (per-request, per-frame) where `arena.free_all()` resets the
+## entire arena in O(1) when the scope exits.
+##
+## Run: zag run arena.zag
+
+fun main() {
+    # Stub arena shim — in a real program this is `Arena.new()` from
+    # the std mem module. For this demo we treat it as a generic
+    # allocator surface.
+    let arena = 0;       # placeholder
+    defer arena_free_all(arena);   # O(1) reset
+
+    let p = new(arena, i32(100));
+    defer arena_free(p);           # per-allocation free
+    print("arena-allocated value at heap address\n");
+}

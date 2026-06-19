@@ -112,6 +112,8 @@ pub const Parser = struct {
                 return .{ .expr_stmt = self.parseExpr() };
             },
             .defer_kw => return .{ .defer_stmt = self.parseDefer() },
+            .errdefer_kw => return .{ .errdefer_stmt = self.parseErrDefer() },
+            .unsafe_kw => return .{ .unsafe_block = self.parseUnsafeBlock() },
             else => return .{ .expr_stmt = self.parseExpr() },
         }
     }
@@ -357,6 +359,35 @@ pub const Parser = struct {
         self.expect(.defer_kw);
         const expr = self.parseExpr();
         return .{ .expr = expr };
+    }
+
+    /// `errdefer expr;` — runs the expression ONLY if the enclosing scope
+    /// exits via `?`-propagation or explicit `return Err(...)`. Mirrors zig
+    /// 0.16's `errdefer` keyword one-to-one. Example (from
+    /// `docs/19-memory.md` Pattern 2):
+    ///   let a = compute()?;
+    ///   errdefer free(a);
+    ///   ...
+    /// Used by the new carve-out where partial initialization must be rolled
+    /// back on `?` but the success path skips the cleanup.
+    fn parseErrDefer(self: *Parser) Stmt.ErrDeferStmt {
+        self.expect(.errdefer_kw);
+        const expr = self.parseExpr();
+        return .{ .expr = expr };
+    }
+
+    /// `unsafe { <stmts> }` block marker. Sits in `parseStmt`'s dispatch so
+    /// the leading ident-or-expression forms don't accidentally consume
+    /// `unsafe` as a binding name; the keyword is reserved at token-time by
+    /// `lexer.readIdent`. The zig 0.16 backend no longer has a block-form
+    /// `unsafe` keyword — codegen emits the body wrapped in plain `{ ... }`
+    /// with comment markers so the AST shape remains analyzable for future
+    /// `-Dunsafe-block-check` tooling without changing the emitted
+    /// zig semantics (raw pointer dereferences and `@ptrCast` are already
+    /// unconditional in 0.16).
+    fn parseUnsafeBlock(self: *Parser) []const Stmt {
+        self.expect(.unsafe_kw);
+        return self.parseBlock();
     }
 
     /// Top-level entry point: parses a full Zag expression. Delegates to a
@@ -616,7 +647,7 @@ pub const Parser = struct {
             .tilde => .bnot,
             .bang => .lnot,
             .star => .deref,
-            else => return self.parsePostfix(),
+            else => return self.parseCast(),
         };
         self.advance();
         const operand = self.parseUnary();
@@ -632,6 +663,77 @@ pub const Parser = struct {
     /// NOT for chained-function-calls (`f(1)(2)`) — that would require a
     /// `.lparen` arm here too, but the user-chosen shape is "chained
     /// single-Index per bracket pair" only.
+    /// `expr as Type` postfix cast. Sits between unary and postfix in the
+    /// ladder so `1 + x as i32` parses as `1 + (x as i32)`. The destination
+    /// type can be a multi-token form (`*raw c_void`, `*const T`, `?*i32`,
+    /// …) so `collectCastType` walks tokens of the source verbatim until a
+    /// structural delimiter. Captured text round-trips into zig 0.16's `as`
+    /// operator without further translation.
+    fn parseCast(self: *Parser) Expr {
+        const lhs = self.parsePostfix();
+        if (self.peek().tag != .as_kw) return lhs;
+        const binding_loc = self.peek().loc;
+        self.advance();
+        const type_text = self.collectCastType();
+        if (type_text.len == 0) {
+            std.debug.print("error:{d}:{d}: expected type after 'as', got empty\n", .{ binding_loc.line, binding_loc.col });
+            std.process.exit(1);
+        }
+        const buf = self.arena.alloc(Expr, 1);
+        buf[0] = lhs;
+        return .{ .cast = .{ .expr = &buf[0], .type_text = type_text } };
+    }
+
+    /// Capture the verbatim `type_text` after a zag `as` keyword. Walks
+    /// tokens without consuming the structural delimiter (newline, comma,
+    /// closing bracket, binary operator, etc.) and joins `*` + identifiers
+    /// with single-space separators except that `*` concatenates directly
+    /// to the next identifier (so `*raw c_void` round-trips to zig as
+    /// `*raw c_void` — the parenthesised type modifier form zig expects for
+    /// raw pointer types). Bounded to 256 bytes; deeper type expressions
+    /// fail loudly at the slice-bounds check.
+    fn collectCastType(self: *Parser) []const u8 {
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        var first = true;
+        while (!self.eof()) {
+            const tok = self.peek();
+            const is_term: bool = switch (tok.tag) {
+                .newline, .comma, .rparen, .rbracket, .rbrace, .colon, .equals, .plus_eq, .minus_eq, .slash_eq, .percent_eq, .amp_eq, .pipe_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .plus, .minus, .slash, .percent, .amp, .pipe, .caret, .tilde, .bang, .lt_lt, .gt_gt, .lt, .gt, .lt_eq, .gt_eq, .eq_eq, .bang_eq, .amp_amp, .pipe_pipe, .range, .ellipsis, .arrow, .doc_comment, .eof => true,
+                else => false,
+            };
+            if (is_term) break;
+            // Treat `.star` as the pointer marker (concatenated, no space)
+            // and identifiers as the type name proper.
+            if (tok.tag == .identifier or tok.tag == .print) {
+                const text = tok.text;
+                if (!first and len + 1 <= buf.len) {
+                    buf[len] = ' ';
+                    len += 1;
+                }
+                if (len + text.len <= buf.len) {
+                    @memcpy(buf[len..][0..text.len], text);
+                    len += text.len;
+                }
+                first = false;
+                self.advance();
+            } else if (tok.tag == .star) {
+                // Pointer marker — emit `*` and concatenate without space so
+                // `*` + `raw` yields `*raw` (the form zig wants for the
+                // raw-pointer modifier keyword).
+                if (len + 1 <= buf.len) {
+                    buf[len] = '*';
+                    len += 1;
+                }
+                first = false;
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        return buf[0..len];
+    }
+
     fn parsePostfix(self: *Parser) Expr {
         var lhs = self.parsePrimary();
         while (self.peek().tag == .lbracket) {
@@ -841,6 +943,31 @@ pub const Parser = struct {
 
     fn parseNew(self: *Parser) Expr {
         self.expect(.new);
+        // Custom-allocator sugar form: `new(<allocator>, T(value))`. The
+        // leading `(` distinguishes it from the simple `new T(value)`
+        // shape; the allocator ident + comma is the discriminator. Codegen
+        // emits `<allocator>.create(T)` rather than the global
+        // `page_allocator.create(T)` so the operand uses the user-supplied
+        // allocator (typical: `<arena>` from `Arena.new()`).
+        if (self.peek().tag == .lparen) {
+            self.advance();
+            const allocator = self.expectIdent();
+            self.expect(.comma);
+            const type_name = self.expectIdent();
+            self.expect(.lparen);
+            const value = self.parseExpr();
+            self.expect(.rparen);
+            self.expect(.rparen);
+            const v = self.arena.alloc(Expr, 1);
+            v[0] = value;
+            return .{ .new_expr = .{
+                .type_name = type_name,
+                .value = &v[0],
+                .allocator = allocator,
+            } };
+        }
+        // Simple form: `new T(value)` — global allocator (zig's
+        // `std.heap.page_allocator`) is used at codegen.
         const type_name = self.expectIdent();
         self.expect(.lparen);
         const value = self.parseExpr();
@@ -992,13 +1119,17 @@ pub const Parser = struct {
     ///   tuple_lit                 — (a, b) → anonymous struct (zig-inferred)
     ///   array_lit                 — `[N]T { … }` → `[N]T` (T in source)
     ///   template_lit              — "…{name}…" → debug-printable slice
+    ///   new_expr                  — `new T(v)` always produces `*T`; the
+    ///                                 type is read from `T` directly in
+    ///                                 the source form (memory-feature
+    ///                                 carve-out, see `docs/19-memory.md`).
     /// Any other Expr kind (binary, ident, call, index, range, …) requires
     /// an explicit `: T` annotation. This keeps the language statically
     /// typed: every binding has a known type at compile time, even when
     /// the user doesn't write `: T` explicitly.
     fn isLiteralInit(expr: Expr) bool {
         return switch (expr) {
-            .int_lit, .float_lit, .bool_lit, .char_lit, .string_lit, .byte_string_lit, .null_lit, .undefined_lit, .tuple_lit, .array_lit, .template_lit => true,
+            .int_lit, .float_lit, .bool_lit, .char_lit, .string_lit, .byte_string_lit, .null_lit, .undefined_lit, .tuple_lit, .array_lit, .template_lit, .new_expr => true,
             else => false,
         };
     }

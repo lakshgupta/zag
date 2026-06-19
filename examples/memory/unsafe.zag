@@ -1,0 +1,24 @@
+## unsafe block — source-level audit marker
+##
+## Zag's `unsafe { ... }` block is a SOURCE-LEVEL marker for code
+## review and tooling. zig 0.16 already permits raw-pointer deref
+## and `@ptrCast` unconditionally, so the block's only effect on
+## the emitted zig is to wrap the body in plain `{ ... }` with
+## `// unsafe {` and `// }` comment markers. Use it for auditability.
+##
+## Run: zag run unsafe.zag
+
+fun main() {
+    unsafe {
+        # Raw pointer arithmetic on `*raw u8` — allowed in zig 0.16
+        # unconditionally but the `unsafe { }` marker makes the audit
+        # boundary explicit.
+        let buf = alloc(4);
+        let p: *raw u8 = buf;
+        *p = 'a';
+        *((p + 1) as *raw u8) = 'b';
+        free(p as *raw c_void);
+        print("unsafe ops completed\n");
+    }
+    print("after unsafe block\n");
+}

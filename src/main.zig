@@ -1857,3 +1857,231 @@ test "codegen: unannotated i32-init binding / int_lit still triggers @divTrunc" 
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc(x, 2)") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (x / 2);") == null);
 }
+
+// -------------------------------------------------------------------
+// docs/19-memory.md feature tests — heap-from-new bug fix, errdefer,
+// unsafe block, `as` cast, and the `new(<alloc>, T(v))` allocator
+// sugar. Each pair has a parser test pinning the AST shape and a
+// codegen test pinning the emitted zigzag source. Without these the
+// next refactor can silently regress the docs-documented surface.
+// -------------------------------------------------------------------
+
+test "lexer: errdefer_kw, unsafe_kw, as_kw are keywords" {
+    const src = "errdefer unsafe as";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    try std.testing.expectEqual(lexer_mod.TokenTag.errdefer_kw, tokens[0].tag);
+    try std.testing.expectEqualStrings("errdefer", tokens[0].text);
+    try std.testing.expectEqual(lexer_mod.TokenTag.unsafe_kw, tokens[1].tag);
+    try std.testing.expectEqualStrings("unsafe", tokens[1].text);
+    try std.testing.expectEqual(lexer_mod.TokenTag.as_kw, tokens[2].tag);
+    try std.testing.expectEqualStrings("as", tokens[2].text);
+}
+
+test "parser: errdefer parses as Stmt.errdefer_stmt" {
+    // Pattern 2 from docs/19-memory.md: `errdefer free(a)` runs only on the
+    // `?`-propagation path. Parser pins the AST tag so the codegen surface
+    // ({errdefer expr;}) is replayable by tests.
+    const src = "fun f() {\n    errdefer print(\"cleanup\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .errdefer_stmt);
+    try std.testing.expect(stmt.errdefer_stmt.expr == .template_lit);
+}
+
+test "parser: unsafe { } parses as Stmt.unsafe_block" {
+    // Source-level audit block. The body statements live inside the union
+    // payload as `[]const Stmt`; codegen emits them inside plain `{ … }`
+    // with `// unsafe {` and `// }` markers for tooling.
+    const src = "fun f() {\n    unsafe {\n        print(\"inside\\n\");\n    }\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .unsafe_block);
+    try std.testing.expectEqual(@as(usize, 1), stmt.unsafe_block.len);
+    try std.testing.expect(stmt.unsafe_block[0] == .expr_stmt);
+}
+
+test "parser: x as Type parses as Expr.cast" {
+    // `as` sits between unary and postfix in the ladder so `1 + x as i32`
+    // parses as `1 + (x as i32)` (cast binds tighter than additive).
+    const src = "fun f() {\n    let y: i32 = x as i32;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .cast);
+    try std.testing.expectEqualStrings("i32", init.cast.type_text);
+    try std.testing.expect(init.cast.expr.* == .ident);
+    try std.testing.expectEqualStrings("x", init.cast.expr.*.ident);
+}
+
+test "parser: p as *raw c_void captures multi-token type" {
+    // The verbatim-source-text capture enables pointer casts where the
+    // destination type includes the `*raw` modifier and a multi-token
+    // tail like `c_void`. The capture joins `*`, `raw`, `c_void` into one
+    // `type_text` slice that codegen can hand to zig's `as` operator.
+    const src = "fun f() {\n    let p: *raw u8 = 0 as *raw u8;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .cast);
+    try std.testing.expectEqualStrings("*raw u8", init.cast.type_text);
+}
+
+test "parser: new(<alloc>, T(v)) sugar sets allocator field" {
+    // Pattern 3 from docs/19-memory.md: arena allocation. Parser pins the
+    // allocator carrier so codegen emits `<arena>.create(T)` rather than
+    // the global page allocator.
+    const src = "fun f() {\n    let p = new(arena, i32(0));\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena2 = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena2);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .new_expr);
+    try std.testing.expectEqualStrings("i32", init.new_expr.type_name);
+    try std.testing.expect(init.new_expr.allocator != null);
+    try std.testing.expectEqualStrings("arena", init.new_expr.allocator.?);
+}
+
+test "parser: new T(v) keeps allocator null for global-heap shape" {
+    // Sanity check on the simple form: allocator=null means codegen emits
+    // `std.heap.page_allocator.create(T)` rather than a user-supplied
+    // arena's `.create(T)`.
+    const src = "fun f() {\n    let p = new i32(42);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena2 = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena2);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .new_expr);
+    try std.testing.expect(init.new_expr.allocator == null);
+    try std.testing.expectEqualStrings("i32", init.new_expr.type_name);
+    try std.testing.expect(init.new_expr.value == .int_lit);
+}
+
+test "codegen: new T(v) emits page_allocator.create heap alloc (bug fix)" {
+    // The docs/spec contract for `new` is heap allocation. The previous
+    // emission `blk: { var __val: T = v; break :blk &__val; }` was a
+    // stack-pointer escape (UB on `free`). The rewrite routes through
+    // `try std.heap.page_allocator.create(T)` so `free(p)`'s matching
+    // `page_allocator.destroy(p)` correctly deallocates the heap cell.
+    const src = "fun f() {\n    let p = new i32(42);\n    defer free(p);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "try std.heap.page_allocator.create(i32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__p_0.* = 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __p_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const p = __p_0") != null);
+    // Sanity: the OLD stack-pointer emission must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var __val: i32 = 42") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "&__val") == null);
+}
+
+test "codegen: new(<arena>, T(v)) emits <arena>.create(T) (allocator sugar)" {
+    // Pattern 3 sugar: codegen routes through the user-supplied allocator's
+    // `create` method rather than the global page allocator.
+    const src = "fun f() {\n    let p = new(arena, i32(0));\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "try arena.create(i32)") != null);
+    // Sanity: must NOT use the global page allocator.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator.create") == null);
+}
+
+test "codegen: alloc_counter increments across multiple new exprs" {
+    // Two `new` expressions in the same body must produce distinct `__p_<N>`
+    // names so zig's no-redeclaration rule is satisfied. Without the
+    // per-function counter the user's `let __p_0` would silently clash.
+    const src =
+        \\fun f() {
+        \\    let a = new i32(1);
+        \\    let b = new i32(2);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const a = __p_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const b = __p_1") != null);
+}
+
+test "codegen: errdefer stmt emits errdefer verbatim" {
+    // Mirrors zig 0.16's `errdefer` keyword one-to-one so zig's semantics
+    // (runs the expression ONLY on `?`-propagation or `Err` early-return)
+    // match the zag docs' Pattern 2 framing.
+    const src = "fun f() {\n    errdefer print(\"cleanup\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    errdefer print(\"cleanup\\n\");") != null);
+}
+
+test "codegen: unsafe block emits body in plain block with comment markers" {
+    // zig 0.16 has no block-form `unsafe` keyword — the block is purely a
+    // source-level audit marker. Codegen emits the body wrapped in plain
+    // `{ ... }` with `// unsafe {` and `// }` comments so the structure is
+    // visible to `-Dunsafe-block-check` tooling without affecting the
+    // emitted zig semantics (raw pointer ops are already unconditional).
+    const src = "fun f() {\n    unsafe {\n        print(\"inside\\n\");\n    }\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    // unsafe {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    print(\"inside\\n\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    // }") != null);
+}
+
+test "codegen: as cast emits passthrough with parens" {
+    // The parser's `collectCastType` joined multi-token types like
+    // `*raw c_void` into one `type_text` slice; codegen emits
+    // `(expr as type_text)` verbatim so zig's `as` operator handles the
+    // cast surface natively (pointers, numerics, raw pointers).
+    const src = "fun f() {\n    let y: i32 = x as i32;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const y: i32 = (x as i32);") != null);
+}

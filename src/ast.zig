@@ -22,6 +22,7 @@ pub const Expr = union(enum) {
     new_expr: NewExpr,
     free_expr: FreeExpr,
     deref: DerefExpr,
+    cast: CastExpr,
     template_lit: TemplateLitExpr,
     binary: BinaryExpr,
     unary: UnaryExpr,
@@ -167,6 +168,15 @@ pub const Expr = union(enum) {
     pub const NewExpr = struct {
         type_name: []const u8,
         value: *Expr,
+        /// Allocator name for the `new(<allocator>, T(...))` form, e.g.
+        /// emitted as `<allocator>.create(T)` instead of the global page
+        /// allocator. `null` means use `std.heap.page_allocator` (the
+        /// default). Used by `docs/19-memory.md` Pattern 3 (Arena) where
+        /// the user writes `new(&arena, T(value))` to allocate inside a
+        /// scoped arena. Only meaningful for the simple single-value form
+        /// `new T(v)` — array-flavoured `new [N]T { ... }` always uses the
+        /// global allocator (rug form: `let arr = new [10]i32 { 0 }`).
+        allocator: ?[]const u8 = null,
     };
 
     pub const FreeExpr = struct {
@@ -175,6 +185,19 @@ pub const Expr = union(enum) {
 
     pub const DerefExpr = struct {
         target_ptr: *Expr,
+    };
+
+    /// `expr as T` type-cast expression. Codegen emits `<expr> as <type_text>`
+    /// verbatim because zig 0.16 `as` is the canonical cast operator and
+    /// supports the same surface as the zag `as` (pointer conversions,
+    /// widening/narrowing numerics). The destination type can be a multi-token
+    /// form like `*raw c_void` so we capture the verbatim source text rather
+    /// than a parsed identifier — the AST parser scans tokens until a
+    /// natural delimiter (newline, comma, `)`, `]`, `}`, `;`, `+`, etc.) and
+    /// stores the joined run as `type_text`.
+    pub const CastExpr = struct {
+        expr: *Expr,
+        type_text: []const u8,
     };
 };
 
@@ -238,6 +261,8 @@ pub const Stmt = union(enum) {
     /// typically other Expr nodes (ident, call, etc.).
     index_assign: IndexAssignStmt,
     defer_stmt: DeferStmt,
+    errdefer_stmt: ErrDeferStmt,
+    unsafe_block: []const Stmt,
     expr_stmt: Expr,
 
     /// Backing struct for all three binding kinds (`let`, `var`, `const`).
@@ -283,6 +308,15 @@ pub const Stmt = union(enum) {
     };
 
     pub const DeferStmt = struct {
+        expr: Expr,
+    };
+
+    /// `errdefer expr;` — runs `expr` ONLY when the enclosing scope exits
+    /// via `?`-propagation or explicit `return Err(...)`. Mirrors zig 0.16's
+    /// `errdefer` keyword one-to-one. Used by `docs/19-memory.md` Pattern 2
+    /// (partial-init cleanup). Codegen emits `errdefer <expr>;` verbatim —
+    /// zig's `errdefer` semantics already match the zag docs.
+    pub const ErrDeferStmt = struct {
         expr: Expr,
     };
 };

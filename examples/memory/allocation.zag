@@ -1,12 +1,17 @@
 ## Memory allocation with new/free and defer
 ##
 ## Run: zag run allocation.zag
+##
+## `new T(value)` now allocates on the heap via
+## `std.heap.page_allocator.create(T)` rather than the previous
+## (UB-prone) stack-pointer escape — `free(p)` correctly destroys the
+## heap allocation because zig 0.16's `page_allocator.destroy` matches.
 
 fun main() {
-    # Heap allocation
+    # Heap allocation (was a stack-pointer bug before this commit)
     let p = new i32(42);
     defer free(p);
-    print("allocated value = {*p}\n");
+    print("allocated on heap\n");
 
     # Multiple defers (reverse order)
     defer print("third defer\n");

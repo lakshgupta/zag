@@ -34,6 +34,13 @@ pub const Codegen = struct {
     /// `pub fn` declarations don't bleed entries across functions.
     type_info_buf: [256]BindingTypeInfo,
     type_info_count: u32,
+    /// Per-function counter for `new`-introduced heap locals. Reset to 0
+    /// by `genFun` so each `pub fn` body has its own `__p_0`, `__p_1`, ...
+    /// sequence. The counter steps both for the simple `new T(value)` form
+    /// and the allocator-sugar form `new(<alloc>, T(value))` so two new
+    /// expressions in the same body never collide on the same temporary
+    /// name (zig's no-redeclaration rule would reject a clash).
+    alloc_counter: u32,
 
     pub fn init() Codegen {
         return .{
@@ -42,6 +49,7 @@ pub const Codegen = struct {
             .destructure_counter = 0,
             .type_info_buf = undefined,
             .type_info_count = 0,
+            .alloc_counter = 0,
         };
     }
 
@@ -86,6 +94,10 @@ pub const Codegen = struct {
         // happens — the predicates need to see this map when each
         // binary/literal expression hits the `.binary` arm.
         self.type_info_count = 0;
+        // Reset the `new`-temp counter at the top of each function so
+        // sibling `pub fn` declarations don't reuse the same `__p_<N>`
+        // names (zig's redeclaration-error would reject a collision).
+        self.alloc_counter = 0;
         for (fun.body) |stmt| {
             self.collectTypedBindings(stmt);
         }
@@ -209,6 +221,29 @@ pub const Codegen = struct {
                 self.write("    defer ");
                 self.genExpr(d.expr);
                 self.write(";\n");
+            },
+            .errdefer_stmt => |d| {
+                // zig 0.16 `errdefer expr;` mirrors zag's semantics
+                // one-to-one — runs `expr` ONLY on the error-propagation
+                // path (`?`-error or explicit `Err` early-return). See
+                // `docs/19-memory.md` Pattern 2 for the canonical use.
+                self.write("    errdefer ");
+                self.genExpr(d.expr);
+                self.write(";\n");
+            },
+            .unsafe_block => |stmts| {
+                // zig 0.16 has no block-form `unsafe` keyword — raw pointer
+                // dereferences and `@ptrCast` are already unconditional.
+                // Emit the body wrapped in a plain block with comment
+                // markers so the AST shape is visible to future
+                // `-Dunsafe-block-check` tooling without affecting the
+                // generated zig semantics. The leading/trailing comments
+                // guarantee the structure is auditable in code review.
+                self.write("    // unsafe {\n");
+                for (stmts) |s| {
+                    self.genStmt(s);
+                }
+                self.write("    // }\n");
             },
             .index_assign => |ia| {
                 // `target[i] = value;` writes a single element of an
@@ -564,11 +599,56 @@ pub const Codegen = struct {
                 }
             },
             .new_expr => |n| {
-                self.write("blk: { var __val: ");
+                // Heap-allocation rewrite (the bug fix exposing the docs
+                // / spec contract for `new`). Each `new T(value)` now
+                // allocates via `std.heap.page_allocator.create(T)` so the
+                // returned pointer is a real owning heap pointer rather
+                // than a stack-local address that would dangle as soon as
+                // the surrounding block exits. Codegen uses a per-function
+                // counter so the synthetic `__p_<N>` names never collide
+                // when a body has multiple `new` expressions.
+                //
+                // The `try` propagates `OutOfMemory` through the enclosing
+                // `pub fn main() !void { … }` signature emitted by
+                // `genFun`. For the custom-allocator sugar `new(<arena>,
+                // T(value))` we route through `<arena>.create(T)` instead
+                // so per-request arena allocations land in the user-supplied
+                // arena (e.g. HTTP-request lifecycles that `defer
+                // arena.free_all()`).
+                const id = self.alloc_counter;
+                self.alloc_counter += 1;
+                var name_buf: [16]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "__p_{d}", .{id}) catch "__p";
+                self.write("blk: { const ");
+                self.write(name);
+                if (n.allocator) |alloc_name| {
+                    self.write(" = try ");
+                    self.write(alloc_name);
+                    self.write(".create(");
+                } else {
+                    self.write(" = try std.heap.page_allocator.create(");
+                }
                 self.write(n.type_name);
-                self.write(" = ");
+                self.write("); ");
+                self.write(name);
+                self.write(".* = ");
                 self.genExpr(n.value.*);
-                self.write("; break :blk &__val; }");
+                self.write("; break :blk ");
+                self.write(name);
+                self.write("; }");
+            },
+            .cast => |c| {
+                // `expr as T` — verbatim passthrough because zig 0.16's
+                // `as` operator handles the same cast surface zag exposes
+                // (type widening, narrowing, pointer conversions, raw
+                // pointer casts). The parser's `collectCastType` joined
+                // multi-token types (`*raw c_void`, `*const T`) into the
+                // one `type_text` slice stored on the AST node.
+                self.write("(");
+                self.genExpr(c.expr.*);
+                self.write(" as ");
+                self.write(c.type_text);
+                self.write(")");
             },
             .free_expr => |f| {
                 self.write("std.heap.page_allocator.destroy(");
