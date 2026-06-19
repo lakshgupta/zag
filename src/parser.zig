@@ -79,9 +79,14 @@ pub const Parser = struct {
     fn parseStmt(self: *Parser) Stmt {
         const tok = self.peek();
         switch (tok.tag) {
-            .let => return .{ .let = self.parseLet() },
-            .var_kw => return .{ .var_binding = self.parseVar() },
-            .const_kw => return .{ .const_binding = self.parseConst() },
+            // Each binding-kind dispatch arm selects the kind AND the union
+            // tag simultaneously so the AST carries both. parseBinding does
+            // not see the union tag — it just parses the common shape and
+            // returns a BindingStmt; the structural duplication that
+            // motivated the refactor lives here at exactly three lines.
+            .let => return .{ .let = self.parseBinding(.let) },
+            .var_kw => return .{ .var_binding = self.parseBinding(.var_binding) },
+            .const_kw => return .{ .const_binding = self.parseBinding(.const_binding) },
             .identifier => {
                 // One-token lookahead: rebinding `name = expr` is a statement,
                 // not a free identifier expression. Without this, the leading
@@ -97,46 +102,36 @@ pub const Parser = struct {
         }
     }
 
-    fn parseLet(self: *Parser) Stmt.LetStmt {
-        self.expect(.let);
+    /// Parse one of the three binding declarations (`let`, `var`, `const`).
+    /// All three share this code path — the only divergence is which keyword
+    /// the source starts with, which we route via the `kind` parameter. The
+    /// dispatch site in `parseStmt` carries the binding kind to the AST by
+    /// selecting the matching union tag (`.let` / `.var_binding` /
+    /// `.const_binding`) and threading the same `kind` value here; the
+    /// payload `BindingStmt` is structurally identical across all three so
+    /// zig's tagged union gives us uniform field access (`stmt.let.init`,
+    /// `stmt.var_binding.name`, `stmt.const_binding.type_name`) without
+    /// duplicating struct definitions.
+    ///
+    /// Adding a future binding kind (`mut`, `implicit`, `ref`, ...) is a
+    /// three-line change: a new `BindingKind` enum member in `ast.zig`, a
+    /// matching arm in the `kw` switch below, plus a new dispatch arm in
+    /// `parseStmt` that calls `parseBinding(<kind>)`.
+    fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
+        // The kind determines which leading keyword the binding must start
+        // with. The lexer enforces `let`/`var`/`const` as reserved
+        // `TokenTag`s so a user-shadowed identifier never reaches us here.
+        const kw: TokenTag = switch (kind) {
+            .let => .let,
+            .var_binding => .var_kw,
+            .const_binding => .const_kw,
+        };
+        self.expect(kw);
         const name = self.expectIdent();
-        // Optional type annotation: `let name: T = expr`.
-        // Mismatch between `:` and a following type ident is reported via
-        // `expectIdent` so users get the standard parser error format.
-        var type_name: ?[]const u8 = null;
-        if (self.peek().tag == .colon) {
-            self.advance();
-            type_name = self.expectIdent();
-        }
-        self.expect(.equals);
-        const initializer = self.parseExpr();
-        return .{ .name = name, .type_name = type_name, .init = initializer };
-    }
-
-    fn parseVar(self: *Parser) Stmt.VarStmt {
-        // Mirror of parseLet, but the emitted Zig binding is mutable. The
-        // `var` keyword is rejected as a reserved identifier from user code
-        // (see lexer TokenTag .var_kw) so we never collide with a user-named
-        // `var` symbol.
-        self.expect(.var_kw);
-        const name = self.expectIdent();
-        var type_name: ?[]const u8 = null;
-        if (self.peek().tag == .colon) {
-            self.advance();
-            type_name = self.expectIdent();
-        }
-        self.expect(.equals);
-        const initializer = self.parseExpr();
-        return .{ .name = name, .type_name = type_name, .init = initializer };
-    }
-
-    fn parseConst(self: *Parser) Stmt.ConstStmt {
-        // Mirror of parseVar: same optional `: T` annotation, same mandatory
-        // `=` and `init: Expr`. The shape mirrors `LetStmt` field-for-field
-        // exactly so `genStmt`'s `.const_binding` case can reuse the same
-        // optional type-name emission logic.
-        self.expect(.const_kw);
-        const name = self.expectIdent();
+        // Optional `name: T` annotation. Mismatch between a `:` followed by
+        // a non-identifier token is reported via `expectIdent` so the user
+        // gets the standard parser error format rather than a misleading
+        // `expected ':', got '='` cascade.
         var type_name: ?[]const u8 = null;
         if (self.peek().tag == .colon) {
             self.advance();

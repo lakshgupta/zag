@@ -101,47 +101,52 @@ pub const Expr = union(enum) {
     };
 };
 
+/// Discriminates the three binding kinds the parser wires to `Stmt`
+/// (`let`, `var`, `const`) and is forward-extensible: adding a future kind
+/// (`mut`, `implicit`, `ref`, …) requires three small additions — a new
+/// enum member here, a new arm in `Parser.parseBinding`'s keyword switch,
+/// and a new dispatch arm in `Parser.parseStmt` — no new struct
+/// definition needed because all kinds carry the same `BindingStmt` shape.
+pub const BindingKind = enum {
+    let,
+    var_binding,
+    const_binding,
+};
+
 pub const Stmt = union(enum) {
-    let: LetStmt,
-    /// Mutable binding via the `var` keyword. The tag is named `.var_binding`
-    /// rather than `.var` because Zig's tagged-union tag literals can't reuse
-    /// `var` (a reserved keyword in Zig 0.16). The lexer accepts `var` as the
+    /// `let` binding. The keyword tag is on the envelope, the kind on the
+    /// payload (see `BindingKind`): one `BindingStmt` struct is reused for
+    /// `let`, `var`, and `const` so adding a future kind (e.g. `mut`,
+    /// `implicit`) only requires a new `BindingKind` member + a new dispatch
+    /// arm in the parser, not a fresh struct definition.
+    let: BindingStmt,
+    /// `var` binding. The tag is named `.var_binding` rather than `.var`
+    /// because Zig's tagged-union tag literals cannot reuse `var` (it's a
+    /// reserved keyword in Zig 0.16). The lexer accepts `var` as the
     /// `var_kw` TokenTag and the parser constructs `.var_binding = …` here.
-    var_binding: VarStmt,
-    /// Compile-time-evaluated binding via the `const` keyword. Mirrors the
-    /// shape of `LetStmt` exactly so the parser and codegen can keep an
-    /// almost-uniform code path: optional `: T` annotation + mandatory
-    /// initializer. The tag is named `.const_binding` (not `.const`) because
-    /// `const` is a Zig keyword — using it as a tagged-union tag literal
-    /// collides with the TokenTag source-tree in zig 0.16.
-    const_binding: ConstStmt,
+    var_binding: BindingStmt,
+    /// `const` binding. Mirrors the shape of the other two exactly. The tag
+    /// is named `.const_binding` (not `.const`) for the same Zig-keyword
+    /// reason as `.var_binding`. Zag's `const` is a *compile-time* binding by
+    /// convention; codegen emits a Zig `const NAME: T = expr;`, which is
+    /// itself evaluated at compile time.
+    const_binding: BindingStmt,
     assign: AssignStmt,
     defer_stmt: DeferStmt,
     expr_stmt: Expr,
 
-    pub const LetStmt = struct {
+    /// Backing struct for all three binding kinds (`let`, `var`, `const`).
+    /// The kind is carried *by the union tag* on `Stmt`, not duplicated here
+    /// in a payload-level field — Zig's tagged union already gives us
+    /// exhaustive payload access (`stmt.let.init`, `stmt.var_binding.name`),
+    /// so storing `kind` here would just be redundant and risk drift. The
+    /// parser emits these from a single `parseBinding(kind)` helper that
+    /// knows the expected keyword from `kind` and the canonical union tag
+    /// from the dispatch site.
+    pub const BindingStmt = struct {
         name: []const u8,
-        /// Optional type annotation parsed from `let name: T = expr`.
+        /// Optional type annotation parsed from `name: T = expr`.
         /// `null` for un-annotated bindings (type inferred from `init`).
-        type_name: ?[]const u8,
-        init: Expr,
-    };
-
-    pub const VarStmt = struct {
-        /// Mirrors `LetStmt` but binds a *mutable* Zig `var`. The exact same
-        /// optional `: T` annotation syntax applies so `var y: f64 = 3.14;`
-        /// and `var y = 3.14;` both parse.
-        name: []const u8,
-        type_name: ?[]const u8,
-        init: Expr,
-    };
-
-    pub const ConstStmt = struct {
-        /// Mirrors `LetStmt` field-for-field so the parser/codegen code paths
-        /// for `const NAME[: T] = expr` mirror `let` and `var`. Zag's `const`
-        /// is a *compile-time* binding by convention; codegen emits a Zig
-        /// `const NAME: T = expr;`, which is itself evaluated at compile time.
-        name: []const u8,
         type_name: ?[]const u8,
         init: Expr,
     };
