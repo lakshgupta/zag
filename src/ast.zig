@@ -113,6 +113,27 @@ pub const BindingKind = enum {
     const_binding,
 };
 
+/// Destructuring pattern for bindings. Lives at module scope (next to
+/// `BindingKind`) so it can be referenced as `ast.BindingPattern` from
+/// `src/parser.zig` and `src/codegen.zig` without the `Stmt.` prefix.
+/// Mirrors the four shapes in `docs/manual/04-variables.md`:
+///
+///   let (x, y) = (10, 20);                 → .tuple([.name("x"), .name("y")])
+///   let [a, b, c] = arr;                   → .array([.name("a"), .name("b"), .name("c")])
+///   let (_, y, _) = (1, 2, 3);             → .tuple([.discard, .name("y"), .discard])
+///   let _ = something;                     → .discard
+///
+/// Recursive via `.tuple` / `.array` so nested forms like
+/// `let (a, (b, c)) = …` parse cleanly. Wildcard `_` is a leaf value
+/// (with no zigzag binding emitted) rather than a separate top-level
+/// variant, so the same helper handles `let _` and partial discards.
+pub const BindingPattern = union(enum) {
+    name: []const u8,
+    discard: void,
+    tuple: []const BindingPattern,
+    array: []const BindingPattern,
+};
+
 pub const Stmt = union(enum) {
     /// `let` binding. The keyword tag is on the envelope, the kind on the
     /// payload (see `BindingKind`): one `BindingStmt` struct is reused for
@@ -149,6 +170,15 @@ pub const Stmt = union(enum) {
         /// `null` for un-annotated bindings (type inferred from `init`).
         type_name: ?[]const u8,
         init: Expr,
+        /// Optional destructuring pattern. `null` for the plain
+        /// `let NAME = INIT` form (codegen emits one zig binding per stmt).
+        /// Non-`null` for destructuring forms like `let (a, b) = …` or
+        /// `let [a, b, c] = arr` (codegen emits a temp `__destruct_<N>`
+        /// followed by per-leaf bindings). When set, `name` is the empty
+        /// sentinel and `type_name` must be `null` (the parser rejects
+        /// `: T` annotations on destructuring forms because the doc does
+        /// not specify a syntax for them).
+        pattern: ?BindingPattern = null,
     };
 
     pub const AssignStmt = struct {

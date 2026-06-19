@@ -62,14 +62,37 @@ let c: f64 = 42;         # explicit annotation
 
 ## Destructuring
 
+Zag supports the binding-side destructuring shapes below today. The source can be a literal (`(10, 20)`), a prior let-binding (`pair`), or any expression that evaluates to a tuple/array value.
+
 ```
-let (x, y) = (10, 20);
-let Vec3 { x, y, z } = v;
-let [a, b, c] = arr;
-let (_, y, _) = (1, 2, 3);   # discard values
+let (x, y) = (10, 20);             # tuple (literal source)
+let (a, b) = pair;                 # tuple (prior binding)
+let [a, b, c] = arr;               # array
+let (_, y, _) = (1, 2, 3);         # tuple with wildcard discards
+let (a, (b, c)) = (1, (2, 3));     # nested (tuple-in-tuple)
+var (m, n) = (1, 2);               # mutable destructuring (var leaves, const temp)
 ```
 
-**Memory:** Each binding is stack-allocated. Destructuring copies/moves values from the source.
+The wildcard `_` may appear anywhere a leaf name is expected and emits no binding. The value is still copied through the temp, so the surrounding leaves' positional access into the source stays correct (e.g. the `y` in `let (_, y, _) = (1, 2, 3);` still reads source index `[1]`).
+
+Destructuring is recursive, so the patterns above freely nest: a tuple leaf can be a tuple, an array leaf can be an array, etc. See `examples/basics/destructuring.zag` for a working demo of every form above.
+
+**Implemented status (as of zig 0.16 codegen):**
+
+- `let (x, y) = (10, 20)` — tuple with literal source: **implemented**
+- `let (a, b) = pair` — tuple from prior binding: **implemented**
+- `let [a, b, c] = arr` — array source: **implemented**
+- `let (_, y, _) = (1, 2, 3)` — wildcard discards: **implemented**
+- `let (a, (b, c)) = …` — nested patterns: **implemented**
+- `var (m, n) = (1, 2)` — mutable destructuring: **implemented**
+- `let Vec3 { x, y, z } = v` — struct destructuring on a `Vec3` struct (see [Structs](12-structs.md)): **deferred**, gated on struct-init support landing first
+
+**`var` destructured leaves and zig 0.16:** two independent hard-error rules apply:
+
+1. **`comptime_int` rejection.** `__destruct_0` is an anonymous struct literal, so `__destruct_0[0]` is a `comptime_int`. `var m = __destruct_0[0];` would be rejected because a runtime `var` cannot hold an unsized integer. The codegen works around this by emitting a concrete type on every `var` leaf (`: i32`, `: f64`, `: bool`, `: u8`, `: []const u8`) inferred from the literal in the source tuple.
+2. **`local variable is never mutated`.** zig 0.16 promotes this warning to a hard error, so `var (m, n) = (1, 2); print(n);` fails to compile even though `n` is read. The compiler emits both leaves; the user is responsible for mutating each one (so add `n = n + 1;` or similar).
+
+**Memory:** Each leaf binding is stack-allocated. The destructuring itself is codegen-driven: there is one synthetic `const __destruct_<N> = INIT;` temp that carries the source value throughout its body, plus one emitted binding per leaf walked through the pattern. Discarded leaves emit nothing; the temp is `const` even under `var` bindings because it is only a synthetic carrier — the leaves hold the user-visible names.
 
 ## Shadowing
 

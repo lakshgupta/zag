@@ -4,11 +4,17 @@ const ast = @import("ast.zig");
 pub const Codegen = struct {
     out_buf: [65536]u8,
     out_len: usize,
+    /// Per-function counter for destructuring temps. Reset to 0 by `genFun`
+    /// so each `pub fn` body has its own `__destruct_0`, `__destruct_1`,
+    /// ... sequence. Multiple destructurings in the same body produce
+    /// distinct names so zig's no-redeclaration rule is satisfied.
+    destructure_counter: u32,
 
     pub fn init() Codegen {
         return .{
             .out_buf = undefined,
             .out_len = 0,
+            .destructure_counter = 0,
         };
     }
 
@@ -43,6 +49,10 @@ pub const Codegen = struct {
     }
 
     fn genFun(self: *Codegen, fun: ast.FunDecl) void {
+        // Reset destructuring counter at the top of each function so the
+        // temp bindings inside this body stay local (avoiding clashes
+        // across sibling `pub fn` declarations) and count from `_0`.
+        self.destructure_counter = 0;
         if (fun.doc) |d| self.genDocComment(d);
         self.write("pub fn ");
         self.write(fun.name);
@@ -88,49 +98,14 @@ pub const Codegen = struct {
 
     fn genStmt(self: *Codegen, stmt: ast.Stmt) void {
         switch (stmt) {
-            .let => |l| {
-                self.write("    const ");
-                self.write(l.name);
-                // Preserve the user's type annotation `let x: T = ...` so Zig's
-                // type checker picks it up too. Without `type_name` we let Zig
-                // infer from the initializer (which still produces a `const`).
-                if (l.type_name) |t| {
-                    self.write(": ");
-                    self.write(t);
-                }
-                self.write(" = ");
-                self.genExpr(l.init);
-                self.write(";\n");
-            },
-            .var_binding => |v| {
-                // Mutable binding: emit Zig's `var` so a follow-up
-                // `name = expr` rebinding via `.assign` compiles cleanly.
-                self.write("    var ");
-                self.write(v.name);
-                if (v.type_name) |t| {
-                    self.write(": ");
-                    self.write(t);
-                }
-                self.write(" = ");
-                self.genExpr(v.init);
-                self.write(";\n");
-            },
-            .const_binding => |c| {
-                // Compile-time binding: emit Zig's `const`. The zig keyword
-                // matches zag's keyword shape exactly; what changes between
-                // the let/var/const trio is where the storage lives (stack
-                // mutable for var, stack immutable for let, compile-time for
-                // const).
-                self.write("    const ");
-                self.write(c.name);
-                if (c.type_name) |t| {
-                    self.write(": ");
-                    self.write(t);
-                }
-                self.write(" = ");
-                self.genExpr(c.init);
-                self.write(";\n");
-            },
+            // All three binding kinds funnel through `genBinding`, which
+            // decides between the simple single-binding path (no `pattern`
+            // set) and the destructuring path (one temp binding + per-leaf
+            // `const/var` bindings recursively walked through the pattern).
+            // `kw` is the literal zig keyword spelling the binding kind.
+            .let => |l| self.genBinding("const", l),
+            .var_binding => |v| self.genBinding("var", v),
+            .const_binding => |c| self.genBinding("const", c),
             .assign => |a| {
                 // Bare rebinding: `name = expr;` (no leading `let`/`var`).
                 // The name must refer to a previously-declared `var`; Zig's
@@ -154,6 +129,168 @@ pub const Codegen = struct {
             },
         }
     }
+
+    /// Emit a single binding declaration. Two paths:
+    /// - **Simple** (`pattern == null`): one zig statement
+    ///   `    <kw> NAME[: T] = INIT;`  — the existing single-name form.
+    /// - **Destructuring** (`pattern != null`): one const temp binding
+    ///   `    const __destruct_<N> = INIT;`  followed by one zig
+    ///   declaration per leaf walked through `pattern`. Discards emit
+    ///   nothing; both tuple and array indices use `[k]` bracket-indexing
+    ///   on the temp (zig 0.16 accepts `[k]` on both arrays and anonymous
+    ///   structs). The temp is `const` even under a `var` binding because
+    ///   it's a synthetic carrier — only the leaves are `var`-mutable.
+    fn genBinding(self: *Codegen, kw: []const u8, b: ast.Stmt.BindingStmt) void {
+        if (b.pattern) |pattern| {
+            const idx = self.destructure_counter;
+            self.destructure_counter += 1;
+            var tmp_buf: [32]u8 = undefined;
+            const tmp_name = std.fmt.bufPrint(&tmp_buf, "__destruct_{d}", .{idx}) catch "__destruct";
+            self.write("    const ");
+            self.write(tmp_name);
+            self.write(" = ");
+            self.genExpr(b.init);
+            self.write(";\n");
+            // Walk the init expression in parallel with the pattern so each
+            // leaf can infer its type from the corresponding source literal
+            // (e.g. `(1, 2)` → leaves get `: i32` for `var` destructurings).
+            self.genBindingLeaves(kw, tmp_name, pattern, getTopElements(b.init));
+            return;
+        }
+        // Simple path.
+        self.write("    ");
+        self.write(kw);
+        self.write(" ");
+        self.write(b.name);
+        // Preserve the user's type annotation `let x: T = ...` so Zig's
+        // type checker picks it up too. Without `type_name` we let Zig
+        // infer from the initializer (which still produces a `const`/`var`).
+        if (b.type_name) |t| {
+            self.write(": ");
+            self.write(t);
+        }
+        self.write(" = ");
+        self.genExpr(b.init);
+        self.write(";\n");
+    }
+
+    /// Recursive walk of a `BindingPattern` emitting leaf bindings. `src_path`
+    /// is the cumulative extraction path from the temp, e.g. for
+    /// `let (a, (b, c)) = (1, (2, 3))` we first emit `b` from
+    /// `__destruct_0[1][0]` and `c` from `__destruct_0[1][1]`. Discards just
+    /// drop the leaf. The buffer for each new path is 256 bytes, plenty for
+    /// any reasonable nesting depth (each level adds `[k]` ≤ 4 chars).
+    ///
+    /// Both `.tuple` and `.array` patterns share the same bracket-indexing
+    /// zag syntax — `[i]` works on arrays AND on anonymous structs in
+    /// zig 0.16. (`.i` numeric-field syntax on anonymous structs is
+    /// rejected in 0.16; `.@"i"` quoted-identifier syntax also works but
+    /// `[i]` is the simpler form and unifies both pattern variants into one
+    /// recursive case.)
+    ///
+    /// `elements` carries the current-level source container's element
+    /// expressions — it's the parallel walk of the init expression. For
+    /// `let (a, b) = (10, 20);` at the top call, `elements` is
+    /// `[IntLit(10), IntLit(20)]`. The shape of the element slice passed to
+    /// each child differs by the child's pattern kind, which is why the
+    /// `.tuple`/`.array` arm switches on `leaf`:
+    ///
+    /// - **Leaf child** (`.name`/`.discard`): the child needs direct access
+    ///   to `elements[i]` for type inference (`inferZigTypeFromExpr`), so we
+    ///   pass a single-element slice `elements[i..][0..1]`. Earlier naive
+    ///   versions wrapped in `getTopElements` and stripped too far, losing
+    ///   the type info on `var` destructured leaves.
+    /// - **Nested child** (`.tuple`/`.array`): the child needs the
+    ///   init expression's element list (e.g. `IntLit(2), IntLit(3)` for the
+    ///   inner pair of `let (a, (b, c)) = (1, (2, 3))`), so we drill in via
+    ///   `getTopElements(elements[i])`.
+    ///
+    /// `inferZigTypeFromExpr` covers the literal kinds the parser can
+    /// produce. For elements we can't infer (idents, calls, etc.), we emit
+    /// no annotation and trust the user's destination type to be concrete
+    /// via the assignment's other side or zig's type inference downstream.
+    fn genBindingLeaves(self: *Codegen, kw: []const u8, src_path: []const u8, pattern: ast.BindingPattern, elements: []const ast.Expr) void {
+        switch (pattern) {
+            .name => |name| {
+                self.write("    ");
+                self.write(kw);
+                self.write(" ");
+                self.write(name);
+                // `var` leaves need concrete type annotations because
+                // zig rejects `var x = comptime_int`. By inspecting the
+                // matching element of init, we infer the type from a small
+                // lookup table covering literals our parser can produce.
+                // For elements we can't infer (idents, calls, etc.), we
+                // emit no annotation and trust the user's destination type
+                // to be concrete via the assignment's other side.
+                if (std.mem.eql(u8, kw, "var") and elements.len > 0) {
+                    const t = inferZigTypeFromExpr(elements[0]);
+                    if (t.len > 0) {
+                        self.write(": ");
+                        self.write(t);
+                    }
+                }
+                self.write(" = ");
+                self.write(src_path);
+                self.write(";\n");
+            },
+            .discard => {
+                // Wildcard leaf — emit no binding. The temp still carries
+                // the value; we just throw it away by not aliasing any
+                // user-visible name to it.
+            },
+            .tuple, .array => |pats| {
+                for (pats, 0..) |leaf, i| {
+                    var new_buf: [256]u8 = undefined;
+                    const new_path = std.fmt.bufPrint(&new_buf, "{s}[{d}]", .{ src_path, i }) catch src_path;
+                    // Hand each child the elements slice appropriate for
+                    // ITS shape. Both branches fall through to the leaf when
+                    // `elements` has no element at `i` (init didn't carry a
+                    // destructurable Expr at this depth — idents, calls,
+                    // etc. — so type inference skips and the leaf is emitted
+                    // bare). See the doc header above for why these two
+                    // forms differ.
+                    const sub_elements: []const ast.Expr = switch (leaf) {
+                        .name, .discard => if (i < elements.len)
+                            elements[i..][0..1]
+                        else
+                            &[_]ast.Expr{},
+                        .tuple, .array => if (i < elements.len)
+                            getTopElements(elements[i])
+                        else
+                            &[_]ast.Expr{},
+                    };
+                    self.genBindingLeaves(kw, new_path, leaf, sub_elements);
+                }
+            },
+        }
+    }
+
+/// Infer the default zig type for a zag literal Expr. Returns "" for cases
+/// where zag has no type info (idents, calls, binary expressions, etc.) —
+/// the caller should emit no type annotation in those cases.
+fn inferZigTypeFromExpr(expr: ast.Expr) []const u8 {
+    return switch (expr) {
+        .int_lit => "i32",
+        .float_lit => "f64",
+        .bool_lit => "bool",
+        .char_lit => "u8",
+        .string_lit, .byte_string_lit => "[]const u8",
+        else => "",
+    };
+}
+
+/// Top-level elements of a destructurable source Expr. `.tuple_lit` and
+/// `.array_lit` produce real element slices; everything else (idents,
+/// calls, etc.) returns an empty slice to signal "can't infer leaf types
+/// at this depth — caller should emit no annotation".
+fn getTopElements(expr: ast.Expr) []const ast.Expr {
+    return switch (expr) {
+        .tuple_lit => |els| els,
+        .array_lit => |a| a.elements,
+        else => &[_]ast.Expr{},
+    };
+}
 
     fn genExpr(self: *Codegen, expr: ast.Expr) void {
         switch (expr) {

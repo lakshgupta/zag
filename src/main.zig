@@ -1388,3 +1388,240 @@ test "codegen: multi-arg interpolation without specs still works" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "z = {any}, flag = {any}, ch = {any}\\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, ", .{z, flag, ch,})") != null);
 }
+
+test "parser: tuple destructuring" {
+    // `let (x, y) = (10, 20);` should split into a tuple pattern with two
+    // name leaves. The legacy `name` field is the empty sentinel for
+    // destructuring forms.
+    const src = "fun f() {\n    let (x, y) = (10, 20);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .let);
+    try std.testing.expect(stmt.let.pattern != null);
+    try std.testing.expect(stmt.let.pattern.? == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), stmt.let.pattern.?.tuple.len);
+    try std.testing.expectEqualStrings("x", stmt.let.pattern.?.tuple[0].name);
+    try std.testing.expectEqualStrings("y", stmt.let.pattern.?.tuple[1].name);
+    try std.testing.expectEqualStrings("", stmt.let.name);
+    try std.testing.expect(stmt.let.type_name == null);
+    try std.testing.expect(stmt.let.init == .tuple_lit);
+}
+
+test "parser: array destructuring" {
+    // `let [a, b, c] = arr;` should split into an array pattern with three
+    // name leaves. Same legacy-field-sentinel behaviour as tuple form.
+    const src = "fun f() {\n    let [a, b, c] = arr;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .let);
+    try std.testing.expect(stmt.let.pattern != null);
+    try std.testing.expect(stmt.let.pattern.? == .array);
+    try std.testing.expectEqual(@as(usize, 3), stmt.let.pattern.?.array.len);
+    try std.testing.expectEqualStrings("a", stmt.let.pattern.?.array[0].name);
+    try std.testing.expectEqualStrings("b", stmt.let.pattern.?.array[1].name);
+    try std.testing.expectEqualStrings("c", stmt.let.pattern.?.array[2].name);
+    try std.testing.expect(stmt.let.init == .ident);
+    try std.testing.expectEqualStrings("arr", stmt.let.init.ident);
+}
+
+test "parser: destructuring with wildcard discard" {
+    // `let (_, y, _) = (1, 2, 3);` should split into a tuple of
+    // [discard, name("y"), discard].
+    const src = "fun f() {\n    let (_, y, _) = (1, 2, 3);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt.let.pattern.? == .tuple);
+    try std.testing.expectEqual(@as(usize, 3), stmt.let.pattern.?.tuple.len);
+    try std.testing.expect(stmt.let.pattern.?.tuple[0] == .discard);
+    try std.testing.expectEqualStrings("y", stmt.let.pattern.?.tuple[1].name);
+    try std.testing.expect(stmt.let.pattern.?.tuple[2] == .discard);
+}
+
+test "parser: top-level wildcard" {
+    // `let _ = 42;` should produce a discard-only pattern with no leaves.
+    const src = "fun f() {\n    let _ = 42;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .let);
+    try std.testing.expect(stmt.let.pattern != null);
+    try std.testing.expect(stmt.let.pattern.? == .discard);
+    try std.testing.expect(stmt.let.init == .int_lit);
+}
+
+test "parser: nested destructuring" {
+    // `let (a, (b, c)) = (1, (2, 3));` should produce a tuple containing
+    // [name("a"), tuple([name("b"), name("c")])] — recursion works.
+    const src = "fun f() {\n    let (a, (b, c)) = (1, (2, 3));\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt.let.pattern.? == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), stmt.let.pattern.?.tuple.len);
+    try std.testing.expectEqualStrings("a", stmt.let.pattern.?.tuple[0].name);
+    try std.testing.expect(stmt.let.pattern.?.tuple[1] == .tuple);
+    try std.testing.expectEqualStrings("b", stmt.let.pattern.?.tuple[1].tuple[0].name);
+    try std.testing.expectEqualStrings("c", stmt.let.pattern.?.tuple[1].tuple[1].name);
+}
+
+test "codegen: tuple destructuring emits temp + per-leaf" {
+    // `let (x, y) = (10, 20);` must surface as:
+    //   const __destruct_0 = .{ 10, 20 };
+    //   const x = __destruct_0[0];
+    //   const y = __destruct_0[1];
+    // Uses bracket indexing on the anonymous struct (zig 0.16 syntax) — the
+    // older `.0` numeric field-access form is rejected by 0.16.
+    const src = "fun f() {\n    let (x, y) = (10, 20);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const __destruct_0 = .{ 10, 20 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const x = __destruct_0[0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const y = __destruct_0[1];") != null);
+    // Sanity: the old dot-style syntax must NOT appear:
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0.1") == null);
+}
+
+test "codegen: array destructuring emits temp + per-leaf indexed" {
+    // `let [a, b] = arr;` must surface as:
+    //   const __destruct_0 = arr;
+    //   const a = __destruct_0[0];
+    //   const b = __destruct_0[1];
+    const src = "fun f() {\n    let [a, b] = arr;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const __destruct_0 = arr;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const a = __destruct_0[0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const b = __destruct_0[1];") != null);
+}
+
+test "codegen: wildcard leaves skip emission" {
+    // `let (_, y, _) = (1, 2, 3);` should only emit a `y` binding; the
+    // discarded slots emit nothing. The temp binding still carries the
+    // whole tuple so `y` can pluck out `.[1]`.
+    const src = "fun f() {\n    let (_, y, _) = (1, 2, 3);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const __destruct_0 = .{ 1, 2, 3 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const y = __destruct_0[1];") != null);
+    // Sanity: nothing emitted for the discarded slots — neither with the
+    // new `[k]` nor the obsolete `.k` form.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0[0]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0[2]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0.2") == null);
+}
+
+test "codegen: nested destructuring emits nested temp paths" {
+    // `let (a, (b, c)) = (1, (2, 3));` should produce temp paths `[0]` for
+    // `a` and `[1][0]`/`[1][1]` for `b`/`c`. There is no second temp — the
+    // inner pair is destructured through the same outer temp.
+    const src = "fun f() {\n    let (a, (b, c)) = (1, (2, 3));\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const a = __destruct_0[0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const b = __destruct_0[1][0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c = __destruct_0[1][1];") != null);
+    // Only one temp for the whole expression — inner pair is destructured
+    // through the same __destruct_0 reference, not a fresh __destruct_1.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_1") == null);
+    // Sanity: dot-syntax paths must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0.1.0") == null);
+}
+
+test "codegen: var destructuring emits var leaves, const temp" {
+    // `var (x, y) = (10, 20);` should produce:
+    //   const __destruct_0 = .{ 10, 20 };   // temp is synthetic carrier, always const
+    //   var x: i32 = __destruct_0[0];       // inferred : i32 to escape comptime_int
+    //   var y: i32 = __destruct_0[1];       // inferred : i32 to escape comptime_int
+    const src = "fun f() {\n    var (x, y) = (10, 20);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const __destruct_0 = .{ 10, 20 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    var x: i32 = __destruct_0[0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    var y: i32 = __destruct_0[1];") != null);
+    // Sanity: dot-syntax must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct_0.1") == null);
+}
+
+test "codegen: counter increments across multiple destructures" {
+    // Two destructurings in the same body get distinct temp names so zig's
+    // no-redeclaration rule is satisfied. Both tuple and array branches
+    // share the same counter and indexing scheme.
+    const src =
+        \\fun f() {
+        \\    let (a, b) = (1, 2);
+        \\    let [c, d] = arr;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const a = __destruct_0[0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c = __destruct_1[0];") != null);
+}
+
+test "codegen: simple binding unchanged when not destructuring" {
+    // Regression: a plain `let x = 42` still produces a single binding
+    // (no temp, no destructuring path) so existing tests don't break.
+    const src = "fun f() {\n    let x = 42;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const x = 42;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct") == null);
+}

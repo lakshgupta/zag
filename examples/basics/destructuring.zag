@@ -1,0 +1,36 @@
+## Destructuring — tuple / array / wildcard / nested
+##
+## Run: zag run destructuring.zag
+
+fun main() {
+    # Tuple destructuring: split a 2-tuple into two named bindings.
+    let pair = (100, 200);
+    let (a, b) = pair;
+    print("tuple: a = {a}, b = {b}\n");
+
+    # Tuple destructuring with one fixed-size array on the RHS.
+    let (x, y, z) = (1, 2, 3);
+    print("triple: x = {x}, y = {y}, z = {z}\n");
+
+    # Wildcard discard: keep only the middle value.
+    let (_, middle, _) = (10, 20, 30);
+    print("discard middle: middle = {middle}\n");
+
+    # Array destructuring from an existing array binding.
+    let arr = [4]i32 { 7, 8, 9, 10 };
+    let [first, second, third, fourth] = arr;
+    print("array: first={first} second={second} third={third} fourth={fourth}\n");
+
+    # Nested destructuring: an inner pair inside an outer pair.
+    let outer = (100, (200, 300));
+    let (o, (p, q)) = outer;
+    print("nested: o = {o}, p = {p}, q = {q}\n");
+
+    # Mutable destructuring: leaves are emitted as `var` bindings. Both
+    # leaves must be mutated at least once because zig 0.16 promotes
+    # "local variable is never mutated" from warning to error.
+    var (m, n) = (1, 2);
+    m = 99;
+    n = n + 10;
+    print("mut destructure: m = {m}, n = {n}\n");
+}

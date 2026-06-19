@@ -117,6 +117,14 @@ pub const Parser = struct {
     /// three-line change: a new `BindingKind` enum member in `ast.zig`, a
     /// matching arm in the `kw` switch below, plus a new dispatch arm in
     /// `parseStmt` that calls `parseBinding(<kind>)`.
+    ///
+    /// The first token after the keyword disambiguates single-name from
+    /// destructuring: `(` opens a tuple pattern, `[` opens an array
+    /// pattern, an identifier is either a name or the wildcard `_`. Either
+    /// way `parseBindingPattern` returns the shape and we promote `.name`
+    /// results into the simple-binding code path (.pattern = null) so the
+    /// existing 83-unit-call-site test suite continues to read
+    /// `stmt.let.name` / `stmt.let.type_name.?` without modification.
     fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
         // The kind determines which leading keyword the binding must start
         // with. The lexer enforces `let`/`var`/`const` as reserved
@@ -127,19 +135,93 @@ pub const Parser = struct {
             .const_binding => .const_kw,
         };
         self.expect(kw);
-        const name = self.expectIdent();
-        // Optional `name: T` annotation. Mismatch between a `:` followed by
-        // a non-identifier token is reported via `expectIdent` so the user
-        // gets the standard parser error format rather than a misleading
-        // `expected ':', got '='` cascade.
-        var type_name: ?[]const u8 = null;
-        if (self.peek().tag == .colon) {
-            self.advance();
-            type_name = self.expectIdent();
+        const pattern = self.parseBindingPattern();
+        if (pattern == .name) {
+            // Plain single-name binding: optionally annotated `: T`. The
+            // pattern's `.name` text is promoted into the legacy `name`
+            // field so callers that read `stmt.let.name` continue to work.
+            var type_name: ?[]const u8 = null;
+            if (self.peek().tag == .colon) {
+                self.advance();
+                type_name = self.expectIdent();
+            }
+            self.expect(.equals);
+            const initializer = self.parseExpr();
+            return .{ .name = pattern.name, .type_name = type_name, .init = initializer };
         }
+        // Destructuring form: docs do not specify a syntax for `: T`
+        // annotations on patterns, so we reject them by consuming the
+        // `=` directly. The `name` field is the empty sentinel (codegen
+        // ignores it when `pattern` is set).
         self.expect(.equals);
         const initializer = self.parseExpr();
-        return .{ .name = name, .type_name = type_name, .init = initializer };
+        return .{ .name = "", .type_name = null, .init = initializer, .pattern = pattern };
+    }
+
+    /// Parse a destructuring pattern starting at the current token. Recursive
+    /// for nested forms (`let (a, (b, c)) = …` is a tuple containing a tuple).
+    ///
+    /// Returns a `BindingPattern`:
+    /// - `.name("x")` — single identifier (no destructuring)
+    /// - `.discard`   — the wildcard `_`
+    /// - `.tuple([ … ])` — pattern wrapped in `(…)` (tuple destructuring)
+    /// - `.array([ … ])` — pattern wrapped in `[…]` (array destructuring)
+    fn parseBindingPattern(self: *Parser) ast.BindingPattern {
+        const tok = self.peek();
+        if (tok.tag == .lparen) {
+            // Tuple destructuring: `(p0, p1, ..., pN)`. Recurse into each
+            // element so `let (a, (b, c)) = …` is a valid form.
+            self.advance();
+            var pats_buf: [16]ast.BindingPattern = undefined;
+            var pat_count: usize = 0;
+            if (self.peek().tag != .rparen) {
+                pats_buf[pat_count] = self.parseBindingPattern();
+                pat_count += 1;
+                while (self.peek().tag == .comma) {
+                    self.advance();
+                    pats_buf[pat_count] = self.parseBindingPattern();
+                    pat_count += 1;
+                }
+            }
+            self.expect(.rparen);
+            const pats = self.arena.alloc(ast.BindingPattern, pat_count);
+            @memcpy(pats, pats_buf[0..pat_count]);
+            return .{ .tuple = pats };
+        }
+        if (tok.tag == .lbracket) {
+            // Array destructuring: `[p0, p1, ..., pN]`. Recursive like tuple.
+            self.advance();
+            var pats_buf: [16]ast.BindingPattern = undefined;
+            var pat_count: usize = 0;
+            if (self.peek().tag != .rbracket) {
+                pats_buf[pat_count] = self.parseBindingPattern();
+                pat_count += 1;
+                while (self.peek().tag == .comma) {
+                    self.advance();
+                    pats_buf[pat_count] = self.parseBindingPattern();
+                    pat_count += 1;
+                }
+            }
+            self.expect(.rbracket);
+            const pats = self.arena.alloc(ast.BindingPattern, pat_count);
+            @memcpy(pats, pats_buf[0..pat_count]);
+            return .{ .array = pats };
+        }
+        if (tok.tag == .identifier) {
+            // `_` is the wildcard; everything else is a name.
+            if (std.mem.eql(u8, tok.text, "_")) {
+                self.advance();
+                return .{ .discard = {} };
+            }
+            const name = self.expectIdent();
+            return .{ .name = name };
+        }
+        // Anything else is a syntactic error: the doc only defines patterns
+        // starting with `(`, `[`, or an identifier.
+        std.debug.print("error:{d}:{d}: expected binding pattern, got '{s}'\n", .{
+            tok.loc.line, tok.loc.col, tok.text,
+        });
+        std.process.exit(1);
     }
 
     fn parseAssign(self: *Parser) Stmt.AssignStmt {
