@@ -148,12 +148,34 @@ pub const Parser = struct {
             .var_binding => .var_kw,
             .const_binding => .const_kw,
         };
+        // Capture the binding keyword's loc BEFORE consume so error
+        // diagnostics point at where the user wrote `let` / `var` /
+        // `const`, not at the next token (`:` or `=` or `(`).
+        const binding_loc = self.peek().loc;
         self.expect(kw);
         const pattern = self.parseBindingPattern();
+        // Map the parser-internal `BindingKind` to the user-facing keyword
+        // spelling so error messages don't leak the TokenTag literal
+        // (`var_kw` would surface in user code which only knows `var`).
+        const kind_name: []const u8 = switch (kind) {
+            .let => "let",
+            .var_binding => "var",
+            .const_binding => "const",
+        };
         if (pattern == .name) {
-            // Plain single-name binding: optionally annotated `: T`. The
-            // pattern's `.name` text is promoted into the legacy `name`
-            // field so callers that read `stmt.let.name` continue to work.
+            // Plain single-name binding: the language is statically typed, so
+            // a `: T` annotation is REQUIRED for any init shape that doesn't
+            // self-describe its type. The carve-out is the LITERAL Expr
+            // kinds (int/float/bool/char/string/byte_string/null/undefined
+            // literals + tuple / array / template literals) — each carries
+            // its type directly in the source form, so the binding is
+            // statically typed even when no explicit `: T` annotation is
+            // written. Non-literal inits (binary expressions, idents,
+            // calls, etc.) still require an annotation because their type
+            // is computed from operand types and zag has no inference for
+            // that yet. The pattern's `.name` text is promoted into the
+            // legacy `name` field so callers that read `stmt.let.name`
+            // continue to work.
             var type_name: ?[]const u8 = null;
             if (self.peek().tag == .colon) {
                 self.advance();
@@ -161,12 +183,35 @@ pub const Parser = struct {
             }
             self.expect(.equals);
             const initializer = self.parseExpr();
+            if (type_name == null and !isLiteralInit(initializer)) {
+                std.debug.print("error:{d}:{d}: {s} requires an explicit type annotation when binding non-tuple values (e.g. {s} {s}: T = …)\n", .{
+                    binding_loc.line,
+                    binding_loc.col,
+                    kind_name,
+                    kind_name,
+                    pattern.name,
+                });
+                std.process.exit(1);
+            }
             return .{ .name = pattern.name, .type_name = type_name, .init = initializer };
         }
-        // Destructuring form: docs do not specify a syntax for `: T`
-        // annotations on patterns, so we reject them by consuming the
-        // `=` directly. The `name` field is the empty sentinel (codegen
-        // ignores it when `pattern` is set).
+        // Destructuring form: per the parser-level type-annotation rule, a
+        // colon after the opening `(` or `[` IS NOT a binding-name annotation
+        // (those tokens select the destructuring shape) — pattern leaves are
+        // type-analyzed at codegen time using the source expression's literal
+        // shape and the matching element's inferred zig type. We reject
+        // colon-on-pattern here so the parser doesn't try to consume `:` as
+        // a top-level annotation; the `name` field is the empty sentinel
+        // (codegen ignores it when `pattern` is set).
+        const peek_tok = self.peek();
+        if (peek_tok.tag == .colon) {
+            std.debug.print("error:{d}:{d}: {s} pattern: per-leaf type annotations are not supported; types are inferred from the source element\n", .{
+                binding_loc.line,
+                binding_loc.col,
+                kind_name,
+            });
+            std.process.exit(1);
+        }
         self.expect(.equals);
         const initializer = self.parseExpr();
         return .{ .name = "", .type_name = null, .init = initializer, .pattern = pattern };
@@ -932,6 +977,30 @@ pub const Parser = struct {
             std.process.exit(1);
         }
         self.advance();
+    }
+
+    /// True iff `expr` is a literal Expr kind whose type is determined by
+    /// the source shape alone (no inference required). Used by parseBinding
+    /// to decide whether a bare `let/var/const NAME = EXPR;` is allowed
+    /// without a `: T` annotation — every kind here carries its type
+    /// directly in the source:
+    ///   int_lit/float_lit         — numeric literal shape → numeric type
+    ///   bool_lit                  — true/false → bool
+    ///   char_lit                  — 'x' → u8
+    ///   string_lit/byte_string_lit — "..."/b"..." → []const u8
+    ///   null_lit/undefined_lit    — zig builtins
+    ///   tuple_lit                 — (a, b) → anonymous struct (zig-inferred)
+    ///   array_lit                 — `[N]T { … }` → `[N]T` (T in source)
+    ///   template_lit              — "…{name}…" → debug-printable slice
+    /// Any other Expr kind (binary, ident, call, index, range, …) requires
+    /// an explicit `: T` annotation. This keeps the language statically
+    /// typed: every binding has a known type at compile time, even when
+    /// the user doesn't write `: T` explicitly.
+    fn isLiteralInit(expr: Expr) bool {
+        return switch (expr) {
+            .int_lit, .float_lit, .bool_lit, .char_lit, .string_lit, .byte_string_lit, .null_lit, .undefined_lit, .tuple_lit, .array_lit, .template_lit => true,
+            else => false,
+        };
     }
 
     fn expectIdent(self: *Parser) []const u8 {

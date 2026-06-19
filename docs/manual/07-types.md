@@ -4,17 +4,25 @@ Zag is statically typed. Every expression has a known type at compile time.
 
 ## Type Inference
 
-```
-let x = 42;           # inferred as i32
-let y = 3.14;         # inferred as f64
-let s = "hello";      # inferred as []const u8
-```
-
-You can add explicit annotations:
+The compiler infers the binding type from the initializer **only when the initializer is a literal expression**. Every other form requires an explicit `: T` annotation. See [Variables → Carve-Out: Literal Initializers](04-variables.md#carve-out-literal-initializers) for the canonical rule and the full list of 11 literal Expr kinds accepted without annotation.
 
 ```
-let x: i64 = 42;
-let y: f32 = 3.14;
+let x: i32 = 42;             # annotated (works for any initializer)
+let y = 42;                  # inferred — int literal coerces to i32
+let z: f64 = 3.14;           # annotated
+let t = 3.14;                # inferred — float literal coerces to f64
+let s = "hello";             # inferred — string literal coerces to []const u8
+
+# Non-literal initializers REQUIRE explicit : T — inference does not apply:
+let sum: i32 = a + b;        # binary expression — : T required
+# let sum = a + b;           compile error: missing : T
+```
+
+You can always add an explicit annotation to a literal initializer — the annotation overrides the inferred default:
+
+```
+let x: i64 = 42;             # u64, not the inferred i32
+let y: f32 = 3.14;           # f32, not the inferred f64
 ```
 
 ## Type Categories

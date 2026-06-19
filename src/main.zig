@@ -528,7 +528,7 @@ test "lexer: byte string literal" {
 }
 
 test "parser: bool literal" {
-    const src = "fun main() {\n    let on = true;\n    let off = false;\n}\n";
+    const src = "fun main() {\n    let on: bool = true;\n    let off: bool = false;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -581,7 +581,7 @@ test "parser: single paren still groups" {
 }
 
 test "codegen: hex literal preserved" {
-    const src = "fun f() {\n    let x = 0xFF;\n}\n";
+    const src = "fun f() {\n    let x: i32 = 0xFF;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -593,7 +593,7 @@ test "codegen: hex literal preserved" {
 }
 
 test "codegen: float literal preserved" {
-    const src = "fun f() {\n    let pi = 3.14;\n    let e = 1.0e10;\n}\n";
+    const src = "fun f() {\n    let pi: f64 = 3.14;\n    let e: f64 = 1.0e10;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -606,7 +606,7 @@ test "codegen: float literal preserved" {
 }
 
 test "codegen: bool literal emits true/false" {
-    const src = "fun f() {\n    let on = true;\n    let off = false;\n}\n";
+    const src = "fun f() {\n    let on: bool = true;\n    let off: bool = false;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -619,7 +619,7 @@ test "codegen: bool literal emits true/false" {
 }
 
 test "codegen: null and undefined emit literally" {
-    const src = "fun f() {\n    let a = null;\n    let b = undefined;\n}\n";
+    const src = "fun f() {\n    let a: ?i32 = null;\n    let b: i32 = undefined;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -632,7 +632,7 @@ test "codegen: null and undefined emit literally" {
 }
 
 test "codegen: char literal emit" {
-    const src = "fun f() {\n    let c = 'a';\n}\n";
+    const src = "fun f() {\n    let c: u8 = 'a';\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -836,7 +836,7 @@ test "codegen: module-level interp_buf emitted" {
 }
 
 test "parser: let with type annotation" {
-    const src = "fun f() {\n    let x: i32 = 42;\n}\n";
+    const src = "fun f() {\n    let x = 42;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -890,7 +890,7 @@ test "parser: let with multiple lets each annotated" {
 }
 
 test "codegen: let with type annotation emits `: T`" {
-    const src = "fun f() {\n    let x: i32 = 42;\n}\n";
+    const src = "fun f() {\n    let x = 42;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -947,7 +947,7 @@ test "lexer: arithmetic operators are tokens" {
 }
 
 test "parser: simple binary add" {
-    const src = "fun f() {\n    let z = 1 + 2;\n}\n";
+    const src = "fun f() {\n    let z: i32 = 1 + 2;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -962,7 +962,7 @@ test "parser: simple binary add" {
 
 test "parser: precedence — mul binds tighter than add" {
     // 1 + 2 * 3 → 1 + (2 * 3) → binary(add, 1, binary(mul, 2, 3))
-    const src = "fun f() {\n    let z = 1 + 2 * 3;\n}\n";
+    const src = "fun f() {\n    let z: i32 = 1 + 2 * 3;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -978,7 +978,7 @@ test "parser: precedence — mul binds tighter than add" {
 
 test "parser: precedence — parens override" {
     // (1 + 2) * 3 → binary(mul, binary(add, 1, 2), 3)
-    const src = "fun f() {\n    let z = (1 + 2) * 3;\n}\n";
+    const src = "fun f() {\n    let z: i32 = (1 + 2) * 3;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -991,7 +991,7 @@ test "parser: precedence — parens override" {
 
 test "parser: left-associative chain" {
     // 1 - 2 - 3 → (1 - 2) - 3 → binary(sub, binary(sub, 1, 2), 3)
-    const src = "fun f() {\n    let z = 1 - 2 - 3;\n}\n";
+    const src = "fun f() {\n    let z: i32 = 1 - 2 - 3;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1004,7 +1004,7 @@ test "parser: left-associative chain" {
 }
 
 test "parser: identifier operands" {
-    const src = "fun f() {\n    let z = x * y;\n}\n";
+    const src = "fun f() {\n    let z: i32 = x * y;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1021,7 +1021,7 @@ test "codegen: binary emission is parenthesised" {
     // The generated zigzag source must wrap binary expressions in `()` so
     // downstream zig's natural precedence rules cannot reorder the AST's
     // intent (relevant once we add lower-precedence operators).
-    const src = "fun f() {\n    let z = 1 + 2;\n}\n";
+    const src = "fun f() {\n    let z: i32 = 1 + 2;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1029,13 +1029,13 @@ test "codegen: binary emission is parenthesised" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (1 + 2);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: i32 = (1 + 2);") != null);
 }
 
 test "codegen: precedenced arithmetic emits nested parens" {
     // 1 + 2 * 3 must surface as `1 + (2 * 3)` in generated zigzag source so
     // zig observes the AST's chosen ruling under standard math precedence.
-    const src = "fun f() {\n    let z = 1 + 2 * 3;\n}\n";
+    const src = "fun f() {\n    let z: i32 = 1 + 2 * 3;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1043,7 +1043,7 @@ test "codegen: precedenced arithmetic emits nested parens" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (1 + (2 * 3));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: i32 = (1 + (2 * 3));") != null);
 }
 
 test "lexer: minus between variables is binary operator" {
@@ -1450,8 +1450,8 @@ test "parser: destructuring with wildcard discard" {
 }
 
 test "parser: top-level wildcard" {
-    // `let _ = 42;` should produce a discard-only pattern with no leaves.
-    const src = "fun f() {\n    let _ = 42;\n}\n";
+    // `        let _ = 42;` should produce a discard-only pattern with no leaves.
+    const src = "fun f() {\n    let _: i32 = 42;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1666,7 +1666,7 @@ test "codegen: 1/2 stays bare when both sides are comptime int" {
     // pure comptime; zig folds the bare `(1 / 2)` form to `0` at compile
     // time, so we don't need to wrap in `@divTrunc`. Preserves the user's
     // source round-trip in the generated zigzag.
-    const src = "fun f() {\n    let z = 1 / 2;\n}\n";
+    const src = "fun f() {\n    let z: i32 = 1 / 2;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1683,7 +1683,7 @@ test "codegen: 1.0/2.0 stays bare when LHS is float" {
     // `needsIntDivShim` short-circuits on its `b.rhs.* != .int_lit` guard
     // and the bare `(/)` form is preserved. `@divTrunc` would be invalid
     // here because it requires integer arguments.
-    const src = "fun f() {\n    let z = 1.0 / 2.0;\n}\n";
+    const src = "fun f() {\n    let z: f64 = 1.0 / 2.0;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1723,7 +1723,7 @@ test "codegen: 2/x stays bare when LHS is comptime int and RHS is ident" {
     // when RHS is an `.ident` (not an int literal) the shim short-circuits,
     // even though LHS is comptime-int. This is the mirror image of the
     // main shim trigger case.
-    const src = "fun f() {\n    let z = 2 / x;\n}\n";
+    const src = "fun f() {\n    let z: i32 = 2 / x;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1740,7 +1740,7 @@ test "codegen: 1.0/x stays bare when LHS is float and RHS is ident" {
     // returns true because LHS IS a `.float_lit`, so even though RHS is
     // not an int literal we'd see a `false` from the predicate via a
     // different guard. Verifies the bare form is preserved.
-    const src = "fun f() {\n    let z = 1.0 / x;\n}\n";
+    const src = "fun f() {\n    let z: f64 = 1.0 / x;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();

@@ -3,15 +3,15 @@
 ## `let` — Immutable Binding
 
 ```
-let x = 42;
-let name = "hello";
+let x: i32 = 42;
+let name: []const u8 = "hello";
 let pi: f64 = 3.14;
 ```
 
 `let` creates an immutable binding. The value cannot be reassigned:
 
 ```
-let x = 10;
+let x: i32 = 10;
 x = 20;    # compile error: cannot reassign let
 ```
 
@@ -20,7 +20,7 @@ x = 20;    # compile error: cannot reassign let
 ## `var` — Mutable Binding
 
 ```
-var counter = 0;
+var counter: i32 = 0;
 counter += 1;    # ok
 ```
 
@@ -54,10 +54,46 @@ const MASK: u32 = 0xFF;
 
 ## Type Annotations
 
+All simple bindings (`let`, `var`, `const`) require an explicit `: T` annotation **unless** the initializer is a literal expression — see [Carve-Out: Literal Initializers](#carve-out-literal-initializers) below for the full list of literal kinds accepted without `: T.
+
 ```
-let a: i32 = 42;
-let b = 42;              # type inferred as i32
-let c: f64 = 42;         # explicit annotation
+let x: i32 = 42;              # annotated (works for any initializer)
+let y = 42;                   # inferred — int literal coerces to i32
+let z: f64 = 3.14;            # annotated
+let w = 3.14;                 # inferred — float literal coerces to f64
+let s = "hello";              # inferred — string literal coerces to []const u8
+let arr = [3]i32 { 1, 2, 3 }; # inferred — array literal
+```
+
+### Carve-Out: Literal Initializers
+
+The 11 literal Expr kinds accept bindings without `: T`. Each kind carries its type in the source form alone, so the compiler assigns the type without assistance:
+
+| Expr kind | Examples | Coerced to |
+|---|---|---|
+| `int_lit` | `42`, `0xFF`, `0b1010`, `1_000_000` | `i32` |
+| `float_lit` | `3.14`, `1.0e10`, `0x1.0p10` | `f64` |
+| `bool_lit` | `true`, `false` | `bool` |
+| `char_lit` | `'a'`, `'\n'`, `'\u2764'`, `'\x00'` | `u8` |
+| `string_lit` | `"hello"`, `"line\nbreak"` | `[]const u8` |
+| `byte_string_lit` | `b"bytes"` | `[]const u8` |
+| `null_lit` | `null` | nullable pointer (context-dependent — codegen errors if no nullable target) |
+| `undefined_lit` | `undefined` | inferred from first use |
+| `tuple_lit` | `(10, 20)`, `(x: 10, y: 20)` | anonymous struct of element types |
+| `array_lit` | `[3]i32 { 1, 2, 3 }`, `[5]i32 { 0 ... }` | `[N]T` (T from elements) |
+| `template_lit` | `` `value: {x}` `` | `[]const u8` (runtime-formatted) |
+
+**Why the carve-out exists.** The literal-init pattern is the most common one in zag code (`let x = 42;`, `let pi = 3.14;`, `let n = arr.len;`). Without the carve-out, every binding would need a redundant `: T` even when the type is obvious from the source. With the carve-out, every binding — abstract or literal — has a compile-time known type without burdening the user. Non-literal initializers still require `: T` because their types cannot be inferred from syntax alone.
+
+For all other Expr kinds (`ident`, `binary`, `unary`, `call`, `new_expr`, `free_expr`, `deref`, `index`, `range`), `: T` is **required** and produces a compile error otherwise:
+
+```
+let sum: i32 = x + y;        # binary expression — annotation required
+# let sum = x + y;           compile error (parser rejects non-literal bare init)
+let copy: []const u8 = s;    # ident initializer  — annotation required
+# let copy = s;              compile error (parser rejects non-literal bare init)
+let parsed: Result<...> = parse(src); # call — annotation required
+# let parsed = parse(src);   compile error (parser rejects non-literal bare init)
 ```
 
 ## Destructuring
@@ -97,8 +133,8 @@ Destructuring is recursive, so the patterns above freely nest: a tuple leaf can 
 ## Shadowing
 
 ```
-let x = 10;
-let x = "hello";   # ok — new binding shadows the old one
+let x: i32 = 10;
+let x: []const u8 = "hello";
 ```
 
 ## Module-Level Variables
@@ -114,9 +150,9 @@ const CONFIG: Config = ...;      # immutable, compile-time
 
 ```
 fun main() {
-    let x = 10;           # x is alive here
+    let x: i32 = 10;
     {
-        let y = 20;       # y is alive here
+        let y: i32 = 20;
         print("{x} {y}\n");
     }
     # y is dead here
