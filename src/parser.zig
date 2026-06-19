@@ -867,7 +867,7 @@ pub const Parser = struct {
 
                 i = end_i + 1; // skip '}'
                 if (has_spec) {
-                    const expr_text = raw[expr_start..spec_start - 1];
+                    const expr_text = raw[expr_start .. spec_start - 1];
                     const spec_text = raw[spec_start..end_i];
                     parts_buf[part_count] = .{
                         .literal = null,

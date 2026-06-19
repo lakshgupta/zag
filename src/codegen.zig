@@ -279,81 +279,81 @@ pub const Codegen = struct {
         }
     }
 
-/// Infer the default zig type for a zag literal Expr. Returns "" for cases
-/// where zag has no type info (idents, calls, binary expressions, etc.) —
-/// the caller should emit no type annotation in those cases.
-fn inferZigTypeFromExpr(expr: ast.Expr) []const u8 {
-    return switch (expr) {
-        .int_lit => "i32",
-        .float_lit => "f64",
-        .bool_lit => "bool",
-        .char_lit => "u8",
-        .string_lit, .byte_string_lit => "[]const u8",
-        else => "",
-    };
-}
+    /// Infer the default zig type for a zag literal Expr. Returns "" for cases
+    /// where zag has no type info (idents, calls, binary expressions, etc.) —
+    /// the caller should emit no type annotation in those cases.
+    fn inferZigTypeFromExpr(expr: ast.Expr) []const u8 {
+        return switch (expr) {
+            .int_lit => "i32",
+            .float_lit => "f64",
+            .bool_lit => "bool",
+            .char_lit => "u8",
+            .string_lit, .byte_string_lit => "[]const u8",
+            else => "",
+        };
+    }
 
-/// Top-level elements of a destructurable source Expr. `.tuple_lit` and
-/// `.array_lit` produce real element slices; everything else (idents,
-/// calls, etc.) returns an empty slice to signal "can't infer leaf types
-/// at this depth — caller should emit no annotation".
-fn getTopElements(expr: ast.Expr) []const ast.Expr {
-    return switch (expr) {
-        .tuple_lit => |els| els,
-        .array_lit => |a| a.elements,
-        else => &[_]ast.Expr{},
-    };
-}
+    /// Top-level elements of a destructurable source Expr. `.tuple_lit` and
+    /// `.array_lit` produce real element slices; everything else (idents,
+    /// calls, etc.) returns an empty slice to signal "can't infer leaf types
+    /// at this depth — caller should emit no annotation".
+    fn getTopElements(expr: ast.Expr) []const ast.Expr {
+        return switch (expr) {
+            .tuple_lit => |els| els,
+            .array_lit => |a| a.elements,
+            else => &[_]ast.Expr{},
+        };
+    }
 
-/// True when any leaf in `expr`'s subtree is a `.float_lit`. Used by
-/// `needsIntDivShim` (below) to decide whether the LHS of a `/` or `%`
-/// could be float-typed — float-typed LHSes can't go through zig's
-/// `@divTrunc`/`@rem` shim because those builtins require integer
-/// arguments. Idents/calls/etc. return false here because we can't
-/// inspect the user's binding type from the AST alone.
-fn exprContainsFloat(expr: ast.Expr) bool {
-    return switch (expr) {
-        .float_lit => true,
-        .binary => |b| exprContainsFloat(b.lhs.*) or exprContainsFloat(b.rhs.*),
-        .unary => |u| exprContainsFloat(u.operand.*),
-        else => false,
-    };
-}
+    /// True when any leaf in `expr`'s subtree is a `.float_lit`. Used by
+    /// `needsIntDivShim` (below) to decide whether the LHS of a `/` or `%`
+    /// could be float-typed — float-typed LHSes can't go through zig's
+    /// `@divTrunc`/`@rem` shim because those builtins require integer
+    /// arguments. Idents/calls/etc. return false here because we can't
+    /// inspect the user's binding type from the AST alone.
+    fn exprContainsFloat(expr: ast.Expr) bool {
+        return switch (expr) {
+            .float_lit => true,
+            .binary => |b| exprContainsFloat(b.lhs.*) or exprContainsFloat(b.rhs.*),
+            .unary => |u| exprContainsFloat(u.operand.*),
+            else => false,
+        };
+    }
 
-/// zig 0.16 promotes `i32 / comptime_int` (and `i32 % comptime_int`) to a
-/// hard error — the result type isn't decidable from the operands alone,
-/// so the compiler demands an explicit `@divTrunc` / `@rem` / `@divFloor`
-/// (or `@divExact`) call. Without the shim, the smoke-test
-/// `var x: i32 = 10; x /= 2;` produced an unrunnable zigzag because the
-/// generated `x = (x / 2);` triggered that rule.
-///
-/// This predicate encodes the user-confirmed wrap rule: emit `@divTrunc` /
-/// `@rem` ONLY when
-///   1. the operator is `.div` or `.mod`,
-///   2. the RHS is a comptime int literal (`.int_lit`), AND
-///   3. the LHS subtree is or could plausibly be integer-typed — i.e.
-///      (a) LHS is itself an int literal (so the whole thing is comptime-
-///          foldable — but in that case we DON'T wrap because zig folds
-///          the bare form fine) OR (b) LHS could be runtime integer
-///          (no `.float_lit` anywhere in the LHS subtree).
-///
-/// The explicit "both sides comptime" carve-out in (3a) keeps the
-/// documentation promise that "floored/comptime cases can stay bare" —
-/// `1 / 2` keeps the bare `/` and zig folds to 0 at compile time.
-///
-/// Caveat: without a type checker we can't tell an `xxx / 2` apart from
-/// `xxx / 2` where `xxx` is a f64 binding. The latter would miscompile
-/// under the shim because `@divTrunc(f64, …)` is not a valid call. User
-/// advice: if your LHS is float-typed, write the RHS as `2.0` instead of
-/// `2` so the shim predicate skips the wrap (RHS is not `.int_lit`).
-fn needsIntDivShim(b: ast.Expr.BinaryExpr) bool {
-    if (b.op != .div and b.op != .mod) return false;
-    if (b.rhs.* != .int_lit) return false;
-    // Both sides comptime_int → zig folds the bare form at compile time.
-    // Skip the shim so the user's source round-trips: `1 / 2 === (1 / 2)`.
-    if (b.lhs.* == .int_lit) return false;
-    return !exprContainsFloat(b.lhs.*);
-}
+    /// zig 0.16 promotes `i32 / comptime_int` (and `i32 % comptime_int`) to a
+    /// hard error — the result type isn't decidable from the operands alone,
+    /// so the compiler demands an explicit `@divTrunc` / `@rem` / `@divFloor`
+    /// (or `@divExact`) call. Without the shim, the smoke-test
+    /// `var x: i32 = 10; x /= 2;` produced an unrunnable zigzag because the
+    /// generated `x = (x / 2);` triggered that rule.
+    ///
+    /// This predicate encodes the user-confirmed wrap rule: emit `@divTrunc` /
+    /// `@rem` ONLY when
+    ///   1. the operator is `.div` or `.mod`,
+    ///   2. the RHS is a comptime int literal (`.int_lit`), AND
+    ///   3. the LHS subtree is or could plausibly be integer-typed — i.e.
+    ///      (a) LHS is itself an int literal (so the whole thing is comptime-
+    ///          foldable — but in that case we DON'T wrap because zig folds
+    ///          the bare form fine) OR (b) LHS could be runtime integer
+    ///          (no `.float_lit` anywhere in the LHS subtree).
+    ///
+    /// The explicit "both sides comptime" carve-out in (3a) keeps the
+    /// documentation promise that "floored/comptime cases can stay bare" —
+    /// `1 / 2` keeps the bare `/` and zig folds to 0 at compile time.
+    ///
+    /// Caveat: without a type checker we can't tell an `xxx / 2` apart from
+    /// `xxx / 2` where `xxx` is a f64 binding. The latter would miscompile
+    /// under the shim because `@divTrunc(f64, …)` is not a valid call. User
+    /// advice: if your LHS is float-typed, write the RHS as `2.0` instead of
+    /// `2` so the shim predicate skips the wrap (RHS is not `.int_lit`).
+    fn needsIntDivShim(b: ast.Expr.BinaryExpr) bool {
+        if (b.op != .div and b.op != .mod) return false;
+        if (b.rhs.* != .int_lit) return false;
+        // Both sides comptime_int → zig folds the bare form at compile time.
+        // Skip the shim so the user's source round-trips: `1 / 2 === (1 / 2)`.
+        if (b.lhs.* == .int_lit) return false;
+        return !exprContainsFloat(b.lhs.*);
+    }
 
     fn genExpr(self: *Codegen, expr: ast.Expr) void {
         switch (expr) {
@@ -724,20 +724,26 @@ fn needsIntDivShim(b: ast.Expr.BinaryExpr) bool {
                 // argument slot — the Spec slot follows the same rules as it
                 // would on a type-specific placeholder).
                 if (fmt_len + 5 <= fmt_buf.len) {
-                    fmt_buf[fmt_len] = '{'; fmt_len += 1;
-                    fmt_buf[fmt_len] = 'a'; fmt_len += 1;
-                    fmt_buf[fmt_len] = 'n'; fmt_len += 1;
-                    fmt_buf[fmt_len] = 'y'; fmt_len += 1;
+                    fmt_buf[fmt_len] = '{';
+                    fmt_len += 1;
+                    fmt_buf[fmt_len] = 'a';
+                    fmt_len += 1;
+                    fmt_buf[fmt_len] = 'n';
+                    fmt_len += 1;
+                    fmt_buf[fmt_len] = 'y';
+                    fmt_len += 1;
                     if (part.spec) |spec| {
                         if (fmt_len + 1 + spec.len <= fmt_buf.len) {
-                            fmt_buf[fmt_len] = ':'; fmt_len += 1;
+                            fmt_buf[fmt_len] = ':';
+                            fmt_len += 1;
                             for (spec) |c| {
                                 fmt_buf[fmt_len] = c;
                                 fmt_len += 1;
                             }
                         }
                     }
-                    fmt_buf[fmt_len] = '}'; fmt_len += 1;
+                    fmt_buf[fmt_len] = '}';
+                    fmt_len += 1;
                 }
                 if (!first_arg) args_cg.write(", ");
                 args_cg.genExpr(expr);

@@ -153,10 +153,7 @@ pub const Lexer = struct {
                 continue;
             }
 
-            if (std.ascii.isDigit(ch)
-                or (ch == '-' and self.pos + 1 < self.src.len and std.ascii.isDigit(self.src[self.pos + 1]))
-                or (ch == '+' and self.pos + 1 < self.src.len and std.ascii.isDigit(self.src[self.pos + 1])))
-            {
+            if (std.ascii.isDigit(ch) or (ch == '-' and self.pos + 1 < self.src.len and std.ascii.isDigit(self.src[self.pos + 1])) or (ch == '+' and self.pos + 1 < self.src.len and std.ascii.isDigit(self.src[self.pos + 1]))) {
                 // Number prefix: `5`, `-5`, `+5`, `-.5` (the `-`/`+` may
                 // immediately precede a decimal fraction via readNumber's
                 // sign-handler). Symmetry with `+` keeps the surface uniform
@@ -171,14 +168,38 @@ pub const Lexer = struct {
             }
 
             switch (ch) {
-                '(' => { self.addToken(.{ .tag = .lparen, .loc = start_loc, .text = "(" }); self.advance(); },
-                ')' => { self.addToken(.{ .tag = .rparen, .loc = start_loc, .text = ")" }); self.advance(); },
-                '[' => { self.addToken(.{ .tag = .lbracket, .loc = start_loc, .text = "[" }); self.advance(); },
-                ']' => { self.addToken(.{ .tag = .rbracket, .loc = start_loc, .text = "]" }); self.advance(); },
-                '{' => { self.addToken(.{ .tag = .lbrace, .loc = start_loc, .text = "{" }); self.advance(); },
-                '}' => { self.addToken(.{ .tag = .rbrace, .loc = start_loc, .text = "}" }); self.advance(); },
-                ':' => { self.addToken(.{ .tag = .colon, .loc = start_loc, .text = ":" }); self.advance(); },
-                ',' => { self.addToken(.{ .tag = .comma, .loc = start_loc, .text = "," }); self.advance(); },
+                '(' => {
+                    self.addToken(.{ .tag = .lparen, .loc = start_loc, .text = "(" });
+                    self.advance();
+                },
+                ')' => {
+                    self.addToken(.{ .tag = .rparen, .loc = start_loc, .text = ")" });
+                    self.advance();
+                },
+                '[' => {
+                    self.addToken(.{ .tag = .lbracket, .loc = start_loc, .text = "[" });
+                    self.advance();
+                },
+                ']' => {
+                    self.addToken(.{ .tag = .rbracket, .loc = start_loc, .text = "]" });
+                    self.advance();
+                },
+                '{' => {
+                    self.addToken(.{ .tag = .lbrace, .loc = start_loc, .text = "{" });
+                    self.advance();
+                },
+                '}' => {
+                    self.addToken(.{ .tag = .rbrace, .loc = start_loc, .text = "}" });
+                    self.advance();
+                },
+                ':' => {
+                    self.addToken(.{ .tag = .colon, .loc = start_loc, .text = ":" });
+                    self.advance();
+                },
+                ',' => {
+                    self.addToken(.{ .tag = .comma, .loc = start_loc, .text = "," });
+                    self.advance();
+                },
                 '=' => {
                     // `=` is the leading byte of:
                     //   `=`  (assignment), `==` (equal), and 10 compound-assign forms
@@ -330,7 +351,10 @@ pub const Lexer = struct {
                         self.advance();
                     }
                 },
-                '~' => { self.addToken(.{ .tag = .tilde, .loc = start_loc, .text = "~" }); self.advance(); },
+                '~' => {
+                    self.addToken(.{ .tag = .tilde, .loc = start_loc, .text = "~" });
+                    self.advance();
+                },
                 '<' => {
                     // `<` is the leading byte of `<=`, `<<`, `<<=` (compound shift-assign).
                     if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == '<' and self.src[self.pos + 2] == '=') {
