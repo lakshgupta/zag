@@ -1,6 +1,20 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 
+/// Lightweight per-function type-info map entry. The Codegen struct
+/// holds a fixed-size array of these and walks each function body once
+/// at `genFun` entry to populate it from `let`/`var`/`const`
+/// declarations that carry an explicit `: T` annotation. The div-shim
+/// predicates then look up whether a referenced `.ident` is recorded
+/// as float-typed in this map. Deliberately codegen-internal (lives
+/// next to `Codegen` rather than in `ast.zig`) because the caller has
+/// no use for the map after compilation — only the shim predicates
+/// consume its lifetime.
+const BindingTypeInfo = struct {
+    name: []const u8,
+    type_name: []const u8,
+};
+
 pub const Codegen = struct {
     out_buf: [65536]u8,
     out_len: usize,
@@ -9,12 +23,25 @@ pub const Codegen = struct {
     /// ... sequence. Multiple destructurings in the same body produce
     /// distinct names so zig's no-redeclaration rule is satisfied.
     destructure_counter: u32,
+    /// Per-function type-info map: walks the body once at `genFun` entry
+    /// and records every binding carrying an explicit `: T` annotation.
+    /// Used by `needsIntDivShim` to skip the shim wrap when the LHS ident
+    /// is float-typed; without this lookup the integer shim fires on
+    /// `.ident` LHSes unconditionally and emits `@divTrunc(pi, 2)` for
+    /// `let pi: f64 = …; pi / 2` (zig 0.16 rejects because `@divTrunc`
+    /// requires integer args — the typed-binding path is the user-asked
+    /// fix). Reset to empty at the top of each `genFun` so sibling
+    /// `pub fn` declarations don't bleed entries across functions.
+    type_info_buf: [256]BindingTypeInfo,
+    type_info_count: u32,
 
     pub fn init() Codegen {
         return .{
             .out_buf = undefined,
             .out_len = 0,
             .destructure_counter = 0,
+            .type_info_buf = undefined,
+            .type_info_count = 0,
         };
     }
 
@@ -53,6 +80,15 @@ pub const Codegen = struct {
         // temp bindings inside this body stay local (avoiding clashes
         // across sibling `pub fn` declarations) and count from `_0`.
         self.destructure_counter = 0;
+        // Reset type-info map at the top of each function so sibling
+        // `pub fn` declarations don't bleed entries across functions.
+        // Walk the body once to populate the map before any emission
+        // happens — the predicates need to see this map when each
+        // binary/literal expression hits the `.binary` arm.
+        self.type_info_count = 0;
+        for (fun.body) |stmt| {
+            self.collectTypedBindings(stmt);
+        }
         if (fun.doc) |d| self.genDocComment(d);
         self.write("pub fn ");
         self.write(fun.name);
@@ -63,6 +99,58 @@ pub const Codegen = struct {
         }
 
         self.write("}\n\n");
+    }
+
+    /// Walk a single statement looking for a binding declaration that
+    /// carries an explicit `: T` annotation. When found, record the
+    /// binding's name and type-name into the per-function type-info map
+    /// so the div-shim predicate can later check whether an `.ident`
+    /// LHS is float-typed. Skips destructured patterns (the parser
+    /// doesn't accept `: T` on them, so they cannot contribute anyway)
+    /// and untyped bindings (their inferred type isn't trustworthy for
+    /// the shim decision without walking init expressions, which is
+    /// explicitly out of scope — see the `needsIntDivShim` caveat for
+    /// the residual cases this leaves behind).
+    fn collectTypedBindings(self: *Codegen, stmt: ast.Stmt) void {
+        const b: ast.Stmt.BindingStmt = switch (stmt) {
+            .let => stmt.let,
+            .var_binding => stmt.var_binding,
+            .const_binding => stmt.const_binding,
+            else => return,
+        };
+        if (b.pattern != null) return;
+        const tn = b.type_name orelse return;
+        if (self.type_info_count >= self.type_info_buf.len) return;
+        self.type_info_buf[self.type_info_count] = .{
+            .name = b.name,
+            .type_name = tn,
+        };
+        self.type_info_count += 1;
+    }
+
+    /// True if `name` is present in the per-function type-info map AND
+    /// its recorded type name is one of the floats zig treats as
+    /// non-integer (`f16`, `f32`, `f64`). Powers the div-shim predicate's
+    /// "is this ident LHS float-typed?" check; absent ident (e.g. from a
+    /// function param, a non-annotated binding, or a destructured leaf)
+    /// returns false, leaving the existing predicate decision intact.
+    fn isFloatIdentType(self: *Codegen, name: []const u8) bool {
+        for (self.type_info_buf[0..self.type_info_count]) |ti| {
+            if (std.mem.eql(u8, ti.name, name)) {
+                return isFloatTypeName(ti.type_name);
+            }
+        }
+        return false;
+    }
+
+    /// Type-name predicate for the float check. Currently catches
+    /// `f16`/`f32`/`f64` (the zig primitive float types); user-defined
+    /// aliases like `type MyFloat = f64` are out of scope — without a
+    /// type resolver we cannot unwrap the alias chain.
+    fn isFloatTypeName(type_name: []const u8) bool {
+        return std.mem.eql(u8, type_name, "f64") or
+            std.mem.eql(u8, type_name, "f32") or
+            std.mem.eql(u8, type_name, "f16");
     }
 
     fn genDocComment(self: *Codegen, doc: []const u8) void {
@@ -341,17 +429,34 @@ pub const Codegen = struct {
     /// documentation promise that "floored/comptime cases can stay bare" —
     /// `1 / 2` keeps the bare `/` and zig folds to 0 at compile time.
     ///
-    /// Caveat: without a type checker we can't tell an `xxx / 2` apart from
-    /// `xxx / 2` where `xxx` is a f64 binding. The latter would miscompile
-    /// under the shim because `@divTrunc(f64, …)` is not a valid call. User
-    /// advice: if your LHS is float-typed, write the RHS as `2.0` instead of
-    /// `2` so the shim predicate skips the wrap (RHS is not `.int_lit`).
-    fn needsIntDivShim(b: ast.Expr.BinaryExpr) bool {
+    /// Caveat (now closed): with the per-function type-info map populated by
+    /// `collectTypedBindings` above, we CAN distinguish a `let pi: f64 = …` LHS
+    /// from a `let x: i32 = …` LHS. When the user annotates the LHS binding
+    /// with a float type (`f16`/`f32`/`f64`), the predicate returns false and
+    /// the bare `/` form survives — `let pi: f64 = 3.14; pi / 2` emits
+    /// `pi / 2` (zig infers f64), not `@divTrunc(pi, 2)`. Only the unresolved
+    /// cases still rely on user discipline:
+    ///   - Unannotated bindings (`let x = 10` whose type zig infers as
+    ///     comptime_int, or `let x = 1.0` whose type zig infers as
+    ///     comptime_float) — the map records neither, so the predicate falls
+    ///     back to the conservative wrap / skip rules.
+    ///   - References to bindings outside this function's body scope (e.g.
+    ///     future module-level globals, future fn-level params). The map
+    ///     only covers body-scope bindings visited by `collectTypedBindings`.
+    /// User advice for those residual cases: annotate float bindings with
+    /// `: f64` to get correct codegen, OR write the RHS as `2.0` to skip the
+    /// shim via the `b.rhs.* != .int_lit` short-circuit.
+    fn needsIntDivShim(self: *Codegen, b: ast.Expr.BinaryExpr) bool {
         if (b.op != .div and b.op != .mod) return false;
         if (b.rhs.* != .int_lit) return false;
         // Both sides comptime_int → zig folds the bare form at compile time.
         // Skip the shim so the user's source round-trips: `1 / 2 === (1 / 2)`.
         if (b.lhs.* == .int_lit) return false;
+        // LHS ident annotated with a float type in the per-function map →
+        // `@divTrunc` requires integer args so the shim would miscompile.
+        // Skip the wrap and emit the bare form; zig infers the operand
+        // types from the binding annotations and accepts `f64 / comptime_int`.
+        if (b.lhs.* == .ident and self.isFloatIdentType(b.lhs.*.ident)) return false;
         return !exprContainsFloat(b.lhs.*);
     }
 
@@ -531,7 +636,7 @@ pub const Codegen = struct {
                 // decidable when an `i32` divides a comptime_int). After the
                 // wrap, control returns — the rest of the binary path is
                 // unreachable for these two ops under the shim.
-                if (needsIntDivShim(b)) {
+                if (needsIntDivShim(self, b)) {
                     self.write(if (b.op == .div) "@divTrunc(" else "@rem(");
                     self.genExpr(b.lhs.*);
                     self.write(", ");

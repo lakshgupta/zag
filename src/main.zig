@@ -1752,3 +1752,108 @@ test "codegen: 1.0/x stays bare when LHS is float and RHS is ident" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
 }
+
+test "codegen: f64-typed ident LHS / int_lit stays bare (typed-binding lookup)" {
+    // The targeted hole: `let pi: f64 = 3.14; pi / 2` — LHS is `.ident "pi"`
+    // so `exprContainsFloat` returns false on the LHS subtree (no
+    // `.float_lit` node), but the binding is annotated `f64`. Without the
+    // `collectTypedBindings` map, `needsIntDivShim` would fire and emit
+    // `@divTrunc(pi, 2)`, which zig 0.16 rejects because `@divTrunc`
+    // requires integer args. The fix maps `pi → f64` and the predicate's
+    // `self.isFloatIdentType(...)` short-circuit returns false, leaving
+    // the bare `(pi / 2)` form. zig infers the operand types from the
+    // const-binding annotation and accepts the result.
+    const src =
+        \\fun f() {
+        \\    let pi: f64 = 3.14;
+        \\    let r = pi / 2;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Bare form preserved; no shim wrap.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const r = (pi / 2);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
+}
+
+test "codegen: i32-typed ident LHS / int_lit still triggers @divTrunc shim" {
+    // The non-regression pin: when the LHS ident is annotated with an
+    // INTEGER type (f16/f32/f64 absent from the map), the predicate still
+    // fires and the shim is emitted. Without this guard the per-function
+    // map could over-broadly skip the shim and break `let x: i32 = 10;
+    // x / 2;` codegen.
+    const src =
+        \\fun f() {
+        \\    let n: i32 = 10;
+        \\    let z = n / 2;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc(n, 2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (n / 2);") == null);
+}
+
+test "codegen: f64-typed ident LHS % int_lit stays bare" {
+    // Mirror of the `/` case for the `.mod` operator: `let pi: f64 = 3.14;
+    // pi % 2` must emit the bare form because `@rem` requires integer args.
+    // The `isFloatIdentType` map check applies symmetrically to `.mod`.
+    const src =
+        \\fun f() {
+        \\    let pi: f64 = 3.14;
+        \\    let r = pi % 2;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const r = (pi % 2);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+}
+
+test "codegen: unannotated i32-init binding / int_lit still triggers @divTrunc" {
+    // Pins the conservative shim rule for unannotated bindings. `let x =
+    // 10; x / 2` doesn't enter the type-info map (the predicate's
+    // `collectTypedBindings` only collects `: T`-annotated bindings —
+    // see the typed-binding-lookup tests for the f64 vs i32 distinction),
+    // so `isFloatIdentType("x")` returns false, the predicate falls
+    // through to its `!exprContainsFloat(.ident)` guard, and the shim
+    // fires — emitting `@divTrunc(x, 2)`. Zig accepts because `x` is a
+    // comptime_int inferred from `10` and both `@divTrunc` operands are
+    // integer-typed. Net effect: no over-broad skip when the map is empty.
+    const src =
+        \\fun f() {
+        \\    let x = 10;
+        \\    let z = x / 2;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc(x, 2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (x / 2);") == null);
+}
