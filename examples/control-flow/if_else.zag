@@ -1,0 +1,33 @@
+## Control flow: if/else, loops, match
+##
+## Run: zag run if_else.zag
+
+fun main() {
+    # if/else as expression
+    let x = if true { 1 } else { 2 };
+    print("x = {x}\n");
+
+    # for loop with range
+    var sum: i32 = 0;
+    for i in 1..5 {
+        sum = sum + i;
+    }
+    print("sum 1..4 = {sum}\n");
+
+    # while loop
+    var count: i32 = 0;
+    while count < 3 {
+        print("count = {count}\n");
+        count = count + 1;
+    }
+
+    # match expression
+    let val: i32 = 42;
+    let label = match val {
+        0      => "zero",
+        1..9   => "digit",
+        42     => "the answer",
+        _      => "other",
+    };
+    print("{val} is {label}\n");
+}

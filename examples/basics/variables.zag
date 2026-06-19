@@ -1,0 +1,25 @@
+## Variables, constants, and primitive types
+##
+## Run: zag run variables.zag
+
+fun main() {
+    # Immutable binding
+    let x: i32 = 42;
+    print("x = {x}\n");
+
+    # Mutable variable
+    var y: f64 = 3.14;
+    y = y * 2.0;
+    print("y = {y}\n");
+
+    # Compile-time constant
+    const PI: f64 = 3.141592653589793;
+    print("pi = {PI:.5}\n");
+
+    # Type inference
+    let z = 100;          # inferred i32
+    let flag = true;      # inferred bool
+    let ch = 'Z';         # inferred char
+
+    print("z = {z}, flag = {flag}, ch = {ch}\n");
+}

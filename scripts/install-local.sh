@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# install-local.sh — install the locally-built zag binary from dist/bins/
+#
+# Usage:
+#   ./scripts/install-local.sh             # install the local binary
+#   ./scripts/install-local.sh --check      # verify installation
+#   ./scripts/install-local.sh --uninstall  # remove installation
+#   ./scripts/install-local.sh --force      # reinstall even if up to date
+#
+# Environment variables:
+#   ZAG_HOME     Installation root (default: ~/.zag)
+#   ZAG_BINS_DIR Directory containing built binaries (default: auto-detected)
+
+set -euo pipefail
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+ZAG_HOME="${ZAG_HOME:-$HOME/.zag}"
+ZAG_BIN_DIR="$ZAG_HOME/bin"
+ZAG_BIN="$ZAG_BIN_DIR/zag"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ZAG_BINS_DIR="${ZAG_BINS_DIR:-$REPO_ROOT/zig-out/bin}"
+
+CHECK_ONLY=0
+UNINSTALL=0
+FORCE=0
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()    { echo -e "${CYAN}→${NC} $*"; }
+success() { echo -e " ${GREEN}✓${NC} $*"; }
+warn()    { echo -e " ${YELLOW}⚠${NC} $*"; }
+error()   { echo -e " ${RED}✗${NC} $*" >&2; }
+
+usage() {
+    cat <<HELP
+Usage: install-local.sh [flags]
+
+Install the locally-built zag binary from dist/bins/ into ~/.zag/bin/
+and configure your shell PATH.
+
+Flags:
+  --check      Verify that zag is installed and working
+  --uninstall  Remove zag from ~/.zag/ and clean up PATH
+  --force      Force reinstall even if already up to date
+  --help       Show this help message
+
+Environment:
+  ZAG_HOME     Installation root (default: ~/.zag)
+  ZAG_BINS_DIR Directory containing built binaries (default: repo-root/dist/bins)
+HELP
+    exit 0
+}
+
+# ── Argument parsing ─────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check)     CHECK_ONLY=1 ;;
+        --uninstall) UNINSTALL=1 ;;
+        --force)     FORCE=1 ;;
+        --help)      usage ;;
+        *)           ;;
+    esac
+    shift
+done
+
+# ── Platform detection ───────────────────────────────────────────────────────
+
+detect_os_arch() {
+    case "$(uname -s)" in
+        Linux)  OS="linux";  SUFFIX="" ;;
+        Darwin) OS="darwin"; SUFFIX="" ;;
+        *_NT-*) OS="windows"; SUFFIX=".exe" ;;
+        MINGW*) OS="windows"; SUFFIX=".exe" ;;
+        MSYS*)  OS="windows"; SUFFIX=".exe" ;;
+        *)      OS="linux";  SUFFIX="" ;;
+    esac
+
+    case "$(uname -m)" in
+        x86_64|amd64)   ARCH="x86_64" ;;
+        aarch64|arm64)  ARCH="arm64" ;;
+        *)              ARCH="x86_64" ;;
+    esac
+}
+
+detect_os_arch
+LOCAL_BIN="$ZAG_BINS_DIR/zag-${OS}-${ARCH}${SUFFIX}"
+
+# ── Check installation ───────────────────────────────────────────────────────
+
+do_check() {
+    echo ""
+    echo -e "${BOLD}Zag local installation check${NC}"
+    echo ""
+
+    if [[ -x "$ZAG_BIN" ]]; then
+        success "Binary found: $ZAG_BIN"
+        if "$ZAG_BIN" version 2>/dev/null; then
+            success "Runs successfully"
+            return 0
+        else
+            warn "Binary exists but fails to run"
+            return 1
+        fi
+    else
+        error "Not installed — no binary at $ZAG_BIN"
+        echo ""
+        echo "  Run: ./scripts/install-local.sh"
+        return 1
+    fi
+}
+
+if [[ $CHECK_ONLY -eq 1 ]]; then
+    do_check
+    exit $?
+fi
+
+# ── Uninstall ────────────────────────────────────────────────────────────────
+
+do_uninstall() {
+    echo ""
+    echo -e "${BOLD}Uninstalling local zag installation${NC}"
+    echo ""
+
+    if [[ -d "$ZAG_HOME" ]]; then
+        info "Removing $ZAG_HOME"
+        rm -rf "$ZAG_HOME"
+        success "Removed $ZAG_HOME"
+    else
+        warn "Nothing to uninstall — $ZAG_HOME not found"
+    fi
+
+    # Clean PATH from shell config files
+    local cleaned=0
+    for profile in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile" "$HOME/.config/fish/config.fish"; do
+        if [[ -f "$profile" ]]; then
+            if grep -q "$ZAG_BIN_DIR" "$profile" 2>/dev/null; then
+                info "Removing PATH entry from ${profile/#$HOME\//~/}"
+                sed -i "/# zag/,+1d" "$profile" 2>/dev/null || true
+                sed -i "/export PATH=.*$ZAG_BIN_DIR/d" "$profile" 2>/dev/null || true
+                cleaned=1
+            fi
+        fi
+    done
+
+    if [[ $cleaned -eq 0 ]]; then
+        info "No PATH entries to clean"
+    fi
+
+    echo ""
+    success "Uninstall complete. Restart your shell or run: source ~/.bashrc"
+}
+
+if [[ $UNINSTALL -eq 1 ]]; then
+    do_uninstall
+    exit 0
+fi
+
+# ── Detect shell profile ─────────────────────────────────────────────────────
+
+detect_shell_profile() {
+    local shell_name
+    shell_name="$(basename "${SHELL:-bash}")"
+
+    case "$shell_name" in
+        zsh)  echo "$HOME/.zshrc" ;;
+        bash) echo "$HOME/.bashrc" ;;
+        fish) echo "$HOME/.config/fish/config.fish" ;;
+        *)    echo "$HOME/.profile" ;;
+    esac
+}
+
+# ── Install ──────────────────────────────────────────────────────────────────
+
+echo ""
+echo -e "${BOLD}${CYAN}═══ Zag Local Install ═══${NC}"
+echo ""
+echo -e "  OS/Arch:   ${OS}-${ARCH}"
+echo -e "  From:      ${LOCAL_BIN}"
+echo -e "  To:        ${ZAG_BIN}"
+echo ""
+
+# Check source binary exists
+if [[ ! -f "$LOCAL_BIN" ]]; then
+    error "No local binary found at $LOCAL_BIN"
+    echo ""
+    echo "  Build the compiler first, then try again:"
+    echo ""
+    echo "    cd $REPO_ROOT"
+    echo "    zig build"
+    echo ""
+    echo "  Or specify a custom bins directory:"
+    echo ""
+    echo "    ZAG_BINS_DIR=./zig-out/bin ./scripts/install-local.sh"
+    echo ""
+    exit 1
+fi
+
+# Check if already installed and up to date
+if [[ -x "$ZAG_BIN" ]] && [[ $FORCE -eq 0 ]]; then
+    if cmp -s "$LOCAL_BIN" "$ZAG_BIN"; then
+        success "Already up to date at $ZAG_BIN"
+        echo ""
+        echo "  Use --force to reinstall anyway."
+        exit 0
+    else
+        info "Updating existing installation"
+    fi
+fi
+
+# Install
+mkdir -p "$ZAG_BIN_DIR"
+info "Copying binary to $ZAG_BIN_DIR/"
+cp "$LOCAL_BIN" "$ZAG_BIN"
+chmod +x "$ZAG_BIN"
+success "Installed $ZAG_BIN"
+
+# Verify
+if "$ZAG_BIN" version 2>/dev/null; then
+    success "Binary verified — runs correctly"
+else
+    error "Binary copied but fails to run — it may need to be rebuilt"
+    exit 1
+fi
+
+# ── Configure PATH ───────────────────────────────────────────────────────────
+
+SHELL_PROFILE="$(detect_shell_profile)"
+PROFILE_SHORT="${SHELL_PROFILE/#$HOME\//~/}"
+
+if [[ -f "$SHELL_PROFILE" ]]; then
+    if grep -q "$ZAG_BIN_DIR" "$SHELL_PROFILE" 2>/dev/null; then
+        success "PATH already configured in $PROFILE_SHORT"
+    else
+        info "Adding $ZAG_BIN_DIR to PATH in $PROFILE_SHORT"
+        {
+            echo ""
+            echo "# zag"
+            echo "export PATH=\"$ZAG_BIN_DIR:\$PATH\""
+        } >> "$SHELL_PROFILE"
+        success "PATH configured in $PROFILE_SHORT"
+    fi
+elif [[ "$SHELL_PROFILE" != "$HOME/.profile" ]]; then
+    # Non-fish: create the profile
+    if [[ "$SHELL_PROFILE" == *fish/config.fish ]]; then
+        mkdir -p "$(dirname "$SHELL_PROFILE")"
+        echo "fish_add_path $ZAG_BIN_DIR" >> "$SHELL_PROFILE"
+        success "PATH configured in $PROFILE_SHORT (fish)"
+    else
+        echo "export PATH=\"$ZAG_BIN_DIR:\$PATH\"" >> "$SHELL_PROFILE"
+        success "Created $PROFILE_SHORT with PATH entry"
+    fi
+else
+    echo "export PATH=\"$ZAG_BIN_DIR:\$PATH\"" >> "$SHELL_PROFILE"
+    success "Created $PROFILE_SHORT with PATH entry"
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+
+echo ""
+echo -e "${BOLD}${GREEN}Zag installed successfully!${NC}"
+echo ""
+echo "  Binary:  $ZAG_BIN"
+echo "  Profile: $PROFILE_SHORT"
+echo ""
+echo "  Restart your shell or run:"
+echo ""
+echo "    source $PROFILE_SHORT"
+echo ""
+echo "  Then try:"
+echo ""
+echo "    zag version"
+echo ""

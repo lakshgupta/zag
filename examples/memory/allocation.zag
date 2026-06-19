@@ -1,0 +1,17 @@
+## Memory allocation with new/free and defer
+##
+## Run: zag run allocation.zag
+
+fun main() {
+    # Heap allocation
+    let p = new i32(42);
+    defer free(p);
+    print("allocated value = {*p}\n");
+
+    # Multiple defers (reverse order)
+    defer print("third defer\n");
+    defer print("second defer\n");
+    defer print("first defer\n");
+
+    print("--- before scope exit ---\n");
+}

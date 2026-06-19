@@ -1,0 +1,26 @@
+## Primitive types and type conversions
+##
+## Run: zag run primitives.zag
+
+fun main() {
+    # Integer types
+    let a: i32 = 42;
+    let b: i64 = a;           # implicit widening
+    let c: u32 = 0xFF;
+    print("a = {a}, b = {b}, c = {c}\n");
+
+    # Float types
+    let pi: f64 = 3.141592653589793;
+    let half: f32 = pi as f32;  # explicit narrowing
+    print("pi = {pi:.5}, half = {half:.5}\n");
+
+    # Bool and char
+    let t: bool = true;
+    let ch: char = '∑';
+    print("t = {t}, ch = {ch}\n");
+
+    # Type conversions
+    let int_val: i32 = 65;
+    let float_val: f64 = int_val as f64;
+    print("{int_val} as f64 = {float_val}\n");
+}

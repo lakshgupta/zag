@@ -1,0 +1,21 @@
+# Build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Distribution packaging
+dist/*/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# bin
+*.out

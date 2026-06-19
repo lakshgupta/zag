@@ -1,0 +1,15 @@
+## Async/await basic example
+##
+## Run: zag run async_basic.zag
+
+import std.time
+
+async fun delayed_greet(name: str) -> str {
+    await time.timer.after(time.Duration.from_millis(10));
+    return "hello, {name}";
+}
+
+async fun main() {
+    let greeting = await delayed_greet("zag");
+    print("{greeting}\n");
+}

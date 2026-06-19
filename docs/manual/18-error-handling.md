@@ -1,0 +1,190 @@
+# Error Handling
+
+Zag uses `Result<T, E>` and `Option<T>` for error handling. No exceptions.
+
+## Result
+
+```
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+```
+
+```
+fun divide(a: f64, b: f64) -> Result<f64, str> {
+    if b == 0.0 {
+        return Err("division by zero");
+    }
+    return Ok(a / b);
+}
+
+match divide(10.0, 3.0) {
+    Ok(val) => print("{val}\n"),
+    Err(msg) => print("error: {msg}\n"),
+}
+```
+
+## Option
+
+```
+enum Option<T> {
+    Some(T),
+    None,
+}
+```
+
+```
+fun find(arr: []i32, target: i32) -> Option<usize> {
+    for i in 0..arr.len {
+        if arr[i] == target {
+            return Option.Some(i);
+        }
+    }
+    return Option.None;
+}
+```
+
+## `?` — Error Propagation
+
+```
+fun read_config(path: str) -> Result<Config, Error> {
+    let fd = open(path)?;          # propagates Err on failure
+    defer close(fd);
+
+    let data = read(fd)?;
+    let config = parse(data)?;
+    return Ok(config);
+}
+```
+
+`?` on `Result<T, E>` returns `Err(e)` early. `?` on `Option<T>` returns `None` early.
+
+### `?` with Tuple Returns
+
+When a function returns a tuple containing a `Result`, `?` applies to the `Result` element and binds the rest:
+
+```
+fun parse(input: str) -> (Result<Config, Error>, u32) {
+    # returns (parsed config or error, bytes consumed)
+}
+
+# ? propagates the Result, binds the u32
+let (config, consumed) = parse(data)?;
+```
+
+The `?` operates on the outer `Result`. If the function returns `Result<T, E>` as one element of a tuple, `?` propagates the error and the remaining elements bind normally.
+
+**Cross-type `?` is not implicit:**
+
+```
+# ERROR: cannot ? on Option inside Result
+fun process() -> Result<i32, Error> {
+    let val = maybe()?;    # compile error: Option ? in Result context
+    return Ok(val);
+}
+
+# FIX: convert explicitly
+fun process() -> Result<i32, Error> {
+    let val = maybe().ok_or(Error.NotFound)?;   # Option -> Result
+    return Ok(val);
+}
+```
+
+## `catch` — Handle Errors
+
+```
+# Block form — error value bound
+let val = risky() catch |err| {
+    eprint("error: {err}");
+    return 0;
+};
+
+# Default value form
+let val = risky() catch 0;
+
+# Match on the error
+let val = risky() catch |err| {
+    match err {
+        Error.NotFound => return 0,
+        _              => return err,
+    }
+};
+```
+
+## Error Type
+
+The canonical error type is zero-alloc:
+
+```
+enum Error {
+    NotFound,
+    Permission,
+    Io,
+    Parse,
+    InvalidInput,
+    Unavailable,
+    Other,
+}
+```
+
+**Memory:** `Error` is 1 byte (tag only). No heap allocation.
+
+## Error Context
+
+For cases needing context (HTTP handlers, database queries):
+
+```
+import std.error
+
+fun read_config(path: str) -> Result<Config, Context> {
+    let data = fs.read(path)?
+        .context_str("failed to read config")?;
+    let config = parse(data)?
+        .context("failed to parse config")?;
+    return Ok(config);
+}
+```
+
+**Memory:** `Context` wraps `Error` with an optional `String` message. Only allocated when `.context()` is called.
+
+## Custom Error Types
+
+```
+enum MyError {
+    NotFound,
+    Timeout,
+    Custom(str),
+}
+
+fun risky() -> Result<i32, MyError> {
+    return Err(MyError.Timeout);
+}
+
+# Works with catch
+let val = risky() catch |err| {
+    match err {
+        MyError.NotFound => 0,
+        MyError.Timeout  => -1,
+        MyError.Custom(msg) => {
+            eprint("{msg}\n");
+            -2
+        }
+    }
+};
+```
+
+## Exhaustiveness
+
+`catch |err| { match err { ... } }` must be exhaustive — all variants must be handled.
+
+## Memory Summary
+
+| Construct | Allocation |
+|-----------|------------|
+| `Result::Ok(val)` | Stack only (tag + value) |
+| `Result::Err(e)` | Stack only (tag + error) |
+| `?` propagation | No allocation — early return |
+| `catch` block | No allocation — branch |
+| `Context` | Heap only when `.context()` called |
+| `Error` enum | 1 byte, no heap |

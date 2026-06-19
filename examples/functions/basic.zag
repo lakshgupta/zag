@@ -1,0 +1,22 @@
+## Functions, return values, and closures
+##
+## Run: zag run basic.zag
+
+fun add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fun greet(name: str) {
+    print("hello, {name}\n");
+}
+
+fun main() {
+    let sum = add(3, 4);
+    print("3 + 4 = {sum}\n");
+
+    greet("zag");
+
+    # Closure
+    let double = |x: i32| -> i32 { return x * 2; };
+    print("double(5) = {double(5)}\n");
+}

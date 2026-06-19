@@ -1,0 +1,36 @@
+## Error handling with Result, Option, and ?
+##
+## Run: zag run result.zag
+
+fun divide(a: i32, b: i32) -> Result<i32, str> {
+    if b == 0 {
+        return Err("division by zero");
+    }
+    return Ok(a / b);
+}
+
+fun maybe_get(index: i32) -> Option<i32> {
+    if index < 0 || index >= 3 {
+        return None;
+    }
+    return Some(index * 10);
+}
+
+fun main() {
+    # Result handling
+    match divide(10, 2) {
+        Ok(val) => print("10 / 2 = {val}\n"),
+        Err(msg) => print("error: {msg}\n"),
+    }
+
+    match divide(10, 0) {
+        Ok(val) => print("10 / 0 = {val}\n"),
+        Err(msg) => print("error: {msg}\n"),
+    }
+
+    # Option handling
+    match maybe_get(1) {
+        Some(val) => print("maybe_get(1) = {val}\n"),
+        None      => print("maybe_get(1) = none\n"),
+    }
+}
