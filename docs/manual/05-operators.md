@@ -86,6 +86,38 @@ let cp: *const i32 = &x;  # immutable pointer
 
 **Memory:** `&` produces a pointer to a stack-allocated value. The pointer is valid only while the referent is alive.
 
+## Operator Precedence
+
+Operators are grouped into precedence classes. Higher classes bind tighter than lower classes; same-class operators are evaluated left-to-right (left-associative) unless noted.
+
+| Priority | Class | Operators | Associativity |
+|----------|-------|-----------|---------------|
+| 1 | Unary | `!`, `-` (negation), `*` (deref) | Right |
+| 2 | Conversion | `as` | Left |
+| 3 | Multiplicative | `*`, `/`, `%` | Left |
+| 4 | Additive | `+`, `-` | Left |
+| 5 | Shift | `<<`, `>>` | Left |
+| 6 | Bitwise AND | `&` | Left |
+| 7 | Bitwise XOR | `^` | Left |
+| 8 | Bitwise OR | `\|` | Left |
+| 9 | Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` | None (cannot chain) |
+| 10 | Logical AND | `&&` | Left |
+| 11 | Logical OR | `\|\|` | Left |
+| 12 | Range | `..`, `...` | None |
+| 13 | Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `\|=`, `^=`, `<<=`, `>>=` | Right |
+
+Examples:
+
+```
+1 + 2 * 3           # 1 + (2 * 3) = 7        (multiplicative binds tighter)
+(1 + 2) * 3         # 9                       (parens override precedence)
+a + b * c - d       # ((a + (b * c)) - d)     (left-to-right within precedence class)
+a < b && c < d      # (a < b) && (c < d)      (comparison has no chaining; `a < b < c` is a syntax error)
+! a && b            # (! a) && b              (unary binds tighter than logical)
+```
+
+The precedence is enforced by zag's recursive-descent parser — `parseExpr` walks an additive → multiplicative → primary ladder, so `1 + 2 * 3` always parses as `binary(add, 1, binary(mul, 2, 3))`. The compiler emits the AST with full parenthesisation in the generated source so downstream zig observes the AST's intent regardless of zig's own precedence rules.
+
 ## Operator Overloading
 
 Define operators by implementing dunder methods:

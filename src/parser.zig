@@ -29,7 +29,15 @@ pub const Parser = struct {
                 self.advance();
                 continue;
             }
+            var doc: ?[]const u8 = null;
+            while (self.peek().tag == .doc_comment) {
+                doc = self.peek().text;
+                self.advance();
+                while (self.peek().tag == .newline) self.advance();
+            }
+            if (self.eof()) break;
             functions_buf[fun_count] = self.parseFunDecl();
+            functions_buf[fun_count].doc = doc;
             fun_count += 1;
         }
 
@@ -45,7 +53,7 @@ pub const Parser = struct {
         self.expect(.lparen);
         self.expect(.rparen);
         const body = self.parseBlock();
-        return .{ .name = name, .body = body, .loc = start };
+        return .{ .name = name, .body = body, .loc = start, .doc = null };
     }
 
     fn parseBlock(self: *Parser) []const Stmt {
@@ -72,6 +80,18 @@ pub const Parser = struct {
         const tok = self.peek();
         switch (tok.tag) {
             .let => return .{ .let = self.parseLet() },
+            .var_kw => return .{ .var_binding = self.parseVar() },
+            .const_kw => return .{ .const_binding = self.parseConst() },
+            .identifier => {
+                // One-token lookahead: rebinding `name = expr` is a statement,
+                // not a free identifier expression. Without this, the leading
+                // `name` would be consumed as an `.expr_stmt` ident, leaving
+                // an unconsumed `=` token and a follow-up parse error.
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .equals) {
+                    return .{ .assign = self.parseAssign() };
+                }
+                return .{ .expr_stmt = self.parseExpr() };
+            },
             .defer_kw => return .{ .defer_stmt = self.parseDefer() },
             else => return .{ .expr_stmt = self.parseExpr() },
         }
@@ -80,9 +100,58 @@ pub const Parser = struct {
     fn parseLet(self: *Parser) Stmt.LetStmt {
         self.expect(.let);
         const name = self.expectIdent();
+        // Optional type annotation: `let name: T = expr`.
+        // Mismatch between `:` and a following type ident is reported via
+        // `expectIdent` so users get the standard parser error format.
+        var type_name: ?[]const u8 = null;
+        if (self.peek().tag == .colon) {
+            self.advance();
+            type_name = self.expectIdent();
+        }
         self.expect(.equals);
         const initializer = self.parseExpr();
-        return .{ .name = name, .init = initializer };
+        return .{ .name = name, .type_name = type_name, .init = initializer };
+    }
+
+    fn parseVar(self: *Parser) Stmt.VarStmt {
+        // Mirror of parseLet, but the emitted Zig binding is mutable. The
+        // `var` keyword is rejected as a reserved identifier from user code
+        // (see lexer TokenTag .var_kw) so we never collide with a user-named
+        // `var` symbol.
+        self.expect(.var_kw);
+        const name = self.expectIdent();
+        var type_name: ?[]const u8 = null;
+        if (self.peek().tag == .colon) {
+            self.advance();
+            type_name = self.expectIdent();
+        }
+        self.expect(.equals);
+        const initializer = self.parseExpr();
+        return .{ .name = name, .type_name = type_name, .init = initializer };
+    }
+
+    fn parseConst(self: *Parser) Stmt.ConstStmt {
+        // Mirror of parseVar: same optional `: T` annotation, same mandatory
+        // `=` and `init: Expr`. The shape mirrors `LetStmt` field-for-field
+        // exactly so `genStmt`'s `.const_binding` case can reuse the same
+        // optional type-name emission logic.
+        self.expect(.const_kw);
+        const name = self.expectIdent();
+        var type_name: ?[]const u8 = null;
+        if (self.peek().tag == .colon) {
+            self.advance();
+            type_name = self.expectIdent();
+        }
+        self.expect(.equals);
+        const initializer = self.parseExpr();
+        return .{ .name = name, .type_name = type_name, .init = initializer };
+    }
+
+    fn parseAssign(self: *Parser) Stmt.AssignStmt {
+        const name = self.expectIdent();
+        self.expect(.equals);
+        const value = self.parseExpr();
+        return .{ .name = name, .value = value };
     }
 
     fn parseDefer(self: *Parser) Stmt.DeferStmt {
@@ -91,44 +160,164 @@ pub const Parser = struct {
         return .{ .expr = expr };
     }
 
+    /// Top-level entry point: parses a full Zag expression including binary
+    /// arithmetic. Delegates to a 2-level precedence ladder (additive →
+    /// multiplicative → primary). `parseExpr` callers get the precedence-
+    /// handled behaviour; primary-only lookahead for unary `*` (deref) is
+    /// handled inside `parsePrimary`.
     fn parseExpr(self: *Parser) Expr {
+        return self.parseAdditive();
+    }
+
+    /// Additive layer: chains `+`/`-` while the next token is one of those.
+    /// Each additive operand is consumed via `parseMultiplicative` so that
+    /// `1 + 2 * 3` parses as `1 + (2 * 3)` rather than `(1 + 2) * 3`.
+    fn parseAdditive(self: *Parser) Expr {
+        var lhs = self.parseMultiplicative();
+        while (true) {
+            const op: ast.Expr.BinaryOp = switch (self.peek().tag) {
+                .plus => .add,
+                .minus => .sub,
+                else => break,
+            };
+            self.advance();
+            const rhs = self.parseMultiplicative();
+            lhs = self.makeBinary(op, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Multiplicative layer: chains `*`/`/` while the next token is one of
+    /// those. Binds tighter than additive. Each operand is a `parsePrimary`
+    /// so leading `*` (deref) is consumed only at primary level.
+    fn parseMultiplicative(self: *Parser) Expr {
+        var lhs = self.parsePrimary();
+        while (true) {
+            const op: ast.Expr.BinaryOp = switch (self.peek().tag) {
+                .star => .mul,
+                .slash => .div,
+                else => break,
+            };
+            self.advance();
+            const rhs = self.parsePrimary();
+            lhs = self.makeBinary(op, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Allocate a BinaryExpr in the arena and return it as an Expr. Using
+    /// the arena for both operands avoids per-node allocations and matches
+    /// the existing NewExpr/DerefExpr `*Expr` pointer convention.
+    fn makeBinary(self: *Parser, op: ast.Expr.BinaryOp, lhs: Expr, rhs: Expr) Expr {
+        const lhs_buf = self.arena.alloc(Expr, 1);
+        lhs_buf[0] = lhs;
+        const rhs_buf = self.arena.alloc(Expr, 1);
+        rhs_buf[0] = rhs;
+        return .{ .binary = .{ .op = op, .lhs = &lhs_buf[0], .rhs = &rhs_buf[0] } };
+    }
+
+    fn parsePrimary(self: *Parser) Expr {
         const tok = self.peek();
+
+        if (tok.tag == .lbracket) {
+            return self.parseArrayLit();
+        }
 
         switch (tok.tag) {
             .new => return self.parseNew(),
             .free => return self.parseFree(),
             .print, .identifier => {
-                const saved = self.pos;
                 const name = tok.text;
                 self.advance();
                 if (self.peek().tag == .lparen) {
                     return self.parseCallExpr(name);
                 } else {
-                    self.pos = saved;
                     return .{ .ident = name };
                 }
             },
             .string_literal => {
                 self.advance();
+                if (std.mem.indexOf(u8, tok.text, "{") != null) {
+                    return self.buildTemplate(tok.text);
+                }
                 return .{ .string_lit = tok.text };
+            },
+            .byte_string_literal => {
+                self.advance();
+                return .{ .byte_string_lit = tok.text };
+            },
+            .char_literal => {
+                self.advance();
+                return .{ .char_lit = tok.text };
             },
             .integer_literal => {
                 self.advance();
-                const val = std.fmt.parseInt(i64, tok.text, 0) catch 0;
-                return .{ .int_lit = val };
+                return .{ .int_lit = tok.text };
+            },
+            .float_literal => {
+                self.advance();
+                return .{ .float_lit = tok.text };
+            },
+            .true_kw => {
+                self.advance();
+                return .{ .bool_lit = true };
+            },
+            .false_kw => {
+                self.advance();
+                return .{ .bool_lit = false };
+            },
+            .null_kw => {
+                self.advance();
+                return .{ .null_lit = {} };
+            },
+            .undefined_kw => {
+                self.advance();
+                return .{ .undefined_lit = {} };
             },
             .star => {
+                // Unary deref at primary level so `*x + 1` parses as
+                // `(*x) + 1` rather than (mis)interpreted as multiply. The
+                // *target* is also primary-only so `(*x)` doesn't accidentally
+                // absorb a following operator: `*(x + y)` would consume only
+                // the parenthesised primary, then stop.
                 self.advance();
-                const target = self.parseExpr();
+                const target = self.parsePrimary();
                 const t = self.arena.alloc(Expr, 1);
                 t[0] = target;
                 return .{ .deref = .{ .target_ptr = &t[0] } };
             },
             .lparen => {
                 self.advance();
-                const inner = self.parseExpr();
+                // Empty tuple: ()
+                if (self.peek().tag == .rparen) {
+                    self.advance();
+                    const elements = self.arena.alloc(Expr, 0);
+                    return .{ .tuple_lit = elements };
+                }
+                // Parse first expression — delegate via the top of the
+                // precedence ladder so `(1 + 2)` is parsed as a full
+                // binary expression rather than just a primary.
+                var elements_buf: [32]Expr = undefined;
+                var element_count: usize = 0;
+                elements_buf[element_count] = self.parseExpr();
+                element_count += 1;
+                // If a comma follows, this is a tuple literal
+                if (self.peek().tag == .comma) {
+                    self.advance();
+                    elements_buf[element_count] = self.parseExpr();
+                    element_count += 1;
+                    while (self.peek().tag == .comma) {
+                        self.advance();
+                        elements_buf[element_count] = self.parseExpr();
+                        element_count += 1;
+                    }
+                    self.expect(.rparen);
+                    const elements = self.arena.alloc(Expr, element_count);
+                    @memcpy(elements, elements_buf[0..element_count]);
+                    return .{ .tuple_lit = elements };
+                }
                 self.expect(.rparen);
-                return inner;
+                return elements_buf[0];
             },
             else => {
                 self.advance();
@@ -157,6 +346,65 @@ pub const Parser = struct {
         return .{ .call = .{ .name = name, .args = args } };
     }
 
+    fn parseArrayLit(self: *Parser) Expr {
+        self.expect(.lbracket);
+        // The size literal follows.
+        const size_tok = self.peek();
+        if (size_tok.tag != .integer_literal) {
+            std.debug.print("error:{d}:{d}: expected integer literal for array size, got '{s}'\n", .{
+                size_tok.loc.line, size_tok.loc.col, size_tok.text,
+            });
+            std.process.exit(1);
+        }
+        var size: u32 = 0;
+        for (size_tok.text) |c| {
+            if (c >= '0' and c <= '9') {
+                size = size * 10 + @as(u32, c - '0');
+            }
+        }
+        self.advance();
+        self.expect(.rbracket);
+        const type_name = self.expectIdent();
+        self.expect(.lbrace);
+
+        var elements_buf: [64]Expr = undefined;
+        var element_count: usize = 0;
+
+        // Allow `}` (zero-element explicit list) or at least one expression.
+        if (self.peek().tag != .rbrace) {
+            elements_buf[element_count] = self.parseExpr();
+            element_count += 1;
+            while (self.peek().tag == .comma) {
+                self.advance();
+                elements_buf[element_count] = self.parseExpr();
+                element_count += 1;
+            }
+        }
+
+        var fill = false;
+        var progression = false;
+        if (self.peek().tag == .ellipsis) {
+            self.advance();
+            if (element_count == 1) {
+                fill = true;
+            } else if (element_count == 2) {
+                progression = true;
+            }
+        }
+
+        self.expect(.rbrace);
+
+        const elements = self.arena.alloc(Expr, element_count);
+        @memcpy(elements, elements_buf[0..element_count]);
+        return .{ .array_lit = .{
+            .size = size,
+            .type_name = type_name,
+            .elements = elements,
+            .fill = fill,
+            .progression = progression,
+        } };
+    }
+
     fn parseNew(self: *Parser) Expr {
         self.expect(.new);
         const type_name = self.expectIdent();
@@ -166,6 +414,101 @@ pub const Parser = struct {
         const v = self.arena.alloc(Expr, 1);
         v[0] = value;
         return .{ .new_expr = .{ .type_name = type_name, .value = &v[0] } };
+    }
+
+    /// Split a raw string literal that contains `{...}` interpolation markers
+    /// into a template literal: alternating literal / expression parts.
+    /// The contents of `{...}` are stored verbatim as a single `.ident` Expr —
+    /// Zig re-tokenizes the emitted text at compile time, which means richer
+    /// interpolation bodies such as `{x + y}` or `{arr[i]}` are accepted
+    /// without further parsing effort here. A trailing empty literal segment
+    /// is always emitted so the parts alternation is intact when the template
+    /// ends with `{...}`.
+    ///
+    /// Reserves a fixed `[32]` parts buffer; deeper templates fail loudly via
+    /// overflow (a `zig` debug-build assert) so silent truncation is impossible.
+    fn buildTemplate(self: *Parser, raw: []const u8) Expr {
+        var parts_buf: [32]ast.Expr.TemplatePart = undefined;
+        var part_count: usize = 0;
+        var i: usize = 0;
+        var literal_start: usize = 0;
+
+        while (i < raw.len) {
+            if (raw[i] == '{' and i + 1 < raw.len) {
+                if (i > literal_start) {
+                    parts_buf[part_count] = .{ .literal = raw[literal_start..i], .expr = null };
+                    part_count += 1;
+                }
+                i += 1; // skip '{'
+                const expr_start = i;
+                // Walk until either `}` or end-of-text. The matched-`}` case
+                // must be distinguished from the end-of-text case explicitly
+                // because `}` at the very last index makes `i` equal `raw.len`
+                // after we exit the while body. Within this walk we also
+                // detect an optional printf-style format spec: `{name:spec}`.
+                // The first `:` we reach separates the expression text from
+                // the spec text; the spec runs from `:`+1 to `}` exclusive.
+                // Plain `{name}` (no `:`) leaves `spec` null and triggers the
+                // backward-compatible `{any}` codegen path.
+                var end_i = expr_start;
+                var found_close = false;
+                var has_spec = false;
+                var spec_start: usize = 0;
+                while (end_i < raw.len) : (end_i += 1) {
+                    if (raw[end_i] == '}') {
+                        found_close = true;
+                        break;
+                    }
+                    if (raw[end_i] == ':' and !has_spec) {
+                        spec_start = end_i + 1;
+                        has_spec = true;
+                    }
+                }
+
+                if (!found_close) {
+                    // Unmatched '{' — treat the remaining run (including the
+                    // '{') as a literal segment and stop.
+                    parts_buf[part_count] = .{
+                        .literal = raw[expr_start - 1 ..],
+                        .expr = null,
+                    };
+                    part_count += 1;
+                    break;
+                }
+
+                i = end_i + 1; // skip '}'
+                if (has_spec) {
+                    const expr_text = raw[expr_start..spec_start - 1];
+                    const spec_text = raw[spec_start..end_i];
+                    parts_buf[part_count] = .{
+                        .literal = null,
+                        .expr = .{ .ident = expr_text },
+                        .spec = spec_text,
+                    };
+                } else {
+                    const expr_text = raw[expr_start..end_i];
+                    parts_buf[part_count] = .{
+                        .literal = null,
+                        .expr = .{ .ident = expr_text },
+                        .spec = null,
+                    };
+                }
+                part_count += 1;
+                literal_start = i;
+            } else {
+                i += 1;
+            }
+        }
+
+        // Always emit a trailing literal part — possibly zero-length — so a
+        // string that ends with `{...}` keeps the alternation intact
+        // ("hello, " / name / "").
+        parts_buf[part_count] = .{ .literal = raw[literal_start..], .expr = null };
+        part_count += 1;
+
+        const parts = self.arena.alloc(ast.Expr.TemplatePart, part_count);
+        @memcpy(parts, parts_buf[0..part_count]);
+        return .{ .template_lit = .{ .parts = parts } };
     }
 
     fn parseFree(self: *Parser) Expr {

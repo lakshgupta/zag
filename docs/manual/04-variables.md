@@ -26,6 +26,22 @@ counter += 1;    # ok
 
 **Memory:** Stack-allocated. Same lifetime as `let`, but the value can be mutated.
 
+## Bare Rebinding
+
+A `var` binding can be reassigned with a bare `name = expr` statement (no `var` keyword on the left):
+
+```
+var count: i32 = 0;
+count = count + 1;          # bare-assignment rebinding
+count = 99;                  # bare-assignment to fresh value
+```
+
+Bare `=` on a `let` binding is a **compile error** — `let` bindings cannot be mutated. The compiler rejects it with the standard zig error `cannot assign to const`. Bare `=` on an identifier that has not been declared is also a compile error (rogue identifier).
+
+A bare `name = expr` is the canonical zag form for rebinding. The compound assignment forms (`+=`, `-=`, `*=`, `/=`) work too and desugar to `name = name OP expr` — but they require the operator overload to be defined for the value's type (`__add__` for `+=`, etc.).
+
+**Memory:** No allocation. The binding's storage location is reused; only the slot value changes.
+
 ## `const` — Compile-Time Constant
 
 ```
