@@ -24,6 +24,9 @@ pub const Expr = union(enum) {
     deref: DerefExpr,
     template_lit: TemplateLitExpr,
     binary: BinaryExpr,
+    unary: UnaryExpr,
+    index: IndexExpr,
+    range: RangeExpr,
 
     pub const BinaryExpr = struct {
         /// Operator tag. Stored as an enum so codegen can switch on the
@@ -40,11 +43,85 @@ pub const Expr = union(enum) {
         rhs: *Expr,
     };
 
+    /// Every binary operator the grammar accepts from `docs/manual/05-operators.md`.
+    /// Codegen emits the corresponding zig operator literal in `genExpr` `.binary` switch
+    /// arms. `.range` is included here for codegen simplicity (RangeExpr lives
+    /// separately in the union so the AST can carry `start`/`end`/`inclusive`
+    /// distinctly, but the descriptor still routes through `.binary`'s path
+    /// shape where arrow-shaped emission would also work). Membership here is
+    /// driven by the precedence ladder: each operator class in the manual maps
+    /// to one layer in `Parser.parseExpr`'s recursive descent.
     pub const BinaryOp = enum {
+        // arithmetic
         add,
         sub,
         mul,
         div,
+        mod,
+        // bitwise
+        bitand,
+        bitor,
+        bitxor,
+        shl,
+        shr,
+        // comparison
+        eq,
+        ne,
+        lt,
+        gt,
+        le,
+        ge,
+        // logical
+        land,
+        lor,
+        // range (codegen picks `.{start, end, false}` or `.{start, end, true}` from the
+        // accompanying Expr.range node's `inclusive` flag — BinaryOp.range is
+        // unused as a node payload but kept for future Range-as-op tagging)
+        _range,
+    };
+
+    /// Unary expression node — built by `Parser.parseUnary` for `-x` /
+    /// `~x` / `!x` / `*x` (the last was previously handled inside
+    /// `parsePrimary`; the move unifies all prefix-op emission here).
+    pub const UnaryExpr = struct {
+        op: UnaryOp,
+        operand: *Expr,
+    };
+
+    pub const UnaryOp = enum {
+        /// `-x` — arithmetic negation (zig: `-operand`)
+        neg,
+        /// `~x` — bitwise NOT (zig: `~operand`)
+        bnot,
+        /// `!x` — logical NOT (zig: `!operand`); acts on bool-typed operands.
+        lnot,
+        /// `*x` — pointer deref (zig: `operand.*`); zig syntax stays as-is because
+        /// deref is postfix in zig, so we emit `&x.*` shimming only when needed.
+        deref,
+    };
+
+    /// Postfix indexing — `arr[i]`. Codegen emits `arr[i]` directly because
+    /// both arrays and anonymous structs accept `[i]` access in zig 0.16.
+    /// The AST is recursive (target may itself be an `.index`), so chains
+    /// like `arr[i][j]` surface as `.index(.index(arr, i), j)` and codegen
+    /// emits them verbatim.
+    pub const IndexExpr = struct {
+        target: *Expr,
+        index: *Expr,
+    };
+
+    /// Range expression — `start..end` (inclusive=false) or `start...end`
+    /// (inclusive=true). Codegen emits an anonymous struct
+    /// `.{ start, end, inclusive }` whose fields zig can pattern-match or
+    /// field-access downstream. `for ... in range` iteration is deferred
+    /// until `for`/`in` keywords land; the range value itself is consumable
+    /// today via tuple destructuring or by extracting `.0`/`.1`/`.2`.
+    pub const RangeExpr = struct {
+        start: *Expr,
+        end: *Expr,
+        /// `false` for `a..b` (half-open `[a, b)`), `true` for `a...b`
+        /// (inclusive `[a, b]`).
+        inclusive: bool,
     };
 
     pub const ArrayLitExpr = struct {
@@ -153,6 +230,13 @@ pub const Stmt = union(enum) {
     /// itself evaluated at compile time.
     const_binding: BindingStmt,
     assign: AssignStmt,
+    /// `arr[i] = x` indexed-write statement. Distinct from `.assign` because
+    /// the target path includes a runtime-computed index; codegen emits
+    /// `target[index] = value;` directly. The `value` field is value-typed
+    /// (Expr) since it is the leaf of the assignment, while `target` and
+    /// `index` are pointer-typed to avoid arena allocations for what are
+    /// typically other Expr nodes (ident, call, etc.).
+    index_assign: IndexAssignStmt,
     defer_stmt: DeferStmt,
     expr_stmt: Expr,
 
@@ -186,6 +270,15 @@ pub const Stmt = union(enum) {
         /// Zag's parser disambiguates this from a call/identifier expression
         /// with a one-token lookahead at statement-scope.
         name: []const u8,
+        value: Expr,
+    };
+
+    /// `arr[i] = x` indexed-write. Empty-tuple payload is `.assign`'s
+    /// counterpart for plain-name rebinding — the target/index paths make
+    /// the destination non-identifier so a separate node is cleaner.
+    pub const IndexAssignStmt = struct {
+        target: *Expr,
+        index: *Expr,
         value: Expr,
     };
 

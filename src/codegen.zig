@@ -122,6 +122,19 @@ pub const Codegen = struct {
                 self.genExpr(d.expr);
                 self.write(";\n");
             },
+            .index_assign => |ia| {
+                // `target[i] = value;` writes a single element of an
+                // indexable container. Zig 0.16 accepts `a[i] = b;` syntax
+                // for both arrays and (where applicable) anonymous-struct
+                // tuple literals, so the AST shape round-trips directly.
+                self.write("    ");
+                self.genExpr(ia.target.*);
+                self.write("[");
+                self.genExpr(ia.index.*);
+                self.write("] = ");
+                self.genExpr(ia.value);
+                self.write(";\n");
+            },
             .expr_stmt => |e| {
                 self.write("    ");
                 self.genExpr(e);
@@ -292,6 +305,56 @@ fn getTopElements(expr: ast.Expr) []const ast.Expr {
     };
 }
 
+/// True when any leaf in `expr`'s subtree is a `.float_lit`. Used by
+/// `needsIntDivShim` (below) to decide whether the LHS of a `/` or `%`
+/// could be float-typed — float-typed LHSes can't go through zig's
+/// `@divTrunc`/`@rem` shim because those builtins require integer
+/// arguments. Idents/calls/etc. return false here because we can't
+/// inspect the user's binding type from the AST alone.
+fn exprContainsFloat(expr: ast.Expr) bool {
+    return switch (expr) {
+        .float_lit => true,
+        .binary => |b| exprContainsFloat(b.lhs.*) or exprContainsFloat(b.rhs.*),
+        .unary => |u| exprContainsFloat(u.operand.*),
+        else => false,
+    };
+}
+
+/// zig 0.16 promotes `i32 / comptime_int` (and `i32 % comptime_int`) to a
+/// hard error — the result type isn't decidable from the operands alone,
+/// so the compiler demands an explicit `@divTrunc` / `@rem` / `@divFloor`
+/// (or `@divExact`) call. Without the shim, the smoke-test
+/// `var x: i32 = 10; x /= 2;` produced an unrunnable zigzag because the
+/// generated `x = (x / 2);` triggered that rule.
+///
+/// This predicate encodes the user-confirmed wrap rule: emit `@divTrunc` /
+/// `@rem` ONLY when
+///   1. the operator is `.div` or `.mod`,
+///   2. the RHS is a comptime int literal (`.int_lit`), AND
+///   3. the LHS subtree is or could plausibly be integer-typed — i.e.
+///      (a) LHS is itself an int literal (so the whole thing is comptime-
+///          foldable — but in that case we DON'T wrap because zig folds
+///          the bare form fine) OR (b) LHS could be runtime integer
+///          (no `.float_lit` anywhere in the LHS subtree).
+///
+/// The explicit "both sides comptime" carve-out in (3a) keeps the
+/// documentation promise that "floored/comptime cases can stay bare" —
+/// `1 / 2` keeps the bare `/` and zig folds to 0 at compile time.
+///
+/// Caveat: without a type checker we can't tell an `xxx / 2` apart from
+/// `xxx / 2` where `xxx` is a f64 binding. The latter would miscompile
+/// under the shim because `@divTrunc(f64, …)` is not a valid call. User
+/// advice: if your LHS is float-typed, write the RHS as `2.0` instead of
+/// `2` so the shim predicate skips the wrap (RHS is not `.int_lit`).
+fn needsIntDivShim(b: ast.Expr.BinaryExpr) bool {
+    if (b.op != .div and b.op != .mod) return false;
+    if (b.rhs.* != .int_lit) return false;
+    // Both sides comptime_int → zig folds the bare form at compile time.
+    // Skip the shim so the user's source round-trips: `1 / 2 === (1 / 2)`.
+    if (b.lhs.* == .int_lit) return false;
+    return !exprContainsFloat(b.lhs.*);
+}
+
     fn genExpr(self: *Codegen, expr: ast.Expr) void {
         switch (expr) {
             .string_lit => |s| {
@@ -412,7 +475,70 @@ fn getTopElements(expr: ast.Expr) []const ast.Expr {
                 self.genExpr(d.target_ptr.*);
                 self.write(").*");
             },
+            .unary => |u| {
+                // Prefix operator — emitted verbatim with the operand
+                // following naturally (no extra parens because prefix
+                // operators bind tighter than any binary op downstream).
+                // Codegen mirrors the parser's four prefix forms:
+                //   `-x`  → `-<operand>`
+                //   `~x`  → `~<operand>`
+                //   `!x`  → `!<operand>`
+                //   `*x`  → `<operand>.*`  (zig's post-fix deref)
+                switch (u.op) {
+                    .neg => self.write("-"),
+                    .bnot => self.write("~"),
+                    .lnot => self.write("!"),
+                    .deref => {},
+                }
+                self.genExpr(u.operand.*);
+                if (u.op == .deref) self.write(".*");
+            },
+            .index => |i| {
+                // `target[index]` in zigzag source. Zig accepts bracket
+                // access on both arrays and anonymous-struct tuples in
+                // 0.16, so no method-call shimming is needed. Multi-dim
+                // chains surface as nested `.index` nodes and emit
+                // `arr[i][j]` verbatim via the recursion.
+                self.genExpr(i.target.*);
+                self.write("[");
+                self.genExpr(i.index.*);
+                self.write("]");
+            },
+            .range => |r| {
+                // Range expression — emitted as an anonymous struct so
+                // downstream consumer code can extract `.0` (start), `.1`
+                // (end), `.2` (inclusive flag) on the resulting value. The
+                // docs describe `Range<T>` as `{ start, end }` (no flag);
+                // we surface `inclusive` here so a future `for i in 0..10`
+                // iterator can read the flag without breaking. Codegen
+                // does not require a zigzag-side type alias for Range —
+                // the anonymous tuple is sufficient and self-describing.
+                self.write(".{ ");
+                self.genExpr(r.start.*);
+                self.write(", ");
+                self.genExpr(r.end.*);
+                self.write(", ");
+                self.write(if (r.inclusive) "true" else "false");
+                self.write(" }");
+            },
             .binary => |b| {
+                // zig 0.16 shim (see `needsIntDivShim` doc above). When the
+                // predicate fires for `.div`/`.mod` we route through
+                // `@divTrunc`/`@rem` instead of emitting the bare
+                // `(lhs / rhs)` form — otherwise zig 0.16 rejects the
+                // generated source with "signed integers must use `@divTrunc`
+                // or `@divFloor`" hard-error (the result type isn't
+                // decidable when an `i32` divides a comptime_int). After the
+                // wrap, control returns — the rest of the binary path is
+                // unreachable for these two ops under the shim.
+                if (needsIntDivShim(b)) {
+                    self.write(if (b.op == .div) "@divTrunc(" else "@rem(");
+                    self.genExpr(b.lhs.*);
+                    self.write(", ");
+                    self.genExpr(b.rhs.*);
+                    self.write(")");
+                    return;
+                }
                 // Emit `(lhs op rhs)` with parenthesisation so emitted
                 // source respects the AST's precedence even if we eventually
                 // loosen the parser ladder (e.g. add `||` short-circuit).
@@ -420,10 +546,35 @@ fn getTopElements(expr: ast.Expr) []const ast.Expr {
                 self.genExpr(b.lhs.*);
                 self.write(" ");
                 switch (b.op) {
+                    // arithmetic
                     .add => self.write("+"),
                     .sub => self.write("-"),
                     .mul => self.write("*"),
                     .div => self.write("/"),
+                    .mod => self.write("%"),
+                    // bitwise
+                    .bitand => self.write("&"),
+                    .bitor => self.write("|"),
+                    .bitxor => self.write("^"),
+                    .shl => self.write("<<"),
+                    .shr => self.write(">>"),
+                    // comparison (zig uses the same symbols)
+                    .eq => self.write("=="),
+                    .ne => self.write("!="),
+                    .lt => self.write("<"),
+                    .gt => self.write(">"),
+                    .le => self.write("<="),
+                    .ge => self.write(">="),
+                    // logical (zig uses keyword forms — `and`, `or` — to
+                    // distinguish from the bitwise `&`/`|` symbols)
+                    .land => self.write("and"),
+                    .lor => self.write("or"),
+                    // The `_range` member exists for forward extensibility
+                    // (BinaryOp is the dispatcher for any future binary
+                    // shape) but the actual Range expression lives in
+                    // Expr.range — codegen never reaches this case because
+                    // the parser emits `.range` for `..`/...`.
+                    ._range => unreachable,
                 }
                 self.write(" ");
                 self.genExpr(b.rhs.*);

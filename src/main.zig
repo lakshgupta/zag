@@ -1625,3 +1625,130 @@ test "codegen: simple binding unchanged when not destructuring" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const x = 42;") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "__destruct") == null);
 }
+
+test "codegen: x/2 emits @divTrunc shim when LHS is runtime int" {
+    // The pattern from the failing smoke test: `x /= 2` desugars to
+    // `x = x / 2;` where LHS is an `.ident` (runtime int) and RHS is a
+    // comptime `.int_lit`. zig 0.16 demands `@divTrunc(x, 2)` here because
+    // the result type of `i32 / comptime_int` isn't decidable.
+    const src = "fun f() {\n    var x: i32 = 10;\n    x = x / 2;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc(x, 2)") != null);
+    // Sanity: the bare `(x / 2)` form must NOT appear in the assignment RHS.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "x = (x / 2)") == null);
+}
+
+test "codegen: x%2 emits @rem shim when LHS is runtime int" {
+    // Mirror of the `.div` test: `x %= 2` desugars to `x = x % 2;` and
+    // codegen routes the RHS through `@rem(x, 2)`.
+    const src = "fun f() {\n    var x: i32 = 10;\n    x = x % 2;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem(x, 2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "x = (x % 2)") == null);
+}
+
+test "codegen: 1/2 stays bare when both sides are comptime int" {
+    // The "floored/comptime cases can stay bare" carve-out: `1 / 2` is
+    // pure comptime; zig folds the bare `(1 / 2)` form to `0` at compile
+    // time, so we don't need to wrap in `@divTrunc`. Preserves the user's
+    // source round-trip in the generated zigzag.
+    const src = "fun f() {\n    let z = 1 / 2;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (1 / 2);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+}
+
+test "codegen: 1.0/2.0 stays bare when LHS is float" {
+    // Both LHS and RHS are float literals — the RHS is NOT `.int_lit`, so
+    // `needsIntDivShim` short-circuits on its `b.rhs.* != .int_lit` guard
+    // and the bare `(/)` form is preserved. `@divTrunc` would be invalid
+    // here because it requires integer arguments.
+    const src = "fun f() {\n    let z = 1.0 / 2.0;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (1.0 / 2.0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
+}
+
+test "codegen: x /= 2 desugars through @divTrunc shim (compound-assign surface)" {
+    // The user-facing surface: `x /= 2;` desugars via parseCompoundAssign
+    // to `x = x / 2;`, which then routes through the shim path. This test
+    // pins the end-to-end zigzag output of the compound-syntax-emits-shim
+    // claim — without it, a future parser refactor that breaks the
+    // desugar path could silently regress the most common user form.
+    const src = "fun f() {\n    var x: i32 = 10;\n    x /= 2;\n    x %= 3;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc(x, 2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem(x, 3)") != null);
+    // Sanity: the bare `(x / 2)` and `(x % 3)` shapes must NOT appear in the
+    // desugared assignment RHS — the shim would have replaced them.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "x = (x / 2)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "x = (x % 3)") == null);
+}
+
+test "codegen: 2/x stays bare when LHS is comptime int and RHS is ident" {
+    // Defensive pin on the predicate's `b.rhs.* != .int_lit` fast path:
+    // when RHS is an `.ident` (not an int literal) the shim short-circuits,
+    // even though LHS is comptime-int. This is the mirror image of the
+    // main shim trigger case.
+    const src = "fun f() {\n    let z = 2 / x;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (2 / x);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+}
+
+test "codegen: 1.0/x stays bare when LHS is float and RHS is ident" {
+    // Defensive pin on the mixed-comptimes case: `exprContainsFloat`
+    // returns true because LHS IS a `.float_lit`, so even though RHS is
+    // not an int literal we'd see a `false` from the predicate via a
+    // different guard. Verifies the bare form is preserved.
+    const src = "fun f() {\n    let z = 1.0 / x;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (1.0 / x);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
+}

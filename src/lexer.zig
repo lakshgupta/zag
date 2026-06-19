@@ -32,11 +32,43 @@ pub const TokenTag = enum {
     lbracket,
     rbracket,
     colon,
-    equals,
+    // The vast majority of these operators come from `docs/manual/05-operators.md`
+    // and were added in one pass to expose the documented operator surface.
+    // All multi-char forms (`<=`, `+=`, `&&`, et al.) are disambiguated in
+    // the `tokenize` loop by peeking the second and third chars from the
+    // current `pos` before consuming.
+    equals, // `=` (also the leading char of `==`, `+=`, `-=`, …)
     plus,
     minus,
     star,
     slash,
+    percent, // `%`
+    amp, // `&`
+    pipe, // `|`
+    caret, // `^`
+    tilde, // `~`
+    lt, // `<`
+    gt, // `>`
+    lt_eq, // `<=`
+    gt_eq, // `>=`
+    bang, // `!`
+    eq_eq, // `==`
+    bang_eq, // `!=`
+    amp_amp, // `&&`
+    pipe_pipe, // `||`
+    lt_lt, // `<<`
+    gt_gt, // `>>`
+    plus_eq, // `+=`
+    minus_eq, // `-=`
+    star_eq, // `*=`
+    slash_eq, // `/=`
+    percent_eq, // `%=`
+    amp_eq, // `&=`
+    pipe_eq, // `|=`
+    caret_eq, // `^=`
+    lt_lt_eq, // `<<=`
+    gt_gt_eq, // `>>=`
+    range, // `..` (half-open range; doc range table also lists `...` which is `ellipsis` for inclusive)
     comma,
     arrow,
     ellipsis,
@@ -146,31 +178,254 @@ pub const Lexer = struct {
                 '{' => { self.addToken(.{ .tag = .lbrace, .loc = start_loc, .text = "{" }); self.advance(); },
                 '}' => { self.addToken(.{ .tag = .rbrace, .loc = start_loc, .text = "}" }); self.advance(); },
                 ':' => { self.addToken(.{ .tag = .colon, .loc = start_loc, .text = ":" }); self.advance(); },
-                '=' => { self.addToken(.{ .tag = .equals, .loc = start_loc, .text = "=" }); self.advance(); },
-                '*' => { self.addToken(.{ .tag = .star, .loc = start_loc, .text = "*" }); self.advance(); },
-                '+' => { self.addToken(.{ .tag = .plus, .loc = start_loc, .text = "+" }); self.advance(); },
-                '/' => { self.addToken(.{ .tag = .slash, .loc = start_loc, .text = "/" }); self.advance(); },
                 ',' => { self.addToken(.{ .tag = .comma, .loc = start_loc, .text = "," }); self.advance(); },
-                '.' => {
-                    if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == '.' and self.src[self.pos + 2] == '.') {
-                        self.addToken(.{ .tag = .ellipsis, .loc = start_loc, .text = "..." });
+                '=' => {
+                    // `=` is the leading byte of:
+                    //   `=`  (assignment), `==` (equal), and 10 compound-assign forms
+                    //   (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`).
+                    // We peek two chars forward to disambiguate. Whichever form
+                    // the user wrote, we consume the right number of bytes.
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .eq_eq, .loc = start_loc, .text = "==" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '+') {
+                        self.addToken(.{ .tag = .plus_eq, .loc = start_loc, .text = "+=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '-') {
+                        self.addToken(.{ .tag = .minus_eq, .loc = start_loc, .text = "-=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '*') {
+                        self.addToken(.{ .tag = .star_eq, .loc = start_loc, .text = "*=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '/') {
+                        self.addToken(.{ .tag = .slash_eq, .loc = start_loc, .text = "/=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '%') {
+                        self.addToken(.{ .tag = .percent_eq, .loc = start_loc, .text = "%=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '&') {
+                        self.addToken(.{ .tag = .amp_eq, .loc = start_loc, .text = "&=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '|') {
+                        self.addToken(.{ .tag = .pipe_eq, .loc = start_loc, .text = "|=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '^') {
+                        self.addToken(.{ .tag = .caret_eq, .loc = start_loc, .text = "^=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == '<' and self.src[self.pos + 2] == '<') {
+                        self.addToken(.{ .tag = .lt_lt_eq, .loc = start_loc, .text = "<<=" });
+                        self.pos += 3;
+                        self.col += 3;
+                    } else if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == '>' and self.src[self.pos + 2] == '>') {
+                        self.addToken(.{ .tag = .gt_gt_eq, .loc = start_loc, .text = ">>=" });
                         self.pos += 3;
                         self.col += 3;
                     } else {
+                        self.addToken(.{ .tag = .equals, .loc = start_loc, .text = "=" });
+                        self.advance();
+                    }
+                },
+                '*' => {
+                    // `*` is the leading byte of `*=` (compound mul-assign). Bare `*`
+                    // is multiplicative (or, in unary context, deref — the parser
+                    // distinguishes via parseUnary vs parseMultiplicative).
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .star_eq, .loc = start_loc, .text = "*=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .star, .loc = start_loc, .text = "*" });
+                        self.advance();
+                    }
+                },
+                '+' => {
+                    // `+` is the leading byte of `+=` (compound add-assign). Bare `+`
+                    // is additive (or, in unary context, plus-prefix on a literal,
+                    // routed to readNumber by the early isDigit check above).
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .plus_eq, .loc = start_loc, .text = "+=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .plus, .loc = start_loc, .text = "+" });
+                        self.advance();
+                    }
+                },
+                '/' => {
+                    // `/` is the leading byte of `/=` (compound div-assign). Bare
+                    // `/` is multiplicative division.
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .slash_eq, .loc = start_loc, .text = "/=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .slash, .loc = start_loc, .text = "/" });
+                        self.advance();
+                    }
+                },
+                '%' => {
+                    // `%` is the leading byte of `%=` (compound mod-assign). Bare
+                    // `%` is multiplicative modulo.
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .percent_eq, .loc = start_loc, .text = "%=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .percent, .loc = start_loc, .text = "%" });
+                        self.advance();
+                    }
+                },
+                '&' => {
+                    // `&` is the leading byte of:
+                    //   `&&` (logical and, parseLogicalAnd)
+                    //   `&=` (compound bitand-assign)
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '&') {
+                        self.addToken(.{ .tag = .amp_amp, .loc = start_loc, .text = "&&" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .amp_eq, .loc = start_loc, .text = "&=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .amp, .loc = start_loc, .text = "&" });
+                        self.advance();
+                    }
+                },
+                '|' => {
+                    // `|` is the leading byte of:
+                    //   `||` (logical or, parseLogicalOr)
+                    //   `|=` (compound bitor-assign)
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '|') {
+                        self.addToken(.{ .tag = .pipe_pipe, .loc = start_loc, .text = "||" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .pipe_eq, .loc = start_loc, .text = "|=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .pipe, .loc = start_loc, .text = "|" });
+                        self.advance();
+                    }
+                },
+                '^' => {
+                    // `^` is the leading byte of `^=` (compound bitxor-assign). Bare
+                    // `^` is bitwise xor.
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .caret_eq, .loc = start_loc, .text = "^=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .caret, .loc = start_loc, .text = "^" });
+                        self.advance();
+                    }
+                },
+                '~' => { self.addToken(.{ .tag = .tilde, .loc = start_loc, .text = "~" }); self.advance(); },
+                '<' => {
+                    // `<` is the leading byte of `<=`, `<<`, `<<=` (compound shift-assign).
+                    if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == '<' and self.src[self.pos + 2] == '=') {
+                        self.addToken(.{ .tag = .lt_lt_eq, .loc = start_loc, .text = "<<=" });
+                        self.pos += 3;
+                        self.col += 3;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '<') {
+                        self.addToken(.{ .tag = .lt_lt, .loc = start_loc, .text = "<<" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .lt_eq, .loc = start_loc, .text = "<=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .lt, .loc = start_loc, .text = "<" });
+                        self.advance();
+                    }
+                },
+                '>' => {
+                    // `>` is the leading byte of `>=`, `>>`, `>>=` (compound shift-assign).
+                    if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == '>' and self.src[self.pos + 2] == '=') {
+                        self.addToken(.{ .tag = .gt_gt_eq, .loc = start_loc, .text = ">>=" });
+                        self.pos += 3;
+                        self.col += 3;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '>') {
+                        self.addToken(.{ .tag = .gt_gt, .loc = start_loc, .text = ">>" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .gt_eq, .loc = start_loc, .text = ">=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .gt, .loc = start_loc, .text = ">" });
+                        self.advance();
+                    }
+                },
+                '!' => {
+                    // `!` is the leading byte of `!=`.
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .bang_eq, .loc = start_loc, .text = "!=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        self.addToken(.{ .tag = .bang, .loc = start_loc, .text = "!" });
+                        self.advance();
+                    }
+                },
+                '.' => {
+                    // `.` is the leading byte of `..` (range) and `...` (ellipsis).
+                    // Range must be checked FIRST so `..` short-circuits before
+                    // `...`; otherwise `0..10` would tokenize as two malformed
+                    // form: `0` `.` `.` `.10` (which readNumber might re-attach).
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '.' and
+                        self.pos + 2 < self.src.len and self.src[self.pos + 2] == '.')
+                    {
+                        // `...` — ellipsis (for inclusive range `a...b` and for
+                        // array fill/progression `[N]T { a, b ... }`). Same
+                        // token consumed in both contexts; parser
+                        // disambiguates from syntax position.
+                        self.addToken(.{ .tag = .ellipsis, .loc = start_loc, .text = "..." });
+                        self.pos += 3;
+                        self.col += 3;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '.') {
+                        // `..` — half-open range operator.
+                        self.addToken(.{ .tag = .range, .loc = start_loc, .text = ".." });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else {
+                        // Standalone `.` (e.g. method-call syntax not yet in
+                        // the language) is dropped on the floor to remain a
+                        // forward-compatible no-op. Members `.f` access
+                        // requires struct support first.
                         self.advance();
                     }
                 },
                 '-' => {
+                    // `-` is the leading byte of:
+                    //   `->` (arrow function-return-type marker)
+                    //   `-=` (compound sub-assign)
                     if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '>') {
                         self.addToken(.{ .tag = .arrow, .loc = start_loc, .text = "->" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
+                        self.addToken(.{ .tag = .minus_eq, .loc = start_loc, .text = "-=" });
                         self.pos += 2;
                         self.col += 2;
                     } else {
                         // Binary minus operator. Number-prefix (`-digit`) is
                         // already routed to readNumber by the early isDigit
                         // check above, so any `-` reaching here is a binary
-                        // operator or unary-prefix-on-an-identifier (the
-                        // latter is not yet exposed in the parser).
+                        // operator (as in `a - b`) or unary-prefix-on-an-identifier
+                        // (the latter handled by parseUnary in the parser).
                         self.addToken(.{ .tag = .minus, .loc = start_loc, .text = "-" });
                         self.advance();
                     }

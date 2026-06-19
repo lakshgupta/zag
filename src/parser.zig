@@ -88,12 +88,26 @@ pub const Parser = struct {
             .var_kw => return .{ .var_binding = self.parseBinding(.var_binding) },
             .const_kw => return .{ .const_binding = self.parseBinding(.const_binding) },
             .identifier => {
-                // One-token lookahead: rebinding `name = expr` is a statement,
-                // not a free identifier expression. Without this, the leading
-                // `name` would be consumed as an `.expr_stmt` ident, leaving
-                // an unconsumed `=` token and a follow-up parse error.
-                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .equals) {
-                    return .{ .assign = self.parseAssign() };
+                // Multi-form lookahead. statement-leading identifier can be:
+                //   - `name = expr;`           → bare assign (.assign)
+                //   - `name OP_EQ rhs;`        → compound assign (desugared)
+                //   - `name[i] = x;`           → indexed write (.index_assign)
+                //   - `name ...` (any other)   → expr_stmt (call / ident / index read)
+                //
+                // Without this lookahead, the identifier would be consumed
+                // by parseExpr as an `.ident` immediately and the second
+                // token (`=`, `+=`, …) would never see its lhs.
+                if (self.pos + 1 < self.tokens.len) {
+                    const next = self.tokens[self.pos + 1].tag;
+                    if (next == .equals) {
+                        return .{ .assign = self.parseAssign() };
+                    }
+                    if (compoundOpForTag(next)) |op| {
+                        return .{ .assign = self.parseCompoundAssign(op) };
+                    }
+                    if (next == .lbracket) {
+                        return .{ .index_assign = self.parseIndexAssign() };
+                    }
                 }
                 return .{ .expr_stmt = self.parseExpr() };
             },
@@ -231,19 +245,84 @@ pub const Parser = struct {
         return .{ .name = name, .value = value };
     }
 
+    /// Parse a compound assignment `x OP= rhs` and desugar it into a bare
+    /// `Stmt.AssignStmt` whose value is `binary(op, ident("x"), rhs)`. No
+    /// new AST node is emitted — the doc frames the compound forms as sugar
+    /// for `x = x OP rhs`, so the existing AssignStmt shape can carry both.
+    /// `op` is supplied by `compoundOpForTag` via the parseStmt lookahead.
+    fn parseCompoundAssign(self: *Parser, op: ast.Expr.BinaryOp) Stmt.AssignStmt {
+        const name = self.expectIdent();
+        // Consume the OP_EQ token — parseStmt's lookahead verified the
+        // specific tag, but `advance` walks past whatever OP_EQ associate
+        // matched the originalTokenTag` to the matching TokenTag forms.
+        self.advance();
+        const rhs = self.parseExpr();
+        // Desugar `x OP= rhs` → `x = x OP rhs`. The ident Expr("x") and the
+        // `rhs` get lifted into arena-allocated slots via makeBinary so
+        // their addresses match the BinaryExpr's pointer convention.
+        const bin_expr = self.makeBinary(op, .{ .ident = name }, rhs);
+        return .{ .name = name, .value = bin_expr };
+    }
+
+    /// Parse `target[i] = value`. The full power is determined by
+    /// parseStmt.identifier branch's lookahead — the only entry is when
+    /// the current token is `.identifier` and the next is `.lbracket`.
+    /// The target is parsed as a primary expression (NOT invoking the
+    /// `[N]T { ... }` array-lit path because that's a leading-`[` only),
+    /// then the bracketed index is expected, then `=`, then the value.
+    /// Multi-dim index writes (`arr[i][j] = x`) are NOT supported here
+    /// because they would require the chained-Index form on the LHS —
+    /// supported only via explicit parens like `(arr[i])[j] = x` once
+    /// chained Index parfactoring lands.
+    fn parseIndexAssign(self: *Parser) Stmt.IndexAssignStmt {
+        const target = self.parsePrimary();
+        self.expect(.lbracket);
+        const index = self.parseExpr();
+        self.expect(.rbracket);
+        self.expect(.equals);
+        const value = self.parseExpr();
+        const target_buf = self.arena.alloc(Expr, 1);
+        target_buf[0] = target;
+        const index_buf = self.arena.alloc(Expr, 1);
+        index_buf[0] = index;
+        return .{ .target = &target_buf[0], .index = &index_buf[0], .value = value };
+    }
+
+    /// Map a compound-assign TokenTag to its corresponding BinaryOp. Returns
+    /// `null` for non-compound tags so parseStmt's identifier branch can
+    /// dispatch in one switch (`next == equals` → parseAssign,
+    /// `compoundOpForTag(next) != null` → parseCompoundAssign, etc).
+    fn compoundOpForTag(tag: TokenTag) ?ast.Expr.BinaryOp {
+        return switch (tag) {
+            .plus_eq => .add,
+            .minus_eq => .sub,
+            .star_eq => .mul,
+            .slash_eq => .div,
+            .percent_eq => .mod,
+            .amp_eq => .bitand,
+            .pipe_eq => .bitor,
+            .caret_eq => .bitxor,
+            .lt_lt_eq => .shl,
+            .gt_gt_eq => .shr,
+            else => null,
+        };
+    }
+
     fn parseDefer(self: *Parser) Stmt.DeferStmt {
         self.expect(.defer_kw);
         const expr = self.parseExpr();
         return .{ .expr = expr };
     }
 
-    /// Top-level entry point: parses a full Zag expression including binary
-    /// arithmetic. Delegates to a 2-level precedence ladder (additive →
-    /// multiplicative → primary). `parseExpr` callers get the precedence-
-    /// handled behaviour; primary-only lookahead for unary `*` (deref) is
-    /// handled inside `parsePrimary`.
+    /// Top-level entry point: parses a full Zag expression. Delegates to a
+    /// 12-layer precedence ladder rooted at parseRange (lowest precedence)
+    /// and terminating at parsePrimary (highest precedence). The ordering
+    /// mirrors `docs/manual/05-operators.md`'s precedence table exactly
+    /// so `1 + 2 * 3` parses as `1 + (2 * 3)` rather than `(1 + 2) * 3`,
+    /// and `0..10 + 5` parses as `0..(10 + 5)` because range binds looser
+    /// than additive.
     fn parseExpr(self: *Parser) Expr {
-        return self.parseAdditive();
+        return self.parseRange();
     }
 
     /// Additive layer: chains `+`/`-` while the next token is one of those.
@@ -264,19 +343,23 @@ pub const Parser = struct {
         return lhs;
     }
 
-    /// Multiplicative layer: chains `*`/`/` while the next token is one of
-    /// those. Binds tighter than additive. Each operand is a `parsePrimary`
-    /// so leading `*` (deref) is consumed only at primary level.
+    /// Multiplicative layer: chains `*`/`/`/`%` while the next token is one
+    /// of those (precedence class 3 per the manual). Adds modulo `%` to the
+    /// previously-only-`*`/`/` set. Each operand recurses through
+    /// parseUnary so leading `-x`/`!x`/`~x`/`*x` (deref) prefix operators are
+    /// consumed at this level too — important for `5 % -3` to attach the
+    /// unary minus to the 3, not to the modulo result.
     fn parseMultiplicative(self: *Parser) Expr {
-        var lhs = self.parsePrimary();
+        var lhs = self.parseUnary();
         while (true) {
             const op: ast.Expr.BinaryOp = switch (self.peek().tag) {
                 .star => .mul,
                 .slash => .div,
+                .percent => .mod,
                 else => break,
             };
             self.advance();
-            const rhs = self.parsePrimary();
+            const rhs = self.parseUnary();
             lhs = self.makeBinary(op, lhs, rhs);
         }
         return lhs;
@@ -291,6 +374,232 @@ pub const Parser = struct {
         const rhs_buf = self.arena.alloc(Expr, 1);
         rhs_buf[0] = rhs;
         return .{ .binary = .{ .op = op, .lhs = &lhs_buf[0], .rhs = &rhs_buf[0] } };
+    }
+
+    // ------------------------------------------------------------------
+    // 12-layer precedence ladder
+    // ------------------------------------------------------------------
+    // The ordering below mirrors `docs/manual/05-operators.md` exactly:
+    //   parseRange         class 12 (lowest precedence)
+    //   parseLogicalOr     class 11
+    //   parseLogicalAnd    class 10
+    //   parseComparison    class 9 (no chaining — errors on `a < b < c`)
+    //   parseBitOr         class 8
+    //   parseBitXor        class 7
+    //   parseBitAnd        class 6
+    //   parseShift         class 5
+    //   parseAdditive      class 4
+    //   parseMultiplicative class 3 (extended with `%`)
+    //   parseUnary         class 1 (prefix `-x`, `~x`, `!x`, `*x` deref)
+    //   parsePostfix       nested between unary and primary — chains `[i]`
+    //   parsePrimary       literal / paren / call / array-literal `[N]T {…}`
+    // Each layer descends by calling the NEXT layer for operands, then
+    // chains same-class operators via a `while` loop. The non-chaining
+    // classes (range, comparison) use a single consume with explicit
+    // error if a same-class op follows.
+    // ------------------------------------------------------------------
+
+    /// Range layer: lowest-precedence binary op. `a..b` (half-open) emits
+    /// `.range { inclusive = false }` and `a...b` (inclusive) emits
+    /// `.range { inclusive = true }`. Per the manual, range has None
+    /// associativity — chaining `0..5..10` is a syntax error caught here.
+    fn parseRange(self: *Parser) Expr {
+        const tok = self.peek().tag;
+        // Range-as-prefix is not in the grammar — `0..10` requires a
+        // preceding LHS that's a full Expression. We start from
+        // parseLogicalOr for both sides so `0..10` parses as Range(0, 10)
+        // but `0 + 1..10` parses as Range(0 + 1, 10) (range binds looser).
+        const lhs = self.parseLogicalOr();
+        if (tok == .range) {
+            self.advance();
+            const rhs = self.parseLogicalOr();
+            self.rejectRangeChaining();
+            return self.makeRange(lhs, rhs, false);
+        }
+        if (tok == .ellipsis) {
+            self.advance();
+            const rhs = self.parseLogicalOr();
+            self.rejectRangeChaining();
+            return self.makeRange(lhs, rhs, true);
+        }
+        return lhs;
+    }
+
+    /// Helper for parseRange. Lifts lhs/rhs into arena-allocated Expr slots
+    /// then constructs the `.range` union payload.
+    fn makeRange(self: *Parser, lhs: Expr, rhs: Expr, inclusive: bool) Expr {
+        const lb = self.arena.alloc(Expr, 1);
+        lb[0] = lhs;
+        const rb = self.arena.alloc(Expr, 1);
+        rb[0] = rhs;
+        return .{ .range = .{ .start = &lb[0], .end = &rb[0], .inclusive = inclusive } };
+    }
+
+    /// Explicit guard for `a..b..c` / `a...b..c` / etc. After consuming
+    /// one range op, any SECOND range/ellipsis op directly following is
+    /// a syntax error per the manual's None-associativity rule. Emits a
+    /// diagnostic with the offending token's location.
+    fn rejectRangeChaining(self: *Parser) void {
+        const peek_tok = self.peek();
+        switch (peek_tok.tag) {
+            .range, .ellipsis => {
+                std.debug.print("error:{d}:{d}: range operator cannot chain; use '&&' or parentheses\n", .{ peek_tok.loc.line, peek_tok.loc.col });
+                std.process.exit(1);
+            },
+            else => {},
+        }
+    }
+
+    /// Logical-OR layer: chains `||` while the next token is one. Codegen
+    /// emits zig's `or` keyword (zig uses words for the logical operators,
+    /// unlike the bitwise `|` operator which is its own symbol).
+    fn parseLogicalOr(self: *Parser) Expr {
+        var lhs = self.parseLogicalAnd();
+        while (self.peek().tag == .pipe_pipe) {
+            self.advance();
+            const rhs = self.parseLogicalAnd();
+            lhs = self.makeBinary(.lor, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Logical-AND layer: chains `&&` while the next token is one. Zig
+    /// emits `and` for `&&` to distinguish from bitwise `&`.
+    fn parseLogicalAnd(self: *Parser) Expr {
+        var lhs = self.parseComparison();
+        while (self.peek().tag == .amp_amp) {
+            self.advance();
+            const rhs = self.parseComparison();
+            lhs = self.makeBinary(.land, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Comparison layer: `==`, `!=`, `<`, `>`, `<=`, `>=`. Per the manual
+    /// these have None associativity — `a < b < c` is a syntax error. So
+    /// this layer consumes AT MOST ONE comparison op and explicitly
+    /// rejects a second one with a helpful diagnostic if the user wrote
+    /// the chained form. A common idiomatic pattern in zig/zag is
+    /// `a < b && c < d` instead of chaining comparisons.
+    fn parseComparison(self: *Parser) Expr {
+        const lhs = self.parseBitOr();
+        const op: ast.Expr.BinaryOp = switch (self.peek().tag) {
+            .eq_eq => .eq,
+            .bang_eq => .ne,
+            .lt => .lt,
+            .gt => .gt,
+            .lt_eq => .le,
+            .gt_eq => .ge,
+            else => return lhs,
+        };
+        self.advance();
+        const rhs = self.parseBitOr();
+        // No chaining: another comparison op directly following means the
+        // user wrote `a < b < c` or similar, which the manual rejects.
+        const peek_tok = self.peek();
+        switch (peek_tok.tag) {
+            .eq_eq, .bang_eq, .lt, .gt, .lt_eq, .gt_eq => {
+                std.debug.print("error:{d}:{d}: comparison cannot chain ({s}); use '&&' or parens\n", .{ peek_tok.loc.line, peek_tok.loc.col, @tagName(peek_tok.tag) });
+                std.process.exit(1);
+            },
+            else => {},
+        }
+        return self.makeBinary(op, lhs, rhs);
+    }
+
+    /// Bitwise-OR layer: chains `|`.
+    fn parseBitOr(self: *Parser) Expr {
+        var lhs = self.parseBitXor();
+        while (self.peek().tag == .pipe) {
+            self.advance();
+            const rhs = self.parseBitXor();
+            lhs = self.makeBinary(.bitor, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Bitwise-XOR layer: chains `^`.
+    fn parseBitXor(self: *Parser) Expr {
+        var lhs = self.parseBitAnd();
+        while (self.peek().tag == .caret) {
+            self.advance();
+            const rhs = self.parseBitAnd();
+            lhs = self.makeBinary(.bitxor, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Bitwise-AND layer: chains `&`. Reserve `&&` for the higher layer
+    /// (`amp_amp`) so the parser cleanly distinguishes them at the
+    /// lexer/`TokenTag` level.
+    fn parseBitAnd(self: *Parser) Expr {
+        var lhs = self.parseShift();
+        while (self.peek().tag == .amp) {
+            self.advance();
+            const rhs = self.parseShift();
+            lhs = self.makeBinary(.bitand, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Shift layer: chains `<<` and `>>`.
+    fn parseShift(self: *Parser) Expr {
+        var lhs = self.parseAdditive();
+        while (true) {
+            const op: ast.Expr.BinaryOp = switch (self.peek().tag) {
+                .lt_lt => .shl,
+                .gt_gt => .shr,
+                else => break,
+            };
+            self.advance();
+            const rhs = self.parseAdditive();
+            lhs = self.makeBinary(op, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Unary prefix layer: `-x`, `!x`, `~x`, `*x` (deref). All four are
+    /// prefix operators binding tighter than any binary op, so this layer
+    /// sits at the top of the precedence ladder. Recursive on the operand
+    /// so `--x` parses as `-(-x)` and `!!flag` as `!(!flag)`. After the
+    /// unary refactor moved deref `*x` here from parsePrimary, the four
+    /// operators emit `Expr.unary { op, operand }` consistently with the
+    /// existing NewExpr/DerefExpr pointer convention.
+    fn parseUnary(self: *Parser) Expr {
+        const op: ast.Expr.UnaryOp = switch (self.peek().tag) {
+            .minus => .neg,
+            .tilde => .bnot,
+            .bang => .lnot,
+            .star => .deref,
+            else => return self.parsePostfix(),
+        };
+        self.advance();
+        const operand = self.parseUnary();
+        const buf = self.arena.alloc(Expr, 1);
+        buf[0] = operand;
+        return .{ .unary = .{ .op = op, .operand = &buf[0] } };
+    }
+
+    /// Postfix layer: chains `[i]` indexing onto a primary expression so
+    /// `arr[i][j]` parses as Index(Index(arr, i), j). The recursive walk
+    /// stops at the first non-bracket token and returns the LHS up the
+    /// precedence ladder to whichever binary op is next. Note: this is
+    /// NOT for chained-function-calls (`f(1)(2)`) — that would require a
+    /// `.lparen` arm here too, but the user-chosen shape is "chained
+    /// single-Index per bracket pair" only.
+    fn parsePostfix(self: *Parser) Expr {
+        var lhs = self.parsePrimary();
+        while (self.peek().tag == .lbracket) {
+            self.advance(); // consume [
+            const idx = self.parseExpr();
+            self.expect(.rbracket);
+            const target_buf = self.arena.alloc(Expr, 1);
+            target_buf[0] = lhs;
+            const idx_buf = self.arena.alloc(Expr, 1);
+            idx_buf[0] = idx;
+            lhs = .{ .index = .{ .target = &target_buf[0], .index = &idx_buf[0] } };
+        }
+        return lhs;
     }
 
     fn parsePrimary(self: *Parser) Expr {
@@ -352,11 +661,14 @@ pub const Parser = struct {
                 return .{ .undefined_lit = {} };
             },
             .star => {
-                // Unary deref at primary level so `*x + 1` parses as
-                // `(*x) + 1` rather than (mis)interpreted as multiply. The
-                // *target* is also primary-only so `(*x)` doesn't accidentally
-                // absorb a following operator: `*(x + y)` would consume only
-                // the parenthesised primary, then stop.
+                // Note: `*x` (deref) is NOT routed here. After the unary
+                // refactor, parseUnary handles all four prefix operators
+                // (`-x`, `~x`, `!x`, `*x` deref) at one level above
+                // parsePrimary. parsePrimary is invoked by parsePostfix,
+                // which is invoked by parseUnary. Tokens that reach this
+                // arm with `.star` are unreachable in practice; we still
+                // emit a structural deref node to keep the AST complete
+                // and silence the exhaustive switcher.
                 self.advance();
                 const target = self.parsePrimary();
                 const t = self.arena.alloc(Expr, 1);

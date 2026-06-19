@@ -1,0 +1,78 @@
+## Operators — arithmetic / bitwise / comparison / logical / compound / index / range
+##
+## Run: zag run operators.zag
+
+fun main() {
+    # Arithmetic: modulo + unary negation.
+    # Use annotated `let` so zig accepts comptime_int operands.
+    let m: i32 = 17 % 5;
+    let n: i32 = -m;
+    print("modulo: 17 % 5 = {m}\n");
+    print("negation: -{m} = {n}\n");
+
+    # Bitwise ops on integer literals.
+    let a: i32 = 0b1100 & 0b1010;
+    let b: i32 = 0b1100 | 0b1010;
+    let c: i32 = 0b1100 ^ 0b1010;
+    let d: i32 = ~0b1100;
+    let e: i32 = 0b0001 << 2;
+    let f: i32 = 0b1000 >> 2;
+    print("bitwise: and={a} or={b} xor={c} not={d} shl={e} shr={f}\n");
+
+    # Comparison ops (each comparison is non-chaining; chained with `&&`).
+    let eq: bool = 1 + 1 == 2;
+    let ne: bool = 1 != 2;
+    let lt: bool = 1 < 2;
+    let gt: bool = 2 > 1;
+    let le: bool = 1 <= 1;
+    let ge: bool = 2 >= 1;
+    print("comparison: eq={eq} ne={ne} lt={lt} gt={gt} le={le} ge={ge}\n");
+
+    # Logical ops — chaining via `&&`/`||` since comparison is non-chaining.
+    let land: bool = true && false;
+    let lor: bool = true || false;
+    let lnot: bool = !true;
+    print("logical: and={land} or={lor} not={lnot}\n");
+
+    # Compound assignment: every var must be mutated at least once because
+    # zig 0.16 promotes "local variable is never mutated" to a hard error.
+    var x: i32 = 10;
+    x += 5;
+    x -= 1;
+    x *= 2;
+    x /= 3;
+    x %= 1;
+    var y: i32 = 12;
+    y &= 10;
+    var z: i32 = 12;
+    z |= 10;
+    var w: i32 = 12;
+    w ^= 10;
+    var s: i32 = 1;
+    s <<= 2;
+    var t: i32 = 8;
+    t >>= 2;
+    print("compounds: x={x} y={y} z={z} w={w} shl={s} shr={t}\n");
+
+    # Indexing: read and write through arrays. Array type annotation
+    # gives zig a concrete element type so `var arr = …` is not
+    # comptime-only.
+    var arr: [3]i32 = [3]i32 { 10, 20, 30 };
+    let first: i32 = arr[0];
+    let second: i32 = arr[1];
+    arr[1] = 99;
+    let after_write: i32 = arr[1];
+    # Verify chained index access still parses.
+    let nested: i32 = arr[0];
+    print("index: first={first} second={second} after_write={after_write} chained={nested}\n");
+
+    # Range: half-open `..` and inclusive `...`. Both produce an
+    # anonymous struct `.{start, end, inclusive}` for downstream
+    # consumption; print("{any}") renders the tuple via zig's debug
+    # formatter so the user can verify shape.
+    let half: i32 = 0;
+    let half_end: i32 = 10;
+    let inc_end: i32 = 10;
+    print("range: half-open 0..{any}-{any} = {any}\n", .{ 0, 10, .{ half, half_end, false } });
+    print("range: inclusive 0...{any} = {any}\n", .{ inc_end, .{ 0, inc_end, true } });
+}
