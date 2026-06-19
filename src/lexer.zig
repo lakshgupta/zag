@@ -18,6 +18,19 @@ pub const TokenTag = enum {
     print,
     as_kw,
     return_kw,
+    /// Reserved with `_kw` suffix because `if`/`else`/`while`/`for`/`match`/
+    /// `break`/`continue` are reserved words in the Zig backend (the lexer
+    /// cannot name a TokenTag literal `if`/`else`/etc. without colliding
+    /// with the corresponding zig keyword). `in` is not zig-reserved but
+    /// gets the suffix for naming consistency across the suite.
+    if_kw,
+    else_kw,
+    while_kw,
+    for_kw,
+    in_kw,
+    match_kw,
+    break_kw,
+    continue_kw,
     true_kw,
     false_kw,
     null_kw,
@@ -647,6 +660,22 @@ pub const Lexer = struct {
             .print
         else if (std.mem.eql(u8, text, "return"))
             .return_kw
+        else if (std.mem.eql(u8, text, "if"))
+            .if_kw
+        else if (std.mem.eql(u8, text, "else"))
+            .else_kw
+        else if (std.mem.eql(u8, text, "while"))
+            .while_kw
+        else if (std.mem.eql(u8, text, "for"))
+            .for_kw
+        else if (std.mem.eql(u8, text, "in"))
+            .in_kw
+        else if (std.mem.eql(u8, text, "match"))
+            .match_kw
+        else if (std.mem.eql(u8, text, "break"))
+            .break_kw
+        else if (std.mem.eql(u8, text, "continue"))
+            .continue_kw
         else if (std.mem.eql(u8, text, "true"))
             .true_kw
         else if (std.mem.eql(u8, text, "false"))

@@ -836,7 +836,12 @@ test "codegen: module-level interp_buf emitted" {
 }
 
 test "parser: let with type annotation" {
-    const src = "fun f() {\n    let x = 42;\n}\n";
+    // Pre-carve-out tests inadvertently regressed to bare `let x = 42` when
+    // the static-typed-coercion migration commit landed (the carve-out makes
+    // bare-form bindings legal, but the test was written when bare-form
+    // auto-typed to `: i32`). An explicit `: T` source matches the assertion
+    // (and is the same form the docs recommend now).
+    const src = "fun f() {\n    let x: i32 = 42;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -890,7 +895,9 @@ test "parser: let with multiple lets each annotated" {
 }
 
 test "codegen: let with type annotation emits `: T`" {
-    const src = "fun f() {\n    let x = 42;\n}\n";
+    // Same regression fix as the parser test above — explicit `: i32` to
+    // match the codegen expectation `const x: i32 = 42`.
+    const src = "fun f() {\n    let x: i32 = 42;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1450,8 +1457,12 @@ test "parser: destructuring with wildcard discard" {
 }
 
 test "parser: top-level wildcard" {
-    // `        let _ = 42;` should produce a discard-only pattern with no leaves.
-    const src = "fun f() {\n    let _: i32 = 42;\n}\n";
+    // `let _ = 42` should produce a discard-only pattern with no leaves.
+    // The earlier `let _: i32 = 42` form regressed when the colon-on-pattern
+    // rejection was added (parser now surfaces
+    // "let pattern: per-leaf type annotations are not supported"); the bare
+    // wildcard form is the canonical use.
+    const src = "fun f() {\n    let _ = 42;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1878,6 +1889,34 @@ test "lexer: errdefer_kw, unsafe_kw, as_kw are keywords" {
     try std.testing.expectEqualStrings("as", tokens[2].text);
 }
 
+test "lexer: control-flow keywords (if/else/while/for/in/match/break/continue)" {
+    // Per docs/06-control-flow.md. Each is reserved with `_kw` suffix
+    // because the underlying zigzag is reserved in Zig 0.16 (mirrors the
+    // `var_kw`/`as_kw`/`return_kw` naming), so a future AST/parser/codegen
+    // pass for the docs/06 surface can dispatch on `.if_kw` etc. without
+    // colliding with zig's grammar.
+    const src = "if else while for in match break continue";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    const expected_tags = [_]lexer_mod.TokenTag{
+        .if_kw,    .else_kw,
+        .while_kw, .for_kw,
+        .in_kw,    .match_kw,
+        .break_kw, .continue_kw,
+    };
+    const expected_texts = [_][]const u8{
+        "if",    "else",
+        "while", "for",
+        "in",    "match",
+        "break", "continue",
+    };
+    for (expected_tags, expected_texts) |tag, text| {
+        const idx = (@intFromPtr(&tag) - @intFromPtr(&expected_tags[0])) / @sizeOf(lexer_mod.TokenTag);
+        try std.testing.expectEqual(tag, tokens[idx].tag);
+        try std.testing.expectEqualStrings(text, tokens[idx].text);
+    }
+}
+
 test "parser: errdefer parses as Stmt.errdefer_stmt" {
     // Pattern 2 from docs/19-memory.md: `errdefer free(a)` runs only on the
     // `?`-propagation path. Parser pins the AST tag so the codegen surface
@@ -1972,7 +2011,7 @@ test "parser: new T(v) keeps allocator null for global-heap shape" {
     try std.testing.expect(init == .new_expr);
     try std.testing.expect(init.new_expr.allocator == null);
     try std.testing.expectEqualStrings("i32", init.new_expr.type_name);
-    try std.testing.expect(init.new_expr.value == .int_lit);
+    try std.testing.expect(init.new_expr.value.* == .int_lit);
 }
 
 test "codegen: new T(v) emits page_allocator.create heap alloc (bug fix)" {
