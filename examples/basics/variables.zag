@@ -17,9 +17,9 @@ fun main() {
     print("pi = {PI:.5}\n");
 
     # Type inference
-    let z = 100;          # inferred i32
-    let flag = true;      # inferred bool
-    let ch = 'Z';         # inferred char
+    let z: i32 = 100;
+    let flag: bool = true;
+    let ch: u8 = 'Z';
 
     print("z = {z}, flag = {flag}, ch = {ch}\n");
 }

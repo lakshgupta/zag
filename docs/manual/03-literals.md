@@ -7,11 +7,11 @@ Zag is **statically typed**: every literal has a known type at compile time. Int
 ## Integer Literals
 
 ```
-let a = 42;          # decimal — i32
+let a: i32 = 42;
 let b = 0xFF;        # hex — i32
 let c = 0o77;        # octal — i32
 let d = 0b1010;      # binary — i32
-let e = 1_000_000;   # decimal with underscores for readability — i32
+let e: i32 = 1_000_000;
 let f: u64 = 100;    # explicit type annotation overrides the default
 ```
 
@@ -20,8 +20,8 @@ Sizes and signedness ranges are documented in [Primitives](08-primitives.md). Ar
 ## Float Literals
 
 ```
-let pi    = 3.14;        # f64 by default
-let speed = 1.0e10;      # scientific notation — f64
+let pi: f64 = 3.14;
+let speed: f64 = 1.0e10;
 let tiny: f32 = 1.0e-10; # explicit type annotation
 let hex   = 0x1.0p10;    # hex float (IEEE 754 binary16/32/64 form)
 ```
@@ -31,14 +31,14 @@ Sizes and hardware-acceleration notes are documented in [Primitives](08-primitiv
 ## Boolean Literals
 
 ```
-let on  = true;     # bool
-let off = false;    # bool
+let on: bool = true;
+let off: bool = false;
 ```
 
 ## Character Literals
 
 ```
-let letter    = 'a';        # char
+let letter: u8 = 'a';
 let newline   = '\n';       # char
 let null_char = '\x00';     # char (NUL byte)
 let heart     = '\u2764';   # char (UTF-8 multi-byte scalar)
@@ -51,7 +51,7 @@ let heart     = '\u2764';   # char (UTF-8 multi-byte scalar)
 String literals produce `[]const u8` — a borrowed view with no allocation:
 
 ```
-let greeting = "hello";          # []const u8 — borrowed, no allocation
+let greeting: []const u8 = "hello";
 let owned    = new String("hello"); # String — heap-allocated, must be free'd
 ```
 
@@ -62,8 +62,8 @@ let owned    = new String("hello"); # String — heap-allocated, must be free'd
 String interpolation:
 
 ```
-let name = "world";
-let msg = "hello, {name}";     # String interpolation
+let name: []const u8 = "world";
+let msg: []u8 = "hello, {name}";
 print("{msg}\n");
 ```
 
@@ -72,7 +72,7 @@ print("{msg}\n");
 ## Byte String Literals
 
 ```
-let bytes = b"hello";   # []u8 — mutable byte slice (see spec §2.2)
+let bytes: []const u8 = b"hello";
 ```
 
 **Memory:** The slice header (`ptr: *u8`, `len: usize`) is stack-allocated; the bytes live in the binary's rodata. The slice type is `[]u8` (mutable); the underlying storage is read-only memory and writing through the pointer is undefined behavior on most targets — use it as a read-only byte view, or `memcpy` it into a mutable buffer first if mutation is needed.

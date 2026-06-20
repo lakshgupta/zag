@@ -1,98 +1,155 @@
 # Pointers
 
+Pointers in zag behave like Zig's pointers: there is **no borrow checker in the core language**, and the programmer is responsible for memory validity. Safety tooling (`-Downership-check`, `-Dref-check`, `-fsanitize=memory`) is opt-in but catches common bugs at compile time or runtime.
+
+This chapter walks through the pointer types zag exposes (per `docs/spec.md §3.2`), how to construct them (`new`, `&`, `new(<alloc>, …)`), how to read and write through them (`*p`, `p[i]`), and how slices (`[]T`) tie the whole surface together. See `examples/memory/pointers.zag` for a runnable tour.
+
 ## Pointer Types
 
-| Type | Meaning | Copy? |
-|------|---------|-------|
-| `*T` | Single-item mutable pointer | No (owning) |
-| `*const T` | Single-item immutable pointer | Yes |
-| `?*T` | Nullable mutable pointer | Yes |
-| `?*const T` | Nullable immutable pointer | Yes |
-| `?*raw T` | Nullable raw pointer | Yes |
-| `*raw T` | C-style raw pointer | Yes |
-| `[]T` | Slice (ptr + len) | Yes |
-| `[]const T` | Immutable slice | Yes |
+| Type              | Meaning                                              |
+|-------------------|------------------------------------------------------|
+| `*T`              | Single-item pointer, mutable                         |
+| `*const T`        | Single-item pointer, immutable                       |
+| `?*T`             | Nullable, mutable; `null` is the null value; `Copy`  |
+| `?*const T`       | Nullable, immutable; `Copy`                          |
+| `?*raw T`         | Nullable, raw C-style; `Copy`                        |
+| `*raw T`          | C-style raw pointer (no ownership, no null safety); use only inside `unsafe` |
+| `[]T`             | Slice, mutable:  layout `{ ptr: *T, len: usize }`   |
+| `[]const T`       | Slice, immutable: layout `{ ptr: *const T, len }`   |
 
-## Taking Addresses
+Only `*T` (non-nullable, mutable) and `String` are not `Copy` — they move on assignment. Every other pointer form is a non-owning view and copies its value. Pointers are first-class in zag: they can be stored in arrays, structs, slices, returned from functions, and passed as arguments.
 
-```
-var x: i32 = 10;
-let p: *i32 = &x;          # mutable pointer to x
-let cp: *const i32 = &x;   # immutable pointer to x
-```
+## Allocating a pointer: `new`
 
-**Memory:** `&` produces a pointer to a stack-allocated value. The pointer is valid only while the referent is alive. No allocation.
-
-## Dereferencing
+`new` allocates on the heap and returns an owning pointer. See `docs/19-memory.md` for the full heap-allocation surface.
 
 ```
-let val: i32 = *p;         # read through pointer
-*p = 42;                   # write through pointer (requires *T)
+let p = new i32(42);        # global allocator (default)
+defer free(p);              # release via destroy on the global allocator
+
+let q = new(arena, Vec3 { x: 1.0, y: 2.0, z: 3.0 });  # arena allocator
 ```
 
-**Memory:** No allocation. Direct memory access through the pointer.
+`free(ptr)` releases a `new`-allocated pointer back to the global allocator. **Do not mix**: freeing an arena-allocated pointer with global `free` is undefined behavior, and freeing a stack address (`&local`) is also undefined.
 
-## Nullable Pointers
+## Taking an address: `&x`
 
-```
-let p: ?*i32 = null;        # null pointer
-let q: ?*i32 = &x;          # non-null pointer
-
-if let Some(ptr) = p {
-    print("{*ptr}\n");      # safe to dereference
-}
-```
-
-**Memory:** `?*T` is the same size as `*T` (one extra bit for null, packed into the pointer).
-
-## Raw Pointers
+The unary `&` operator returns a pointer to a value. The resulting type depends on whether the source binding is mutable (`var`) or immutable (`let`/`const`):
 
 ```
-let p: *raw i32 = alloc(4) as *raw i32;
+var   mutable:   i32 = 10;
+let   read_only: i32 = 20;
+
+let p_mut:  *i32      = &mutable;        # *i32      (mutable)
+let p_ro:   *const i32 = &read_only;     # *const i32 (immutable)
+```
+
+`&x` is **only valid on lvalues** — a variable or a struct field, not a literal or a temporary expression. The compiler emits `&<operand>` directly in the generated zig, so the layout matches one-to-one.
+
+Binary `&` is bitwise AND and not affected by the address-of addition; the parser disambiguates by syntactic context — prefix position routes to address-of, infix position routes to bitwise AND. Both share the same `.amp` TokenTag in the lexer; the dispatch lives entirely in the parser.
+
+## Dereferencing: `*p`
+
+`*p` reads or writes through a pointer:
+
+```
+let v: i32 = *p;        # read
+*p = 100;                # write
+```
+
+The dereferenced type is the pointee's type — `*i32` dereferences to `i32`. The compiler emits `<pointer>.*` in zig (postfix deref), so the AST shape round-trips directly. `*p = expr` is the canonical way to mutate state through a borrowed pointer without naming the underlying variable.
+
+## Slicing: `arr[a..b]`
+
+Slicing produces a `[]T` view into an underlying `[N]T` array without copying:
+
+```
+let arr: [5]i32 = [5]i32 { 1, 2, 3, 4, 5 };
+let s:    []i32  = arr[1..4];  # elements at indices 1, 2, 3
+let all:  []i32  = arr[..];    # full array view
+let tail: []i32  = arr[3..];   # from index 3 to end
+let head: []i32  = arr[..3];   # from start to index 2 (exclusive)
+let incl: []i32  = arr[1...3]; # INCLUSIVE — equivalent to arr[1..4]
+```
+
+A slice's layout is `{ ptr: *T, len: usize }` — same as Zig's. You can index into a slice (`s[1]`), pass it to a function (`fun sum(s: []i32) -> i32`), iterate it (`for v in slice { … }`), or store it in a struct. Slicing is zero-copy.
+
+The four slicing shapes:
+
+| Source       | Meaning                                             |
+|--------------|-----------------------------------------------------|
+| `arr[a..b]`  | Half-open `[a, b)` — excludes index `b`             |
+| `arr[a...b]` | Inclusive `[a, b]` — includes index `b` (integer slices only) |
+| `arr[a..]`   | From index `a` to the end of the array              |
+| `arr[..b]`   | From start to index `b - 1`                         |
+| `arr[..]`    | Whole-array view                                    |
+
+## Nullable pointers
+
+Any pointer type can be made nullable by prefixing `?`:
+
+```
+let p:   ?*i32       = null;        # initialised to no pointer
+let q:   ?*const i32 = &x;          # can hold a real pointer OR null
+let r:   ?[]const u8  = null;       # nullable slice
+```
+
+Nullable pointers are `Copy` — assigning one to another duplicates the value (including the `null` case). Reading a `null` value is a runtime error (it would deref a null pointer). Use a `match` against the scrutinee or pass the nullable pointer to a function that handles the `null` arm explicitly.
+
+## Raw pointers (`*raw T`)
+
+Raw pointers (`*raw T`) are C-style: no ownership, no null safety, no alignment guarantee. **All reads and writes through `*raw T` require an `unsafe` block**:
+
+```
 unsafe {
+    let p: *raw i32 = alloc(4) as *raw i32;
     *p = 42;
-    let val = *p;
 }
 ```
 
-**Memory:** Raw pointers have no ownership semantics. Use only inside `unsafe`.
-
-## Pointer Arithmetic
+Pointer arithmetic on `*raw T` is also `unsafe`:
 
 ```
 unsafe {
     let q = p.add(5);     # p + 5 * sizeof(T)
-    let r = p.sub(2);     # p - 2 * sizeof(T)
     let n = q.offset(p);  # (q - p) / sizeof(T)
 }
 ```
 
-## Slicing
+Use `*raw T` only for FFI interop, lock-free algorithms, or other low-level code that has no safe alternative.
+
+## What zag does NOT catch
+
+The "no hidden control flow" principle means zag is explicitly permissive at the type level and pushes safety to optional, opt-in tools. The classes of bug below are common but require explicit tooling to surface:
+
+| Class of bug                                       | Behavior in source language | Tool to detect |
+|----------------------------------------------------|------------------------------|----------------|
+| Use-after-free of `*T` or `*raw T`                 | Allowed                      | `-fsanitize=memory`                              |
+| Double-free of an owning `*T`                      | Allowed                      | `-Downership-check` or `-fsanitize=memory`       |
+| Leak of an owning `*T` (never freed)               | Allowed                      | `-Dleak-check` or `-fsanitize=leak`             |
+| Aliasing two `*T` (mutable)                        | Allowed                      | Programmer discipline; v2 borrow-check pass     |
+| Dangling `&local` past the scope it points into    | Allowed                      | `-Dref-check` (intraprocedural)                  |
+| Misaligned load/store via `*raw T`                 | Allowed, UB on most targets  | `-fsanitize=undefined`                           |
+
+The default `zag check` profile runs `-Downership-check` and `-Dleak-check` automatically — these two checks are the cheapest to run and they compensate for the absence of a borrow checker.
+
+## Worked example
 
 ```
-let arr = [10]i32 { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-let slice: []i32 = arr[2..7];     # elements 2..6
-let view: []const i32 = arr[..];  # full view
+fun main() {
+    var counter: i32 = 0;
+    let p: *i32 = &counter;
+
+    *p = 1;
+    *p = *p + 1;
+
+    let data: [4]i32 = [4]i32 { 10, 20, 30, 40 };
+    let view: []const i32 = data[1..3];
+    for v in view {
+        print("{v} ");
+    }
+    print("\n");
+}
 ```
 
-**Memory:** Slicing produces a stack-allocated slice `{ ptr: *T, len: usize }`. No copy of elements.
-
-## Memory Layout
-
-```
-[]T = { ptr: *T, len: usize }      # 16 bytes on 64-bit
-?*T = pointer with null bit         # 8 bytes on 64-bit
-```
-
-## Ownership
-
-Pointers returned by `new` are owning:
-
-```
-let p = new i32(42);     # owning pointer
-defer free(p);            # must free
-
-let q = &local;           # non-owning — no free needed
-```
-
-**Memory:** Owning pointers (`new`) must be `free`d. Non-owning pointers (`&`, slicing) are valid only while the referent lives. The `-Downership-check` flag catches double-free and use-after-move.
+See `examples/memory/pointers.zag` for the full runnable example demonstrating mutable / const address-of, deref, every slicing form, and nullable pointer initialisation.

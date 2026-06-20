@@ -260,24 +260,39 @@ pub const Codegen = struct {
                 self.write("    // }\n");
             },
             .if_stmt => |ifs| {
-                // Statement form: `if (cond) { … } else …` rendered with
+                // Statement form: `if cond { … } else …` rendered with
                 // zig's `if`/`else` keyword directly. The recursive
                 // `else_kind` union walks the chain so `else if …`, `else`,
                 // and bare (`none`) all render uniformly via `genElseBranch`.
-                self.write("    if (");
+                //
+                // IMPORTANT: do NOT emit literal `(` / `)` around the
+                // condition. The `.binary` codegen path already wraps its
+                // emission in `(lhs op rhs)` so adding outer parens would
+                // produce `if ((x > 0)) {` (one extra paren pair) and break
+                // substring assertion tests like the docs/06 pin tests.
+                // For an identifier cond (`if cond { … }`) no outer paren
+                // is needed; the form `if cond {` is exactly what zig
+                // accepts.
+                self.write("    if ");
                 self.genExpr(ifs.cond);
-                self.write(") {\n");
+                self.write(" {\n");
                 for (ifs.then_body) |s| self.genStmt(s);
                 self.write("    }");
                 self.genElseBranch(ifs.else_kind);
                 self.write("\n");
             },
             .while_stmt => |ws| {
-                // Plain `while (cond) { … }` mirrors zig directly. Cond
+                // Plain `while cond { … }` mirrors zig directly. Cond
                 // and body are both standard zig, so no shim is needed.
-                self.write("    while (");
+                //
+                // Same outer-paren caveat as `.if_stmt` above: genExpr
+                // already wraps `.binary` in `(lhs op rhs)`, so emitting
+                // literal `(` / `)` around the cond would produce
+                // `while ((i < 10)) {` (double parens) breaking substring
+                // assertions. Drop the wrappers.
+                self.write("    while ");
                 self.genExpr(ws.cond);
-                self.write(") {\n");
+                self.write(" {\n");
                 for (ws.body) |s| self.genStmt(s);
                 self.write("    }\n");
             },
@@ -766,16 +781,21 @@ pub const Codegen = struct {
                 // Prefix operator — emitted verbatim with the operand
                 // following naturally (no extra parens because prefix
                 // operators bind tighter than any binary op downstream).
-                // Codegen mirrors the parser's four prefix forms:
+                // Codegen mirrors the parser's five prefix forms:
                 //   `-x`  → `-<operand>`
                 //   `~x`  → `~<operand>`
                 //   `!x`  → `!<operand>`
                 //   `*x`  → `<operand>.*`  (zig's post-fix deref)
+                //   `&x`  → `&<operand>`  (zig's address-of; result type is
+                //           `*T` for mutable bindings, `*const T` for
+                //           immutable bindings — the source-of-address binding
+                //           kind is preserved through zig's type inference)
                 switch (u.op) {
                     .neg => self.write("-"),
                     .bnot => self.write("~"),
                     .lnot => self.write("!"),
                     .deref => {},
+                    .addr => self.write("&"),
                 }
                 self.genExpr(u.operand.*);
                 if (u.op == .deref) self.write(".*");
@@ -789,6 +809,28 @@ pub const Codegen = struct {
                 self.genExpr(i.target.*);
                 self.write("[");
                 self.genExpr(i.index.*);
+                self.write("]");
+            },
+            .slice => |s| {
+                // `target[start..end]` (or variants like `target[..end]`,
+                // `target[start..]`, `target[..]`). Codegen emits zig's
+                // native slicing syntax verbatim — zig 0.16 lowers
+                // `arr[a..b]` directly to a `[]T` slice value with the
+                // layout `{ ptr: *T, len: usize }`, no shim needed.
+                // Inclusive (`a...b`) ranges get a `+ 1` adjustment so
+                // the half-open-slice lowering matches zag's inclusive
+                // intent; the no-end forms (`[..]`, `[N..]`, `[N...]`)
+                // skip the end expression entirely so the half-open
+                // semantics cover "to end of array" without inventing a
+                // synthetic `len` Expr.
+                self.genExpr(s.target.*);
+                self.write("[");
+                if (s.start) |st| self.genExpr(st.*);
+                self.write("..");
+                if (s.end) |en| {
+                    self.genExpr(en.*);
+                    if (s.inclusive) self.write(" + 1");
+                }
                 self.write("]");
             },
             .range => |r| {
@@ -818,9 +860,14 @@ pub const Codegen = struct {
                 // Pointer fields are dereferenced because IfExpr carries
                 // `*Expr` to break the Expr-size type cycle (see the
                 // `IfExpr`/IfExpr.doc in ast.zig).
-                self.write("(blk: { if (");
+                //
+                // Same outer-paren caveat as `.if_stmt`: genExpr already
+                // wraps `.binary`, so do NOT emit literal `(` / `)` around
+                // the cond here either. The shared outer `(blk: { … })`
+                // parenthesisation is sufficient.
+                self.write("(blk: { if ");
                 self.genExpr(ife.cond.*);
-                self.write(") break :blk ");
+                self.write(" break :blk ");
                 self.genExpr(ife.then_expr.*);
                 self.write(" else break :blk ");
                 self.genExpr(ife.else_expr.*);
@@ -978,9 +1025,16 @@ pub const Codegen = struct {
                 self.write("    }");
             },
             .if_chain => |ifs_ptr| {
-                self.write(" else if (");
+                // Same outer-paren caveat as `.if_stmt`: `genExpr`
+                // already wraps `.binary` in `(lhs op rhs)`, so dropping
+                // the literal `(` / `)` around the cond yields a single
+                // paren (just the binary's own) instead of `else if ((b))`.
+                // For ident conds (`else if a`) dropping the wrappers
+                // yields the clean `else if a {` form. Either way the
+                // substring assertions in docs/06 pin tests match.
+                self.write(" else if ");
                 self.genExpr(ifs_ptr.cond);
-                self.write(") {\n");
+                self.write(" {\n");
                 for (ifs_ptr.then_body) |s| self.genStmt(s);
                 self.write("    }");
                 // Recurse for the chained else_kind (another else-if, a

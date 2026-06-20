@@ -1,0 +1,117 @@
+# Zag literals — exercises every form from docs/03-literals.md.
+#
+# Integer prefixes:
+#   0xFF        hex
+#   0o77        octal
+#   0b1010      binary
+#   1_000_000   decimal with underscores for readability
+#
+# Floats:
+#   3.14        standard decimal
+#   1.0e10      scientific notation
+#
+# Booleans, null, undefined — keywords recognised by the lexer/parser.
+#
+# Tuple literals:
+#   (10, 20)         2-element tuple, anonymous struct at codegen
+#   (1, 2.5, true)   3-element mixed-type tuple
+#   ()               empty / unit tuple
+#   (42)             parens still group, not a tuple
+#
+# Array literals (three sub-forms):
+#   [3]i32 { 1, 2, 3 }      explicit list of 3 values
+#   [5]i32 { 0 ... }        fill: every slot = 0
+#   [4]i32 { 1, 2 ... }     progression: pattern repeats → [1, 2, 1, 2]
+#
+# String interpolation: `{expr}` placeholders inside a string, evaluated as
+# the first argument to `print(...)`.
+fun main() {
+    let hex_val = 0xFF;
+    let oct_val = 0o77;
+    let bin_val = 0b1010;
+    let big: i32 = 1_000_000;
+
+    let pi: f64 = 3.14;
+    let speed: f64 = 1.0e10;
+
+    let on: bool = true;
+    let off: bool = false;
+    let nothing: ?i32 = null;
+
+    let ascii_letter: u8 = 'a';
+    let escaped_nl   = '\n';
+    let escaped_null = '\x00';
+
+    let pair    = (10, 20);
+    let triple  = (1, 2.5, true);
+    let unit    = ();
+    let grouped = (42);
+
+    # ── Array literals ──────────────────────────────────────────────
+    let explicit = [3]i32 { 1, 2, 3 };
+    let fill     = [5]i32 { 0 ... };
+    let repeats  = [4]i32 { 1, 2 ... };
+
+    print("hex_val = ");
+    print(hex_val);
+    print(" oct_val = ");
+    print(oct_val);
+    print(" bin_val = ");
+    print(bin_val);
+    print(" big = ");
+    print(big);
+    print("\n");
+
+    print("pi = ");
+    print(pi);
+    print(" speed = ");
+    print(speed);
+    print("\n");
+
+    print("on = ");
+    print(on);
+    print(" off = ");
+    print(off);
+    print(" nothing = ");
+    print(nothing);
+    print("\n");
+
+    print("ascii_letter = ");
+    print(ascii_letter);
+    print(" escaped_nl = ");
+    print(escaped_nl);
+    print(" escaped_null = ");
+    print(escaped_null);
+    print("\n");
+
+    # String forms exercised inline:
+    print("plain string literal form: ");
+    print("hello, world\n");
+    print("byte string literal form: ");
+    print(b"hello");
+    print("\n");
+
+    print("pair = ");
+    print(pair);
+    print(" triple = ");
+    print(triple);
+    print(" grouped = ");
+    print(grouped);
+    print(" unit = ");
+    print(unit);
+    print("\n");
+
+    # Array literals — print length and first element as a sanity check.
+    print("array lengths: explicit=");
+    print(explicit);
+    print(" fill=");
+    print(fill);
+    print(" repeats=");
+    print(repeats);
+    print("\n");
+
+    # ── String interpolation ────────────────────────────────────────
+    let name: []const u8 = "Zag";
+    print("hello, {name}!\n");
+    print("two plus three is {2 + 3}\n");
+}

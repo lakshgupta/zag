@@ -27,6 +27,15 @@ pub const Expr = union(enum) {
     binary: BinaryExpr,
     unary: UnaryExpr,
     index: IndexExpr,
+    /// `target[start..end]` (or variants like `target[start..]` /
+    /// `target[..end]` / `target[..]`). Produced by the postfix chain
+    /// when `[` opens and the inside resolves to a range expression
+    /// rather than a single index. `start` and `end` are nullable to
+    /// cover the no-bound forms (`arr[..]`, `arr[2..]`, `arr[..5]`).
+    /// Codegen emits zig's native `[start..end]`/slice syntax so the
+    /// resulting value is a `[]T` slice (layout `{ ptr, len }`) — no
+    /// extra shim required.
+    slice: SliceExpr,
     range: RangeExpr,
     /// `if cond { expr } else { expr }` expression form (single expression
     /// per branch). Built by `Parser.parseIfExpr` when `if_kw` is the
@@ -110,6 +119,13 @@ pub const Expr = union(enum) {
         /// `*x` — pointer deref (zig: `operand.*`); zig syntax stays as-is because
         /// deref is postfix in zig, so we emit `&x.*` shimming only when needed.
         deref,
+        /// `&x` — address-of. Codegen emits `&<operand>`; the resulting zig type
+        /// is `*T` (mutable) when `x` is a `var` and `*const T` (immutable)
+        /// when `x` is a `let` / `const` / function parameter. The zag parser
+        /// keeps a single `.amp` token and dispatches unary-vs-binary by
+        /// syntactic context, mirroring how `-x` (unary) vs `a - b` (binary)
+        /// share the `.minus` token.
+        addr,
     };
 
     /// Postfix indexing — `arr[i]`. Codegen emits `arr[i]` directly because
@@ -133,6 +149,26 @@ pub const Expr = union(enum) {
         end: *Expr,
         /// `false` for `a..b` (half-open `[a, b)`), `true` for `a...b`
         /// (inclusive `[a, b]`).
+        inclusive: bool,
+    };
+
+    /// `target[start..end]` slicing. Distinct from `.index` because the
+    /// slice expression has TWO operands (start, end) plus the inclusive
+    /// flag, and codegen emits zig's native slicing syntax `target[a..b]`
+    /// which lowers to a `[]T` slice value. `start` and `end` are
+    /// nullable so the no-bound forms (respectively `arr[..]` and the
+    /// `[a..]` / `[..b]` halves) parse cleanly without inventing a
+    /// synthetic `0` or `len` Expr. The pointer-typed `*Expr` fields
+    /// follow the existing `IndexExpr.target`/`.index` convention to
+    /// keep `Expr`'s size bounded (the cycle-breaking convention is
+    /// explained in `BinaryExpr`).
+    pub const SliceExpr = struct {
+        target: *Expr,
+        start: ?*Expr,
+        end: ?*Expr,
+        /// `false` for `a..b` (half-open `[a, b)`), `true` for `a...b`
+        /// (inclusive `[a, b]`). When `end` is `null` the flag is moot —
+        /// codegen ignores it for the no-end forms.
         inclusive: bool,
     };
 

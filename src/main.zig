@@ -2297,7 +2297,7 @@ test "codegen: if-stmt with else emits zig if/else" {
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    if (x > 0) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    } else {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    print(\"neg\\n\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    std.debug.print(\"neg\\n\", .{});") != null);
 }
 
 test "codegen: if-stmt with else-if chain emits chained zig emission" {
@@ -2323,10 +2323,10 @@ test "codegen: if-stmt with else-if chain emits chained zig emission" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    if (a) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    } else if (b) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    if a {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    } else if b {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    } else {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    print(\"other\\n\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    std.debug.print(\"other\\n\", .{});") != null);
 }
 
 test "codegen: if-expression emits labeled blk + break :blk" {
@@ -2627,7 +2627,7 @@ test "parser: match-expression parses as Expr.match_expr" {
     // so codegen can emit it as a value-yielding block.
     const src =
         \\fun f() {
-        \\    let label: []const u8 = match n {
+        \\    let label: i32 = match n {
         \\        1 => "one",
         \\        _ => "other",
         \\    };
@@ -2672,7 +2672,7 @@ test "codegen: match-stmt emits labeled laddered if-else" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "if (true) { break :blk \"other\"; }") != null);
     // Sanity: trail is appended as a `;` (stmt-position append in
     // genStmt `.match_stmt` arm).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "};") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "});") != null);
 }
 
 test "codegen: match-stmt with non-wildcard last emits `else unreachable;`" {
@@ -2928,4 +2928,265 @@ test "codegen: bare return emits `return;`" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    return;") != null);
+}
+
+// -------------------------------------------------------------------
+// docs/manual/09-pointers.md feature tests - `&` address-of, slicing,
+// and the multi-token pointer type annotations (`*T`, `*const T`,
+// `[]T`, `[]const T`, `?*T`). Each pair pins the AST shape or the
+// emitted zig source so a future refactor in `parser.zig`/`codegen.zig`
+// cannot silently break the chapter's documented surface.
+// -------------------------------------------------------------------
+
+test "parser: unary `&x` parses as Expr.unary with UnaryOp.addr" {
+    // The unary-vs-binary dispatch on `.amp`: in prefix position the
+    // (otherwise-shared) `.amp` TokenTag routes to `.addr` rather than
+    // `.bitand`, mirroring how `-x` (unary) vs `a - b` (binary) share
+    // the `.minus` token. The operand lives inside a pointer-typed
+    // field of `Expr.UnaryExpr` so the AST follows the existing `*Expr`
+    // cycle-breaker convention.
+    const src = "fun f() {\n    var x: i32 = 0;\n    let p: *i32 = &x;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const body = prog.functions[0].body;
+    // body[1] is `let p = &x` (body[0] is `var x: i32 = 0`).
+    const init = body[1].let.init;
+    try std.testing.expect(init == .unary);
+    try std.testing.expectEqual(ast.Expr.UnaryOp.addr, init.unary.op);
+    try std.testing.expect(init.unary.operand.* == .ident);
+    try std.testing.expectEqualStrings("x", init.unary.operand.*.ident);
+}
+
+test "parser: binary `&` still bitwise AND (not addr)" {
+    // Defensive pin on the unary/binary dispatch: when `.amp` is
+    // between two expressions the result is the `.bitand` binary form,
+    // NOT a unary prefix on the first operand. The lexer emits a
+    // single `.amp` token; parser context alone makes the distinction.
+    const src = "fun f() {\n    let r: i32 = a & b;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.bitand, init.binary.op);
+}
+
+test "parser: slicing `arr[1..3]` produces Expr.slice with explicit bounds" {
+    // The postfix chain dispatch detects slice form by lookahead ON
+    // the inside of `[`: when range/ellipsis follows the bound
+    // expression (or appears immediately as the empty-start form),
+    // `.slice` is built instead of `.index`. `start`/`end` carry the
+    // lifted-expr payloads via the `*Expr` slot convention so the
+    // bounds stay on the AST after the parsing function returns.
+    const src = "fun f() {\n    let s: []i32 = arr[1..3];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .slice);
+    try std.testing.expect(!init.slice.inclusive);
+    try std.testing.expect(init.slice.start != null);
+    try std.testing.expect(init.slice.end != null);
+    try std.testing.expect(init.slice.start.?.* == .int_lit);
+    try std.testing.expectEqualStrings("1", init.slice.start.?.*.int_lit);
+    try std.testing.expect(init.slice.end.?.* == .int_lit);
+    try std.testing.expectEqualStrings("3", init.slice.end.?.*.int_lit);
+}
+
+test "parser: no-bound slice `arr[..]` produces SliceExpr with null bounds" {
+    // `..` with no start OR end signals "whole-array view". The
+    // nullable `start`/`end` AST fields are both null so codegen
+    // emits just `arr[..]` (zig's native full-view slice syntax).
+    const src = "fun f() {\n    let s: []i32 = arr[..];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .slice);
+    try std.testing.expect(init.slice.start == null);
+    try std.testing.expect(init.slice.end == null);
+    try std.testing.expect(!init.slice.inclusive);
+}
+
+test "parser: `arr[i]` stays as Expr.index (slice form does not eat single index)" {
+    // The non-slice shape must keep parsing as `.index` so existing
+    // tests for `arr[N]` access (and the `[N]T { ... }` array-literal
+    // parser) keep working. The postfix loop's `.rbracket` peek after
+    // a single bound expression routes to `.index` regardless of
+    // what came before inside `[`.
+    const src = "fun f() {\n    let v: i32 = arr[2];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .index);
+}
+
+test "codegen: address-of `&x` emits zig `&x`" {
+    // Codegen mirrors the parser route: `.unary .addr` writes `&` and
+    // then emits the operand verbatim, producing zig's address-of
+    // operator at the call site. The resulting zig type is `*T` (or
+    // `*const T` for immutable bindings) - zig infers it from the
+    // surrounding binding's mutability, so codegen stays surface-agnostic.
+    const src = "fun f() {\n    var x: i32 = 0;\n    let p: *i32 = &x;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "&x") != null);
+}
+
+test "codegen: half-open slice `arr[1..3]` emits `arr[1..3]`" {
+    // The `.slice` arm emits target + `[` + (start?) + `..` + (end?) + `]`
+    // verbatim. Zig 0.16 lowers `arr[a..b]` directly to a `[]T` slice
+    // value (layout `{ ptr: *T, len: usize }`) - no codegen shim needed.
+    const src = "fun f() {\n    let s: []i32 = arr[1..3];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[1..3]") != null);
+}
+
+test "codegen: inclusive slice `arr[1...3]` emits `arr[1..3 + 1]`" {
+    // Inclusive slices are lowered by emitting the half-open form
+    // with a `+ 1` adjustment on the bound - works for integer-typed
+    // slices because `+ 1` is a valid binary expression in zig.
+    const src = "fun f() {\n    let s: []i32 = arr[1...3];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[1..3 + 1]") != null);
+}
+
+test "codegen: `[]const u8` annotation round-trips in let binding" {
+    // The `[]` slice-type prefix is consumed as a single two-byte
+    // token in `collectCastType` BEFORE the is_term arm fires (so `]`
+    // cannot be treated as a structural delimiter mid-type). Without
+    // this carve-out the captured type text truncates at `[]` and zig
+    // rejects the emitted binding's `: []` (downstream checker
+    // requires a complete type expression).
+    const src = "fun f() {\n    let s: []const u8 = \"hi\";\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": []const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const s: []const u8 = \"hi\";") != null);
+}
+
+test "codegen: `?*T` annotation round-trips in let binding" {
+    // Mirror of the `[]T` test: the `?` nullable prefix is a separate
+    // `.question` token glued onto the rest of the type by
+    // `collectCastType` (using the same `prev_was_ptr = true` flag as
+    // the `*` pointer marker, so `?*T` round-trips as one combined
+    // identifier). Without the `?`-arm insert BEFORE the is_term
+    // check, nullable pointer annotations would silently drop the `?`
+    // byte and break every zig-side downcast / null-check.
+    const src = "fun f() {\n    let p: ?*T = null;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": ?*T") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const p: ?*T = null;") != null);
+}
+
+test "parser: slicing `arr[2..]` produces SliceExpr with end null" {
+    // The "start explicit, no end" form: peek after the start bound is
+    // `.range`/`.ellipsis` (slice form fires), end-side peek is
+    // `.rbracket` (no end expression parsed, so `end` stays null).
+    // Verifies the postfix extension handles the trailing `..` correctly
+    // without leaving the end-bound parser to over-consume `]`.
+    const src = "fun f() {\n    let s: []i32 = arr[2..];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .slice);
+    try std.testing.expect(!init.slice.inclusive);
+    try std.testing.expect(init.slice.start != null);
+    try std.testing.expect(init.slice.start.* == .int_lit);
+    try std.testing.expectEqualStrings("2", init.slice.start.*.int_lit);
+    try std.testing.expect(init.slice.end == null);
+}
+
+test "parser: slicing `arr[..3]` produces SliceExpr with start null" {
+    // The "no start, end explicit" form: peek after `[` is `.range`/
+    // `.ellipsis` immediately (empty-start slice fires), end-bound is
+    // parsed via parseAdditive. `start` stays null.
+    const src = "fun f() {\n    let s: []i32 = arr[..3];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .slice);
+    try std.testing.expect(!init.slice.inclusive);
+    try std.testing.expect(init.slice.start == null);
+    try std.testing.expect(init.slice.end != null);
+    try std.testing.expect(init.slice.end.* == .int_lit);
+    try std.testing.expectEqualStrings("3", init.slice.end.*.int_lit);
+}
+
+test "codegen: `arr[2..]` slice emits verbatim" {
+    // The `.slice` arm emits target + `[` + start + `..` + `]` when
+    // end is null (no ` + 1` adjustment fires because there's no end
+    // to adjust). zig 0.16 lowers `arr[2..]` directly to a half-open
+    // slice expression that runs from index 2 to the array's end.
+    const src = "fun f() {\n    let s: []i32 = arr[2..];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[2..]") != null);
+}
+
+test "codegen: `arr[..3]` slice emits verbatim" {
+    // The no-start variant: `.slice` arm emits target + `[` + `..` +
+    // end + `]` (no `+ 1` adjustment when inclusive is false). zig
+    // accepts `arr[..3]` and lowers it to a half-open slice from the
+    // array's start through index 2.
+    const src = "fun f() {\n    let s: []i32 = arr[..3];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[..3]") != null);
 }

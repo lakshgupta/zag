@@ -67,8 +67,8 @@ type      undefined unsafe    var       void      while
 
 ```
 print("error: {err}\n");           # zero-alloc — writes to stdout
-let msg = "error: {err}";          # heap-allocated String
-let greeting = "hello {name}";     # heap-allocated String
+let msg: []u8 = "error: {err}";
+let greeting: []u8 = "hello {name}";
 
 # Zero-alloc alternative outside print:
 var buf = String.with_capacity(64);
@@ -312,7 +312,7 @@ let view: []const u8 = s.as_str();   # borrow as []const u8
 String literals produce `[]const u8`. Use `new String(literal)` to heap-allocate an owned copy:
 
 ```
-let greeting = "hello";                   # []const u8 (borrowed)
+let greeting: []const u8 = "hello";
 let owned = new String("hello");          # String (heap-allocated)
 ```
 
@@ -1159,7 +1159,7 @@ A pointer returned by `new` or `alloc` is considered **owning**. Pointers and sl
 fun print(s: *const String) { ... }
 fun bump(s: *String) { ... }
 
-var x = 10;
+var x: i32 = 10;
 let r1 = &x;
 let r2 = &x;
 ```
@@ -2089,7 +2089,7 @@ let result = add(...pair());   # desugars to add(3, 5)
 
 ```
 fun sum(values: i32...) -> i32 {
-    var total = 0;
+    var total: i32 = 0;
     for v in values {
         total += v;
     }
@@ -2110,7 +2110,7 @@ fun apply<T, U>(f: fun(T) -> U, value: T) -> U {
 Function types use lowercase `fun`. Closures capture by reference by default; use `move` to take ownership. **Explicit capture lists** (recommended) make captures visible and enable compile-time checking via `-Dref-check` / `-Dasync-ref-check`:
 
 ```
-let offset = 10;
+let offset: i32 = 10;
 let add_offset = [&offset] |x: i32| -> i32 { return x + offset; };   # explicit borrow
 
 let s = new String("hello");
@@ -2128,7 +2128,7 @@ Without a capture list, the compiler infers captures (reference by default, `mov
 
 ```
 async fun spawn_task() {
-    let local = 42;
+    let local: i32 = 42;
     # ERROR with -Dasync-ref-check: captures &local which points to stack
     let bad = task.spawn(async [&local] { await do_work(local); });
     
@@ -2661,7 +2661,7 @@ impl Matrix4x4 {
         var r = Matrix4x4 { data: [16]f64 { 0.0 ... } };
         for i in 0..4 {
             for j in 0..4 {
-                var sum = 0.0;
+                var sum: f64 = 0.0;
                 for k in 0..4 {
                     sum += a.data[i + k * 4] * b.data[k + j * 4];
                 }

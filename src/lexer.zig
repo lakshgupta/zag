@@ -88,6 +88,13 @@ pub const TokenTag = enum {
     comma,
     arrow,
     ellipsis,
+    /// `?` — used in nullable pointer type annotations like `?*T` and
+    /// `?i32`. Distinct from `as`'s destination-type syntax because the
+    /// `?` is part of the type identifier, not a separate operator —
+    /// `collectCastType` consumes the leading `?` and concatenates it
+    /// to the rest of the type verbatim so the emitted zig type mirrors
+    /// zag's surface (`?*T` → `?*T`, `?i32` → `?i32`).
+    question,
     newline,
     doc_comment,
     eof,
@@ -218,10 +225,15 @@ pub const Lexer = struct {
                 },
                 '=' => {
                     // `=` is the leading byte of:
-                    //   `=`  (assignment), `==` (equal), and 10 compound-assign forms
-                    //   (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`).
-                    // We peek two chars forward to disambiguate. Whichever form
-                    // the user wrote, we consume the right number of bytes.
+                    //   `=`    (assignment)
+                    //   `==`   (equal)
+                    //   `=>`   (match-arm arrow)
+                    //   `+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`
+                    //     (compound-assign forms)
+                    // We peek up to two chars forward to disambiguate. The
+                    // `=>` arm shares the same `.arrow` tag as `->` (function
+                    // return marker); parser dispatch on position context
+                    // keeps them distinct at the AST level.
                     if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
                         self.addToken(.{ .tag = .eq_eq, .loc = start_loc, .text = "==" });
                         self.pos += 2;
@@ -266,6 +278,14 @@ pub const Lexer = struct {
                         self.addToken(.{ .tag = .gt_gt_eq, .loc = start_loc, .text = ">>=" });
                         self.pos += 3;
                         self.col += 3;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '>') {
+                        // `=>` — match-arm arrow (e.g. `1 => "one"`). Same
+                        // `.arrow` tag as the `->` function-return marker;
+                        // AST-level position tells them apart at the
+                        // dispatch site (parseMatchExpr vs parseFunDecl).
+                        self.addToken(.{ .tag = .arrow, .loc = start_loc, .text = "=>" });
+                        self.pos += 2;
+                        self.col += 2;
                     } else {
                         self.addToken(.{ .tag = .equals, .loc = start_loc, .text = "=" });
                         self.advance();
@@ -369,6 +389,15 @@ pub const Lexer = struct {
                 },
                 '~' => {
                     self.addToken(.{ .tag = .tilde, .loc = start_loc, .text = "~" });
+                    self.advance();
+                },
+                '?' => {
+                    // Nullable pointer prefix. Always emitted as a single
+                    // `?` token so `collectCastType` can glue it onto the
+                    // following identifier (or `*` for `?*T` shapes) without
+                    // an intervening space; the type text round-trips as
+                    // `?*T` / `?i32` / `?*const T` verbatim.
+                    self.addToken(.{ .tag = .question, .loc = start_loc, .text = "?" });
                     self.advance();
                 },
                 '<' => {

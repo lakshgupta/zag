@@ -63,7 +63,7 @@ The last parameter can be variadic:
 
 ```
 fun sum(values: i32...) -> i32 {
-    var total = 0;
+    var total: i32 = 0;
     for v in values {
         total += v;
     }
@@ -157,7 +157,7 @@ Resolution is compile-time with zero runtime cost.
 ## Closures
 
 ```
-let offset = 10;
+let offset: i32 = 10;
 let add_offset = |x: i32| -> i32 { return x + offset; };
 let result = add_offset(5);    # result = 15
 ```

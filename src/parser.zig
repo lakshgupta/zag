@@ -131,29 +131,29 @@ pub const Parser = struct {
         }
     }
 
-    /// Parse one of the three binding declarations (`let`, `var`, `const`).
-    /// All three share this code path — the only divergence is which keyword
-    /// the source starts with, which we route via the `kind` parameter. The
-    /// dispatch site in `parseStmt` carries the binding kind to the AST by
-    /// selecting the matching union tag (`.let` / `.var_binding` /
-    /// `.const_binding`) and threading the same `kind` value here; the
-    /// payload `BindingStmt` is structurally identical across all three so
-    /// zig's tagged union gives us uniform field access (`stmt.let.init`,
-    /// `stmt.var_binding.name`, `stmt.const_binding.type_name`) without
-    /// duplicating struct definitions.
-    ///
-    /// Adding a future binding kind (`mut`, `implicit`, `ref`, ...) is a
-    /// three-line change: a new `BindingKind` enum member in `ast.zig`, a
-    /// matching arm in the `kw` switch below, plus a new dispatch arm in
-    /// `parseStmt` that calls `parseBinding(<kind>)`.
-    ///
-    /// The first token after the keyword disambiguates single-name from
-    /// destructuring: `(` opens a tuple pattern, `[` opens an array
-    /// pattern, an identifier is either a name or the wildcard `_`. Either
-    /// way `parseBindingPattern` returns the shape and we promote `.name`
-    /// results into the simple-binding code path (.pattern = null) so the
-    /// existing 83-unit-call-site test suite continues to read
-    /// `stmt.let.name` / `stmt.let.type_name.?` without modification.
+    // Parse one of the three binding declarations (`let`, `var`, `const`).
+    // All three share this code path — the only divergence is which keyword
+    // the source starts with, which we route via the `kind` parameter. The
+    // dispatch site in `parseStmt` carries the binding kind to the AST by
+    // selecting the matching union tag (`.let` / `.var_binding` /
+    // `.const_binding`) and threading the same `kind` value here; the
+    // payload `BindingStmt` is structurally identical across all three so
+    // zig's tagged union gives us uniform field access (`stmt.let.init`,
+    // `stmt.var_binding.name`, `stmt.const_binding.type_name`) without
+    // duplicating struct definitions.
+    //
+    // Adding a future binding kind (`mut`, `implicit`, `ref`, ...) is a
+    // three-line change: a new `BindingKind` enum member in `ast.zig`, a
+    // matching arm in the `kw` switch below, plus a new dispatch arm in
+    // `parseStmt` that calls `parseBinding(<kind>)`.
+    //
+    // The first token after the keyword disambiguates single-name from
+    // destructuring: `(` opens a tuple pattern, `[` opens an array
+    // pattern, an identifier is either a name or the wildcard `_`. Either
+    // way `parseBindingPattern` returns the shape and we promote `.name`
+    // results into the simple-binding code path (.pattern = null) so the
+    // existing 83-unit-call-site test suite continues to read
+    // `stmt.let.name` / `stmt.let.type_name.?` without modification.
     fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
         // The kind determines which leading keyword the binding must start
         // with. The lexer enforces `let`/`var`/`const` as reserved
@@ -250,14 +250,14 @@ pub const Parser = struct {
         return .{ .name = "", .type_name = null, .init = initializer, .pattern = pattern };
     }
 
-    /// Parse a destructuring pattern starting at the current token. Recursive
-    /// for nested forms (`let (a, (b, c)) = …` is a tuple containing a tuple).
-    ///
-    /// Returns a `BindingPattern`:
-    /// - `.name("x")` — single identifier (no destructuring)
-    /// - `.discard`   — the wildcard `_`
-    /// - `.tuple([ … ])` — pattern wrapped in `(…)` (tuple destructuring)
-    /// - `.array([ … ])` — pattern wrapped in `[…]` (array destructuring)
+    // Parse a destructuring pattern starting at the current token. Recursive
+    // for nested forms (`let (a, (b, c)) = …` is a tuple containing a tuple).
+    //
+    // Returns a `BindingPattern`:
+    // - `.name("x")` — single identifier (no destructuring)
+    // - `.discard`   — the wildcard `_`
+    // - `.tuple([ … ])` — pattern wrapped in `(…)` (tuple destructuring)
+    // - `.array([ … ])` — pattern wrapped in `[…]` (array destructuring)
     fn parseBindingPattern(self: *Parser) ast.BindingPattern {
         const tok = self.peek();
         if (tok.tag == .lparen) {
@@ -323,11 +323,11 @@ pub const Parser = struct {
         return .{ .name = name, .value = value };
     }
 
-    /// Parse a compound assignment `x OP= rhs` and desugar it into a bare
-    /// `Stmt.AssignStmt` whose value is `binary(op, ident("x"), rhs)`. No
-    /// new AST node is emitted — the doc frames the compound forms as sugar
-    /// for `x = x OP rhs`, so the existing AssignStmt shape can carry both.
-    /// `op` is supplied by `compoundOpForTag` via the parseStmt lookahead.
+    // Parse a compound assignment `x OP= rhs` and desugar it into a bare
+    // `Stmt.AssignStmt` whose value is `binary(op, ident("x"), rhs)`. No
+    // new AST node is emitted — the doc frames the compound forms as sugar
+    // for `x = x OP rhs`, so the existing AssignStmt shape can carry both.
+    // `op` is supplied by `compoundOpForTag` via the parseStmt lookahead.
     fn parseCompoundAssign(self: *Parser, op: ast.Expr.BinaryOp) Stmt.AssignStmt {
         const name = self.expectIdent();
         // Consume the OP_EQ token — parseStmt's lookahead verified the
@@ -342,16 +342,16 @@ pub const Parser = struct {
         return .{ .name = name, .value = bin_expr };
     }
 
-    /// Parse `target[i] = value`. The full power is determined by
-    /// parseStmt.identifier branch's lookahead — the only entry is when
-    /// the current token is `.identifier` and the next is `.lbracket`.
-    /// The target is parsed as a primary expression (NOT invoking the
-    /// `[N]T { ... }` array-lit path because that's a leading-`[` only),
-    /// then the bracketed index is expected, then `=`, then the value.
-    /// Multi-dim index writes (`arr[i][j] = x`) are NOT supported here
-    /// because they would require the chained-Index form on the LHS —
-    /// supported only via explicit parens like `(arr[i])[j] = x` once
-    /// chained Index parfactoring lands.
+    // Parse `target[i] = value`. The full power is determined by
+    // parseStmt.identifier branch's lookahead — the only entry is when
+    // the current token is `.identifier` and the next is `.lbracket`.
+    // The target is parsed as a primary expression (NOT invoking the
+    // `[N]T { ... }` array-lit path because that's a leading-`[` only),
+    // then the bracketed index is expected, then `=`, then the value.
+    // Multi-dim index writes (`arr[i][j] = x`) are NOT supported here
+    // because they would require the chained-Index form on the LHS —
+    // supported only via explicit parens like `(arr[i])[j] = x` once
+    // chained Index parfactoring lands.
     fn parseIndexAssign(self: *Parser) Stmt.IndexAssignStmt {
         const target = self.parsePrimary();
         self.expect(.lbracket);
@@ -366,10 +366,10 @@ pub const Parser = struct {
         return .{ .target = &target_buf[0], .index = &index_buf[0], .value = value };
     }
 
-    /// Map a compound-assign TokenTag to its corresponding BinaryOp. Returns
-    /// `null` for non-compound tags so parseStmt's identifier branch can
-    /// dispatch in one switch (`next == equals` → parseAssign,
-    /// `compoundOpForTag(next) != null` → parseCompoundAssign, etc).
+    // Map a compound-assign TokenTag to its corresponding BinaryOp. Returns
+    // `null` for non-compound tags so parseStmt's identifier branch can
+    // dispatch in one switch (`next == equals` → parseAssign,
+    // `compoundOpForTag(next) != null` → parseCompoundAssign, etc).
     fn compoundOpForTag(tag: TokenTag) ?ast.Expr.BinaryOp {
         return switch (tag) {
             .plus_eq => .add,
@@ -392,46 +392,46 @@ pub const Parser = struct {
         return .{ .expr = expr };
     }
 
-    /// `errdefer expr;` — runs the expression ONLY if the enclosing scope
-    /// exits via `?`-propagation or explicit `return Err(...)`. Mirrors zig
-    /// 0.16's `errdefer` keyword one-to-one. Example (from
-    /// `docs/19-memory.md` Pattern 2):
-    ///   let a = compute()?;
-    ///   errdefer free(a);
-    ///   ...
-    /// Used by the new carve-out where partial initialization must be rolled
-    /// back on `?` but the success path skips the cleanup.
+    // `errdefer expr;` — runs the expression ONLY if the enclosing scope
+    // exits via `?`-propagation or explicit `return Err(...)`. Mirrors zig
+    // 0.16's `errdefer` keyword one-to-one. Example (from
+    // `docs/19-memory.md` Pattern 2):
+    //   let a = compute()?;
+    //   errdefer free(a);
+    //   ...
+    // Used by the new carve-out where partial initialization must be rolled
+    // back on `?` but the success path skips the cleanup.
     fn parseErrDefer(self: *Parser) Stmt.ErrDeferStmt {
         self.expect(.errdefer_kw);
         const expr = self.parseExpr();
         return .{ .expr = expr };
     }
 
-    /// `unsafe { <stmts> }` block marker. Sits in `parseStmt`'s dispatch so
-    /// the leading ident-or-expression forms don't accidentally consume
-    /// `unsafe` as a binding name; the keyword is reserved at token-time by
-    /// `lexer.readIdent`. The zig 0.16 backend no longer has a block-form
-    /// `unsafe` keyword — codegen emits the body wrapped in plain `{ ... }`
-    /// with comment markers so the AST shape remains analyzable for future
-    /// `-Dunsafe-block-check` tooling without changing the emitted
-    /// zig semantics (raw pointer dereferences and `@ptrCast` are already
-    /// unconditional in 0.16).
+    // `unsafe { <stmts> }` block marker. Sits in `parseStmt`'s dispatch so
+    // the leading ident-or-expression forms don't accidentally consume
+    // `unsafe` as a binding name; the keyword is reserved at token-time by
+    // `lexer.readIdent`. The zig 0.16 backend no longer has a block-form
+    // `unsafe` keyword — codegen emits the body wrapped in plain `{ ... }`
+    // with comment markers so the AST shape remains analyzable for future
+    // `-Dunsafe-block-check` tooling without changing the emitted
+    // zig semantics (raw pointer dereferences and `@ptrCast` are already
+    // unconditional in 0.16).
     fn parseUnsafeBlock(self: *Parser) []const Stmt {
         self.expect(.unsafe_kw);
         return self.parseBlock();
     }
 
-    /// Parse one `if cond { stmts... }` head plus its optional else-branch.
-    /// Consumes the leading `.if_kw` here (mirroring the convention used by
-    /// parseWhileStmt / parseForStmt / parseMatchExpr / parseReturnStmt).
-    /// Without this `expect`, parseExpr (called for the cond) would
-    /// self-dispatch on `.if_kw` to `parseIfExpr`, leaving the parser with
-    /// `if_kw` unconsumed and the cond never parsed — surfacing as
-    /// `expected rbrace, got 'print'` on the body statement. The
-    /// recursive `else if` chain is rendered via the `.if_chain` arm of
-    /// `IfStmt.else_kind` (boxed `*IfStmt`); terminal `else { ... }` via
-    /// the `.block` arm. The condition parses via `parseExpr` so binary
-    /// precedence (e.g. `i < 10 && ready`) works without special-casing.
+    // Parse one `if cond { stmts... }` head plus its optional else-branch.
+    // Consumes the leading `.if_kw` here (mirroring the convention used by
+    // parseWhileStmt / parseForStmt / parseMatchExpr / parseReturnStmt).
+    // Without this `expect`, parseExpr (called for the cond) would
+    // self-dispatch on `.if_kw` to `parseIfExpr`, leaving the parser with
+    // `if_kw` unconsumed and the cond never parsed — surfacing as
+    // `expected rbrace, got 'print'` on the body statement. The
+    // recursive `else if` chain is rendered via the `.if_chain` arm of
+    // `IfStmt.else_kind` (boxed `*IfStmt`); terminal `else { ... }` via
+    // the `.block` arm. The condition parses via `parseExpr` so binary
+    // precedence (e.g. `i < 10 && ready`) works without special-casing.
     fn parseIfBranch(self: *Parser) Stmt.IfStmt {
         const start_loc = self.peek().loc;
         self.expect(.if_kw);
@@ -467,14 +467,14 @@ pub const Parser = struct {
         return .{ .cond = cond, .then_body = then_body, .else_kind = else_kind };
     }
 
-    /// `if cond { expr } else { expr }` expression form. Used when `if_kw`
-    /// is the leading token in an expression-position context
-    /// (RHS of a `let`, inside a binary operand list, etc.). Each branch's
-    /// `Expr` is lifted into an arena slot so the resulting `IfExpr`'s
-    /// pointer fields point at stable storage (the existing BinaryExpr
-    /// `*Expr` convention). The else-branch is REQUIRED for the
-    /// expression form (otherwise the type would be `?T`); the parser
-    /// emits a clear error if missing.
+    // `if cond { expr } else { expr }` expression form. Used when `if_kw`
+    // is the leading token in an expression-position context
+    // (RHS of a `let`, inside a binary operand list, etc.). Each branch's
+    // `Expr` is lifted into an arena slot so the resulting `IfExpr`'s
+    // pointer fields point at stable storage (the existing BinaryExpr
+    // `*Expr` convention). The else-branch is REQUIRED for the
+    // expression form (otherwise the type would be `?T`); the parser
+    // emits a clear error if missing.
     fn parseIfExpr(self: *Parser) Expr {
         self.expect(.if_kw);
         const cond_buf = self.arena.alloc(Expr, 1);
@@ -500,11 +500,11 @@ pub const Parser = struct {
         } };
     }
 
-    /// `while cond { stmts... }`. `while let` is deferred to followup commit
-    /// — surface requires enum-variant patterns which lexer doesn't tokenize.
-    /// Return type is `Stmt.WhileStmt` (the inner payload struct), not the
-    /// outer `Stmt` union, so the dispatch in `parseStmt` can assign the
-    /// value into `.while_stmt = …` without a redundant re-wrap.
+    // `while cond { stmts... }`. `while let` is deferred to followup commit
+    // — surface requires enum-variant patterns which lexer doesn't tokenize.
+    // Return type is `Stmt.WhileStmt` (the inner payload struct), not the
+    // outer `Stmt` union, so the dispatch in `parseStmt` can assign the
+    // value into `.while_stmt = …` without a redundant re-wrap.
     fn parseWhileStmt(self: *Parser) Stmt.WhileStmt {
         self.expect(.while_kw);
         const cond = self.parseExpr();
@@ -512,12 +512,12 @@ pub const Parser = struct {
         return .{ .cond = cond, .body = body };
     }
 
-    /// `for pat in iter { stmts... }`. Pattern is currently the one-element
-    /// subset (ident or discard) — see `Stmt.for_stmt` doc for the
-    /// tuple-pattern followup plan. After the pattern, parser expects `in`,
-    /// then any expression for `iter`, then a `{ stmts }` body. Returns
-    /// the inner payload struct `Stmt.ForStmt` so the dispatch in
-    /// `parseStmt` can assign into `.for_stmt = …` directly.
+    // `for pat in iter { stmts... }`. Pattern is currently the one-element
+    // subset (ident or discard) — see `Stmt.for_stmt` doc for the
+    // tuple-pattern followup plan. After the pattern, parser expects `in`,
+    // then any expression for `iter`, then a `{ stmts }` body. Returns
+    // the inner payload struct `Stmt.ForStmt` so the dispatch in
+    // `parseStmt` can assign into `.for_stmt = …` directly.
     fn parseForStmt(self: *Parser) Stmt.ForStmt {
         self.expect(.for_kw);
         // Pattern-side: ident or `_` (discard). Lookahead distinguishes
@@ -544,16 +544,16 @@ pub const Parser = struct {
         return .{ .pattern = pat, .iter = iter, .body = body };
     }
 
-    /// `match scrutinee { arms... }` expression. Built once and reused for
-    /// statement-position use (via `Stmt.match_stmt`) and expression-
-    /// position use (via `Expr.match_expr`); the AST node lives in the
-    /// `Expr` envelope. Arm bodies are single expressions per the user-
-    /// confirmed shape; arm separator is comma.
-    ///
-    /// Scrutinee, guard, and arm body are each lifted into arena slots
-    /// so the resulting `Expr.MatchExpr` and `MatchArm` pointer fields
-    /// point at stable storage (mirrors the existing BinaryExpr `*Expr`
-    /// cycle-breaking convention — see the `IfExpr` doc for why).
+    // `match scrutinee { arms... }` expression. Built once and reused for
+    // statement-position use (via `Stmt.match_stmt`) and expression-
+    // position use (via `Expr.match_expr`); the AST node lives in the
+    // `Expr` envelope. Arm bodies are single expressions per the user-
+    // confirmed shape; arm separator is comma.
+    //
+    // Scrutinee, guard, and arm body are each lifted into arena slots
+    // so the resulting `Expr.MatchExpr` and `MatchArm` pointer fields
+    // point at stable storage (mirrors the existing BinaryExpr `*Expr`
+    // cycle-breaking convention — see the `IfExpr` doc for why).
     fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
         self.expect(.match_kw);
         const scrut_buf = self.arena.alloc(Expr, 1);
@@ -576,10 +576,17 @@ pub const Parser = struct {
                 guard = &guard_buf[0];
             }
             self.expect(.arrow); // =>
-            self.expect(.lbrace);
+            // Arm body is a single expression, NOT braced. The earlier
+            // `self.expect(.lbrace)` / `expect(.rbrace)` pair around the
+            // body forced a `=> { expr }` shape, but zag's grammar (and
+            // every test in main.zig's match-stmt suite) writes arms as
+            // `=> expr`. With the lbrace/rbrace expectations in place, the
+            // parser hit `expected lbrace, got 'one'` on the canonical
+            // `1 => "one"` form. The brace pair was removed; the body now
+            // commits to one Expr, terminated by either a comma (handled
+            // below) or the enclosing match-block `}`.
             const body_buf = self.arena.alloc(Expr, 1);
             body_buf[0] = self.parseExpr();
-            self.expect(.rbrace);
             // Comma separator between arms. The trailing comma before `}`
             // is optional — if rbrace is the immediate next token after the
             // rbrace of the body, we accept it without error.
@@ -822,12 +829,24 @@ pub const Parser = struct {
     /// `.range { inclusive = true }`. Per the manual, range has None
     /// associativity — chaining `0..5..10` is a syntax error caught here.
     fn parseRange(self: *Parser) Expr {
-        const tok = self.peek().tag;
         // Range-as-prefix is not in the grammar — `0..10` requires a
         // preceding LHS that's a full Expression. We start from
         // parseLogicalOr for both sides so `0..10` parses as Range(0, 10)
         // but `0 + 1..10` parses as Range(0 + 1, 10) (range binds looser).
+        //
+        // IMPORTANT: peek the range/ellipsis tag AFTER parsing the LHS, not
+        // before. Pre-fix this function captured `peek().tag` into `tok`
+        // before calling `parseLogicalOr`. When the source was `for x in
+        // 0..10 { … }`, that snapshot captured `.integer_literal` for `0`,
+        // LHS parsing consumed `0` leaving the parser looking at `.range`,
+        // but the stale `tok` flag stayed `.integer_literal` so the range
+        // branch never fired — `..10` orphaned and the next call
+        // (`parseBlock`) surfaced `expected lbrace, got '..'`. Decoupling
+        // the peek from LHS parsing allows `0..10` to surface as a single
+        // `RangeExpr` while still disallowing the prefix form (when peek
+        // returns non-range non-ellipsis BEFORE the LHS, we just return lhs).
         const lhs = self.parseLogicalOr();
+        const tok = self.peek().tag;
         if (tok == .range) {
             self.advance();
             const rhs = self.parseLogicalOr();
@@ -835,6 +854,16 @@ pub const Parser = struct {
             return self.makeRange(lhs, rhs, false);
         }
         if (tok == .ellipsis) {
+            // Ellipsis is only a range op when followed by an expression
+            // starter (e.g. `0...5` → Range(0, 5, inclusive=true)). In
+            // array-lit fill mode `[N]ty { 0 ... }`, the `.ellipsis` is
+            // consumed by parseArrayLit AS the fill marker AFTER parseExpr
+            // returns just `0` — NOT here. If we fired this arm
+            // unconditionally, we'd try to parse `}` (or `;`, or EOF) as
+            // the RHS expression and surface a misleading `expected X`
+            // error. peekAhead gives 2-token lookahead so we can decide
+            // without committing to consuming `.ellipsis` first.
+            if (!isExprStart(self.peekAhead(1))) return lhs;
             self.advance();
             const rhs = self.parseLogicalOr();
             self.rejectRangeChaining();
@@ -851,6 +880,19 @@ pub const Parser = struct {
         const rb = self.arena.alloc(Expr, 1);
         rb[0] = rhs;
         return .{ .range = .{ .start = &lb[0], .end = &rb[0], .inclusive = inclusive } };
+    }
+
+    /// True if `tag` can begin an expression — i.e. is a primary Expr kind
+    /// or a unary prefix, or one of the recipe-level `if_kw` / `match_kw`
+    /// sentinels that parseExpr dispatches on at the top of the ladder.
+    /// Used by parseRange to gate the `.ellipsis` arm on a valid RHS so
+    /// `0...5` parses as a range but `0...}` (array-lit fill mode) is
+    /// left untouched for the caller to interpret as the fill marker.
+    fn isExprStart(tag: TokenTag) bool {
+        return switch (tag) {
+            .integer_literal, .float_literal, .string_literal, .byte_string_literal, .char_literal, .true_kw, .false_kw, .null_kw, .undefined_kw, .identifier, .print, .lparen, .lbracket, .minus, .amp, .plus, .tilde, .bang, .star, .new, .free, .if_kw, .match_kw => true,
+            else => false,
+        };
     }
 
     /// Explicit guard for `a..b..c` / `a...b..c` / etc. After consuming
@@ -976,19 +1018,31 @@ pub const Parser = struct {
         return lhs;
     }
 
-    /// Unary prefix layer: `-x`, `!x`, `~x`, `*x` (deref). All four are
-    /// prefix operators binding tighter than any binary op, so this layer
-    /// sits at the top of the precedence ladder. Recursive on the operand
-    /// so `--x` parses as `-(-x)` and `!!flag` as `!(!flag)`. After the
-    /// unary refactor moved deref `*x` here from parsePrimary, the four
-    /// operators emit `Expr.unary { op, operand }` consistently with the
-    /// existing NewExpr/DerefExpr pointer convention.
+    /// Unary prefix layer: `-x`, `!x`, `~x`, `*x` (deref), `&x` (addr-of).
+    /// All five are prefix operators binding tighter than any binary op,
+    /// so this layer sits at the top of the precedence ladder. Recursive
+    /// on the operand so `--x` parses as `-(-x)` and `**p` parses as
+    /// `*( *p)` (two stacked derefs). After the unary refactor moved deref
+    /// `*x` here from parsePrimary, the operators emit
+    /// `Expr.unary { op, operand }` consistently with the existing
+    /// NewExpr/DerefExpr pointer convention.
+    ///
+    /// The `.amp` token is shared with the binary bitwise-AND operator
+    /// (consumed by `parseBitAnd`); the choice between unary address-of
+    /// and binary bitwise-AND is purely syntactic context — when `.amp`
+    /// appears in expression-prefix position it routes to `.addr`, when
+    /// it appears between two expressions (e.g. `a & b`) it routes to
+    /// `.bitand`. The lexer keeps a single `.amp` token so the parser
+    /// can make this dispatch without expanding the lexer surface
+    /// (mirrors how `-x` (unary) vs `a - b` (binary) share the `.minus`
+    /// token, and `*x` (deref) vs `a * b` (mul) share the `.star`).
     fn parseUnary(self: *Parser) Expr {
         const op: ast.Expr.UnaryOp = switch (self.peek().tag) {
             .minus => .neg,
             .tilde => .bnot,
             .bang => .lnot,
             .star => .deref,
+            .amp => .addr,
             else => return self.parseCast(),
         };
         self.advance();
@@ -1050,6 +1104,44 @@ pub const Parser = struct {
         var prev_was_ptr = false;
         while (!self.eof()) {
             const tok = self.peek();
+            // Slice type prefix `[]` — consume the bracket pair as a single
+            // two-byte token so collectCastType round-trips `[]const T` and
+            // `[]T` to zig verbatim. Without this carve-out the `]` would
+            // hit the `.rbracket` is_term arm and break the type-text
+            // capture before the `const T` element is read, leaving the
+            // emitted binding annotation as `[]` only and breaking zig's
+            // type-check (`[]` alone is not a valid type).
+            //
+            // `prev_was_ptr` is set so the `T` of `[]T` glues onto `[]`
+            // without an inserted space — zig rejects `[] T` (a slice of
+            // `T` written with a space between prefix and element name)
+            // because `[]` already binds to whatever identifier follows
+            // in the source.
+            if (tok.tag == .lbracket and self.peekAhead(1) == .rbracket) {
+                if (len + 2 <= buf.len) {
+                    @memcpy(buf[len..][0..2], "[]");
+                    len += 2;
+                }
+                prev_was_ptr = true;
+                self.advance();
+                self.advance();
+                continue;
+            }
+            // Nullable pointer prefix `?` — consume as a single byte and
+            // mark `prev_was_ptr` so the next identifier or `*` glues on
+            // without a separator (`?i32`, `?*T`). The `.rbracket`-as-term
+            // rule was previously the only way a `?` could exit the loop,
+            // so the new arm is inserted BEFORE the is_term switch to keep
+            // the dispatch order on `tok.tag` consistent.
+            if (tok.tag == .question) {
+                if (len + 1 <= buf.len) {
+                    buf[len] = '?';
+                    len += 1;
+                }
+                prev_was_ptr = true;
+                self.advance();
+                continue;
+            }
             const is_term: bool = switch (tok.tag) {
                 .newline, .comma, .rparen, .rbracket, .rbrace, .colon, .equals, .plus_eq, .minus_eq, .slash_eq, .percent_eq, .amp_eq, .pipe_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .plus, .minus, .slash, .percent, .amp, .pipe, .caret, .tilde, .bang, .lt_lt, .gt_gt, .lt, .gt, .lt_eq, .gt_eq, .eq_eq, .bang_eq, .amp_amp, .pipe_pipe, .range, .ellipsis, .arrow, .doc_comment, .eof => true,
                 else => false,
@@ -1057,7 +1149,12 @@ pub const Parser = struct {
             if (is_term) break;
             // Treat `.star` as the pointer marker (concatenated, no space)
             // and identifiers as the type name proper.
-            if (tok.tag == .identifier or tok.tag == .print) {
+            // `.const_kw` joins the identifier-equivalent dispatch so multi-token
+            // pointer types like `*const T` and `[]const T` round-trip the
+            // keyword "const" as a type-name byte — otherwise the predicate
+            // falls into the `else => break;` arm at `.const_kw` and truncates
+            // the captured type text. See `docs/manual/09-pointers.md`.
+            if (tok.tag == .identifier or tok.tag == .print or tok.tag == .const_kw) {
                 const text = tok.text;
                 // Insert a space ONLY when both prev was an ident (not a
                 // pointer marker) AND something has already been emitted.
@@ -1100,17 +1197,99 @@ pub const Parser = struct {
         return arena_slice;
     }
 
+    /// Postfix layer: chains `[i]` indexing OR `[start..end]` slicing
+    /// onto a primary expression so `arr[i][j]` parses as
+    /// `Index(Index(arr, i), j)` and `arr[a..b][0]` parses as
+    /// `Index(Slice(arr, a, b, false), 0)`. Three bracket shapes:
+    ///   - index:  `EXPR ]`                 → IndexExpr(target, EXPR)
+    ///   - slice:  `[ .. | ... ] [EXPR] ]`  → SliceExpr with nullable bounds
+    ///   - slice:  `[.. | ...] ]`           → SliceExpr with both bounds null
+    ///   - slice:  `[EXPR [.. | ...] ]`     → SliceExpr with non-null start
+    ///
+    /// Disambiguation: after consuming `[`, peek is one of `.range`,
+    /// `.ellipsis`, `.rbracket`, or a primary-start token. The first two
+    /// make the slice form immediately known (empty-start slice); the
+    /// third is an empty `[]` form (currently rejected as malformed);
+    /// the fourth path parses a single `parseAdditive` for the start
+    /// bounded AT the additive layer (NOT reaching parseRange, which
+    /// would consume a trailing `..`/`...` and silently turn the slice
+    /// into an index over a RangeExpr). The bounded parse ensures the
+    /// postfix loop sees the `.range`/`.ellipsis`/`.rbracket` token
+    /// next and can dispatch correctly.
+    ///
+    /// The recursive walk stops at the first non-bracket token and
+    /// returns the LHS up the precedence ladder to whichever binary op
+    /// is next. Note: this is NOT for chained-function-calls
+    /// (`f(1)(2)`) — that would require a `.lparen` arm here too, but
+    /// the user-chosen shape is "chained single-Index per bracket pair"
+    /// only.
     fn parsePostfix(self: *Parser) Expr {
         var lhs = self.parsePrimary();
         while (self.peek().tag == .lbracket) {
             self.advance(); // consume [
-            const idx = self.parseExpr();
+            // Three valid shapes and one error follow the opening `[`:
+            // 1. empty start slice: peek `.range` or `.ellipsis`
+            // 2. malformed `[]`: peek `.rbracket` immediately
+            // 3. explicit start: parseAdditive, then range/ellipsis/bracket
+            // The single `inclusive` flag lives below the dispatch
+            // because every slice form shares the same end-bound logic
+            // (parseAdditive if peek isn't `.rbracket`, then expect `.rbracket`).
+            var inclusive: bool = false;
+            var start_opt: ?*Expr = null;
+
+            if (self.peek().tag == .range) {
+                inclusive = false;
+                self.advance();
+            } else if (self.peek().tag == .ellipsis) {
+                inclusive = true;
+                self.advance();
+            } else if (self.peek().tag == .rbracket) {
+                const tok = self.peek();
+                std.debug.print("error:{d}:{d}: empty slice form '[]' — write '[..]' for whole-array view or '[N..]' / '[..N]' for partial slices\n", .{ tok.loc.line, tok.loc.col });
+                std.process.exit(1);
+            } else {
+                const start_expr = self.parseAdditive();
+                if (self.peek().tag == .range) {
+                    inclusive = false;
+                    const sb = self.arena.alloc(Expr, 1);
+                    sb[0] = start_expr;
+                    start_opt = &sb[0];
+                    self.advance();
+                } else if (self.peek().tag == .ellipsis) {
+                    inclusive = true;
+                    const sb = self.arena.alloc(Expr, 1);
+                    sb[0] = start_expr;
+                    start_opt = &sb[0];
+                    self.advance();
+                } else {
+                    // Plain index: `[EXPR]`. Lift to meet IndexExpr's
+                    // `*Expr` slot convention.
+                    self.expect(.rbracket);
+                    const target_buf = self.arena.alloc(Expr, 1);
+                    target_buf[0] = lhs;
+                    const idx_buf = self.arena.alloc(Expr, 1);
+                    idx_buf[0] = start_expr;
+                    lhs = .{ .index = .{ .target = &target_buf[0], .index = &idx_buf[0] } };
+                    continue;
+                }
+            }
+
+            // Reaching here means: peek showed `.range`/`.ellipsis`. Parse
+            // optional end bound then expect `]`. Empty end (`[..]`,
+            // `[N..]`, `[N...]`) skips the bound parse entirely so we
+            // don't trigger parsePrimary on `.rbracket` and accidentally
+            // consume the slice's own closing bracket.
+            var end_opt: ?*Expr = null;
+            if (self.peek().tag != .rbracket) {
+                const end_expr = self.parseAdditive();
+                const eb = self.arena.alloc(Expr, 1);
+                eb[0] = end_expr;
+                end_opt = &eb[0];
+            }
             self.expect(.rbracket);
             const target_buf = self.arena.alloc(Expr, 1);
             target_buf[0] = lhs;
-            const idx_buf = self.arena.alloc(Expr, 1);
-            idx_buf[0] = idx;
-            lhs = .{ .index = .{ .target = &target_buf[0], .index = &idx_buf[0] } };
+            lhs = .{ .slice = .{ .target = &target_buf[0], .start = start_opt, .end = end_opt, .inclusive = inclusive } };
         }
         return lhs;
     }
@@ -1456,6 +1635,18 @@ pub const Parser = struct {
 
     fn eof(self: *Parser) bool {
         return self.pos >= self.tokens.len or self.tokens[self.pos].tag == .eof;
+    }
+
+    /// Two-token lookahead: returns the tag at `pos + n` without consuming
+    /// any tokens. Mirrors the 1-token `peek()` at the parser entry but
+    /// with an explicit offset. Used by parseRange to disambiguate `0...5`
+    /// (expression-starter follows — true range form) from `0...}`
+    /// (structural delimiter follows — NOT a range; caller consumes the
+    /// `.ellipsis` as the fill or progression marker instead).
+    fn peekAhead(self: *Parser, n: u32) TokenTag {
+        const idx = self.pos + n;
+        if (idx >= self.tokens.len) return .eof;
+        return self.tokens[idx].tag;
     }
 
     fn expect(self: *Parser, tag: TokenTag) void {

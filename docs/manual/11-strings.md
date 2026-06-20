@@ -10,7 +10,7 @@ Zag has two string types:
 | `String` | Owned, growable, heap-allocated | Heap |
 
 ```
-let greeting = "hello";              # []const u8 — borrowed, no allocation
+let greeting: []const u8 = "hello";
 let owned = new String("hello");     # String — heap allocated
 ```
 
@@ -19,7 +19,7 @@ let owned = new String("hello");     # String — heap allocated
 String literals produce `[]const u8`:
 
 ```
-let s = "hello";         # []const u8
+let s: []const u8 = "hello";
 let len = s.len;         # 5
 let byte = s[0];         # 'h' as u8
 ```
@@ -74,12 +74,12 @@ fun build_greeting(name: str) -> String {
 ## String Interpolation
 
 ```
-let name = "world";
-let msg = "hello, {name}";
+let name: []const u8 = "world";
+let msg: []u8 = "hello, {name}";
 print("{msg}\n");
 
 # Format specifiers
-let pi = 3.14159;
+let pi: f64 = 3.14159;
 print("pi = {pi:.2}\n");        # "pi = 3.14"
 print("{42:x}\n");              # "2a"
 print("{42:b}\n");              # "101010"
@@ -90,7 +90,7 @@ print("{42:b}\n");              # "101010"
 ## String Slicing
 
 ```
-let s = "hello, world";
+let s: []const u8 = "hello, world";
 let sub: []const u8 = s[0..5];    # "hello"
 ```
 
@@ -99,7 +99,7 @@ let sub: []const u8 = s[0..5];    # "hello"
 ## Byte Strings
 
 ```
-let bytes = b"hello";    # []u8
+let bytes: []const u8 = b"hello";
 ```
 
 **Memory:** Stack-allocated slice pointing to static data.

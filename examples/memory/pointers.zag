@@ -1,0 +1,64 @@
+# Pointers chapter — `&x` (address-of), `*p` (deref), and slicing.
+#
+# This example walks through the pointer surface documented in
+# `docs/manual/09-pointers.md`: mutable / const address-of, deref,
+# half-open and inclusive slicing, full-array view via `arr[..]`, and
+# nullable pointer initialisation. Run it with `zag run examples/memory/pointers.zag`.
+
+fun main() {
+    # Address-of: take a mutable pointer to a stack-local variable.
+    var counter: i32 = 0;
+    let p_mut: *i32 = &counter;
+
+    # Address-of on an immutable binding is still legal in zag; the
+    # pointer type is `*const T` once we annotate it explicitly. The
+    # emitted zig also infers `*const i32` from the binding's `let`
+    # kind, but we annotate for clarity.
+    let read_only: i32 = 100;
+    let p_const: *const i32 = &read_only;
+
+    # Deref: read through a pointer.
+    let initial: i32 = *p_mut;
+    print("initial = {initial}\n");
+
+    # Deref on the LHS of an assignment writes through the pointer.
+    *p_mut = 42;
+    print("counter = {counter}\n");
+
+    # Slicing: produce a `[]i32` view into an array. Half-open form
+    # `arr[a..b]` excludes index `b`; full-array view `arr[..]` covers
+    # the entire array; `arr[a..]` runs from `a` to end; `arr[..b]`
+    # runs from start to index `b - 1`.
+    let data: [5]i32 = [5]i32 { 10, 20, 30, 40, 50 };
+    let middle: []i32 = data[1..4];     # [20, 30, 40]
+    let tail: []i32 = data[3..];        # [40, 50]
+    let head: []i32 = data[..3];        # [10, 20, 30]
+    let all:  []i32 = data[..];         # [10, 20, 30, 40, 50]
+
+    # Inclusive slicing: `arr[a...b]` includes index `b`. Codegen emits
+    # the half-open form with `+ 1` adjustment, so `data[1...3]` is
+    # equivalent to `data[1..4]` for integer slices.
+    let inclusive: []i32 = data[1...3]; # [20, 30, 40]
+
+    # Iteration: `for` consumes the slice and yields one element per
+    # iteration. Indexing into a slice (`middle[0]`) gives the i-th
+    # element.
+    print("middle = {middle[0]} {middle[1]} {middle[2]}\n");
+
+    # Nullable pointers: any pointer form can be made nullable by
+    # prefixing `?`. Initialise to `null` when no value is ready; bind
+    # a real pointer otherwise. Nullable pointer forms are `Copy` — the
+    # assignment below duplicates the (possibly null) pointer value.
+    let maybe_ptr: ?*i32 = null;
+    var owned_counter: i32 = 7;
+    let also_maybe: ?*i32 = &owned_counter;
+    print("maybe = {maybe_ptr}\n");
+    print("also_maybe = {also_maybe}\n");
+
+    # Indexed assignment to a slice element.
+    var scratch: [3]i32 = [3]i32 { 0 ... };
+    scratch[0] = 11;
+    scratch[1] = 22;
+    scratch[2] = 33;
+    print("scratch = {scratch[0]} {scratch[1]} {scratch[2]}\n");
+}
