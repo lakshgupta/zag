@@ -443,11 +443,15 @@ pub const Parser = struct {
         if (self.peek().tag == .else_kw) {
             self.advance();
             if (self.peek().tag == .if_kw) {
-                self.advance();
                 // Recursive descent into the chained `else if cond { … }`.
                 // The chain can be arbitrarily long because the recursive
                 // boxed `*IfStmt` desugars to a left-leaning list, not a
-                // self-referential recursion in the type system.
+                // self-referential recursion in the type system. NOTE: do
+                // NOT advance past `.if_kw` here — the nested call below
+                // recurses into `parseIfBranch`, which begins with
+                // `expect(.if_kw)`. A premature advance skipped that token
+                // and surfaced as `expected if_kw, got <cond-ident>` in the
+                // chained `else if` test cases.
                 const inner = self.parseIfBranch();
                 const boxed = self.arena.alloc(Stmt.IfStmt, 1);
                 boxed[0] = inner;

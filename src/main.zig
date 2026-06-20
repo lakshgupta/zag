@@ -1931,6 +1931,13 @@ test "parser: errdefer parses as Stmt.errdefer_stmt" {
     // Pattern 2 from docs/19-memory.md: `errdefer free(a)` runs only on the
     // `?`-propagation path. Parser pins the AST tag so the codegen surface
     // ({errdefer expr;}) is replayable by tests.
+    //
+    // The expression `print("cleanup\n")` parses as a `.call` node because
+    // `"cleanup\n"` is a string-literal (no `{` markers) — the parser's
+    // `.string_literal` arm only routes to `buildTemplate` when an
+    // interpolation marker is present. Pre-existing test wrote this with
+    // `.template_lit` based on an earlier codegen shape that no longer
+    // applies; updated to match the current AST shape.
     const src = "fun f() {\n    errdefer print(\"cleanup\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -1939,7 +1946,10 @@ test "parser: errdefer parses as Stmt.errdefer_stmt" {
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
     try std.testing.expect(stmt == .errdefer_stmt);
-    try std.testing.expect(stmt.errdefer_stmt.expr == .template_lit);
+    try std.testing.expect(stmt.errdefer_stmt.expr == .call);
+    try std.testing.expectEqualStrings("print", stmt.errdefer_stmt.expr.call.name);
+    try std.testing.expectEqual(@as(usize, 1), stmt.errdefer_stmt.expr.call.args.len);
+    try std.testing.expectEqualStrings("cleanup\\n", stmt.errdefer_stmt.expr.call.args[0].string_lit);
 }
 
 test "parser: unsafe { } parses as Stmt.unsafe_block" {
@@ -2030,6 +2040,14 @@ test "codegen: new T(v) emits page_allocator.create heap alloc (bug fix)" {
     // stack-pointer escape (UB on `free`). The rewrite routes through
     // `try std.heap.page_allocator.create(T)` so `free(p)`'s matching
     // `page_allocator.destroy(p)` correctly deallocates the heap cell.
+    //
+    // The current emit for `let p = new i32(42)` is:
+    //   const p = blk: { const __p_0 = try std.heap.page_allocator.create(i32);
+    //                     __p_0.* = 42; break :blk __p_0; };
+    // (Pre-existing test asserted `const p = __p_0` — a bare-assignment
+    // shape that was true before the docs/19-memory.md heap rewrite; the
+    // rewrite uses the blk-wrapped form so we can still reference `__p_0`
+    // after the assignment without zig's no-redeclaration trouble.)
     const src = "fun f() {\n    let p = new i32(42);\n    defer free(p);\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -2038,10 +2056,12 @@ test "codegen: new T(v) emits page_allocator.create heap alloc (bug fix)" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const p = blk: {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "try std.heap.page_allocator.create(i32)") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "__p_0.* = 42") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __p_0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const p = __p_0") != null);
+    // The page_allocator.destroy(p) — for the matching free(p) below.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.destroy") != null);
     // Sanity: the OLD stack-pointer emission must NOT appear.
     try std.testing.expect(std.mem.indexOf(u8, zig, "var __val: i32 = 42") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "&__val") == null);
@@ -2065,8 +2085,13 @@ test "codegen: new(<arena>, T(v)) emits <arena>.create(T) (allocator sugar)" {
 
 test "codegen: alloc_counter increments across multiple new exprs" {
     // Two `new` expressions in the same body must produce distinct `__p_<N>`
-    // names so zig's no-redeclaration rule is satisfied. Without the
-    // per-function counter the user's `let __p_0` would silently clash.
+    // names so zig's no-redeclaration rule is satisfied. The codegen uses a
+    // single per-function `alloc_counter` (reset at `genFun`) that increments
+    // per `new_expr` visit in `genExpr`, so two bindings surface distinct
+    // `__p_0` and `__p_1`. Each `__p_<N>` is also internal to its own
+    // `blk: { … }` scope — the counter step is the simpler invariant that
+    // satisfies both flat scopes and nested blk scopes (the latter tolerate
+    // same-name shadowing but the counter keeps emissions human-comparable).
     const src =
         \\fun f() {
         \\    let a = new i32(1);
@@ -2081,14 +2106,25 @@ test "codegen: alloc_counter increments across multiple new exprs" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const a = __p_0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const b = __p_1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const a = blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const b = blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "try std.heap.page_allocator.create(i32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__p_0.* = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__p_1.* = 2") != null);
 }
 
 test "codegen: errdefer stmt emits errdefer verbatim" {
     // Mirrors zig 0.16's `errdefer` keyword one-to-one so zig's semantics
     // (runs the expression ONLY on `?`-propagation or `Err` early-return)
     // match the zag docs' Pattern 2 framing.
+    //
+    // `errdefer <expr>` triggers genExpr on `expr`. For `print(string_lit)`
+    // the call-emit is `std.debug.print("...", .{})` (the literal-string
+    // specialization). So the errdefer output is
+    // `    errdefer std.debug.print("cleanup\n", .{});`.
+    // Pre-existing test was written when codegen emitted the user's
+    // `print(...)` verbatim (a simpler print codegen). Updated to the
+    // current stamp-shape substring.
     const src = "fun f() {\n    errdefer print(\"cleanup\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -2097,7 +2133,7 @@ test "codegen: errdefer stmt emits errdefer verbatim" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    errdefer print(\"cleanup\\n\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    errdefer std.debug.print(\"cleanup\\n\", .{})") != null);
 }
 
 test "codegen: unsafe block emits body in plain block with comment markers" {
@@ -2106,6 +2142,10 @@ test "codegen: unsafe block emits body in plain block with comment markers" {
     // `{ ... }` with `// unsafe {` and `// }` comments so the structure is
     // visible to `-Dunsafe-block-check` tooling without affecting the
     // emitted zig semantics (raw pointer ops are already unconditional).
+    //
+    // The body's `print(string_lit)` codegen emits `std.debug.print(...)`,
+    // NOT the user's `print(...)` verbatim. Pre-existing test was written
+    // when codegen was simpler — updated to the current emission shape.
     const src = "fun f() {\n    unsafe {\n        print(\"inside\\n\");\n    }\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -2115,7 +2155,7 @@ test "codegen: unsafe block emits body in plain block with comment markers" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    // unsafe {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    print(\"inside\\n\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.debug.print(\"inside\\n\", .{})") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    // }") != null);
 }
 
@@ -2151,14 +2191,7 @@ test "parser: if-stmt parses as Stmt.if_stmt" {
     // (NOT `.if_expr`), confirming that the statement form is in place.
     // The cond captures the predicate expression and the body block
     // holds the inner statement list.
-    const src =
-        \\fun f() {
-        \\    if x > 0 {
-        \\        print(\"positive\n\");
-        \\    }
-        \\}
-        \\
-    ;
+    const src = "fun f() {\n    if x > 0 {\n        print(\"positive\\n\");\n    }\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2178,18 +2211,7 @@ test "parser: if-stmt with else-if chain walks nested if_kind" {
     // OUTER if_stmt's else_kind rather than creating a stmt-level
     // sibling — the chain lives structurally inside the first if so
     // codegen can emit it as a single `if/else if/else if` block.
-    const src =
-        \\fun f() {
-        \\    if a {
-        \\        print("a\n");
-        \\    } else if b {
-        \\        print("b\n");
-        \\    } else {
-        \\        print("other\n");
-        \\    }
-        \\}
-        \\
-    ;
+    const src = "fun f() {\n    if a {\n        print(\"a\\n\");\n    } else if b {\n        print(\"b\\n\");\n    } else {\n        print(\"other\\n\");\n    }\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
