@@ -114,6 +114,19 @@ pub const Parser = struct {
             .defer_kw => return .{ .defer_stmt = self.parseDefer() },
             .errdefer_kw => return .{ .errdefer_stmt = self.parseErrDefer() },
             .unsafe_kw => return .{ .unsafe_block = self.parseUnsafeBlock() },
+            .if_kw => return .{ .if_stmt = self.parseIfBranch() },
+            .while_kw => return .{ .while_stmt = self.parseWhileStmt() },
+            .for_kw => return .{ .for_stmt = self.parseForStmt() },
+            .match_kw => return .{ .match_stmt = self.parseMatchExpr() },
+            .break_kw => {
+                self.advance();
+                return .{ .break_stmt = {} };
+            },
+            .continue_kw => {
+                self.advance();
+                return .{ .continue_stmt = {} };
+            },
+            .return_kw => return .{ .return_stmt = self.parseReturnStmt() },
             else => return .{ .expr_stmt = self.parseExpr() },
         }
     }
@@ -181,7 +194,25 @@ pub const Parser = struct {
             var type_name: ?[]const u8 = null;
             if (self.peek().tag == .colon) {
                 self.advance();
-                type_name = self.expectIdent();
+                // Use the same multi-token collector that `as` casts use so
+                // binding annotations can carry pointer types like
+                // `*raw u8` consistently with cast destinations. Previously
+                // this called `expectIdent` which rejected `.star`, breaking
+                // raw-pointer bindings. `collectCastType` arena-allocates
+                // the result so the slice is stable after the parser
+                // function returns.
+                const collected = self.collectCastType();
+                if (collected.len == 0) {
+                    std.debug.print("error:{d}:{d}: {s} binding requires a type name after ':' (e.g. {s} {s}: T = …)\\n", .{
+                        binding_loc.line,
+                        binding_loc.col,
+                        kind_name,
+                        kind_name,
+                        pattern.name,
+                    });
+                    std.process.exit(1);
+                }
+                type_name = collected;
             }
             self.expect(.equals);
             const initializer = self.parseExpr();
@@ -390,6 +421,293 @@ pub const Parser = struct {
         return self.parseBlock();
     }
 
+    /// Parse one `if cond { stmts... }` head plus its optional else-branch.
+    /// Consumes the leading `.if_kw` here (mirroring the convention used by
+    /// parseWhileStmt / parseForStmt / parseMatchExpr / parseReturnStmt).
+    /// Without this `expect`, parseExpr (called for the cond) would
+    /// self-dispatch on `.if_kw` to `parseIfExpr`, leaving the parser with
+    /// `if_kw` unconsumed and the cond never parsed — surfacing as
+    /// `expected rbrace, got 'print'` on the body statement. The
+    /// recursive `else if` chain is rendered via the `.if_chain` arm of
+    /// `IfStmt.else_kind` (boxed `*IfStmt`); terminal `else { ... }` via
+    /// the `.block` arm. The condition parses via `parseExpr` so binary
+    /// precedence (e.g. `i < 10 && ready`) works without special-casing.
+    fn parseIfBranch(self: *Parser) Stmt.IfStmt {
+        const start_loc = self.peek().loc;
+        self.expect(.if_kw);
+        const cond = self.parseExpr();
+        self.expect(.lbrace);
+        const then_body = self.parseStmtList();
+        self.expect(.rbrace);
+        var else_kind: Stmt.IfStmt.IfElseKind = .{ .none = {} };
+        if (self.peek().tag == .else_kw) {
+            self.advance();
+            if (self.peek().tag == .if_kw) {
+                self.advance();
+                // Recursive descent into the chained `else if cond { … }`.
+                // The chain can be arbitrarily long because the recursive
+                // boxed `*IfStmt` desugars to a left-leaning list, not a
+                // self-referential recursion in the type system.
+                const inner = self.parseIfBranch();
+                const boxed = self.arena.alloc(Stmt.IfStmt, 1);
+                boxed[0] = inner;
+                else_kind = .{ .if_chain = &boxed[0] };
+            } else {
+                self.expect(.lbrace);
+                const else_body = self.parseStmtList();
+                self.expect(.rbrace);
+                else_kind = .{ .block = else_body };
+            }
+        }
+        _ = start_loc;
+        return .{ .cond = cond, .then_body = then_body, .else_kind = else_kind };
+    }
+
+    /// `if cond { expr } else { expr }` expression form. Used when `if_kw`
+    /// is the leading token in an expression-position context
+    /// (RHS of a `let`, inside a binary operand list, etc.). Each branch's
+    /// `Expr` is lifted into an arena slot so the resulting `IfExpr`'s
+    /// pointer fields point at stable storage (the existing BinaryExpr
+    /// `*Expr` convention). The else-branch is REQUIRED for the
+    /// expression form (otherwise the type would be `?T`); the parser
+    /// emits a clear error if missing.
+    fn parseIfExpr(self: *Parser) Expr {
+        self.expect(.if_kw);
+        const cond_buf = self.arena.alloc(Expr, 1);
+        cond_buf[0] = self.parseExpr();
+        self.expect(.lbrace);
+        const then_buf = self.arena.alloc(Expr, 1);
+        then_buf[0] = self.parseExpr();
+        self.expect(.rbrace);
+        if (self.peek().tag != .else_kw) {
+            const tok = self.peek();
+            std.debug.print("error:{d}:{d}: 'if' as expression requires 'else' branch for a well-typed value\n", .{ tok.loc.line, tok.loc.col });
+            std.process.exit(1);
+        }
+        self.advance();
+        self.expect(.lbrace);
+        const else_buf = self.arena.alloc(Expr, 1);
+        else_buf[0] = self.parseExpr();
+        self.expect(.rbrace);
+        return .{ .if_expr = .{
+            .cond = &cond_buf[0],
+            .then_expr = &then_buf[0],
+            .else_expr = &else_buf[0],
+        } };
+    }
+
+    /// `while cond { stmts... }`. `while let` is deferred to followup commit
+    /// — surface requires enum-variant patterns which lexer doesn't tokenize.
+    /// Return type is `Stmt.WhileStmt` (the inner payload struct), not the
+    /// outer `Stmt` union, so the dispatch in `parseStmt` can assign the
+    /// value into `.while_stmt = …` without a redundant re-wrap.
+    fn parseWhileStmt(self: *Parser) Stmt.WhileStmt {
+        self.expect(.while_kw);
+        const cond = self.parseExpr();
+        const body = self.parseBlock();
+        return .{ .cond = cond, .body = body };
+    }
+
+    /// `for pat in iter { stmts... }`. Pattern is currently the one-element
+    /// subset (ident or discard) — see `Stmt.for_stmt` doc for the
+    /// tuple-pattern followup plan. After the pattern, parser expects `in`,
+    /// then any expression for `iter`, then a `{ stmts }` body. Returns
+    /// the inner payload struct `Stmt.ForStmt` so the dispatch in
+    /// `parseStmt` can assign into `.for_stmt = …` directly.
+    fn parseForStmt(self: *Parser) Stmt.ForStmt {
+        self.expect(.for_kw);
+        // Pattern-side: ident or `_` (discard). Lookahead distinguishes
+        // `_` from a real name.
+        var pat: ast.Pattern = undefined;
+        const tok = self.peek();
+        if (tok.tag == .identifier and std.mem.eql(u8, tok.text, "_")) {
+            self.advance();
+            pat = .{ .discard = {} };
+        } else {
+            // Reject any non-ident token at pattern position so the parser
+            // surfaces a clear error instead of silently accepting a
+            // malformed `for` form. The error message names the offending
+            // token for easier debugging.
+            if (tok.tag != .identifier) {
+                std.debug.print("error:{d}:{d}: expected for-loop binding (ident or '_'), got '{s}'\n", .{ tok.loc.line, tok.loc.col, tok.text });
+                std.process.exit(1);
+            }
+            pat = .{ .ident = self.expectIdent() };
+        }
+        self.expect(.in_kw);
+        const iter = self.parseExpr();
+        const body = self.parseBlock();
+        return .{ .pattern = pat, .iter = iter, .body = body };
+    }
+
+    /// `match scrutinee { arms... }` expression. Built once and reused for
+    /// statement-position use (via `Stmt.match_stmt`) and expression-
+    /// position use (via `Expr.match_expr`); the AST node lives in the
+    /// `Expr` envelope. Arm bodies are single expressions per the user-
+    /// confirmed shape; arm separator is comma.
+    ///
+    /// Scrutinee, guard, and arm body are each lifted into arena slots
+    /// so the resulting `Expr.MatchExpr` and `MatchArm` pointer fields
+    /// point at stable storage (mirrors the existing BinaryExpr `*Expr`
+    /// cycle-breaking convention — see the `IfExpr` doc for why).
+    fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
+        self.expect(.match_kw);
+        const scrut_buf = self.arena.alloc(Expr, 1);
+        scrut_buf[0] = self.parseExpr();
+        self.expect(.lbrace);
+        var arms_buf: [16]ast.MatchArm = undefined;
+        var arm_count: usize = 0;
+        while (self.peek().tag != .rbrace and !self.eof()) {
+            if (self.peek().tag == .newline) {
+                self.advance();
+                continue;
+            }
+            // Arm: `Pat [if guard] => body,`
+            const pat = self.parsePattern();
+            var guard: ?*ast.Expr = null;
+            if (self.peek().tag == .if_kw) {
+                self.advance();
+                const guard_buf = self.arena.alloc(Expr, 1);
+                guard_buf[0] = self.parseExpr();
+                guard = &guard_buf[0];
+            }
+            self.expect(.arrow); // =>
+            self.expect(.lbrace);
+            const body_buf = self.arena.alloc(Expr, 1);
+            body_buf[0] = self.parseExpr();
+            self.expect(.rbrace);
+            // Comma separator between arms. The trailing comma before `}`
+            // is optional — if rbrace is the immediate next token after the
+            // rbrace of the body, we accept it without error.
+            if (self.peek().tag == .comma) self.advance();
+            arms_buf[arm_count] = .{ .pat = pat, .guard = guard, .expr = &body_buf[0] };
+            arm_count += 1;
+        }
+        self.expect(.rbrace);
+        const arms = self.arena.alloc(ast.MatchArm, arm_count);
+        @memcpy(arms, arms_buf[0..arm_count]);
+        return .{ .scrutinee = &scrut_buf[0], .arms = arms };
+    }
+
+    /// Parse one match-arm pattern. Four shapes:
+    /// - `.literal(*LitExpr)` — int / bool / string / char literal value
+    /// - `.range(...)`        — `int_lit..int_lit` or `int_lit...int_lit`
+    /// - `.ident(name)`       — a name binding; the arm's body can reference it
+    /// - `.discard`           — the wildcard `_`
+    /// Enum-variant patterns are deferred to followup (need lexer support).
+    /// Emit a clear error on patterns we can't express (tuple, array,
+    /// prefix operators).
+    ///
+    /// Literal/range fields carry `*Expr` pointers (not value-typed
+    /// Expr) for the same cycle-breaking reason as MatchArm/IfExpr
+    /// fields — see the `Pattern` doc in ast.zig. Each pattern value
+    /// is lifted into an arena slot before being wrapped in the
+    /// pointer-typed union variant.
+    fn parsePattern(self: *Parser) ast.Pattern {
+        const tok = self.peek();
+        switch (tok.tag) {
+            .integer_literal => {
+                // Range detection: if literal is followed by .. or ...,
+                // and the next-after-that is another int literal, it's a
+                // range pattern. Otherwise it's a literal pattern.
+                if (self.pos + 2 < self.tokens.len and
+                    (self.tokens[self.pos + 1].tag == .range or self.tokens[self.pos + 1].tag == .ellipsis) and
+                    self.tokens[self.pos + 2].tag == .integer_literal)
+                {
+                    const start_text = tok.text;
+                    const sep = self.tokens[self.pos + 1].tag;
+                    const inclusive = sep == .ellipsis;
+                    const end_text = self.tokens[self.pos + 2].text;
+                    self.advance(); // start
+                    self.advance(); // .. or ...
+                    self.advance(); // end
+                    const start_buf = self.arena.alloc(Expr, 1);
+                    start_buf[0] = .{ .int_lit = start_text };
+                    const end_buf = self.arena.alloc(Expr, 1);
+                    end_buf[0] = .{ .int_lit = end_text };
+                    return .{ .range = .{ .start = &start_buf[0], .end = &end_buf[0], .inclusive = inclusive } };
+                }
+                self.advance();
+                const lit_buf = self.arena.alloc(Expr, 1);
+                lit_buf[0] = .{ .int_lit = tok.text };
+                return .{ .literal = &lit_buf[0] };
+            },
+            .string_literal => {
+                self.advance();
+                const lit_buf = self.arena.alloc(Expr, 1);
+                lit_buf[0] = .{ .string_lit = tok.text };
+                return .{ .literal = &lit_buf[0] };
+            },
+            .true_kw => {
+                self.advance();
+                const lit_buf = self.arena.alloc(Expr, 1);
+                lit_buf[0] = .{ .bool_lit = true };
+                return .{ .literal = &lit_buf[0] };
+            },
+            .false_kw => {
+                self.advance();
+                const lit_buf = self.arena.alloc(Expr, 1);
+                lit_buf[0] = .{ .bool_lit = false };
+                return .{ .literal = &lit_buf[0] };
+            },
+            .char_literal => {
+                self.advance();
+                const lit_buf = self.arena.alloc(Expr, 1);
+                lit_buf[0] = .{ .char_lit = tok.text };
+                return .{ .literal = &lit_buf[0] };
+            },
+            .identifier => {
+                if (std.mem.eql(u8, tok.text, "_")) {
+                    self.advance();
+                    return .{ .discard = {} };
+                }
+                const name = self.expectIdent();
+                return .{ .ident = name };
+            },
+            else => {
+                std.debug.print("error:{d}:{d}: expected match-arm pattern (literal, range, ident, or '_'), got '{s}'\n", .{ tok.loc.line, tok.loc.col, tok.text });
+                std.process.exit(1);
+            },
+        }
+    }
+
+    /// `return [expr];` — expr is optional, yielding bare `return;`.
+    /// Returns the inner payload struct `Stmt.ReturnStmt` so the dispatch
+    /// in `parseStmt` can assign into `.return_stmt = …` directly.
+    fn parseReturnStmt(self: *Parser) Stmt.ReturnStmt {
+        self.expect(.return_kw);
+        // Bare return: only valid when the next token is `;`, `}`, or
+        // newline-terminated (which our block parser strips). For body
+        // source like `return;` parse post-newline `parsePostStmt` runs
+        // before the next parseStmt call so the leading token is whatever
+        // follows; treat newlines and `}` as bare.
+        if (self.peek().tag == .newline or self.peek().tag == .rbrace or self.peek().tag == .eof) {
+            return .{ .value = null };
+        }
+        const value = self.parseExpr();
+        return .{ .value = value };
+    }
+
+    /// Helper for parsing the inside of a block. Caller is responsible for
+    /// consuming the surrounding `{` and `}`. Skips leading newlines and
+    /// terminates at the first non-newline token that's NOT a statement
+    /// delimiter (i.e. when the next token is `}` the caller will consume).
+    fn parseStmtList(self: *Parser) []const Stmt {
+        var stmts_buf: [256]Stmt = undefined;
+        var stmt_count: usize = 0;
+        while (self.peek().tag != .rbrace and !self.eof()) {
+            if (self.peek().tag == .newline) {
+                self.advance();
+                continue;
+            }
+            stmts_buf[stmt_count] = self.parseStmt();
+            stmt_count += 1;
+        }
+        const stmts = self.arena.alloc(Stmt, stmt_count);
+        @memcpy(stmts, stmts_buf[0..stmt_count]);
+        return stmts;
+    }
+
     /// Top-level entry point: parses a full Zag expression. Delegates to a
     /// 12-layer precedence ladder rooted at parseRange (lowest precedence)
     /// and terminating at parsePrimary (highest precedence). The ordering
@@ -397,8 +715,28 @@ pub const Parser = struct {
     /// so `1 + 2 * 3` parses as `1 + (2 * 3)` rather than `(1 + 2) * 3`,
     /// and `0..10 + 5` parses as `0..(10 + 5)` because range binds looser
     /// than additive.
+    ///
+    /// Handles expression-position `if` and `match` BEFORE delegating to
+    /// the precedence ladder. The check is essential because the ladder's
+    /// parseRange never sees `.if_kw` (its first layer parses an Expression
+    /// for the LHS, then expects `.range` or `.ellipsis`); without the
+    /// leading-token check at the entry, `let x = if cond { … } else { … };`
+    /// would consume `let x = <parse-the-let>` and reject the `if` because
+    /// parseExpr only knows how to dispatch to binary-expr layers.
     fn parseExpr(self: *Parser) Expr {
-        return self.parseRange();
+        switch (self.peek().tag) {
+            .if_kw => return self.parseIfExpr(),
+            .match_kw => {
+                const m = self.parseMatchExpr();
+                // Wrap in Expr.match_expr so codegen sees the same node shape
+                // regardless of whether the call site is statement-position
+                // or expression-position. Statement-position call sites
+                // (i.e. `parseStmt`'s `.match_kw` arm) build the same
+                // match_expr and route the codegen via this exact node.
+                return .{ .match_expr = m };
+            },
+            else => return self.parseRange(),
+        }
     }
 
     /// Additive layer: chains `+`/`-` while the next token is one of those.
@@ -695,7 +1033,17 @@ pub const Parser = struct {
     fn collectCastType(self: *Parser) []const u8 {
         var buf: [256]u8 = undefined;
         var len: usize = 0;
-        var first = true;
+        // `prev_was_ptr` tracks whether the prior emitted token was the
+        // pointer marker `*`. When true, the NEXT identifier must be
+        // concatenated directly (no space) so `*` + `raw` yields the
+        // single token `*raw` (the form zig 0.16 expects for raw-pointer
+        // modifier keywords). When false, two consecutive identifiers
+        // ARE separated by a space (`T` + `U` → `T U`). The previous
+        // `first`-flag approach lost this distinction: after consuming
+        // `*`, `first` flipped to `false`, then the next ident triggered
+        // the space branch — so `*raw u8` was emitted as `* raw u8`,
+        // breaking the `cast.type_text == "*raw u8"` test.
+        var prev_was_ptr = false;
         while (!self.eof()) {
             const tok = self.peek();
             const is_term: bool = switch (tok.tag) {
@@ -707,7 +1055,9 @@ pub const Parser = struct {
             // and identifiers as the type name proper.
             if (tok.tag == .identifier or tok.tag == .print) {
                 const text = tok.text;
-                if (!first and len + 1 <= buf.len) {
+                // Insert a space ONLY when both prev was an ident (not a
+                // pointer marker) AND something has already been emitted.
+                if (len > 0 and !prev_was_ptr and len + 1 <= buf.len) {
                     buf[len] = ' ';
                     len += 1;
                 }
@@ -715,23 +1065,35 @@ pub const Parser = struct {
                     @memcpy(buf[len..][0..text.len], text);
                     len += text.len;
                 }
-                first = false;
+                prev_was_ptr = false;
                 self.advance();
             } else if (tok.tag == .star) {
                 // Pointer marker — emit `*` and concatenate without space so
-                // `*` + `raw` yields `*raw` (the form zig wants for the
-                // raw-pointer modifier keyword).
+                // `*` + `raw` yields `*raw`. No preceding space regardless
+                // of prior emission because the previous token was an ident
+                // we want glued onto `*<name>` shape (zig rejects `T * raw`
+                // in raw-pointer context).
                 if (len + 1 <= buf.len) {
                     buf[len] = '*';
                     len += 1;
                 }
-                first = false;
+                prev_was_ptr = true;
                 self.advance();
             } else {
                 break;
             }
         }
-        return buf[0..len];
+        // Arena-allocate the captured text so it outlives this function's
+        // stack frame. The earlier stack-local `return buf[0..len]` was a
+        // dangling pointer — `parseCast` stored the slice directly on the
+        // AST's `cast.type_text` field, and codegen read random stack
+        // residue at use time. Mirroring the existing pattern of allocating
+        // Expr / Stmt structs on the arena (see `parseCast`'s
+        // `arena.alloc(Expr, 1)` and `parseIfExpr`'s allocations).
+        if (len == 0) return &[_]u8{};
+        const arena_slice = self.arena.alloc(u8, len);
+        @memcpy(arena_slice, buf[0..len]);
+        return arena_slice;
     }
 
     fn parsePostfix(self: *Parser) Expr {

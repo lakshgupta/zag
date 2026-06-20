@@ -41,6 +41,13 @@ pub const Codegen = struct {
     /// expressions in the same body never collide on the same temporary
     /// name (zig's no-redeclaration rule would reject a clash).
     alloc_counter: u32,
+    /// Per-function counter for match scrutinee temps. Reset to 0 by
+    /// `genFun` so each `pub fn` body has its own `__m_0`, `__m_1`, ...
+    /// sequence. Two match expressions in the same body produce distinct
+    /// names so zig's no-redeclaration rule is satisfied. Reusing the
+    /// existing counters here would create collisions with destructuring
+    /// temps (`__destruct_<N>`) and `new` heap locals (`__p_<N>`).
+    match_counter: u32,
 
     pub fn init() Codegen {
         return .{
@@ -50,6 +57,7 @@ pub const Codegen = struct {
             .type_info_buf = undefined,
             .type_info_count = 0,
             .alloc_counter = 0,
+            .match_counter = 0,
         };
     }
 
@@ -98,6 +106,12 @@ pub const Codegen = struct {
         // sibling `pub fn` declarations don't reuse the same `__p_<N>`
         // names (zig's redeclaration-error would reject a collision).
         self.alloc_counter = 0;
+        // Per-function match scrutinee counter for the laddered match
+        // codegen path (see `genMatchExpr`). Two match expressions in
+        // the same body produce distinct `__m_<N>` names so zig's
+        // no-redeclaration rule is satisfied; sibling `pub fn`s reset
+        // their own counters to start fresh at `_0`.
+        self.match_counter = 0;
         for (fun.body) |stmt| {
             self.collectTypedBindings(stmt);
         }
@@ -244,6 +258,94 @@ pub const Codegen = struct {
                     self.genStmt(s);
                 }
                 self.write("    // }\n");
+            },
+            .if_stmt => |ifs| {
+                // Statement form: `if (cond) { … } else …` rendered with
+                // zig's `if`/`else` keyword directly. The recursive
+                // `else_kind` union walks the chain so `else if …`, `else`,
+                // and bare (`none`) all render uniformly via `genElseBranch`.
+                self.write("    if (");
+                self.genExpr(ifs.cond);
+                self.write(") {\n");
+                for (ifs.then_body) |s| self.genStmt(s);
+                self.write("    }");
+                self.genElseBranch(ifs.else_kind);
+                self.write("\n");
+            },
+            .while_stmt => |ws| {
+                // Plain `while (cond) { … }` mirrors zig directly. Cond
+                // and body are both standard zig, so no shim is needed.
+                self.write("    while (");
+                self.genExpr(ws.cond);
+                self.write(") {\n");
+                for (ws.body) |s| self.genStmt(s);
+                self.write("    }\n");
+            },
+            .for_stmt => |fs| {
+                // `for (iter) |pat| { … }`. The iter expression is emitted
+                // verbatim when it isn't a RangeExpr; for ranges we
+                // INLINE emit `start..end[ + 1]` so zig's native range
+                // syntax handles iteration without the
+                // anonymous-tuple-wrapper round-trip (zag's RangeExpr
+                // emits `.{ start, end, inclusive }`, NOT a native range).
+                // Inclusive ranges get +1 so the half-open semantics
+                // become inclusive; static and dynamic ends both work
+                // because `end + 1` is a valid zig binary expression.
+                self.write("    for (");
+                if (fs.iter == .range) {
+                    self.genExpr(fs.iter.range.start.*);
+                    self.write("..");
+                    self.genExpr(fs.iter.range.end.*);
+                    if (fs.iter.range.inclusive) self.write(" + 1");
+                } else {
+                    self.genExpr(fs.iter);
+                }
+                self.write(") |");
+                switch (fs.pattern) {
+                    .ident => |name| self.write(name),
+                    .discard => self.write("_"),
+                    else => {
+                        // Range / literal patterns inside `for` are not
+                        // supported in this commit; emit a placeholder.
+                        self.write("_");
+                    },
+                }
+                self.write("| {\n");
+                for (fs.body) |s| self.genStmt(s);
+                self.write("    }\n");
+            },
+            .match_stmt => |m| {
+                // Match is always expression-valued per the user-confirmed
+                // shape; the statement-position wrapper just wraps the
+                // match_expr emission in `expr_stmt` semantics by emitting
+                // it inline and ignoring the discard (zig accepts unused
+                // expressions without error in statement position).
+                self.genMatchExpr(m);
+                self.write(";\n");
+            },
+            .break_stmt => {
+                // Statement-only break per the user-confirmed shape.
+                // zig's `break;` targets the innermost enclosing loop by
+                // default; no label needed for the single-level case.
+                self.write("    break;\n");
+            },
+            .continue_stmt => {
+                // Continue targets the innermost loop by default; emit
+                // verbatim.
+                self.write("    continue;\n");
+            },
+            .return_stmt => |r| {
+                // `return expr;` or bare `return;`. The function
+                // signature isn't yet parsed, so zig's downstream type
+                // checker validates the type against the inferred
+                // `pub fn main() !void` body return shape.
+                if (r.value) |v| {
+                    self.write("    return ");
+                    self.genExpr(v);
+                    self.write(";\n");
+                } else {
+                    self.write("    return;\n");
+                }
             },
             .index_assign => |ia| {
                 // `target[i] = value;` writes a single element of an
@@ -706,6 +808,31 @@ pub const Codegen = struct {
                 self.write(if (r.inclusive) "true" else "false");
                 self.write(" }");
             },
+            .if_expr => |ife| {
+                // `if cond { … } else { … }` expression form. Emitted as a
+                // labeled block + two `break :blk` arms so the whole
+                // construct yields a value without forcing zig's `if` to
+                // be the only shape. The outer parens make this a
+                // parenthesised expression so the caller can use it in any
+                // expression position (RHS of let, binary operand, etc.).
+                // Pointer fields are dereferenced because IfExpr carries
+                // `*Expr` to break the Expr-size type cycle (see the
+                // `IfExpr`/IfExpr.doc in ast.zig).
+                self.write("(blk: { if (");
+                self.genExpr(ife.cond.*);
+                self.write(") break :blk ");
+                self.genExpr(ife.then_expr.*);
+                self.write(" else break :blk ");
+                self.genExpr(ife.else_expr.*);
+                self.write("; })");
+            },
+            .match_expr => |m| {
+                // Same laddered emission as the statement-position form.
+                // Just rendered without a trailing semicolon because the
+                // caller is embedding us in a larger expression (e.g. the
+                // RHS of a let binding).
+                self.genMatchExpr(m);
+            },
             .binary => |b| {
                 // zig 0.16 shim (see `needsIntDivShim` doc above). When the
                 // predicate fires for `.div`/`.mod` we route through
@@ -835,6 +962,164 @@ pub const Codegen = struct {
     }
 
     const TemplateCtx = enum { debug_print, buf_print };
+
+    /// Recursive walker for `Stmt.IfStmt.else_kind`. The caller's
+    /// `genStmt` does the leading `if (cond) { … }` and we emit the suffix
+    /// — `.none` ends the chain, `.block` emits a terminal `else { … }`,
+    /// `.if_chain` recurses into a boxed `else if` (boxed `*IfStmt`
+    /// pointer enables arbitrarily deep chains without the struct being
+    /// self-referential in the tagged-union type system).
+    fn genElseBranch(self: *Codegen, else_kind: ast.Stmt.IfStmt.IfElseKind) void {
+        switch (else_kind) {
+            .none => {},
+            .block => |stmts| {
+                self.write(" else {\n");
+                for (stmts) |s| self.genStmt(s);
+                self.write("    }");
+            },
+            .if_chain => |ifs_ptr| {
+                self.write(" else if (");
+                self.genExpr(ifs_ptr.cond);
+                self.write(") {\n");
+                for (ifs_ptr.then_body) |s| self.genStmt(s);
+                self.write("    }");
+                // Recurse for the chained else_kind (another else-if, a
+                // terminal else block, or none).
+                self.genElseBranch(ifs_ptr.else_kind);
+            },
+        }
+    }
+
+    /// Emit a `match scrutinee { arms... }` as a labeled-block if-else
+    /// ladder. The block binds the scrutinee ONCE to a unique `__m_<N>`
+    /// (per-function counter), so arm conditions and bodies can refer to
+    /// the same value without re-evaluating the scrutinee each time.
+    ///
+    /// Trailing fallback: when the last arm is NOT a wildcard, codegen
+    /// appends `else unreachable;` so zig's exhaustive-match check is
+    /// satisfied (zig would otherwise flag the ladder as
+    /// not-covering-all-paths). When the last arm IS a wildcard, the
+    /// wildcard arm's body is the natural fallback — no extra emission.
+    ///
+    /// Ident-pattern arm body emission prepends `const <name> = __m_<N>;`
+    /// before `break :blk body` so the body's expression can reference
+    /// the binding name. Codegen's `exhaustiveness` intent — without
+    /// this prepend, `match e { x => x + 1, _ => 0 }` would emit
+    /// `break :blk (x + 1);` with no `x` definition and zig would reject.
+    ///
+    /// Caller of `.match_stmt` (statement-position use) appends `;\n`
+    /// after this emission; caller of `.match_expr` (expression-position
+    /// use) does NOT — the result is already inside parens so it fits
+    /// as RHS of `let` or operand of binary op.
+    fn genMatchExpr(self: *Codegen, m: ast.Expr.MatchExpr) void {
+        const id = self.match_counter;
+        self.match_counter += 1;
+        var name_buf: [16]u8 = undefined;
+        const scrut_name = std.fmt.bufPrint(&name_buf, "__m_{d}", .{id}) catch "__m";
+        self.write("(blk: { const ");
+        self.write(scrut_name);
+        self.write(" = ");
+        // `m.scrutinee` is `*Expr` (cycle-breaking pointer) — deref before
+        // walking the AST via genExpr.
+        self.genExpr(m.scrutinee.*);
+        self.write("; ");
+        var had_any_arm = false;
+        for (m.arms) |arm| {
+            if (had_any_arm) self.write(" else ");
+            self.write("if (");
+            self.emitPatternCond(scrut_name, arm.pat);
+            if (arm.guard) |g| {
+                self.write(" and (");
+                // `arm.guard` is `?*Expr` — deref the pointer before
+                // emitting the guard expression body.
+                self.genExpr(g.*);
+                self.write(")");
+            }
+            self.write(") { ");
+            if (arm.pat == .ident) {
+                // Ident-pattern arm: bind scrutinee to `<name>` so the
+                // arm's body can reference it. Always emitted as
+                // `const` because the binding is synthetic and a
+                // shadow never reuses the name within an arm body.
+                self.write("const ");
+                self.write(arm.pat.ident);
+                self.write(" = ");
+                self.write(scrut_name);
+                self.write("; ");
+            }
+            self.write("break :blk ");
+            // `arm.expr` is `*Expr` (cycle-breaking pointer) — deref before
+            // emitting the arm-body expression.
+            self.genExpr(arm.expr.*);
+            self.write("; }");
+            had_any_arm = true;
+        }
+        const last_is_wildcard = m.arms.len > 0 and m.arms[m.arms.len - 1].pat == .discard;
+        if (!last_is_wildcard) {
+            if (had_any_arm) {
+                self.write(" else unreachable;");
+            } else {
+                self.write("unreachable;");
+            }
+        }
+        self.write(" })");
+    }
+
+    /// Emit the boolean condition that gates one match-arm. Pulled out
+    /// from `genMatchExpr` because each pattern kind has a distinct
+    /// emission shape (literal comparison, range bound check, ident/
+    /// discard constant `true`).
+    ///
+    /// The scrutinee name is passed in so the caller picks a fresh
+    /// `__m_<N>` per match expression (without parameterising, two
+    /// matches in the same body would clash on `__m`).
+    fn emitPatternCond(self: *Codegen, scrut_name: []const u8, p: ast.Pattern) void {
+        switch (p) {
+            .literal => |lit| {
+                // `__m == <lit>` for int / bool / char. For string,
+                // emit `std.mem.eql(u8, __m, "...")` because direct `==`
+                // is rejected by zig 0.16 on `[]const u8` (slices don't
+                // implement equality by default). `lit` is `*Expr` (the
+                // Pattern-variant cycle-breaking pointer) so deref
+                // before walking.
+                switch (lit.*) {
+                    .string_lit => |s| {
+                        self.write("std.mem.eql(u8, ");
+                        self.write(scrut_name);
+                        self.write(", \"");
+                        self.write(s);
+                        self.write("\")");
+                    },
+                    else => {
+                        self.write(scrut_name);
+                        self.write(" == ");
+                        self.genExpr(lit.*);
+                    },
+                }
+            },
+            .range => |r| {
+                // Half-open: `__m >= start and __m < end`.
+                // Inclusive: `__m >= start and __m <= end`.
+                // Wrapping in `(...)` so the `and` operator is the
+                // outermost, not silently captured by surrounding
+                // precedence (zig's `and` is a freestanding keyword
+                // here, but we keep the parens for explicitness).
+                // `.start` and `.end` are `*Expr` (Pattern-range cycle-
+                // breaking pointers) so deref before emitting.
+                self.write("((");
+                self.write(scrut_name);
+                self.write(" >= ");
+                self.genExpr(r.start.*);
+                self.write(") and (");
+                self.write(scrut_name);
+                if (r.inclusive) self.write(" <= ") else self.write(" < ");
+                self.genExpr(r.end.*);
+                self.write("))");
+            },
+            .ident => self.write("true"),
+            .discard => self.write("true"),
+        }
+    }
 
     /// Emit a Zag string-interpolation template literal.
     ///

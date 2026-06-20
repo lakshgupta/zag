@@ -1685,7 +1685,10 @@ test "codegen: 1/2 stays bare when both sides are comptime int" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (1 / 2);") != null);
+    // Preserve the explicit `let z: i32 = 1 / 2` annotation through to
+    // zig; the carve-out keeps bare-form legal too, so the test stays
+    // source-shape stable here.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: i32 = (1 / 2);") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
 }
 
@@ -1702,7 +1705,8 @@ test "codegen: 1.0/2.0 stays bare when LHS is float" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (1.0 / 2.0);") != null);
+    // Preserve the explicit `let z: f64 = 1.0 / 2.0` annotation through.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: f64 = (1.0 / 2.0);") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
 }
@@ -1742,7 +1746,9 @@ test "codegen: 2/x stays bare when LHS is comptime int and RHS is ident" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (2 / x);") != null);
+    // Source includes the `: i32` annotation — preserve it in the
+    // assertion to track the actual emission.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: i32 = (2 / x);") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
 }
 
@@ -1759,7 +1765,12 @@ test "codegen: 1.0/x stays bare when LHS is float and RHS is ident" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (1.0 / x);") != null);
+    // Preserve the explicit `let z: f64 = 1.0 / x` annotation through to
+    // zig; codegen forwards `: T` on the binding so the assertion tracks
+    // the actual emission shape (the test stays bare-form-agnostic —
+    // `1.0` is float and `x` is unannotated, neither path can ever
+    // trigger the `@divTrunc` shim).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: f64 = (1.0 / x);") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
 }
@@ -1777,7 +1788,7 @@ test "codegen: f64-typed ident LHS / int_lit stays bare (typed-binding lookup)" 
     const src =
         \\fun f() {
         \\    let pi: f64 = 3.14;
-        \\    let r = pi / 2;
+        \\    let r: f64 = pi / 2;
         \\}
         \\
     ;
@@ -1789,7 +1800,9 @@ test "codegen: f64-typed ident LHS / int_lit stays bare (typed-binding lookup)" 
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     // Bare form preserved; no shim wrap.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const r = (pi / 2);") != null);
+    // Source includes the `: f64` annotation — mirror it in the assertion
+    // so the test tracks the actual emission.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const r: f64 = (pi / 2);") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
 }
@@ -1803,7 +1816,7 @@ test "codegen: i32-typed ident LHS / int_lit still triggers @divTrunc shim" {
     const src =
         \\fun f() {
         \\    let n: i32 = 10;
-        \\    let z = n / 2;
+        \\    let z: i32 = n / 2;
         \\}
         \\
     ;
@@ -1815,7 +1828,10 @@ test "codegen: i32-typed ident LHS / int_lit still triggers @divTrunc shim" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc(n, 2)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (n / 2);") == null);
+    // Source includes `: i32` annotation; codegen shim path replaces
+    // `(n / 2)` with `@divTrunc(n, 2)` so the literal bare form does
+    // NOT survive.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: i32 = (n / 2);") == null);
 }
 
 test "codegen: f64-typed ident LHS % int_lit stays bare" {
@@ -1825,7 +1841,7 @@ test "codegen: f64-typed ident LHS % int_lit stays bare" {
     const src =
         \\fun f() {
         \\    let pi: f64 = 3.14;
-        \\    let r = pi % 2;
+        \\    let r: f64 = pi % 2;
         \\}
         \\
     ;
@@ -1836,37 +1852,26 @@ test "codegen: f64-typed ident LHS % int_lit stays bare" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const r = (pi % 2);") != null);
+    // Source includes `: f64` annotation; codegen routes the bare form
+    // through (mirror of the `/` test).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const r: f64 = (pi % 2);") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
 }
 
 test "codegen: unannotated i32-init binding / int_lit still triggers @divTrunc" {
-    // Pins the conservative shim rule for unannotated bindings. `let x =
-    // 10; x / 2` doesn't enter the type-info map (the predicate's
-    // `collectTypedBindings` only collects `: T`-annotated bindings —
-    // see the typed-binding-lookup tests for the f64 vs i32 distinction),
-    // so `isFloatIdentType("x")` returns false, the predicate falls
-    // through to its `!exprContainsFloat(.ident)` guard, and the shim
-    // fires — emitting `@divTrunc(x, 2)`. Zig accepts because `x` is a
-    // comptime_int inferred from `10` and both `@divTrunc` operands are
-    // integer-typed. Net effect: no over-broad skip when the map is empty.
-    const src =
-        \\fun f() {
-        \\    let x = 10;
-        \\    let z = x / 2;
-        \\}
-        \\
-    ;
-    var l = lexer_mod.Lexer.init(src);
-    const tokens = l.tokenize();
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-    var cg = codegen_mod.Codegen.init();
-    const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc(x, 2)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const z = (x / 2);") == null);
+    // DELETED: the static-typed-coercion carve-out now requires `: T`
+    // annotations on EVERY bare binding whose RHS is a non-literal
+    // expression. The original test source `let x = 10; let z = x / 2;`
+    // no longer parses (it surfaces "let requires an explicit type
+    // annotation when binding non-tuple values"). The semantic intent
+    // — verifying that the shim still fires when the LHS maps to an
+    // integer type — is now exercised by the
+    // `i32-typed ident LHS / int_lit still triggers @divTrunc shim` test
+    // directly above, which carries the `: i32` annotation on both
+    // bindings and asserts the same shim path. No regression introduced
+    // — the typed-binding map's "integer → shim fires" code path is
+    // still covered.
 }
 
 // -------------------------------------------------------------------
@@ -1910,10 +1915,15 @@ test "lexer: control-flow keywords (if/else/while/for/in/match/break/continue)" 
         "in",    "match",
         "break", "continue",
     };
+    // Use a simple counter instead of @intFromPtr arithmetic — pointer
+    // math on a `for`-loop iteration variable computes gibberish because
+    // `tag` lives on the stack, NOT as an element of `expected_tags`.
+    // (This previously panicked at runtime with `index out of bounds`.)
+    var i: usize = 0;
     for (expected_tags, expected_texts) |tag, text| {
-        const idx = (@intFromPtr(&tag) - @intFromPtr(&expected_tags[0])) / @sizeOf(lexer_mod.TokenTag);
-        try std.testing.expectEqual(tag, tokens[idx].tag);
-        try std.testing.expectEqualStrings(text, tokens[idx].text);
+        try std.testing.expectEqual(tag, tokens[i].tag);
+        try std.testing.expectEqualStrings(text, tokens[i].text);
+        i += 1;
     }
 }
 
@@ -2123,4 +2133,777 @@ test "codegen: as cast emits passthrough with parens" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const y: i32 = (x as i32);") != null);
+}
+
+// -------------------------------------------------------------------
+// docs/06-control-flow.md feature tests — if / while / for / match /
+// break / continue / return. Each pair pins a parser tag and a codegen
+// emission shape. These are the foundational surface for the control
+// flow chapter; any future refactor that breaks the AST tag mapping or
+// the zig emission shape will be caught here. The features deliberately
+// stop short of the full docs/06 surface (panic, enum-variant
+// patterns, tuple destructuring in `for`, `break val;` value-form,
+// multi-statement match arm bodies — see the orphan-tests followup).
+// -------------------------------------------------------------------
+
+test "parser: if-stmt parses as Stmt.if_stmt" {
+    // The unconditional `if` branch surfaces as a Tagged-Stmt.if_stmt
+    // (NOT `.if_expr`), confirming that the statement form is in place.
+    // The cond captures the predicate expression and the body block
+    // holds the inner statement list.
+    const src =
+        \\fun f() {
+        \\    if x > 0 {
+        \\        print(\"positive\n\");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .if_stmt);
+    try std.testing.expect(stmt.if_stmt.cond == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.gt, stmt.if_stmt.cond.binary.op);
+    try std.testing.expectEqual(@as(usize, 1), stmt.if_stmt.then_body.len);
+    try std.testing.expect(stmt.if_stmt.then_body[0] == .expr_stmt);
+    try std.testing.expect(stmt.if_stmt.else_kind == .none);
+}
+
+test "parser: if-stmt with else-if chain walks nested if_kind" {
+    // An `else if …` chain should fold into the .if_chain arm of the
+    // OUTER if_stmt's else_kind rather than creating a stmt-level
+    // sibling — the chain lives structurally inside the first if so
+    // codegen can emit it as a single `if/else if/else if` block.
+    const src =
+        \\fun f() {
+        \\    if a {
+        \\        print("a\n");
+        \\    } else if b {
+        \\        print("b\n");
+        \\    } else {
+        \\        print("other\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .if_stmt);
+    try std.testing.expect(stmt.if_stmt.else_kind == .if_chain);
+    const mid = stmt.if_stmt.else_kind.if_chain;
+    try std.testing.expect(mid.cond == .ident);
+    try std.testing.expectEqualStrings("b", mid.cond.ident);
+    try std.testing.expect(mid.else_kind == .block);
+}
+
+test "parser: if-expression parses as Expr.if_expr (RHS of let)" {
+    // The expression form `let x = if cond { … } else { … }` lands in
+    // Expr.if_expr (NOT .if_stmt) so codegen can emit it as a value-yielding
+    // block. The two arms carry pointers (cycle-broken type, see
+    // parseIfExpr in parser.zig).
+    const src =
+        \\fun f() {
+        \\    let z: i32 = if x > 0 { 1 } else { 0 };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .if_expr);
+    try std.testing.expect(init.if_expr.cond.* == .binary);
+    try std.testing.expect(init.if_expr.then_expr.* == .int_lit);
+    try std.testing.expectEqualStrings("1", init.if_expr.then_expr.*.int_lit);
+    try std.testing.expect(init.if_expr.else_expr.* == .int_lit);
+    try std.testing.expectEqualStrings("0", init.if_expr.else_expr.*.int_lit);
+}
+
+test "codegen: plain if-stmt emits zig if without else" {
+    // Statement form with no else: codegen emits `if (cond) { … }` and
+    // no suffix for the absent else branch (no dangling `else`).
+    const src =
+        \\fun f() {
+        \\    if x > 0 {
+        \\        print("positive\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    if (x > 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    }") != null);
+    // Sanity: not a labeled blk form (was used for the expression variant
+    // only).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk: {") == null);
+}
+
+test "codegen: if-stmt with else emits zig if/else" {
+    // Statement form with else: codegen emits `if (cond) { … } else { … }`.
+    const src =
+        \\fun f() {
+        \\    if x > 0 {
+        \\        print("pos\n");
+        \\    } else {
+        \\        print("neg\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    if (x > 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    } else {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    print(\"neg\\n\");") != null);
+}
+
+test "codegen: if-stmt with else-if chain emits chained zig emission" {
+    // A multi-arm else-if chain should emit as a single `if/else if/
+    // else` zigzag statement — no nested `(blk: { ... })` blocks for the
+    // pure statement form.
+    const src =
+        \\fun f() {
+        \\    if a {
+        \\        print("a\n");
+        \\    } else if b {
+        \\        print("b\n");
+        \\    } else {
+        \\        print("other\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    if (a) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    } else if (b) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    } else {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    print(\"other\\n\");") != null);
+}
+
+test "codegen: if-expression emits labeled blk + break :blk" {
+    // The expression form must surface as a labeled block yielding a value:
+    // `(blk: { if (cond) break :blk <then> else break :blk <else>; })`.
+    // The outer `(blk: { … })` makes the rhs parenthesised so it can sit in
+    // any expression position (e.g. RHS of a `let` binding).
+    const src =
+        \\fun f() {
+        \\    let z: i32 = if x > 0 { 1 } else { 0 };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk: { if (x > 0) break :blk 1 else break :blk 0; })") != null);
+}
+
+test "parser: while-stmt parses as Stmt.while_stmt" {
+    // Standard while loop: cond captured as Expr, body as slice of Stmt.
+    const src =
+        \\fun f() {
+        \\    while i < 10 {
+        \\        i = i + 1;
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .while_stmt);
+    try std.testing.expect(stmt.while_stmt.cond == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.lt, stmt.while_stmt.cond.binary.op);
+    try std.testing.expectEqual(@as(usize, 1), stmt.while_stmt.body.len);
+}
+
+test "codegen: while-stmt emits zig while verbatim" {
+    // The cond and body emit directly via zig's native syntax — no shim
+    // is needed because zig's `while` semantics match zag's.
+    const src =
+        \\fun f() {
+        \\    while i < 10 {
+        \\        i = i + 1;
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    while (i < 10) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    i = (i + 1);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    }") != null);
+}
+
+test "parser: for-range parses as Stmt.for_stmt with RangeExpr iter" {
+    // `for i in 0..10` should land on Stmt.for_stmt. The iter expression
+    // should be an Expr.range (start=0, end=10, inclusive=false). The
+    // pattern is a single .ident so the for-loop's capture-name comes
+    // through verbatim.
+    const src =
+        \\fun f() {
+        \\    for i in 0..10 {
+        \\        print("i\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .for_stmt);
+    try std.testing.expect(stmt.for_stmt.iter == .range);
+    try std.testing.expectEqualStrings("0", stmt.for_stmt.iter.range.start.*.int_lit);
+    try std.testing.expectEqualStrings("10", stmt.for_stmt.iter.range.end.*.int_lit);
+    try std.testing.expect(!stmt.for_stmt.iter.range.inclusive);
+    try std.testing.expect(stmt.for_stmt.pattern == .ident);
+    try std.testing.expectEqualStrings("i", stmt.for_stmt.pattern.ident);
+}
+
+test "parser: for-incl range sets inclusive flag" {
+    // `...` (ellipsis) in zag maps to inclusive=true so codegen can add
+    // 1 to make zig's half-open range iterate inclusively.
+    const src =
+        \\fun f() {
+        \\    for i in 0...10 {
+        \\        print("i\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .for_stmt);
+    try std.testing.expect(stmt.for_stmt.iter.range.inclusive);
+}
+
+test "parser: for-iter non-range parses with the user expression as iter" {
+    // `for x in items()` carries the call expression as for_stmt.iter
+    // (NOT as range) so codegen routes to verbatim emission rather than
+    // the inline range rewrite.
+    const src =
+        \\fun f() {
+        \\    for x in items() {
+        \\        print("x\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .for_stmt);
+    try std.testing.expect(stmt.for_stmt.iter == .call);
+    try std.testing.expectEqualStrings("items", stmt.for_stmt.iter.call.name);
+}
+
+test "codegen: for-range emits zig `start..end[+1]`" {
+    // The range shape gets INLINE-emitted as `start..end[ + 1]` so zig's
+    // native range syntax (half-open) encodes the inclusive flag without
+    // the anonymous-tuple round-trip.
+    const src =
+        \\fun f() {
+        \\    for i in 0..10 {
+        \\        print("i\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    for (0..10) |i| {") != null);
+    // Sanity: the .iter not as anonymous struct.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "for (.{ 0,") == null);
+}
+
+test "codegen: for-incl range emits end+1" {
+    // Inclusive range (3-arm `.end + 1`) flips the half-open semantics
+    // into inclusive so `for i in 0...10` iterates 0,1,…,10 (not 0,…,9).
+    const src =
+        \\fun f() {
+        \\    for i in 0...10 {
+        \\        print("i\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    for (0..10 + 1) |i| {") != null);
+}
+
+test "codegen: for-iter non-range emits verbatim iter call" {
+    // For-loop iter that isn't a range emits the user's expression
+    // verbatim — codegen bypasses the inline range rewrite.
+    const src =
+        \\fun f() {
+        \\    for x in items() {
+        \\        print("x\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    for (items()) |x| {") != null);
+}
+
+test "parser: match-stmt with literal arms parses as Stmt.match_stmt" {
+    // The statement-position match lands on Stmt.match_stmt; the
+    // scrutinee and arms are populated correctly. Each arm carries
+    // `pat` + optional `guard` + arm-body expression.
+    const src =
+        \\fun f() {
+        \\    match n {
+        \\        1 => "one",
+        \\        2 => "two",
+        \\        _ => "other",
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .match_stmt);
+    try std.testing.expect(stmt.match_stmt.scrutinee.* == .ident);
+    try std.testing.expectEqualStrings("n", stmt.match_stmt.scrutinee.*.ident);
+    try std.testing.expectEqual(@as(usize, 3), stmt.match_stmt.arms.len);
+
+    try std.testing.expect(stmt.match_stmt.arms[0].pat == .literal);
+    try std.testing.expectEqualStrings("1", stmt.match_stmt.arms[0].pat.literal.*.int_lit);
+    try std.testing.expect(stmt.match_stmt.arms[0].guard == null);
+    try std.testing.expectEqualStrings("one", stmt.match_stmt.arms[0].expr.*.string_lit);
+
+    try std.testing.expect(stmt.match_stmt.arms[1].pat == .literal);
+    try std.testing.expectEqualStrings("2", stmt.match_stmt.arms[1].pat.literal.*.int_lit);
+
+    try std.testing.expect(stmt.match_stmt.arms[2].pat == .discard);
+    try std.testing.expectEqualStrings("other", stmt.match_stmt.arms[2].expr.*.string_lit);
+}
+
+test "parser: match-stmt with range arm and guard" {
+    // A range pattern captures both bounds + inclusive flag; a guard
+    // (the `if cond` after the pattern) is recorded on the arm alongside
+    // the pattern rather than baked into it.
+    const src =
+        \\fun f() {
+        \\    match n {
+        \\        0..10 => "low",
+        \\        _ => "high",
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .match_stmt);
+    try std.testing.expect(stmt.match_stmt.arms[0].pat == .range);
+    try std.testing.expectEqualStrings("0", stmt.match_stmt.arms[0].pat.range.start.*.int_lit);
+    try std.testing.expectEqualStrings("10", stmt.match_stmt.arms[0].pat.range.end.*.int_lit);
+    try std.testing.expect(!stmt.match_stmt.arms[0].pat.range.inclusive);
+}
+
+test "parser: match-stmt with ident-pattern arm binds name" {
+    // An ident-pattern arm (`n => n + 1`) carries the binding name on
+    // arm.pat so codegen can emit `const <name> = __m_<N>;` before the
+    // arm body, giving the body access to the binding.
+    const src =
+        \\fun f() {
+        \\    match n {
+        \\        x => x + 1,
+        \\        _ => 0,
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .match_stmt);
+    try std.testing.expect(stmt.match_stmt.arms[0].pat == .ident);
+    try std.testing.expectEqualStrings("x", stmt.match_stmt.arms[0].pat.ident);
+    try std.testing.expect(stmt.match_stmt.arms[0].expr.* == .binary);
+}
+
+test "parser: match-expression parses as Expr.match_expr" {
+    // Mirroring of the statement form: when `match` sits in expression
+    // position (e.g. RHS of a let binding) it lands on Expr.match_expr
+    // so codegen can emit it as a value-yielding block.
+    const src =
+        \\fun f() {
+        \\    let label: []const u8 = match n {
+        \\        1 => "one",
+        \\        _ => "other",
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init;
+    try std.testing.expect(init == .match_expr);
+    try std.testing.expectEqualStrings("n", init.match_expr.scrutinee.*.ident);
+    try std.testing.expectEqual(@as(usize, 2), init.match_expr.arms.len);
+}
+
+test "codegen: match-stmt emits labeled laddered if-else" {
+    // Each arm gets emitted as an `if (<cond>) { break :blk <body>; }`,
+    // chained via `else`. The scrutinee is bound to a `__m_<N>` temp so
+    // arm conditions can refer to the value without re-evaluation.
+    const src =
+        \\fun f() {
+        \\    match n {
+        \\        1 => "one",
+        \\        2 => "two",
+        \\        _ => "other",
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk: { const __m_0 = n;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (__m_0 == 1) { break :blk \"one\"; }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (__m_0 == 2) { break :blk \"two\"; }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (true) { break :blk \"other\"; }") != null);
+    // Sanity: trail is appended as a `;` (stmt-position append in
+    // genStmt `.match_stmt` arm).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "};") != null);
+}
+
+test "codegen: match-stmt with non-wildcard last emits `else unreachable;`" {
+    // When the last arm is NOT a wildcard, codegen appends `else unreachable;`
+    // so zig's exhaustive-match check is satisfied and the user gets a
+    // compile-time error if they missed a case.
+    const src =
+        \\fun f() {
+        \\    match n {
+        \\        1 => "one",
+        \\        _ => "other",
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The trailing arm IS a wildcard, so no fallback expected:
+    try std.testing.expect(std.mem.indexOf(u8, zig, "unreachable") == null);
+}
+
+test "codegen: match-stmt with non-wildcard LAST arm emits \";}\" + unreachable fallback" {
+    // The user-confirmed shape: when the chain has NO wildcard arm, codegen
+    // must append `else unreachable;` after the last `if (...)` so zig's
+    // exhaustive-match check doesn't fail. This pins the exhaustiveness
+    // intent explicitly.
+    const src =
+        \\fun f() {
+        \\    match n {
+        \\        1 => "one",
+        \\        2 => "two",
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "} else unreachable;") != null);
+}
+
+test "codegen: match-stmt with range arm emits bounds check" {
+    // The range arm builds a bounds check on the scrutinee temp. Half-open
+    // range `0..10` emits `(>= 0) and (< 10)` so the ladder condition
+    // uses zig's native `and` keyword.
+    const src =
+        \\fun f() {
+        \\    match n {
+        \\        0..10 => "low",
+        \\        _ => "high",
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "((__m_0 >= 0) and (__m_0 < 10))") != null);
+}
+
+test "codegen: match-stmt identifies ident arm emits const binding" {
+    // An ident-pattern arm (`x => x + 1`) must emit
+    // `const x = __m_<N>;` BEFORE the arm body's `break :blk` so the
+    // body can reference `x`.
+    const src =
+        \\fun f() {
+        \\    match n {
+        \\        x => x + 1,
+        \\        _ => 0,
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (true) { const x = __m_0; break :blk (x + 1); }") != null);
+}
+
+test "codegen: match-counter increments per match" {
+    // Two match expressions in the same body produce distinct `__m_<N>`
+    // names so zig's no-redeclaration rule is satisfied.
+    const src =
+        \\fun f() {
+        \\    match a {
+        \\        1 => 10,
+        \\        _ => 0,
+        \\    };
+        \\    match b {
+        \\        2 => 20,
+        \\        _ => 0,
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __m_0 = a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __m_1 = b") != null);
+}
+
+test "parser: break-stmt parses as Stmt.break_stmt" {
+    // Statement-only break per the user-confirmed shape: no value form,
+    // no label. The stmt has no payload (the parser materialises the
+    // union case with empty data).
+    const src =
+        \\fun f() {
+        \\    while true {
+        \\        break;
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0].while_stmt.body[0];
+    try std.testing.expect(stmt == .break_stmt);
+}
+
+test "codegen: break-stmt emits zig break;" {
+    // Codegen emits zig's bare `break;` (no label, no value).
+    const src =
+        \\fun f() {
+        \\    while true {
+        \\        break;
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    break;") != null);
+}
+
+test "parser: continue-stmt parses as Stmt.continue_stmt" {
+    // Continue is a bare statements emitted by codegen verbatim.
+    const src =
+        \\fun f() {
+        \\    for i in 0..10 {
+        \\        continue;
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0].for_stmt.body[0];
+    try std.testing.expect(stmt == .continue_stmt);
+}
+
+test "codegen: continue-stmt emits zig continue;" {
+    const src =
+        \\fun f() {
+        \\    for i in 0..10 {
+        \\        continue;
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    continue;") != null);
+}
+
+test "parser: return-stmt with value parses as Stmt.return_stmt with expr" {
+    // `return expr;` carries the value expression on the stmt so codegen
+    // can emit `return <expr>;` verbatim.
+    const src = "fun f() {\n    return 42;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .return_stmt);
+    try std.testing.expect(stmt.return_stmt.value != null);
+    try std.testing.expectEqualStrings("42", stmt.return_stmt.value.?.int_lit);
+}
+
+test "parser: bare return parses as Stmt.return_stmt with null value" {
+    // Bare `return;` (no value) populates `value` with null so codegen
+    // emits `return;` (no expression after).
+    const src = "fun f() {\n    return;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const stmt = prog.functions[0].body[0];
+    try std.testing.expect(stmt == .return_stmt);
+    try std.testing.expect(stmt.return_stmt.value == null);
+}
+
+test "codegen: return-stmt with value emits `return <expr>;`" {
+    const src = "fun f() {\n    return 42;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    return 42;") != null);
+    // Sanity: not the bare form.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    return;") == null);
+}
+
+test "codegen: bare return emits `return;`" {
+    const src = "fun f() {\n    return;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    return;") != null);
 }

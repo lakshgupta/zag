@@ -1,0 +1,32 @@
+## While loops + break / continue
+fun main() {
+    ## Plain `while cond { … }` — zig's native `while` keyword handles
+    ## this verbatim. The cond is an Expression so binary precedence works
+    ## (`i < 10 && ready`).
+    let i: i32 = 0;
+    while i < 3 {
+        print("tick {i}\n");
+        i = i + 1;
+    }
+
+    ## `break;` exits the innermost enclosing loop without a value.
+    ## zag's break is statement-only (no `break val;` value form).
+    let countdown: i32 = 5;
+    while countdown > 0 {
+        if countdown == 2 {
+            break;
+        }
+        countdown = countdown - 1;
+    }
+    print("done\n");
+
+    ## `continue;` skips to the next loop iteration.
+    let skipped: i32 = 0;
+    while skipped < 4 {
+        skipped = skipped + 1;
+        if skipped == 2 {
+            continue;
+        }
+        print("kept {skipped}\n");
+    }
+}

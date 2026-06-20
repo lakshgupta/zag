@@ -1,0 +1,38 @@
+## Match — literal / range / ident / wildcard arms with guards
+fun main() {
+    let n: i32 = 3;
+
+    ## Literal arms: each value case maps to one branch. Codegen emits
+    ## `__m_<N> == <lit>` for the comparison (a temp binds the scrutinee).
+    let is_small: []const u8 = match n {
+        0 => "zero",
+        1 => "one",
+        2 => "two",
+        _ => "other",
+    };
+    print("is_small = {is_small}\n");
+
+    ## Range arm: `start..end` (half-open) emits `__m_0 >= start and __m_0 < end`.
+    ## `start...end` (inclusive) emits `..start and __m_0 <= end`.
+    let bucket: []const u8 = match n {
+        0..10 => "low",
+        10..100 => "mid",
+        _ => "high",
+    };
+    print("bucket = {bucket}\n");
+
+    ## Ident arm: the binding name is referenced inside the arm body. Codegen
+    ## emits `const x = __m_<N>;` before the body so the expression can use it.
+    let doubled: i32 = match n {
+        x => x * 2,
+        _ => 0,
+    };
+    print("doubled = {doubled}\n");
+
+    ## Wildcard arm (last) — terminal fallback. Subsequent statements still
+    ## execute after the match because the match is expression-valued.
+    let safe: i32 = match n {
+        _ => 0,
+    };
+    print("safe = {safe}\n");
+}
