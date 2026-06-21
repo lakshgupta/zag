@@ -1,22 +1,73 @@
-## Functions, return values, and closures
-##
-## Run: zag run basic.zag
+# basic.zag — Phase 2 docs/15-functions.md surface demo.
+#
+# Surfaces covered (↔ section numbers in main):
+#   multi-arg + return type      → section 1  (fun add)
+#   void functions               → section 2  (fun log -> void, fun log_implicit)
+#   closures (annotated + bare)  → section 3  (let double, let c)
+#   var parameter semantics      → section 4  (fun bump(var x: i32))
+#
+# Higher-tier surfaces (Default params, Variadic, Higher-Order, Tuple spread)
+# are deferred to Phase 3 (pending a type-resolver pass) and omitted here.
 
+# 1. Multi-arg function with explicit `-> i32` return type. Codegen emits
+#    `pub fn add(a: i32, b: i32) i32 { return a + b; }`. Top-level fun decls
+#    honor the user-supplied return type (Phase 2 carve-out: the legacy
+#    `!void` coercion was removed from genFun).
 fun add(a: i32, b: i32) -> i32 {
     return a + b;
 }
 
-fun greet(name: str) {
-    print("hello, {name}\n");
+# 2a. void function with EXPLICIT `-> void`. Same parse shape; the explicit
+#     annotation makes the no-return intent visible to readers and lets
+#     codegen emit `void` (rather than inferring it from a missing `return`).
+fun log(msg: str) -> void {
+    print("log: {msg}\n");
+}
+
+# 2b. void function with INFERRED return type (omit the `-> void`). Both
+#     forms compile to the same zig emit (void).
+fun log_implicit(msg: str) {
+    print("also: {msg}\n");
+}
+
+# 4. `var` parameter semantics. Codegen injects `var x = x;` at the body
+#    entry so body mutations stay isolated to the caller-passed copy. The
+#    zig emit `pub fn bump(x: i32) void { var x = x; ... }` keeps the
+#    caller's value untouched across the call (printed as "after:" below).
+fun bump(var x: i32) {
+    x = x + 1;
+    print("  bumped locally: x = {x}\n");
 }
 
 fun main() {
-    let sum = add(3, 4);
-    print("3 + 4 = {sum}\n");
+    # 1. Multi-arg call — exercises the N-arg path on existing CallExpr
+    #    (already supported; Phase 1+2 verify the args are routed correctly).
+    print("add(3, 4) = {add(3, 4)}\n");
 
-    greet("zag");
+    # 2a/2b. Two void function calls — one explicit -> void, one inferred.
+    log("hello, phase 2");
+    log_implicit("no-annotation form");
 
-    # Closure
+    # 3. Annotated closure binding — codegen emits an anonymous-struct-by-
+    #    value `(struct { pub fn call(x: i32) i32 { return x * 2; } }){}`
+    #    and rewrites every `double(args)` call site to `double.call(args)`.
+    #    Detection keys off the init being `.closure` (not on a `: Closure`
+    #    type annotation), so the natural `let c = |...| ...` form in 3b
+    #    is cleanly supported without re-declaring `: Closure` on the bind.
     let double = |x: i32| -> i32 { return x * 2; };
     print("double(5) = {double(5)}\n");
+    print("double(9) = {double(9)}\n");
+
+    # 3b. Unannotated closure — no `: Closure` type annotation. The
+    #     closure-init detection pass in `collectTypedBindings` records
+    #     `is_closure = true` regardless of whether `: T` was present, so
+    #     `c.call(4)` is still wired even on a bare `let c = |x| ...;` bind.
+    let c = |x: i32| -> i32 { return x + 1; };
+    print("c(4) = {c(4)}\n");
+
+    # 4. var param call — confirms the caller's value is unchanged.
+    let start: i32 = 10;
+    print("before: start = {start}\n");
+    bump(start);
+    print("after:  start = {start} (unchanged — caller isolates)\n");
 }
