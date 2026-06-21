@@ -29,6 +29,22 @@ let nums: List<i32> = ...;
 let strs: List<str> = ...;
 ```
 
+Generic structs monomorphize at compile time to the **thunk form**:
+
+```
+// zag source                                // zig emission
+struct List<T> { data: *T, len: usize, ... } pub fn List(comptime T: type) type {
+                                                return struct {
+                                                    data: *T,
+                                                    len: usize,
+                                                    ...
+                                                };
+                                            }
+let nums: List<i32> = ...;                   // resolves to List(i32)[]…
+```
+
+The compiler rewrites the source turbofish `<TYPE>` to a parentheses-monomorphization `(TYPE)` at every call site and type annotation. Struct literals `List<i32> { … }` round-trip through the same rewrite.
+
 ## Trait Bounds
 
 ```
@@ -37,14 +53,19 @@ fun print_all<T: Display>(items: []T) { ... }
 fun clone_and_modify<T: Clone>(val: T) -> T { ... }
 ```
 
-Available bounds:
-- `Clone` — has `clone()` method
-- `Default` — has `default()` constructor
-- `Zero` — all-zero bytes is valid
-- `Ordered` — comparison operators defined
-- `Display` — zero-alloc formatting
-- `Iterator<T>` — iteration protocol
-- `AsyncStream<T>` — async iteration
+Available bounds and the method the compiler checks for via `@hasDecl`:
+
+| Bound          | Method required on the type |
+|----------------|------------------------------|
+| `Clone`        | `clone()` |
+| `Default`      | `default()` |
+| `Zero`         | `is_zero()` |
+| `Ordered`      | `compare()` |
+| `Display`      | `display()` |
+| `Iterator`     | `next()` |
+| `AsyncStream`  | `poll_next()` |
+
+The compiler emits `if (!@hasDecl(T, "method")) @compileError("type T must implement Trait (missing `method` method)");` at the generic function / impl-block body entry. Built-in zig primitive types (`i32`, `f64`, `usize`, …) naturally expose `compare` and the other baseline methods, so the bounds pass for primitives without user work.
 
 ## Const Parameters
 
@@ -69,6 +90,15 @@ impl<T> List<T> {
 }
 ```
 
+Generic impl blocks emit one orphan free function per method at module scope:
+
+```
+// zig emission for List<T>::push
+pub fn List_T_push(comptime T: type, self: *List(T), value: T) void { ... }
+```
+
+The compiler rewrites each `<TYPE>` segment in receiver and parameter types to `(TYPE)` when the segment matches one of the impl's declared type-param names (`T`, `U`, `K`, `V`, …). Segments that don't match a type-param name on the enclosing impl (e.g. nested generic-enum monomorphizations) pass through verbatim.
+
 ## No Trait Bounds on Associated Types
 
 In v1, bounds only apply to type parameters:
@@ -92,5 +122,9 @@ const TABLE: [256]u32 = const {
     return t;
 };
 ```
+
+A `const` binding can take a `const { … return EXPR; }` block initializer. The block is evaluated at compile time, the result is embedded in the binary as a static constant, and every runtime use of the binding resolves to the embedded value with no per-site recomputation.
+
+The body can use any statement form available to function bodies (`var`, `for`, `if`, nested `const`, etc.). The trailing `return EXPR;` is required — it is the value the binding takes. Bare `return;` (no value) is rejected at parse time.
 
 **Memory:** `const` blocks are evaluated at compile time. The result is embedded in the binary as a static constant.

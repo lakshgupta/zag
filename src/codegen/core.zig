@@ -76,6 +76,7 @@ pub const Codegen = struct {
     pub const genTemplateLit = @import("primary.zig").genTemplateLit;
     pub const genTypeParamsPreamble = @import("decl.zig").genTypeParamsPreamble;
     pub const genBoundsGuards = @import("decl.zig").genBoundsGuards;
+    pub const rewriteReceiverType = @import("decl.zig").rewriteReceiverType;
     pub const generate = @import("core.zig").generate;
     pub const init = @import("core.zig").init;
     pub const isClosureBound = @import("core.zig").isClosureBound;
@@ -145,8 +146,19 @@ pub const Codegen = struct {
             }
             self.genEnumDecl(ed, prog.impls);
         }
+        // Generics (§2 Generic Types + §5 Generic impl Blocks): when a
+        // struct carries type params, its decl becomes a thunk form
+        // (`pub fn NAME(comptime T: type) type { return struct { … }; }`)
+        // that cannot host nested methods (the returned type is a
+        // fresh anonymous type per monomorphization). The matching impls
+        // must therefore be emitted at module scope via `genFreeMethod`
+        // — that's the orphan-impl path below. To make that routing
+        // happen we DO NOT record the generic struct's name in
+        // `matched_targets_buf` so the orphan-impl loop sees it as
+        // unmatched. Non-generic structs keep their existing nested-
+        // method emission (genStructDecl's `!is_generic` branch).
         for (prog.structs) |sd| {
-            if (matched_count < matched_targets_buf.len) {
+            if (matched_count < matched_targets_buf.len and sd.type_params.len == 0) {
                 matched_targets_buf[matched_count] = sd.name;
                 matched_count += 1;
             }

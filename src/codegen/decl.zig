@@ -10,6 +10,88 @@ const Codegen = core.Codegen;
 // FILE-SCOPE methods (DECL bucket)
 // ============================================================
 
+    pub     fn rewriteReceiverType(self: *Codegen, text: []const u8, tps: []const ast.TypeParam) void {
+        // Generics (§5 Generic impl Blocks): inside an
+        // `impl<T, U, ...> Target<T, U, ...>` block, method-receiver
+        // `type_text` carries turbofish syntax (`*Target<T>`, `*const
+        // Map<K, V>`, `[]Option<T>`). zig's thunk form for generic
+        // structs requires paren-monomorphization (`*Target(T)`,
+        // `*const Map(K, V)`, `[]Option(T)`), so this helper scans each
+        // `<...>` segment inside `text` and converts it to `(...)` when
+        // its contents match a type-param name declared on the
+        // enclosing impl. Segments whose contents are NOT in the
+        // current impl's type-param list are emitted verbatim — the
+        // user's other generic types (none generic structs / enums)
+        // round-trip as-is and would require explicit handling if v1
+        // ever grows multi-param canonical-form generics elsewhere.
+        //
+        // Multi-token names like `*const Map<K, V>` are handled by
+        // walking the segment characters: split on `<`, locate the
+        // matching `>` (single-level greedy; nested generic-arg
+        // expressions are not chunked, the `K, V` body emits verbatim
+        // because no single TypeParam.name matches the comma-bearing
+        // string), then rewrite-or-leave the contents. First-segment
+        // rewrite only — the user's v1 surface is single-level
+        // turbofish as per docs/16 §1 (`T`, `T, U`, `K, V`).
+        //
+        // Choosing Option A (rewrite only when contents match the
+        // current impl's type_params) over the more aggressive
+        // every-`<...>` rewrite keeps generic-enum mono usage working
+        // at impl-block receivers where no rewrite is wanted.
+        if (tps.len == 0) {
+            self.write(text);
+            return;
+        }
+        var i: usize = 0;
+        while (i < text.len) {
+            const lt = std.mem.indexOfScalar(u8, text[i..], '<');
+            if (lt == null) {
+                self.write(text[i..]);
+                return;
+            }
+            const lt_abs = i + lt.?;
+            self.write(text[i..lt_abs]);
+            // Find the matching `>` (single-level; nested generics not
+            // yet supported as a turbofish case).
+            const gt_rel = std.mem.indexOfScalar(u8, text[lt_abs + 1 ..], '>');
+            if (gt_rel == null) {
+                // Unbalanced `<` — emit the rest verbatim and bail.
+                self.write(text[lt_abs..]);
+                return;
+            }
+            const inner_start = lt_abs + 1;
+            const inner_end = lt_abs + 1 + gt_rel.?;
+            const inner = text[inner_start..inner_end];
+            // Trim whitespace so `Map< K, V >` (source-discretionary
+            // spacing) doesn't miss the tps match by a stray space.
+            var a: usize = 0;
+            var b: usize = inner.len;
+            while (a < b and (inner[a] == ' ' or inner[a] == '\t')) : (a += 1) {}
+            while (b > a and (inner[b - 1] == ' ' or inner[b - 1] == '\t')) : (b -= 1) {}
+            const trimmed = inner[a..b];
+            var matched: ?[]const u8 = null;
+            for (tps) |tp| {
+                if (std.mem.eql(u8, tp.name, trimmed)) {
+                    matched = tp.name;
+                    break;
+                }
+            }
+            if (matched) |name| {
+                self.write("(");
+                self.write(name);
+                self.write(")");
+            } else {
+                // Not a current-impl type-param; emit the segment
+                // verbatim (non-generic use case, or a generic-enum
+                // reference that v1 doesn't yet rewrite).
+                self.write("<");
+                self.write(inner);
+                self.write(">");
+            }
+            i = inner_end + 1;
+        }
+    }
+
     pub     fn genFreeMethod(self: *Codegen, target_type: []const u8, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
         self.write("pub fn ");
         self.write(target_type);
@@ -19,15 +101,17 @@ const Codegen = core.Codegen;
         // Generics impl-level type_params preamble. Mirrors genMethod
         // and genFun so generic impl-blocks land as
         // `pub fn List_T_push(comptime T: type, self: *List(T), value: T)`.
-        // The `*List(T)` receiver note: Phase 4 wires the codegen
-        // type-text rewrite (`*List<T>` → `*List(T)`); for Phase 2 this
-        // preamble only — receiver types stay verbatim until then.
+        // The `*List(T)` receiver is produced by `rewriteReceiverType`
+        // (above) which converts `<TyParamName>` to `(TyParamName)` for
+        // each segment whose contents match the impl's declared type
+        // params. See `rewriteReceiverType`'s doc for the multi-token
+        // and non-matching-passthrough semantics.
         const generics_preamble = self.genTypeParamsPreamble(impl_type_params);
         for (m.params, 0..) |p, i| {
             if (i > 0 or generics_preamble) self.write(", ");
             self.write(p.name);
             self.write(": ");
-            self.write(p.type_text);
+            self.rewriteReceiverType(p.type_text, impl_type_params);
         }
         self.write(") ");
         if (m.return_type) |rt| self.write(rt);
@@ -58,9 +142,37 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genStructDecl(self: *Codegen, sd: ast.StructDecl, all_impls: []const ast.ImplBlock) void {
-        self.write("pub const ");
-        self.write(sd.name);
-        self.write(" = struct {\n");
+        // Generics (§2 Generic Types): when `sd.type_params.len > 0`,
+        // emit the thunk form `pub fn NAME(comptime T0: type, ...) type
+        // { return struct { … }; }` so call sites `List(i32, ...)`
+        // resolve at monomorphization time. The non-generic path keeps
+        // the existing `pub const NAME = struct { … };` shape so all
+        // pre-existing tests/examples round-trip unchanged.
+        //
+        // Nested impl-method emission is SKIPPED on the thunk path. The
+        // returned struct type cannot contain methods directly (zig
+        // compiles the return type as a fresh anonymous type per call
+        // site, so nested methods would clash on per-monomorphization
+        // vtable construction). The `generate` function in core.zig
+        // marks generic structs as orphans by NOT recording them in
+        // `matched_targets_buf` so the matching impls fall through to
+        // `genFreeMethod`'s orphan-impl emit. The free-fn name encodes
+        // `TargetType_methodName` and includes the rewritten receivers
+        // (via `rewriteReceiverType`), so `List_T_push(comptime T: type,
+        // self: *List(T), value: T)` is the actual emitted form once
+        // generic impl-block wires in.
+        const is_generic = sd.type_params.len > 0;
+        if (is_generic) {
+            self.write("pub fn ");
+            self.write(sd.name);
+            self.write("(");
+            _ = self.genTypeParamsPreamble(sd.type_params);
+            self.write(") type {\n    return struct {\n");
+        } else {
+            self.write("pub const ");
+            self.write(sd.name);
+            self.write(" = struct {\n");
+        }
         for (sd.fields) |f| {
             switch (f.kind) {
                 .named => |nf| {
@@ -96,17 +208,32 @@ const Codegen = core.Codegen;
         // stmt/expr handling (destructuring, compound assign, if/match,
         // etc.) works for methods too. Each method body sees a fresh
         // counter set so destructuring temps + new-temporaries inside
-        // the method don't clash with sibling methods' temps.
-        for (all_impls) |impl| {
-            if (!std.mem.eql(u8, impl.target_type, sd.name)) continue;
-            for (impl.methods) |m| {
-                // Phase 2 tail: thread impl-level type_params so the
-                // nested method emits `comptime X: type` BEFORE its
-                // own params. Mirrors genFreeMethod's call update.
-                self.genMethod(m, impl.type_params);
+        // the method don't clash with sibling methods' temps. SKIPPED
+        // on the generic struct path because the thunk-returned type
+        // cannot host nested methods (zig compiles each monomorphization
+        // to a fresh anonymous type); see the doc above on the thunk
+        // form. The orphan-impl routing in `generate` catches the
+        // matching impls and lands them at module scope.
+        if (!is_generic) {
+            for (all_impls) |impl| {
+                if (!std.mem.eql(u8, impl.target_type, sd.name)) continue;
+                for (impl.methods) |m| {
+                    // Phase 2 tail: thread impl-level type_params so the
+                    // nested method emits `comptime X: type` BEFORE its
+                    // own params. Mirrors genFreeMethod's call update.
+                    self.genMethod(m, impl.type_params);
+                }
             }
         }
-        self.write("};\n\n");
+        if (is_generic) {
+            // Close both layers of the thunk form: the inner
+            // `return struct { … };` and the outer `pub fn NAME(…) type
+            // { … }`. Without the double-closing brace zig rejects the
+            // emission with "expected '}' after struct body".
+            self.write("    };\n}\n\n");
+        } else {
+            self.write("};\n\n");
+        }
     }
 
     pub     fn genMethod(self: *Codegen, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
@@ -119,13 +246,15 @@ const Codegen = core.Codegen;
         // matching call site (genStructDecl / genEnumDecl for the
         // nested case; the orphan-impl loop in generate for the
         // free-fn case via genFreeMethod) threads `impl.type_params`
-        // in. Phase 2 commit-scope.
+        // in. Phase 4 wires the `*List<T>` → `*List(T)` receiver
+        // rewrite via `rewriteReceiverType` so generic impl-block
+        // method parameters resolve through the thunk form.
         const generics_preamble = self.genTypeParamsPreamble(impl_type_params);
         for (m.params, 0..) |p, i| {
             if (i > 0 or generics_preamble) self.write(", ");
             self.write(p.name);
             self.write(": ");
-            self.write(p.type_text);
+            self.rewriteReceiverType(p.type_text, impl_type_params);
         }
         self.write(") ");
         if (m.return_type) |rt| self.write(rt);
