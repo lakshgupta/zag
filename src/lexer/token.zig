@@ -1,0 +1,137 @@
+const std = @import("std");
+const ast = @import("../ast.zig");
+
+// ============================================================
+// token.zig — top-level types from src/lexer.zig
+// ============================================================
+
+pub const TokenTag = enum {
+    fun,
+    let,
+    var_kw,
+    const_kw,
+    defer_kw,
+    errdefer_kw,
+    unsafe_kw,
+    new,
+    free,
+    print,
+    as_kw,
+    return_kw,
+    /// `struct` keyword — introduces a struct declaration
+    /// (`struct Vec3 { x: f64, … }`). Distinct from `.struct_lit` AST
+    /// variant which lives downstream at the expression level.
+    struct_kw,
+    /// `impl` keyword — introduces an impl block
+    /// (`impl Vec3 { pub fun length(...) -> … { … } }`). Methods inside
+    /// the block are flattened to zig free functions by codegen.
+    impl_kw,
+    /// `enum` keyword — introduces an enum declaration
+    /// (`enum Direction { North, South, East, West }`). Variants are
+    /// tokenized as bare identifiers (PascalCase by convention) and
+    /// optionally carry a parenthesized payload type
+    /// (`Shape { Circle(f64), Rectangle(f64, f64) }`). Codegen emits the
+    /// declared enum as zig's native `enum { ... }` form so functions
+    /// over variants compile via zig's exhaustive match checking.
+    enum_kw,
+    /// `pub` keyword — visibility modifier on top-level decls and
+    /// methods. Spec framing reserves privacy enforcement to a followup;
+    /// current parser accepts-and-ignores it (the keyword is preserved
+    /// in the AST for future use but codegen does not gate emission on
+    /// `pub` because all generated decls already use zig's `pub fn`).
+    pub_kw,
+    /// Reserved with `_kw` suffix because `if`/`else`/`while`/`for`/`match`/
+    /// `break`/`continue` are reserved words in the Zig backend (the lexer
+    /// cannot name a TokenTag literal `if`/`else`/etc. without colliding
+    /// with the corresponding zig keyword). `in` is not zig-reserved but
+    /// gets the suffix for naming consistency across the suite.
+    if_kw,
+    else_kw,
+    while_kw,
+    for_kw,
+    in_kw,
+    match_kw,
+    break_kw,
+    continue_kw,
+    true_kw,
+    false_kw,
+    null_kw,
+    undefined_kw,
+    string_literal,
+    byte_string_literal,
+    char_literal,
+    integer_literal,
+    float_literal,
+    identifier,
+    lparen,
+    rparen,
+    lbrace,
+    rbrace,
+    lbracket,
+    rbracket,
+    colon,
+    // The vast majority of these operators come from `docs/manual/05-operators.md`
+    // and were added in one pass to expose the documented operator surface.
+    // All multi-char forms (`<=`, `+=`, `&&`, et al.) are disambiguated in
+    // the `tokenize` loop by peeking the second and third chars from the
+    // current `pos` before consuming.
+    equals, // `=` (also the leading char of `==`, `+=`, `-=`, …)
+    plus,
+    minus,
+    star,
+    slash,
+    percent, // `%`
+    amp, // `&`
+    pipe, // `|`
+    caret, // `^`
+    tilde, // `~`
+    lt, // `<`
+    gt, // `>`
+    lt_eq, // `<=`
+    gt_eq, // `>=`
+    bang, // `!`
+    eq_eq, // `==`
+    bang_eq, // `!=`
+    amp_amp, // `&&`
+    pipe_pipe, // `||`
+    lt_lt, // `<<`
+    gt_gt, // `>>`
+    plus_eq, // `+=`
+    minus_eq, // `-=`
+    star_eq, // `*=`
+    slash_eq, // `/=`
+    percent_eq, // `%=`
+    amp_eq, // `&=`
+    pipe_eq, // `|=`
+    caret_eq, // `^=`
+    lt_lt_eq, // `<<=`
+    gt_gt_eq, // `>>=`
+    range, // `..` (half-open range; doc range table also lists `...` which is `ellipsis` for inclusive)
+    comma,
+    arrow,
+    ellipsis,
+    /// `?` — used in nullable pointer type annotations like `?*T` and
+    /// `?i32`. Distinct from `as`'s destination-type syntax because the
+    /// `?` is part of the type identifier, not a separate operator —
+    /// `collectCastType` consumes the leading `?` and concatenates it
+    /// to the rest of the type verbatim so the emitted zig type mirrors
+    /// zag's surface (`?*T` → `?*T`, `?i32` → `?i32`).
+    question,
+    /// `.` — the standalone dot operator. Used for postfix member access
+    /// (`v.x`), method call (`v.length()`, `Vec3.new(...)`), and as the
+    /// leading byte of `..` (range) and `...` (ellipsis). The parser
+    /// dispatches based on what follows the `.`: an identifier chains
+    /// into `.member_access` (no parens) or `.method_call` (parens); a
+    /// second `.` short-circuits into the range/ellipsis arms.
+    dot,
+    newline,
+    doc_comment,
+    eof,
+};
+
+pub const Token = struct {
+    tag: TokenTag,
+    loc: ast.Loc,
+    text: []const u8,
+};
+
