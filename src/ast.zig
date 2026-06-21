@@ -43,6 +43,12 @@ pub const MethodDecl = ast_decl.MethodDecl;
 pub const ImplBlock = ast_decl.ImplBlock;
 pub const EnumDecl = ast_decl.EnumDecl;
 pub const EnumVariant = ast_decl.EnumVariant;
+// Generics (docs/16). The TypeParam struct lives next to FunDecl
+// in decl.zig and is referenced from parser/decl.zig helpers
+// (`parseTypeParam`, `parseTypeParams`). The aggregator re-export
+// preserves the `ast.TypeParam` access path documented for the
+// AST-laundering layer in main.zig.
+pub const TypeParam = ast_decl.TypeParam;
 
 // Template-literal types (extracted from Expr union body, now top-level).
 pub const TemplateLitExpr = ast_template.TemplateLitExpr;

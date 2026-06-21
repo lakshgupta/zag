@@ -286,6 +286,16 @@ pub const Expr = union(enum) {
     pub const CallExpr = struct {
         name: []const u8,
         args: []const Expr,
+        /// Generics turbofish (docs/16 §"Turbofish"): verbatim source
+        /// text per slot, e.g. `["i32"]` for `max<i32>(3, 5)` or
+        /// `["i32", "10"]` for `fill<i32, 10>(0)`. Empty default slice
+        /// preserves the non-generic call shape. Codegen prefix-emits
+        /// `type_args` before `args` because zig's comptime parameter
+        /// convention places compile-time values ahead of runtime args
+        /// (e.g. `max(i32, 3, 5)`). Each slot is captured verbatim by
+        /// `Parser.parseTurbofishArgs` — no AST-level resolution of
+        /// `List<i32>`-style nested generics in this phase.
+        type_args: []const []const u8 = &[_][]const u8{},
     };
 
     pub const NewExpr = struct {

@@ -229,6 +229,15 @@ pub const Parser = struct {
     pub const parseImplBlock = @import("decl.zig").parseImplBlock;
     pub const parseMethod = @import("decl.zig").parseMethod;
     pub const parseMethodParam = @import("decl.zig").parseMethodParam;
+    // Generics (docs/16). parseTypeParam / parseTypeParams /
+    // parseTurbofishArgs live in decl.zig next to parseFunDecl
+    // because they share the same `Parser` API (expect / expectIdent
+    // / collectCastType / arena.alloc). Registering them here gives
+    // `self.parseTypeParams()` access path the wired parseFunDecl /
+    // parseStructDecl / parseImplBlock sites rely on.
+    pub const parseTypeParam = @import("decl.zig").parseTypeParam;
+    pub const parseTypeParams = @import("decl.zig").parseTypeParams;
+    pub const parseTurbofishArgs = @import("decl.zig").parseTurbofishArgs;
     pub const parseStructDecl = @import("decl.zig").parseStructDecl;
 
     // --- stmt.zig ---

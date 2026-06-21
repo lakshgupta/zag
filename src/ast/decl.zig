@@ -16,6 +16,35 @@ const Stmt = stmt.Stmt;
 // decl.zig — top-level types from src/ast.zig
 // ============================================================
 
+/// One type-parameter slot parsed from `fun NAME<T: Bound1 + Bound2, U, const N: usize>(...)`,
+/// `struct NAME<T> { ... }`, or `impl<T> NAME<T> { ... }` (docs/16).
+///
+/// - `name` is the verbatim source identifier (`"T"`, `"N"`, ...).
+/// - `bounds` is a split list of trait names — empty when unbounded.
+///   Splitting rather than joining at parse-time keeps codegen
+///   iteration clean: each bound emits its own `@hasDecl` guard with
+///   no further string-splitting needed at emit time.
+/// - `is_const` is true for `const N: usize` slots. Codegen emits
+///   these as `comptime N: usize` rather than `comptime N: type` so
+///   the value is monomorphized per call site.
+/// - `type_text` is non-null ONLY when `is_const` is true; it carries
+///   the verbatim source-type text after the `:` (e.g. `"usize"` for
+///   `const N: usize`). Reuses `collectCastType`'s multi-token
+///   capture pipeline so multi-token const-types like
+///   `const N: *const usize` round-trip verbatim.
+pub const TypeParam = struct {
+    name: []const u8,
+    bounds: []const []const u8 = &[_][]const u8{},
+    /// True iff this is a `const N: TYPE` slot (docs/16 §"Const
+    /// Parameters"); false for type slots. Mutually exclusive with
+    /// `bounds`. The const slot's type lives in `type_text`.
+    is_const: bool = false,
+    /// Captured verbatim type text for `const N: TYPE` slots (e.g.
+    /// `"usize"`, `"*const Foo"`); null for non-const slots. Codegen
+    /// emits `<type_text>` after the colon in the signature preamble.
+    type_text: ?[]const u8 = null,
+};
+
 pub const FunDecl = struct {
     name: []const u8,
     /// Parameter list, parsed comma-separated `name: type` form (with
@@ -33,6 +62,16 @@ pub const FunDecl = struct {
     /// still entered as `pub fn NAME() !void`). Codegen falls back to
     /// zig's type-inference downstream when `null`.
     return_type: ?[]const u8 = null,
+    /// Generics (docs/16 §"Generic Functions"): the `<...>` parameter
+    /// list parsed immediately after the function name and BEFORE the
+    /// opening `(`. Empty default slice keeps the AST backward-compatible
+    /// with non-generic decls (codegen only emits `comptime X: type`
+    /// preamble and `@hasDecl` bounds guards when `len > 0`). Each
+    /// TypeParam carries its own bounds + const-flag + verbatim type
+    /// text so codegen can emit a straight-line `comptime TP_N: type`
+    /// for the type-param preamble and `@hasDecl(T, "method")` guards
+    /// for each bound.
+    type_params: []const TypeParam = &[_]TypeParam{},
 };
 
 /// One field in a struct declaration. Two shapes:
@@ -88,6 +127,15 @@ pub const StructDecl = struct {
     name: []const u8,
     fields: []const StructField,
     loc: Loc,
+    /// Generics (docs/16 §"Generic Types"): `<...>` type-parameter
+    /// list parsed immediately after the struct name and BEFORE the
+    /// opening `{`. Same shape as `FunDecl.type_params`, default-empty
+    /// to preserve the non-generic path. Empty slice emits the
+    /// existing `pub const NAME = struct { ... };` shape; non-empty
+    /// triggers the thunk form `pub fn NAME(comptime T: type) type
+    /// { return struct { ... }; }` so call-site `List(i32)` resolves
+    /// at monomorphization time (Phase 2 commit).
+    type_params: []const TypeParam = &[_]TypeParam{},
 };
 
 /// One parameter on a method declaration inside an impl block. The
@@ -152,6 +200,14 @@ pub const ImplBlock = struct {
     target_type: []const u8,
     methods: []const MethodDecl,
     loc: Loc,
+    /// Generics (docs/16 §"Generic impl Blocks"): `<...>` type-param
+    /// list parsed immediately after `impl` keyword and BEFORE the
+    /// `TARGET_TYPE` ident or `{`. Default-empty preserves the
+    /// non-generic path. Phase 4 commit unlocks the
+    /// `impl<T> List<T> { pub fun push(self: *List<T>, value: T) ... }`
+    /// shape; the codegen rewrite pass on `type_text` then converts
+    /// `*List<T>` → `*List(T)` for thunk-form struct receivers.
+    type_params: []const TypeParam = &[_]TypeParam{},
 };
 
 /// One enum declaration of the form

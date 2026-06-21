@@ -12,6 +12,136 @@ const Expr = ast.Expr;
 const Parser = core.Parser;
 
 
+pub fn parseTypeParam(self: *Parser) ast.TypeParam {
+        var is_const = false;
+        // `const N: usize` prefix — the only thing distinguishing a
+        // const-param from a type-param. Consumes `.const_kw` and
+        // sets `is_const = true` so codegen emits `comptime N: usize`
+        // instead of `comptime N: type`.
+        if (self.peek().tag == .const_kw) {
+            self.advance();
+            is_const = true;
+        }
+        const name = self.expectIdent();
+        if (is_const) {
+            // Const params REQUIRE a type annotation (`const NAME: T`).
+            // Reuses `collectCastType` so multi-token const-types like
+            // `const N: *const usize` round-trip verbatim (zig accepts
+            // those as `comptime X: *const usize`).
+            self.expect(.colon);
+            // Local `const` avoids a `.len` field-access on the
+            // OPTIONAL `type_text` outer var (zig rejects optional
+            // field-access directly). The slice is implicitly
+            // coerced into the optional slot at struct-init.
+            const tt = self.collectCastType();
+            if (tt.len == 0) {
+                std.debug.print("error:{d}:{d}: const type parameter '{s}' requires a type after ':'\n", .{ self.peek().loc.line, self.peek().loc.col, name });
+                std.process.exit(1);
+            }
+            return .{ .name = name, .bounds = &[_][]const u8{}, .is_const = true, .type_text = tt };
+        }
+        // Type param: optional `: Bound1 + Bound2 + ...` after the
+        // name. The bounds list is a `[]const []const u8` split at
+        // `+` boundaries so codegen can iterate without further
+        // string-splitting. Bounds are stored verbatim (the trait
+        // name appears as-is in the source — `Clone`, `Ordered`, etc.).
+        var bounds_buf: [8][]const u8 = undefined;
+        var bound_count: usize = 0;
+        if (self.peek().tag == .colon) {
+            self.advance();
+            if (self.peek().tag != .gt and self.peek().tag != .comma) {
+                bounds_buf[bound_count] = self.expectIdent();
+                bound_count += 1;
+                while (self.peek().tag == .plus) {
+                    self.advance();
+                    bounds_buf[bound_count] = self.expectIdent();
+                    bound_count += 1;
+                }
+            }
+        }
+        const bounds_arena = self.arena.alloc([]const u8, bound_count);
+        @memcpy(bounds_arena, bounds_buf[0..bound_count]);
+        return .{ .name = name, .bounds = bounds_arena };
+    }
+
+
+pub fn parseTypeParams(self: *Parser) []const ast.TypeParam {
+        // Caller has verified peek() == .lt already. Consume `<`, then
+        // one or more comma-separated TypeParams, then a closing `>`.
+        // Empty `<>` is rejected (no zero-param generics are valid) —
+        // callers should bypass parseTypeParams when there's nothing
+        // to parse.
+        self.expect(.lt);
+        var tps_buf: [8]ast.TypeParam = undefined;
+        var tp_count: usize = 0;
+        tps_buf[tp_count] = self.parseTypeParam();
+        tp_count += 1;
+        while (self.peek().tag == .comma) {
+            self.advance();
+            tps_buf[tp_count] = self.parseTypeParam();
+            tp_count += 1;
+        }
+        self.expect(.gt);
+        const tps_arena = self.arena.alloc(ast.TypeParam, tp_count);
+        @memcpy(tps_arena, tps_buf[0..tp_count]);
+        return tps_arena;
+    }
+
+
+pub fn parseTurbofishArgs(self: *Parser) []const []const u8 {
+        // Caller has verified the ident-`<`-typename-`>`-`(` shape
+        // and consumed the leading ident + `<`. We now collect one
+        // turbofish slot per comma-separated list, then consume `>`.
+        //
+        // Each slot is verbatim source text. We accept three shapes:
+        //   1. typename ident (`i32`, `f64`, `usize`, ...) — reuses
+        //      `collectCastType` so multi-token typenames like
+        //      `*const T` round-trip (Phase 2 commitment).
+        //   2. integer literal (`10`, `256`, ...) — verbatim from the
+        //      token's `.text`. These are the const-args in
+        //      `fill<i32, 10>(0)`.
+        //   3. single identifier token (rare, but accepted).
+        //
+        // For the first cut of generics (`fun NAME<T>(...) { ... }`
+        // and the turbofish call site at `NAME<T>(args)`), we keep this
+        // simple: ONE token per slot, captured verbatim as a single
+        // string. Compositional generics inside turbofish (e.g.
+        // `Map<K, V>`) require collecting with bracket-balancing;
+        // that's Phase 2 work.
+        var args_buf: [8][]const u8 = undefined;
+        var arg_count: usize = 0;
+        if (self.peek().tag != .gt) {
+            if (self.peek().tag == .identifier) {
+                args_buf[arg_count] = self.peek().text;
+                self.advance();
+            } else if (self.peek().tag == .integer_literal) {
+                args_buf[arg_count] = self.peek().text;
+                self.advance();
+            } else {
+                args_buf[arg_count] = self.collectCastType();
+            }
+            arg_count += 1;
+            while (self.peek().tag == .comma) {
+                self.advance();
+                if (self.peek().tag == .identifier) {
+                    args_buf[arg_count] = self.peek().text;
+                    self.advance();
+                } else if (self.peek().tag == .integer_literal) {
+                    args_buf[arg_count] = self.peek().text;
+                    self.advance();
+                } else {
+                    args_buf[arg_count] = self.collectCastType();
+                }
+                arg_count += 1;
+            }
+        }
+        self.expect(.gt);
+        const args_arena = self.arena.alloc([]const u8, arg_count);
+        @memcpy(args_arena, args_buf[0..arg_count]);
+        return args_arena;
+    }
+
+
 pub fn parseClosureExpr(self: *Parser) Expr {
         self.expect(.pipe);
         var params_buf: [16]ast.MethodParam = undefined;
@@ -130,6 +260,18 @@ pub fn parseFunDecl(self: *Parser) ast.FunDecl {
         const start = self.peek().loc;
         self.expect(.fun);
         const name = self.expectIdent();
+        // Generics (docs/16 §"Generic Functions"): if the source uses
+        // `fun NAME<T>(...)`, consume the `<...>` type-param list
+        // IMMEDIATELY after the ident and before the opening `(`.
+        // Mirrors parseStructDecl / parseImplBlock; the lookahead is
+        // `.lt` (3-byte left-angle bracket; `<=` `<` `<<=` `<` are
+        // distinct tokens so we don't disambiguate beyond the bare
+        // `.lt` form). When absent, the existing path emits the
+        // legacy non-generic signature.
+        var type_params: []const ast.TypeParam = &[_]ast.TypeParam{};
+        if (self.peek().tag == .lt) {
+            type_params = self.parseTypeParams();
+        }
         self.expect(.lparen);
         // Phase 2 (docs/15 §"Declaration"): parse a comma-separated
         // parameter list inside `(<params>)`. Each param is the same
@@ -172,6 +314,7 @@ pub fn parseFunDecl(self: *Parser) ast.FunDecl {
             .loc = start,
             .doc = null,
             .return_type = return_type,
+            .type_params = type_params,
         };
     }
 
@@ -179,6 +322,13 @@ pub fn parseFunDecl(self: *Parser) ast.FunDecl {
 pub fn parseImplBlock(self: *Parser) ast.ImplBlock {
         const start_loc = self.peek().loc;
         self.expect(.impl_kw);
+        // Generics (docs/16 §"Generic impl Blocks"): if the source
+        // uses `impl<T>`, consume the `<...>` BEFORE the target-type
+        // ident. Same ler as parseFunDecl.
+        var type_params: []const ast.TypeParam = &[_]ast.TypeParam{};
+        if (self.peek().tag == .lt) {
+            type_params = self.parseTypeParams();
+        }
         const target_type = self.expectIdent();
         self.expect(.lbrace);
         var methods_buf: [64]ast.MethodDecl = undefined;
@@ -194,7 +344,7 @@ pub fn parseImplBlock(self: *Parser) ast.ImplBlock {
         self.expect(.rbrace);
         const methods = self.arena.alloc(ast.MethodDecl, method_count);
         @memcpy(methods, methods_buf[0..method_count]);
-        return .{ .target_type = target_type, .methods = methods, .loc = start_loc };
+        return .{ .target_type = target_type, .methods = methods, .loc = start_loc, .type_params = type_params };
     }
 
 
@@ -274,6 +424,13 @@ pub fn parseStructDecl(self: *Parser) ast.StructDecl {
         const start_loc = self.peek().loc;
         self.expect(.struct_kw);
         const name = self.expectIdent();
+        // Generics (docs/16 §"Generic Types"): if `struct NAME<T> { ... }`,
+        // consume the `<...>` BEFORE the opening `{`. Same ler as
+        // parseFunDecl.
+        var type_params: []const ast.TypeParam = &[_]ast.TypeParam{};
+        if (self.peek().tag == .lt) {
+            type_params = self.parseTypeParams();
+        }
         self.expect(.lbrace);
         var fields_buf: [64]ast.StructField = undefined;
         var field_count: usize = 0;
@@ -319,6 +476,6 @@ pub fn parseStructDecl(self: *Parser) ast.StructDecl {
         self.expect(.rbrace);
         const fields_src = fields_buf[0..field_count];
         const fields = self.arena.dupe(ast.StructField, fields_src);
-        return .{ .name = name, .fields = fields, .loc = start_loc };
+        return .{ .name = name, .fields = fields, .loc = start_loc, .type_params = type_params };
     }
 

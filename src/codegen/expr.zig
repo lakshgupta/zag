@@ -147,8 +147,26 @@ const needsIntDivShim = @import("primary.zig").needsIntDivShim;
                     }
                     self.write(")");
                 } else {
+                    // Generics (docs/16 §"Turbofish"):
+                    // `name<type_args...>(regular_args...)` emits
+                    // `name(type_args..., regular_args...)` so the
+                    // comptime args come BEFORE runtime args (zig's
+                    // `comptime` parameter convention). When
+                    // `type_args` is empty, the call shape is identical
+                    // to the non-generic legacy path so existing
+                    // 213-baseline tests are preserved untouched.
+                    // Type-arg slices are verbatim source text (e.g.
+                    // `["i32"]` for `max<i32>(3, 5)` or `["i32", "10"]`
+                    // for `fill<i32, 10>(0)`); corgen passes them
+                    // through unchanged so zig's compile-time arg
+                    // matching handles the dispatch.
                     self.write(c.name);
                     self.write("(");
+                    for (c.type_args, 0..) |ta, i| {
+                        if (i > 0) self.write(", ");
+                        self.write(ta);
+                    }
+                    if (c.args.len > 0 and c.type_args.len > 0) self.write(", ");
                     for (c.args, 0..) |arg, i| {
                         if (i > 0) self.write(", ");
                         self.genExpr(arg);

@@ -1,0 +1,33 @@
+# Demonstrates docs/10 surface: array length, multi-dim arrays,
+# and a preview of the bounds-check flag (covered by tests in
+# src/main.zig, not enabled in this runnable).
+#
+# Run with:  zag run examples/arrays/multi_dim.zag
+# For bounds-checked mode:  zag run -Dbounds-check examples/arrays/multi_dim.zag
+
+fun main() {
+    # 1. arr.len on a single-dim array
+    let numbers: [5]i32 = [5]i32 { 10, 20, 30, 40, 50 };
+    print("numbers.len = {numbers.len}\n");   # 5
+
+    # 2. arr.len on a slice
+    let view: []i32 = numbers[1..4];
+    print("view.len = {view.len}\n");         # 3
+
+    # 3. multi-dim [N][M] literal — the identity matrix from the docs example
+    let matrix: [3][3]i32 = [3][3]i32 {
+        [3]i32 { 1, 0, 0 },
+        [3]i32 { 0, 1, 0 },
+        [3]i32 { 0, 0, 1 },
+    };
+    print("matrix[1][2] = {matrix[1][2]}\n"); # 0  (matrix.len here = 3 rows)
+
+    # 4. multi-dim traversal — len on the outer + per-row len
+    print("matrix.len = {matrix.len}\n");
+    print("matrix[0].len = {matrix[0].len}\n");
+
+    # 5. indexed access on a single-dim array — without -Dbounds-check,
+    # zig's default ReleaseFast emits bare target[index].
+    let third: i32 = numbers[2];
+    print("numbers[2] = {third}\n");          # 30
+}

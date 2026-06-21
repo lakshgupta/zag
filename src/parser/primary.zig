@@ -226,6 +226,65 @@ pub fn parseNew(self: *Parser) Expr {
 
 pub fn parsePostfix(self: *Parser) Expr {
         var lhs = self.parsePrimary();
+        // Generics turbofish (docs/16 §"Turbofish"). Detected AT-IDENT
+        // rather than in `parseComparison` because the grammar
+        // distinguishes `name<T>(...)` (turbofish call) from
+        // `a < b` (less-than comparison) by the IDENT-leading + `.lt`
+        // shape followed by typename-or-constarg tokens + matching
+        // `.gt` + closing `.lparen`. A 4-token lookahead (peek+1
+        // `.lt`, scan to matching `.gt`, verify `.lparen` follows)
+        // is enough to disambiguate without lexer changes. When the
+        // shape holds, we collect turbofish args immediately so the
+        // existing `.call(...)` recursive path can pick them up.
+        if (lhs == .ident and self.peek().tag == .lt) {
+            const tps_start = self.pos;
+            var depth: u32 = 1;
+            var idx: u32 = 1;
+            while (idx < self.tokens.len - tps_start and depth > 0) : (idx += 1) {
+                switch (self.tokens[tps_start + idx].tag) {
+                    .lt => depth += 1,
+                    .gt => {
+                        depth -= 1;
+                        if (depth == 0) {
+                            // Verify turbofish shape: the token AFTER the
+                            // matching `.gt` is `.lparen`. If not, fall
+                            // back to non-turbofish path (the `a < b` form).
+                            if (idx + 1 < self.tokens.len - tps_start and self.tokens[tps_start + idx + 1].tag == .lparen) {
+                                const name = lhs.ident;
+                                const tps_args = self.parseTurbofishArgs();
+                                self.expect(.lparen);
+                                var call_args_buf: [16]Expr = undefined;
+                                var call_arg_count: usize = 0;
+                                if (self.peek().tag != .rparen) {
+                                    const prev = self.allow_struct_lit;
+                                    self.allow_struct_lit = false;
+                                    defer self.allow_struct_lit = prev;
+                                    call_args_buf[call_arg_count] = self.parseExpr();
+                                    call_arg_count += 1;
+                                    while (self.peek().tag == .comma) {
+                                        self.advance();
+                                        call_args_buf[call_arg_count] = self.parseExpr();
+                                        call_arg_count += 1;
+                                    }
+                                }
+                                self.expect(.rparen);
+                                const args_arena = self.arena.alloc(Expr, call_arg_count);
+                                @memcpy(args_arena, call_args_buf[0..call_arg_count]);
+                                lhs = .{ .call = .{ .name = name, .args = args_arena, .type_args = tps_args } };
+                                // Continue the postfix chain so things like
+                                // `max<i32>(3,5)[0]` or `max<i32>(3,5).field`
+                                // continue parsing. The fragment below is
+                                // a fallback hook so the postfix chain
+                                // continues.
+                                continue;
+                            }
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
         // The postfix chain interleaves two shapes:
         //   - `[start..end]` (or single-index or no-bound variants) → `.index` / `.slice`
         //   - `.name` (no parens) → `.member_access` | `.name(args...)` → `.method_call`
