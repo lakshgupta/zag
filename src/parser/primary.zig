@@ -101,16 +101,44 @@ pub fn parseArrayLit(self: *Parser) Expr {
         self.expect(.lbracket);
         // The size literal follows.
         const size_tok = self.peek();
-        if (size_tok.tag != .integer_literal) {
-            std.debug.print("error:{d}:{d}: expected integer literal for array size, got '{s}'\n", .{
+        // Phase 3 followup closure: also accept `.identifier` for the
+        // size slot so `var out = [N]T { val ... };` (where `N` is a
+        // `comptime N: usize` const-param from the surrounding fun
+        // signature) parses through zig's own comptime monomorphization
+        // path. The literal-only case (`.integer_literal`) keeps the
+        // pre-Phase-3 surface intact. A future zag source with computed
+        // sizes (e.g. `[N + 1]`) is still rejected here — it's outside
+        // this commit's scope but the user's docs/16 §4 surface is
+        // covered (the bracket-identifier form).
+        if (size_tok.tag != .integer_literal and size_tok.tag != .identifier) {
+            // Reviewer-polish (Phase 3): the gate accepts ANY `.identifier`
+            // (the size slot isn't constrained to const-param declarations
+            // specifically — zig's comptime resolution handles the
+            // identifier-sized array surface uniformly). The previous
+            // "const-param identifier" framing misled users when they
+            // reached for a regular identifier. Purely cosmetic; the
+            // parse-time acceptance hasn't changed.
+            std.debug.print("error:{d}:{d}: expected integer literal or identifier for array size, got '{s}'\n", .{
                 size_tok.loc.line, size_tok.loc.col, size_tok.text,
             });
             std.process.exit(1);
         }
+        // Phase 3 followup: preserve verbatim size text on the identifier
+        // branch so codegen can emit `** N` (comptime flow-through)
+        // instead of `** 0` (silently-broken literal-walk fallback).
+        // The literal branch leaves `size_text = null` and the digit-
+        // walked `size: u32` is authoritative; `genArrayLit` prefers
+        // `size_text orelse size` so the existing literal surface is
+        // unchanged.
         var size: u32 = 0;
-        for (size_tok.text) |c| {
-            if (c >= '0' and c <= '9') {
-                size = size * 10 + @as(u32, c - '0');
+        var size_text: ?[]const u8 = null;
+        if (size_tok.tag == .identifier) {
+            size_text = size_tok.text;
+        } else {
+            for (size_tok.text) |c| {
+                if (c >= '0' and c <= '9') {
+                    size = size * 10 + @as(u32, c - '0');
+                }
             }
         }
         self.advance();
@@ -149,6 +177,7 @@ pub fn parseArrayLit(self: *Parser) Expr {
         @memcpy(elements, elements_buf[0..element_count]);
         return .{ .array_lit = .{
             .size = size,
+            .size_text = size_text,
             .type_name = type_name,
             .elements = elements,
             .fill = fill,

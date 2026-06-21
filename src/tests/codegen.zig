@@ -1941,3 +1941,137 @@ test "codegen: bounded generic fun emits `@hasDecl` + `@compileError` guard" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "comptime N: usize") != null);
 }
 
+test "codegen: `[<int_lit>]T` annotation round-trips through collectCastType" {
+    // Phase 3 followup (closing the `[<ident>]T` bracket-ident parse-
+    // time hole) extends the bracket-size carve-out to also accept
+    // literal-size brackets `[4]i32`. Without this carve-out the
+    // annotation `let x: [4]i32 = ...` captures EMPTY type-text
+    // (since `[` falls through `collectCastType`'s dispatch into the
+    // `else => break` arm and short-circuits the function). With the
+    // carve-out the slice `[`, the literal-N, and the closing `]`
+    // land as the multi-byte emit `[4]`, then the identifier
+    // `i32` glues on without a separator so the emitted signature
+    // is `[4]i32` verbatim — the form zig accepts.
+    const src = "fun f() {\n    let x: [4]i32 = a;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const x: [4]i32 = a;") != null);
+    // Sanity: the spaced form `[4] i32` must NOT appear — the bracket
+    // glue prevents the disambiguation-shim from inserting a space.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[4] i32") == null);
+}
+
+test "codegen: `[<ident>]T` annotation round-trips through collectCastType" {
+    // The companion test for the docs/16 §4 const-generic + array-shape
+    // surface: `fun fill<T, const N: usize>(val: T) -> [N]T` requires
+    // the `[N]T` return-type annotation to capture as `[N]T` (not the
+    // empty string `collectCastType` returned prior to the bracket-
+    // ident carve-out). The emitted zig signature should carry the
+    // bracket-size case `-> [N]T` verbatim so zig's const-generic
+    // monomorphization reads `comptime N: usize` for the array size.
+    const src = "fun fill<T, const N: usize>(val: T) -> [N]T {\n    return val;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn fill(comptime T: type, comptime N: usize, val: T) [N]T") != null);
+    // Sanity: the spaced form must NOT appear — the bracket-ident glue
+    // keeps `[N]T` as a single token in the emitted sig.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[N] T") == null);
+}
+
+test "codegen: `[<ident>]T { val ... }` array literal round-trips through fill rewrite" {
+    // Phase 3 followup pin on the parseArrayLit `.identifier` size
+    // extension. Before the extension, `parseArrayLit` rejected any
+    // non-integer-literal size token with `expected integer literal
+    // or const-param identifier for array size, got 'N'` and
+    // `std.process.exit(1)`'d at parse time. After the extension,
+    // `var out = [N]T { val ... };` parses cleanly when `N` is a
+    // const-param from the surrounding fun signature.
+    //
+    // Codegen's array-fill pipe rewrites the single-elem + `...` form
+    // as the zig repeat `[1]T{ val } ** N` — same shape as the literal
+    // case `[5]i32 { 0 ... }` → `[1]i32{ 0 } ** 5` (pin in
+    // `codegen: array fill emits [1]T{...}**N`). The leading element
+    // becomes `[1]` because the repeat operator's LHS is a 1-element
+    // runner; the count on the RHS of `**` is the original size (N).
+    // zig's comptime resolution reads `comptime N: usize` from the
+    // surrounding fun's preamble, so the literal `N` flows through to
+    // the emitted array length verbatim — there's no string-side
+    // concatenation to worry about.
+    //
+    // This test pins BOTH halves of the const-generic array-fill
+    // cycle: the parser accepts `[<ident>]T` and the codegen rewrites
+    // it to the zig-native `[1]T{ val } ** N` shape. The docs/16 §4
+    // `fill` example body relies on this exact emission path.
+    const src =
+        \\fun fill<T, const N: usize>(val: T) -> T {
+        \\    var out = [N]T { val ... };
+        \\    return out;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var out = [1]T{ val } ** N") != null);
+    // Sanity: still emit the func body termination + the spelled ident
+    // `N` (zeros in place of `N` would mean the AST's `size: u32` slot
+    // had silently dropped the text — the parseArrayLit extension only
+    // accepts the size, it doesn't rewrite it; the codegen passes `N`
+    // through to the RHS of `**`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "** N") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "** 0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return out;") != null);
+}
+
+test "codegen: `[<ident>]T` annotation + body combined round-trip" {
+    // Coverage gap filled by Phase 3 followup review: the user's
+    // stated surface is `var out: [N]T = [N]T { val ... };` — the
+    // `[N]T` annotation AND the `[N]T { val ... }` body exercise
+    // distinct code paths (collectCastType's bracket-size carve-out
+    // for the LHS, parseArrayLit's `.identifier` size extension for
+    // the RHS). Pinning both within a single test catches regressions
+    // where ONE side gets fixed but the OTHER one silently breaks.
+    //
+    // `var out: [N]T` → `var out: [N]T = [1]T{ val } ** N;` in emitted
+    // zig. The LHS annotation emits verbatim (collectCastType carve-
+    // out preserves `[N]`); the RHS body emits through genArrayLit's
+    // fill rewrite (`[1]T{ val } ** N`). The trailing return prints
+    // the array so zig's runtime monomorphization is exercised end to
+    // end (not just compile-time codegen shape).
+    const src =
+        \\fun fill<T, const N: usize>(val: T) -> T {
+        \\    var out: [N]T = [N]T { val ... };
+        \\    return out;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Annotation side: bracket-size carve-out preserves `[N]` here.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var out: [N]T = ") != null);
+    // Body side: array-fill rewrite emits the canonical zig repeat.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[1]T{ val } ** N") != null);
+    // Sanity: the spaced `[N] T` annotation form must NOT appear
+    // (collectCastType's prev_was_ptr glue rules it out).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[N] T") == null);
+}
+

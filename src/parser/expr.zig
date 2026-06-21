@@ -51,6 +51,80 @@ pub fn collectCastType(self: *Parser) []const u8 {
                 self.advance();
                 continue;
             }
+            // Array-size prefix `[<size>]` — consume the bracket pair
+            // with a single-token size (`[N]T`, `[4]i32`, `[const N]`) as
+            // a single multi-byte type-text segment. Without this carve-out
+            // `[` falls through the dispatch and hits `else => break;`,
+            // leaving the captured type text EMPTY when the source uses
+            // any non-`[]` bracket form for an annotation. The most common
+            // miss-mode prior to this carve-out was the docs/16 §4
+            // const-generic + array-shape return type
+            // `fun fill<T, const N: usize>(val: T) -> [N]T` where the
+            // `[N]T` return-type annotation truncated to empty type-text
+            // and zig rejected the emitted `pub fn fill(...)` signature
+            // for the missing return type. Both literal-N (`[4]i32`) and
+            // ident-N (`[N]T`) shapes now round-trip.
+            //
+            // The carve-out only handles single-token size (`[N+1]` is
+            // punted to a follow-up; the docs/16 surface doesn't include
+            // computed-size brackets yet). The size's token text is copied
+            // verbatim — docs/16's `comptime N: usize` const-generic slot
+            // already round-trips because the type_param capture in
+            // `parser/decl.zig` uses collectCastType too (so `const M: *const
+            // usize` works through the same `[*.consume]` pathway).
+            //
+            // `prev_was_ptr = true` so the next identifier glues onto
+            // `[N]` without a separator (so `[N]T` emits `[N]T`, not
+            // `[N] T` — zig rejects the spaced form because `[N]` already
+            // binds to a single type-name).
+            if (tok.tag == .lbracket and self.pos + 2 < self.tokens.len) {
+                const size_tag = self.tokens[self.pos + 1].tag;
+                const is_simple_size: bool = switch (size_tag) {
+                    // Size tokens accepted:
+                    //   `.integer_literal` — `[4]i32` (literal-N arrays)
+                    //   `.float_literal`   — `[1.5]T` (would be unusual but
+                    //                         parity with the integer case)
+                    //   `.identifier`      — `[N]T` (const-param N from
+                    //                         the surrounding fun sig)
+                    // Tokens NOT accepted (would emit invalid zig if
+                    // present in zag source):
+                    //   `.true_kw` / `.false_kw` — bool literals, not
+                    //                              array sizes
+                    //   `.const_kw`              — `[const N]T` lands as a
+                    //                              literal 5-byte `[const`
+                    //                              token in zig but zig 0.16
+                    //                              rejects `[const` outside
+                    //                              decl contexts. The user's
+                    //                              actual surface is `[N]T`
+                    //                              where `N` is already
+                    //                              `comptime N: usize` in
+                    //                              the fun signature; the
+                    //                              `const_kw` lives upstream
+                    //                              of the bracket, not inside.
+                    .integer_literal, .float_literal, .identifier => true,
+                    else => false,
+                };
+                if (is_simple_size and self.tokens[self.pos + 2].tag == .rbracket) {
+                    if (len + 1 <= buf.len) {
+                        buf[len] = '[';
+                        len += 1;
+                    }
+                    const size_text = self.tokens[self.pos + 1].text;
+                    if (len + size_text.len <= buf.len) {
+                        @memcpy(buf[len..][0..size_text.len], size_text);
+                        len += size_text.len;
+                    }
+                    if (len + 1 <= buf.len) {
+                        buf[len] = ']';
+                        len += 1;
+                    }
+                    prev_was_ptr = true;
+                    self.advance(); // consume `[`
+                    self.advance(); // consume size
+                    self.advance(); // consume `]`
+                    continue;
+                }
+            }
             // Nullable pointer prefix `?` — consume as a single byte and
             // mark `prev_was_ptr` so the next identifier or `*` glues on
             // without a separator (`?i32`, `?*T`). The `.rbracket`-as-term

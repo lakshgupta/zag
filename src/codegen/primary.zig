@@ -105,8 +105,18 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genArrayLit(self: *Codegen, a: ast.Expr.ArrayLitExpr) void {
+        // Phase 3 followup: prefer `a.size_text` (preserved verbatim by
+        // parseArrayLit's identifier branch) over the digit-walked
+        // `a.size` so `[N]T { ... }` round-trips as `[1]T{ val } ** N`
+        // (or `[N]T{ a, b, c }` on the explicit-list path) instead of
+        // the silently-broken `** 0`/`[0]T{ ... }`. The literal branch
+        // (`[3]i32 { 1, 2, 3 }`) keeps the `size_str` from the
+        // existing `std.fmt.bufPrint` path so the pre-Phase-3 surface
+        // is unchanged. Mirrors the additive-optional convention
+        // threaded through `NewExpr.allocator` (a `?[]const u8`)
+        // — adding a slot, not changing an existing one.
         var size_buf: [16]u8 = undefined;
-        const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{a.size}) catch "0";
+        const size_str = a.size_text orelse std.fmt.bufPrint(&size_buf, "{d}", .{a.size}) catch "0";
 
         if (a.fill) {
             // `[1]T{ v } ** N` — Zig's repeat operator. The leading element is

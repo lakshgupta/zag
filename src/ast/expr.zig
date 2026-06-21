@@ -263,7 +263,25 @@ pub const Expr = union(enum) {
 
     pub const ArrayLitExpr = struct {
         /// Compile-time-known element count parsed from `[N]T { ... }`.
+        /// Only meaningful for the literal-size case (`[3]i32 { ... }`,
+        /// `[4]T`); for the identifier-size case (`[N]T { ... }` where `N`
+        /// is a const-param ident in scope) the digit-walk yields `0` and
+        /// `size_text` carries the verbatim source (`"N"`) so codegen can
+        /// emit the comptime-monomomorphized form. `Init pattern: ?` —
+        /// mirrors `NewExpr.allocator` so the optional slot is omitted
+        /// from the literal-only path (the existing `size: u32` keeps its
+        /// meaning for inferred-array-size surfaces).
         size: u32,
+        /// Verbatim size text for the identifier-size case (`[N]T`,
+        /// `[count]T`, ...). `null` for the literal-size case (the
+        /// digit-walked `size: u32` is the authoritative value).
+        /// Codegen prefers this text over `size` when present so the
+        /// emitted zig code carries the user-facing identifier (the
+        /// comptime N flows through zig's monomorphization path with
+        /// zero surgical conversion). Set by `parseArrayLit` ONLY on the
+        /// `.identifier` size branch; the `.integer_literal` branch
+        /// leaves it null.
+        size_text: ?[]const u8 = null,
         /// Element type identifier (e.g. "i32" in `[3]i32`).
         type_name: []const u8,
         /// Explicit element expressions before any `...`.
