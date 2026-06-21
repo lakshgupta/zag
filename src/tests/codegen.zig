@@ -1836,7 +1836,7 @@ test "codegen: closure emit shapes anonymous struct with call method" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call(x: i32) i32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "return x * 2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return (x * 2);") != null);
 }
 
 test "codegen: closure-typed call site rewrites double(5) to double.call(5)" {
