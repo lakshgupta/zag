@@ -89,15 +89,21 @@ pub const Expr = union(enum) {
     struct_lit: StructLitExpr,
     member_access: MemberAccessExpr,
     method_call: MethodCallExpr,
-    /// `Enum.Variant(args...)` or unqualified `Variant(args...)` — the
-    /// constructor form (RHS of `let`, call arg, return value, etc.).
-    /// `enum_name` is `null` when the parser saw only `Variant` (the
-    /// user is relying on type inference per docs/13; codegen forwards
-    /// the bare `Variant(args...)` form verbatim and lets zig's type
-    /// checker resolve the enum name). When `enum_name` is non-null`
-    /// it's the verbatim captured identifier (e.g. `Option`). Built by
-    /// `Parser.parsePrimary`'s `.identifier` arm when an uppercase
-    /// PascalCase identifier is followed by `(`.
+    /// `Enum.Variant(args...)` (with payload) or the no-args form
+    /// `Enum.Variant` -- the qualified constructor form (RHS of `let`,
+    /// call arg, return value, etc.). Codegen forwards both forms
+    /// verbatim and lets zig's type checker resolve the enum name.
+    /// Built by `Parser.parsePrimary`'s `.identifier` arm when TWO
+    /// consecutive PascalCase identifiers are followed by a `.`
+    /// (the enum-name + variant-name qualified shape). The trailing
+    /// `.lparen` is OPTIONAL because the no-args variant ctor shape
+    /// `Direction.North` (no payload) terminates at the variant name
+    /// itself without requiring a parenthesised argument list. The
+    /// pattern counterpart for match arms
+    /// (`Direction.North => 1`) is a separate `Pattern.EnumVariantPattern`
+    /// node -- that form does require parens when bindings are
+    /// captured (e.g. `Some(x)`) and is documented separately on
+    /// `Pattern.EnumVariantPattern` below.
     enum_variant_ctor: EnumVariantCtor,
     /// `|params| -> RET? { body }` closure expression (docs/15 §"Closures").
     /// Parsed by `Parser.parseClosureExpr` from expression position

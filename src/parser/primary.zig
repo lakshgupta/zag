@@ -439,10 +439,11 @@ pub fn parsePrimary(self: *Parser) Expr {
             .print, .identifier => {
                 const name = tok.text;
                 self.advance();
-                // Qualified enum-variant constructor `Enum.Variant(args...)`
-                // (docs/manual/13). Conservative gate: only enable the
-                // QUALIFIED form because the unqualified `Variant(args)`
-                // shape is ambiguous between variant-construction and
+                // Qualified enum-variant constructor `Enum.Variant(...)` or
+                // bare `Enum.Variant` (no-args form, docs/manual/13).
+                // Conservative gate: only enable the QUALIFIED form
+                // because the unqualified `Variant(args)` shape is
+                // ambiguous between variant-construction and
                 // function-call (the existing `.print, .identifier` arm
                 // already routes parenthetical idents to parseCallExpr).
                 // Pattern-context (match/if-let/while-let) is the ONLY
@@ -461,33 +462,82 @@ pub fn parsePrimary(self: *Parser) Expr {
                 // not support struct initialization syntax" because the
                 // bare `enum { North, South, ... }` form doesn't have
                 // fields.
+                //
+                // The gate accepts BOTH the parened form `Enum.Variant(args)`
+                // AND the unparened `Enum.Variant` (no-args variant
+                // constructor — matches the test `parser: qualified
+                // enum-variant-ctor expression with no args` and the
+                // idiomatic Rust shape `Direction::North` translated to
+                // zag's `.`-style namespace). Token-economy check: after
+                // consuming the enum-name ident via the outer arm, peek
+                // `.dot` and then an ident with uppercase leading
+                // letter. We do NOT require `.lparen` at peek+2 -- the
+                // no-args form terminates after the variant name itself
+                // (peek could be `;`, `,`, `.` for chained access, EOF,
+                // or any other terminator). Both branches produce
+                // `Expr.enum_variant_ctor` because that's the parser's
+                // surfacing of the syntactic constructor form; semantic
+                // validation lands downstream in zig's type-checker once
+                // codegen emits the verbatim `Enum.Variant` or
+                // `Enum{ .Variant = ... }` form.
+                //
+                // `.new` (reserved keyword) is excluded by the
+                // `tokens[pos + 1].tag == .identifier` gate -- the
+                // lexer emits `.new` as a single TokenTag, not
+                // `.identifier`, so `Vec3.new(...)` (a method-call on
+                // Vec3) keeps its postfix chain route through
+                // `parsePostfix`'s `.dot` dispatch. Same carve-out for
+                // any future reserved method-name keywords (`.init`,
+                // `.deinit`, etc.).
                 if (tok.tag == .identifier and name.len > 0 and name[0] >= 'A' and name[0] <= 'Z' and
-                    self.pos + 2 < self.tokens.len and
+                    self.pos + 1 < self.tokens.len and
                     self.tokens[self.pos].tag == .dot and
                     self.tokens[self.pos + 1].tag == .identifier and
                     self.tokens[self.pos + 1].text.len > 0 and
                     self.tokens[self.pos + 1].text[0] >= 'A' and
-                    self.tokens[self.pos + 1].text[0] <= 'Z' and
-                    self.tokens[self.pos + 2].tag == .lparen)
+                    self.tokens[self.pos + 1].text[0] <= 'Z')
                 {
                     const variant_name = self.tokens[self.pos + 1].text;
                     self.expect(.dot);
                     _ = self.expectIdent();
-                    self.expect(.lparen);
-                    var args_buf: [16]Expr = undefined;
-                    var arg_count: usize = 0;
-                    if (self.peek().tag != .rparen) {
-                        args_buf[arg_count] = self.parseExpr();
-                        arg_count += 1;
-                        while (self.peek().tag == .comma) {
-                            self.advance();
+                    if (self.peek().tag == .lparen) {
+                        // With-args form: `Direction.North(2.5)` —
+                        // args are comma-separated Exprs parsed via
+                        // `parseExpr`, same convention as method-call
+                        // and tuple-literal. Mirrors the args-parsing
+                        // block in `parseCallExpr` above.
+                        self.expect(.lparen);
+                        var args_buf: [16]Expr = undefined;
+                        var arg_count: usize = 0;
+                        if (self.peek().tag != .rparen) {
                             args_buf[arg_count] = self.parseExpr();
                             arg_count += 1;
+                            while (self.peek().tag == .comma) {
+                                self.advance();
+                                args_buf[arg_count] = self.parseExpr();
+                                arg_count += 1;
+                            }
                         }
+                        self.expect(.rparen);
+                        const args = self.arena.alloc(Expr, arg_count);
+                        @memcpy(args, args_buf[0..arg_count]);
+                        return .{ .enum_variant_ctor = .{
+                            .enum_name = name,
+                            .variant_name = variant_name,
+                            .args = args,
+                        } };
                     }
-                    self.expect(.rparen);
-                    const args = self.arena.alloc(Expr, arg_count);
-                    @memcpy(args, args_buf[0..arg_count]);
+                    // No-args form: `Direction.North` — the variant
+                    // ctor with no payload. Peek after the variant name
+                    // is some terminator (`.` for chained access,
+                    // `;`/`,`/`)`/`]` for end-of-statement, EOF, etc.)
+                    // but NOT `.lparen`. Mirrors the docs/13 surface
+                    // for payload-less variants; codegen forwards
+                    // `Enum.Variant` verbatim and lets zig's type
+                    // checker thread through the inferred enum-name
+                    // surface (the same forwarding strategy as the
+                    // with-args branch).
+                    const args = self.arena.alloc(Expr, 0);
                     return .{ .enum_variant_ctor = .{
                         .enum_name = name,
                         .variant_name = variant_name,
