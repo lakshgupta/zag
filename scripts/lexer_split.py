@@ -624,16 +624,15 @@ def emit_core_block(top_level_blocks, inner_methods, free_blocks):
     # Insert aliases at insert_idx (after last field).
     new_inner_lines = new_inner_lines[:insert_idx] + alias_lines + new_inner_lines[insert_idx:]
 
-    # 4. Promote core methods to `pub`. Allowed since the core Lexer struct
-    #    is exported (`pub const Lexer = struct { ... }` at module scope),
-    #    so its methods being `pub fn` is consistent with the public
-    #    interface. Reader sub-files in src/lexer/{string,ident,number}.zig
-    #    call `self.addToken(...)` and `self.advance(...)`, which require
-    #    these methods to be visible at the struct body level (matching the
-    #    codegen split's precedence).
-    pub_promotion_re = re.compile(r'^    fn (\w+)\(')
+    # 4. Promote kept methods to `pub fn`. Reader sub-files in
+    #    src/lexer/{string,ident,number}.zig call them via
+    #    `self.addToken(...)` / `self.advance(...)`, which requires
+    #    the method to be visible at the struct-body level. Reuse
+    #    INNER_METHOD_RE (defined earlier) and gate on
+    #    `m.group(1) == ''` so we don't double-promote existing
+    #    `pub fn` decls to `pub pub fn ...`.
     new_inner_lines = [
-        ('    pub ' + ln[4:]) if pub_promotion_re.match(ln) else ln
+        ('    pub ' + ln[4:]) if (m := INNER_METHOD_RE.match(ln)) is not None and m.group(1) == '' else ln
         for ln in new_inner_lines
     ]
 
