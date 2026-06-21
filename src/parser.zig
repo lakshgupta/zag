@@ -358,10 +358,7 @@ pub const Parser = struct {
             return_type = if (rt.len == 0) null else rt;
         }
         const body = self.parseBlock();
-        const params = if (param_count > 0)
-            self.arena.alloc(ast.MethodParam, param_count)
-        else
-            &[_]ast.MethodParam{};
+        const params = self.arena.alloc(ast.MethodParam, param_count);
         if (param_count > 0) @memcpy(params, params_buf[0..param_count]);
         return .{ .closure = .{
             .params = params,
