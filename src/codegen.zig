@@ -10,9 +10,19 @@ const ast = @import("ast.zig");
 /// next to `Codegen` rather than in `ast.zig`) because the caller has
 /// no use for the map after compilation — only the shim predicates
 /// consume its lifetime.
+///
+/// Phase 2 (docs/15 §"Closures"): add `is_closure` to record
+/// bindings whose initializer is `Expr.closure`. The map carries the
+/// closure flag even when no `: T` annotation is present because
+/// closure expressions are anonymous-struct values (no user-supplied
+/// type). `isClosureBound(name)` then powers the `.call` -> `.call
+/// (closure)` rewrite at every call site (e.g. `double(5)` becomes
+/// `double.call(5)` so zig recognises the closure-bound value as a
+/// struct with a `call` method rather than a free fn).
 const BindingTypeInfo = struct {
     name: []const u8,
     type_name: []const u8,
+    is_closure: bool = false,
 };
 
 pub const Codegen = struct {
@@ -184,6 +194,16 @@ pub const Codegen = struct {
         self.match_counter = 0;
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
+        // Phase 2 var-params injection — mirrors genMethod/genFun.
+        for (m.params) |p| {
+            if (p.is_var) {
+                self.write("    var ");
+                self.write(p.name);
+                self.write(" = ");
+                self.write(p.name);
+                self.write(";\n");
+            }
+        }
         for (m.body) |s| self.collectTypedBindings(s);
         for (m.body, 0..) |s, i| self.genStmt(s, self.fn_returns_value and i == m.body.len - 1);
         self.write("}\n");
@@ -280,6 +300,19 @@ pub const Codegen = struct {
         // for the method's own locals (not the enclosing pub fn's).
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
+        // Phase 2 (docs/15 §"Parameters"): inject `var p = p;` for each
+        // `is_var = true` param so mutations stay local. Mirrors the
+        // genFun patch so `pub fun bump(var x: i32) { x += 1; }` round-
+        // trips to a `bump` method that mutates a stack-local copy.
+        for (m.params) |p| {
+            if (p.is_var) {
+                self.write("        var ");
+                self.write(p.name);
+                self.write(" = ");
+                self.write(p.name);
+                self.write(";\n");
+            }
+        }
         for (m.body) |s| self.collectTypedBindings(s);
         for (m.body, 0..) |s, i| self.genStmt(s, self.fn_returns_value and i == m.body.len - 1);
         self.write("    }\n");
@@ -403,20 +436,56 @@ pub const Codegen = struct {
         // no-redeclaration rule is satisfied; sibling `pub fn`s reset
         // their own counters to start fresh at `_0`.
         self.match_counter = 0;
-        // Top-level `fun` ALWAYS emits `() !void` regardless of any
-        // source-side return annotation, because the grammar does not
-        // yet parse top-level return types. So `fn_returns_value` stays
-        // `false` here — every match-stmt in the top-level fn body
-        // emits as a value-discarding indented `(blk: { ... });`
-        // statement.
+        // Top-level `fun` is parsed for return_type in Phase 2, but
+        // `fn_returns_value` is only relevant for impl-block methods
+        // where the typed-return drives tail-position match emission.
+        // Top-level funs conservatively keep the legacy
+        // value-discarding match emission — the body can still use
+        // explicit `return expr;` to yield a value, which zig's type
+        // checker validates against the emitted `RET_TYPE` signature.
         self.fn_returns_value = false;
         for (fun.body) |stmt| {
             self.collectTypedBindings(stmt);
         }
         if (fun.doc) |d| self.genDocComment(d);
+        // Phase 2 (docs/15 §"Declaration"): emit the FULL signature
+        // from `fun.params`. Pre-Phase-2 the body unconditionally
+        // emitted `pub fn NAME() !void {` regardless of source-side
+        // params or return type; that's why the docs example
+        // `fun add(a, b) -> i32 { return a + b; }` previously didn't
+        // compile-able (zig rejected the call sites that omitted the
+        // two args). Now args and return type both round-trip
+        // verbatim. Default `ret = "void"` when `fun.return_type` is
+        // null so the legacy form (`fun NAME() {}`) keeps emitting
+        // the no-return surface.
         self.write("pub fn ");
         self.write(fun.name);
-        self.write("() !void {\n");
+        self.write("(");
+        for (fun.params, 0..) |p, i| {
+            if (i > 0) self.write(", ");
+            self.write(p.name);
+            self.write(": ");
+            self.write(p.type_text);
+        }
+        self.write(") ");
+        if (fun.return_type) |rt| self.write(rt) else self.write("void");
+        self.write(" {\n");
+        // Phase 2 (docs/15 §"Parameters"): inject `var p = p;` at body
+        // entry for each `is_var = true` param so mutations to `p`
+        // don't reach the caller's binding (zag's "mutable local copy"
+        // semantic). zig 0.16 makes parameters `const` so the body
+        // can't rebind a param directly through `p = ...`; this
+        // shadow-rebind is the simplest path that honors the
+        // "var copies the value to a stack-local mutable" contract.
+        for (fun.params) |p| {
+            if (p.is_var) {
+                self.write("    var ");
+                self.write(p.name);
+                self.write(" = ");
+                self.write(p.name);
+                self.write(";\n");
+            }
+        }
 
         for (fun.body) |stmt| {
             self.genStmt(stmt, false);
@@ -435,6 +504,14 @@ pub const Codegen = struct {
     /// the shim decision without walking init expressions, which is
     /// explicitly out of scope — see the `needsIntDivShim` caveat for
     /// the residual cases this leaves behind).
+    ///
+    /// Phase 2 (docs/15 §"Closures"): in addition to typed bindings,
+    /// record a binding whose initializer is `Expr.closure` with
+    /// `is_closure = true` so the `.call` rewrite at every call site
+    /// can route `closure_val(args)` through `closure_val.call(args)`.
+    /// Closures do NOT need a `: T` annotation for this lookup because
+    /// the closure expression itself is a self-describing anonymous
+    /// struct; presence of the closure init is the only signal.
     fn collectTypedBindings(self: *Codegen, stmt: ast.Stmt) void {
         const b: ast.Stmt.BindingStmt = switch (stmt) {
             .let => stmt.let,
@@ -443,11 +520,22 @@ pub const Codegen = struct {
             else => return,
         };
         if (b.pattern != null) return;
-        const tn = b.type_name orelse return;
         if (self.type_info_count >= self.type_info_buf.len) return;
+        // Closure-typed binding — no `: T` annotation required.
+        if (b.init == .closure) {
+            self.type_info_buf[self.type_info_count] = .{
+                .name = b.name,
+                .type_name = "",
+                .is_closure = true,
+            };
+            self.type_info_count += 1;
+            return;
+        }
+        const tn = b.type_name orelse return;
         self.type_info_buf[self.type_info_count] = .{
             .name = b.name,
             .type_name = tn,
+            .is_closure = false,
         };
         self.type_info_count += 1;
     }
@@ -475,6 +563,23 @@ pub const Codegen = struct {
         return std.mem.eql(u8, type_name, "f64") or
             std.mem.eql(u8, type_name, "f32") or
             std.mem.eql(u8, type_name, "f16");
+    }
+
+    /// True if `name` is recorded in the per-function type-info map
+    /// with `is_closure = true`. Powers the `.call` arm's rewrite of
+    /// `closure_val(args)` into `closure_val.call(args)` so zig sees
+    /// the closure as a struct-method-call rather than a free fn.
+    /// Idents absent from the map (params, top-level fn calls,
+    /// non-closure lets) return false and the `.call` arm keeps the
+    /// bare `<name>(args)` form so existing call sites compile
+    /// unchanged.
+    fn isClosureBound(self: *Codegen, name: []const u8) bool {
+        for (self.type_info_buf[0..self.type_info_count]) |ti| {
+            if (std.mem.eql(u8, ti.name, name)) {
+                return ti.is_closure;
+            }
+        }
+        return false;
     }
 
     fn genDocComment(self: *Codegen, doc: []const u8) void {
@@ -1141,51 +1246,65 @@ pub const Codegen = struct {
             .template_lit => |t| {
                 self.genTemplateLit(t, .buf_print);
             },
+            .closure => |cl| {
+                // Phase 2 (docs/15 §"Closures"): emit the closure as an
+                // anonymous-struct-instance literal whose zig type
+                // exposes exactly one `call(args) RET` method.
+                // Example `let double = |x: i32| -> i32 { return x *
+                // 2; };` emits `(struct { pub fn call(x: i32) i32 {
+                // return x * 2; } }){}` — the outer `(struct {...}){}`
+                // is a fresh anonymous-struct value, and the `call`
+                // method captures the user's closure body verbatim.
+                // The let-binding's `isClosureBound` retrieval (set by
+                // `collectTypedBindings` on `.closure` init) routes any
+                // subsequent `double(args)` call site through
+                // `<name>.call(args)` via the `.call` arm above.
+                //
+                // Empty `params` and `null` return_type are accepted:
+                // `|| { print("hi"); }` -> `(struct { pub fn call()
+                // void { ... } }){}`. Without an explicit return type,
+                // zig's type inference picks `void` for the body shape
+                // `{}` and refuses to return a value; if the user
+                // needs a returned value, the docs require the
+                // explicit `-> T` annotation.
+                self.write("(struct { pub fn call(");
+                for (cl.params, 0..) |p, i| {
+                    if (i > 0) self.write(", ");
+                    self.write(p.name);
+                    self.write(": ");
+                    self.write(p.type_text);
+                }
+                self.write(") ");
+                if (cl.return_type) |rt| self.write(rt) else self.write("void");
+                self.write(" {\n");
+                for (cl.body) |s| self.genStmt(s, false);
+                self.write("    } }){}");
+            },
             .ident => |name| {
                 self.write(name);
             },
             .call => |c| {
                 if (std.mem.eql(u8, c.name, "print")) {
-                    if (c.args.len == 1) {
-                        switch (c.args[0]) {
-                            .string_lit, .byte_string_lit => |str| {
-                                // Literal string/byte-string: emit the bytes
-                                // directly as the format string with no args.
-                                self.write("std.debug.print(\"");
-                                self.write(str);
-                                self.write("\", .{})");
-                            },
-                            .char_lit => {
-                                // Zig's `{}` formats `u8` as a numeric code
-                                // point; use `{c}` to render the actual char.
-                                self.write("std.debug.print(\"{c}\", .{");
-                                self.genExpr(c.args[0]);
-                                self.write(",})");
-                            },
-                            .array_lit => {
-                                // Arrays don't accept `{}` in zig 0.16;
-                                // `{any}` produces a debug-list of elements.
-                                self.write("std.debug.print(\"{any}\", .{");
-                                self.genExpr(c.args[0]);
-                                self.write(",})");
-                            },
-                            .tuple_lit => {
-                                // `{any}` produces a debug-formatted
-                                // anonymous struct of the tuple fields.
-                                self.write("std.debug.print(\"{any}\", .{");
-                                self.genExpr(c.args[0]);
-                                self.write(",})");
-                            },
-                            .template_lit => |t| {
-                                self.genTemplateLit(t, .debug_print);
-                            },
-                            else => {
-                                self.write("std.debug.print(\"{any}\", .{");
-                                self.genExpr(c.args[0]);
-                                self.write(",})");
-                            },
-                        }
+                    self.genPrintCall(c);
+                } else if (self.isClosureBound(c.name)) {
+                    // Phase 2 (docs/15 §"Closures"): rewrite a closure-
+                    // bound callee into a method-call on the closure's
+                    // anonymous-struct instance. Without this rewrite
+                    // zig emits `<name>(<args>)` and rejects with
+                    // "expected type expression, found '('" because
+                    // closures are anonymous-struct values that don't
+                    // act as free fns. The rewrite produces
+                    // `<name>.call(<args>)` which zig accepts as a
+                    // struct method dispatch (each closure's codegen
+                    // shape defines exactly one `call(args) RET`
+                    // method).
+                    self.write(c.name);
+                    self.write(".call(");
+                    for (c.args, 0..) |arg, i| {
+                        if (i > 0) self.write(", ");
+                        self.genExpr(arg);
                     }
+                    self.write(")");
                 } else {
                     self.write(c.name);
                     self.write("(");
@@ -1558,6 +1677,61 @@ pub const Codegen = struct {
                 self.write(" ");
                 self.genExpr(b.rhs.*);
                 self.write(")");
+            },
+        }
+    }
+
+    /// Print dispatch — pulled out from the `.call` arm so the
+    /// multi-overload dispatch table is preserved when the closure-
+    /// rewrite branch was added (docs/15 §"Closures" Phase 2). Same
+    /// per-arg-kind behaviour as the prior inline form: literal-string
+    /// formats as `.*.{}` (no args), `char_lit` uses `{c}`, arrays /
+    /// tuples / generic expressions use `{any}`, and template-literal
+    /// expressions route to the debug-print template codegen.
+    fn genPrintCall(self: *Codegen, c: ast.Expr.CallExpr) void {
+        if (c.args.len != 1) {
+            // Multi-arg print: fall back to the generic debug-print
+            // form with the args list. Mirrors the codegen already
+            // used for templates where the trailing comma is appended
+            // unconditionally when args are non-empty.
+            self.write("std.debug.print(\"{any}\", .{");
+            for (c.args, 0..) |arg, i| {
+                if (i > 0) self.write(", ");
+                self.genExpr(arg);
+            }
+            if (c.args.len > 0) self.write(",");
+            self.write("})");
+            return;
+        }
+        const arg = c.args[0];
+        switch (arg) {
+            .string_lit, .byte_string_lit => |str| {
+                self.write("std.debug.print(\"");
+                self.write(str);
+                self.write("\", .{})");
+            },
+            .char_lit => {
+                self.write("std.debug.print(\"{c}\", .{");
+                self.genExpr(arg);
+                self.write(",})");
+            },
+            .array_lit => {
+                self.write("std.debug.print(\"{any}\", .{");
+                self.genExpr(arg);
+                self.write(",})");
+            },
+            .tuple_lit => {
+                self.write("std.debug.print(\"{any}\", .{");
+                self.genExpr(arg);
+                self.write(",})");
+            },
+            .template_lit => |t| {
+                self.genTemplateLit(t, .debug_print);
+            },
+            else => {
+                self.write("std.debug.print(\"{any}\", .{");
+                self.genExpr(arg);
+                self.write(",})");
             },
         }
     }

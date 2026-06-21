@@ -272,7 +272,33 @@ pub const Parser = struct {
     /// (the docs/12 receiver convention). The type text is captured
     /// verbatim via `collectCastType` so multi-token types
     /// (`*const Vec3`, `*Vec3`) round-trip cleanly.
+    /// Parse one comma-separated param: optional `var` prefix +
+    /// `name: type_text` + optional `...` suffix + optional `= default`
+    /// tail. Three Phase-2 extensions over the original
+    /// `name: type_text` method param shape:
+    ///
+    /// - `var`: when the leading token is `.var_kw`, flag
+    ///   `is_var = true` so codegen emits `var x = x;` at body entry.
+    ///   Mutual exclusion with `is_self` is enforced by the parser
+    ///   implicitly — `self` parameters are receivers and don't carry
+    ///   `var` mutation semantics in the docs/15 contract.
+    ///
+    /// - `...`: trailing `.ellipsis` immediately after the type token
+    ///   flags `is_variadic = true`. codegen currently treats this as
+    ///   `T: anytype` (the simplest zig compat; full slice-typed
+    ///   variadic + call-site splat is Phase 3+).
+    ///
+    /// - `= EXPR`: trailing `.equals` followed by a parsed Expr
+    ///   produces `default_value`. The Expr is arena-allocated so the
+    ///   pointer-cycle-breaking convention (`?*const Expr`) is
+    ///   honoured. Same as `is_variadic`, codegen support for the
+    ///   optional-arg call-site shim is Phase 3+.
     fn parseMethodParam(self: *Parser) ast.MethodParam {
+        var is_var = false;
+        if (self.peek().tag == .var_kw) {
+            self.advance();
+            is_var = true;
+        }
         const name = self.expectIdent();
         self.expect(.colon);
         const type_text = self.collectCastType();
@@ -280,8 +306,68 @@ pub const Parser = struct {
             std.debug.print("error:{d}:{d}: method parameter '{s}' requires a type after ':'\n", .{ self.peek().loc.line, self.peek().loc.col, name });
             std.process.exit(1);
         }
+        var is_variadic = false;
+        if (self.peek().tag == .ellipsis) {
+            self.advance();
+            is_variadic = true;
+        }
+        var default_value: ?*const ast.Expr = null;
+        if (self.peek().tag == .equals) {
+            self.advance();
+            const dv_buf = self.arena.alloc(ast.Expr, 1);
+            dv_buf[0] = self.parseExpr();
+            default_value = &dv_buf[0];
+        }
         const is_self = std.mem.eql(u8, name, "self");
-        return .{ .name = name, .type_text = type_text, .is_self = is_self };
+        return .{
+            .name = name,
+            .type_text = type_text,
+            .is_self = is_self,
+            .is_var = is_var,
+            .is_variadic = is_variadic,
+            .default_value = default_value,
+        };
+    }
+
+    /// Parse `|params| -> RET? { body }` closure expression
+    /// (docs/15 §"Closures"). Body is a stmt list (mirrors
+    /// `FunDecl.body`) so the docs-canonical form
+    /// `|x: i32| -> i32 { return x * 2; }` parses with `return` in
+    /// stmt position. Param parsing reuses `parseMethodParam` —
+    /// including the Phase-2 `var`/`...`/`= default` extensions on
+    /// MethodParam — so closures accept the same param shape as
+    /// top-level funs and impl-block methods.
+    fn parseClosureExpr(self: *Parser) Expr {
+        self.expect(.pipe);
+        var params_buf: [16]ast.MethodParam = undefined;
+        var param_count: usize = 0;
+        if (self.peek().tag != .pipe) {
+            params_buf[param_count] = self.parseMethodParam();
+            param_count += 1;
+            while (self.peek().tag == .comma) {
+                self.advance();
+                params_buf[param_count] = self.parseMethodParam();
+                param_count += 1;
+            }
+        }
+        self.expect(.pipe);
+        var return_type: ?[]const u8 = null;
+        if (self.peek().tag == .arrow) {
+            self.advance();
+            const rt = self.collectCastType();
+            return_type = if (rt.len == 0) null else rt;
+        }
+        const body = self.parseBlock();
+        const params = if (param_count > 0)
+            self.arena.alloc(ast.MethodParam, param_count)
+        else
+            &[_]ast.MethodParam{};
+        if (param_count > 0) @memcpy(params, params_buf[0..param_count]);
+        return .{ .closure = .{
+            .params = params,
+            .return_type = return_type,
+            .body = body,
+        } };
     }
 
     fn parseFunDecl(self: *Parser) ast.FunDecl {
@@ -289,9 +375,48 @@ pub const Parser = struct {
         self.expect(.fun);
         const name = self.expectIdent();
         self.expect(.lparen);
+        // Phase 2 (docs/15 §"Declaration"): parse a comma-separated
+        // parameter list inside `(<params>)`. Each param is the same
+        // shape as `parseMethodParam` (just without the `self`
+        // receiver carve-out — top-level functions don't carry a
+        // receiver). The multi-token type collector handles
+        // pointer types like `*const T` and bracket prefixes `[]T`
+        // so `fun add(a: i32, b: i32)` round-trips. When the param
+        // list is empty (the legacy `fun NAME() {}` form), we emit
+        // a zero-length slice and codegen uses the legacy
+        // `pub fn NAME() RET_TYPE` shape.
+        var params_buf: [16]ast.MethodParam = undefined;
+        var param_count: usize = 0;
+        if (self.peek().tag != .rparen) {
+            params_buf[param_count] = self.parseMethodParam();
+            param_count += 1;
+            while (self.peek().tag == .comma) {
+                self.advance();
+                params_buf[param_count] = self.parseMethodParam();
+                param_count += 1;
+            }
+        }
         self.expect(.rparen);
+        // Optional `-> RET_TYPE` annotation. When absent, codegen
+        // defaults to `void` (no return value); zig's type
+        // inference takes over for the expression-bodied cases.
+        var return_type: ?[]const u8 = null;
+        if (self.peek().tag == .arrow) {
+            self.advance();
+            const rt = self.collectCastType();
+            return_type = if (rt.len == 0) null else rt;
+        }
         const body = self.parseBlock();
-        return .{ .name = name, .body = body, .loc = start, .doc = null };
+        const params = self.arena.alloc(ast.MethodParam, param_count);
+        @memcpy(params, params_buf[0..param_count]);
+        return .{
+            .name = name,
+            .params = params,
+            .body = body,
+            .loc = start,
+            .doc = null,
+            .return_type = return_type,
+        };
     }
 
     fn parseBlock(self: *Parser) []const Stmt {
@@ -1316,6 +1441,19 @@ pub const Parser = struct {
                 // match_expr and route the codegen via this exact node.
                 return .{ .match_expr = m };
             },
+            // Closure expressions (docs/15 §"Closures") start with the
+            // leading `.pipe` token of the param-bracketed `|x| body`
+            // shape. Dispatched here at the top of parseExpr so the rest
+            // of the precedence ladder sees the closure as a single
+            // operand and `let f = |x| x + 1;` parses as a single
+            // Closure-typed RHS rather than something bitwise-OR-shaped.
+            // This route mirrors the `.if_kw` arm above and avoids
+            // touching `parsePrimary` directly (where the anchor
+            // surface is large). The `.pipe_pipe` (logical-or) and
+            // `.pipe_eq` (compound-assign) tokens remain binary
+            // operators handled by the binary parse-layers; only the
+            // bare `.pipe` is the closure sentinel.
+            .pipe => return self.parseClosureExpr(),
             else => return self.parseRange(),
         }
     }

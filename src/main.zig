@@ -3996,3 +3996,162 @@ test "codegen: single-arg named (x: 42,) emits .{ .x = 42 }" {
     try std.testing.expect(std.mem.indexOf(u8, zig, ".{ .x = 42 }") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, ".{ 42 }") == null);
 }
+
+test "parser: fun NAME(params) -> RET_TYPE captures full signature" {
+    const src = "fun add(a: i32, b: i32) -> i32 {\n    return a + b;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.functions.len == 1);
+    try std.testing.expect(std.mem.eql(u8, prog.functions[0].name, "add"));
+    try std.testing.expect(prog.functions[0].params.len == 2);
+    try std.testing.expect(std.mem.eql(u8, prog.functions[0].params[0].name, "a"));
+    try std.testing.expect(std.mem.eql(u8, prog.functions[0].params[0].type_text, "i32"));
+    try std.testing.expect(prog.functions[0].params[0].is_var == false);
+    try std.testing.expect(prog.functions[0].params[1].is_var == false);
+    try std.testing.expect(prog.functions[0].return_type != null);
+    try std.testing.expect(std.mem.eql(u8, prog.functions[0].return_type.?, "i32"));
+}
+
+test "parser: var prefix on parameter sets is_var flag" {
+    const src = "fun bump(var x: i32) {\n    x += 1;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.functions.len == 1);
+    try std.testing.expect(prog.functions[0].params.len == 1);
+    try std.testing.expect(prog.functions[0].params[0].is_var == true);
+    try std.testing.expect(std.mem.eql(u8, prog.functions[0].params[0].type_text, "i32"));
+}
+
+test "parser: variadic ... suffix sets is_variadic flag" {
+    const src = "fun sum(values: i32...) -> i32 {\n    return 0;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.functions[0].params.len == 1);
+    try std.testing.expect(prog.functions[0].params[0].is_variadic == true);
+}
+
+test "parser: default value = expr captures default_value" {
+    const src = "fun connect(host: str, port: u16 = 8080) {\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.functions[0].params.len == 2);
+    try std.testing.expect(prog.functions[0].params[1].default_value != null);
+}
+
+test "parser: closure expression |x:T|->T{} produces Expr.closure" {
+    const src = "fun main() {\n    let double = |x: i32| -> i32 { return x * 2; };\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.functions.len == 1);
+    try std.testing.expect(prog.functions[0].body.len == 1);
+    const let_stmt = prog.functions[0].body[0].let;
+    try std.testing.expect(let_stmt.init == .closure);
+    try std.testing.expect(let_stmt.init.closure.params.len == 1);
+    try std.testing.expect(std.mem.eql(u8, let_stmt.init.closure.params[0].name, "x"));
+    try std.testing.expect(std.mem.eql(u8, let_stmt.init.closure.return_type.?, "i32"));
+}
+
+test "codegen: full signature emits pub fn NAME(p: T, ...) RET_TYPE" {
+    const src = "fun add(a: i32, b: i32) -> i32 {\n    return a + b;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn add(a: i32, b: i32) i32") != null);
+}
+
+test "codegen: void fun emits pub fn NAME(...) void" {
+    const src = "fun greet(name: str) {\n    print("hello, {name}\\n");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn greet(name: []const u8) void") != null);
+}
+
+test "codegen: var param injection emits var x = x; at body entry" {
+    const src = "fun bump(var x: i32) {\n    x += 1;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn bump(x: i32) void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    var x = x;") != null);
+}
+
+test "codegen: closure emit shapes anonymous struct with call method" {
+    const src = "fun main() {\n    let double = |x: i32| -> i32 { return x * 2; };\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call(x: i32) i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return x * 2;") != null);
+}
+
+test "codegen: closure-typed call site rewrites double(5) to double.call(5)" {
+    const src = "fun main() {\n    let double = |x: i32| -> i32 { return x * 2; };\n    let result = double(5);\n    print("{result}\\n");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "double.call(5)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "double(5)") == null);
+}
+
+test "codegen: unannotated closure binding still rewrites call to .call(...)" {
+    // The most natural closure shape omits an explicit `: Closure`
+    // type annotation. `isClosureBound` must seed from
+    // collectTypedBindings's closure-init detection pass (not the
+    // typed-binding pass), so even a bare `let c = |x| ...;`
+    // rewrites `c(args)` to `c.call(args)`. This test locks the
+    // wire against a future regression that gates closure detection
+    // on the typed-binding precondition.
+    const src =
+        \\fun f() {
+        \\    let c = |x: i32| -> i32 { return x + 1; };
+        \\    print("{c(4)}\n");
+        \\}
+        \\;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "c.call(4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "c(4)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "print({c(4)}") == null);
+}

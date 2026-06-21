@@ -82,11 +82,21 @@ pub const Expr = union(enum) {
     /// `enum_name` is `null` when the parser saw only `Variant` (the
     /// user is relying on type inference per docs/13; codegen forwards
     /// the bare `Variant(args...)` form verbatim and lets zig's type
-    /// checker resolve the enum name). When `enum_name` is non-null
+    /// checker resolve the enum name). When `enum_name` is non-null`
     /// it's the verbatim captured identifier (e.g. `Option`). Built by
     /// `Parser.parsePrimary`'s `.identifier` arm when an uppercase
     /// PascalCase identifier is followed by `(`.
     enum_variant_ctor: EnumVariantCtor,
+    /// `|params| -> RET? { body }` closure expression (docs/15 §"Closures").
+    /// Parsed by `Parser.parseClosureExpr` from expression position
+    /// when the leading token is `.pipe`. Codegen emits an anonymous
+    /// struct with a `call(args) RET` method so `closure_expr(args)`
+    /// can be rewritten as `closure_expr.call(args)` at call sites
+    /// (closure-type tracking happens in codegen's per-fn type-info map
+    /// so binding-driven call sites are detected correctly). Empty
+    /// `params` and `null` return_type are accepted (primitives
+    /// like `|| { print("hi"); return 0; }`).
+    closure: ClosureExpr,
 
     pub const BinaryExpr = struct {
         /// Operator tag. Stored as an enum so codegen can switch on the
@@ -383,6 +393,20 @@ pub const Expr = union(enum) {
     pub const NamedTupleLit = struct {
         names: []const []const u8,
         elements: []const Expr,
+    };
+
+    /// Backing struct for `Expr.closure`. `params` carries the
+    /// pipe-bracketed parameter list (same shape as `FunDecl.params` /
+    /// `MethodDecl.params`). `return_type` is the optional `-> T` arrow
+    /// following the params; `null` falls through to zig's type
+    /// inference. `body` is a stmt-list (mirrors `FunDecl.body` /
+    /// `MethodDecl.body`) so the canonical docs/15 form
+    /// `|x: i32| -> i32 { return x * 2; }` parses with the `return`
+    /// stmt in body position.
+    pub const ClosureExpr = struct {
+        params: []const MethodParam,
+        return_type: ?[]const u8,
+        body: []const Stmt,
     };
 };
 
@@ -700,9 +724,21 @@ pub const Stmt = union(enum) {
 
 pub const FunDecl = struct {
     name: []const u8,
+    /// Parameter list, parsed comma-separated `name: type` form (with
+    /// optional `var` prefix and `...` suffix, plus optional `= default`
+    /// tail). Mirrors `MethodDecl.params` shape so codegen emits the
+    /// zig `pub fn NAME(p1: T1, p2: T2, ...) RET_TYPE {` signature
+    /// verbatim. Empty slice means no parameters (existing legacy form).
+    /// Phase 2: full decl params; Phase 1 was `pub fn NAME() !void`.
+    params: []const MethodParam = &[_]MethodParam{},
     body: []const Stmt,
     loc: Loc,
     doc: ?[]const u8,
+    /// Optional return type annotation `fun foo(...) -> RET_TYPE { … }`.
+    /// `null` when the source omits the arrow clause (legacy form,
+    /// still entered as `pub fn NAME() !void`). Codegen falls back to
+    /// zig's type-inference downstream when `null`.
+    return_type: ?[]const u8 = null,
 };
 
 /// One field in a struct declaration. Two shapes:
@@ -777,6 +813,24 @@ pub const MethodParam = struct {
     /// `self` to the source author — they write `v.length()` not
     /// `v.length(self)`).
     is_self: bool,
+    /// `var x: T` parameter marker (docs/15 §"Parameters"). When true,
+    /// codegen emits `var x = x;` at the body top so mutations to `x`
+    /// don't reach the caller's binding. `false` (default) preserves
+    /// the parameter-as-immutable-binding semantic per the docs.
+    is_var: bool = false,
+    /// `x: T...` variadic-parameter marker. When true, the parameter
+    /// receives a slice-typed value (e.g. `values: []const i32`) so the
+    /// body can iterate via `for v in values`. Codegen folds  ... /
+    /// slicer-spell via @call() at the call site when args are literal
+    /// (see `Phase 2+` notes in docs/15).
+    is_variadic: bool = false,
+    /// `x: T = EXPR` default-value marker. Codegen treats the param
+    /// as optional and at every call site emits a shim pass that
+    /// substitutes the default. Direct zig codegen path: emit the
+    /// default as a sentinel `__opt_<i>` arg and let the body branch.
+    /// Currently parser-side only — full call-site shaping is Phase 3
+    /// because zag has no type-resolver to count args per call site.
+    default_value: ?*const Expr = null,
 };
 
 /// One method inside an `impl` block. The `params` slice preserves
