@@ -141,7 +141,15 @@ pub fn isLiteralInit(expr: Expr) bool {
             // expression position, so allowing bare binding of these two
             // variants is safe — the resulting zig code round-trips through
             // downstream uses (print, member access, comparisons).
-            .int_lit, .float_lit, .bool_lit, .char_lit, .string_lit, .byte_string_lit, .null_lit, .undefined_lit, .tuple_lit, .array_lit, .template_lit, .new_expr, .struct_lit, .single_tuple_lit, .named_tuple_lit => true,
+            .int_lit, .float_lit, .bool_lit, .char_lit, .string_lit, .byte_string_lit, .null_lit, .undefined_lit, .tuple_lit, .array_lit, .template_lit, .new_expr, .struct_lit, .single_tuple_lit, .named_tuple_lit, .closure => true,
+            // .closure is also a literal init because codegen tracks
+            // closure-typed bindings via type_info_buf.is_closure = true
+            // (see collectTypedBindings in src/codegen/stmt.zig), so
+            // the closure's zig type is decidable at the binding site
+            // without an explicit : T annotation. Same-self-describe
+            // rationale as the anonymous-struct (single/named-tuple-lit)
+            // variants above, just dispatched through a different
+            // codegen slot.
             else => false,
         };
     }
