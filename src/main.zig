@@ -1259,7 +1259,7 @@ test "codegen: const + var mix matches examples/basics/variables.zag" {
     // but each uses the distinct keyword then the distinct emitted zig
     // binding.
     // (broken raw-string form was here; replaced with regular string form below)
-    const src = "f() { let x = if Foo { 1 } else { 2 }; let v = Vec3 { x: 1, y: 2, z: 3 };\n}";
+    const src = "fun main() {\n    let x: i32 = 10;\n    var y: f64 = 3.14;\n    const PI: f64 = 3.14159;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1325,7 +1325,7 @@ test "codegen: format spec emitted in placeholder" {
     // so zig's debug formatter applies it. Args tuple still emits only `PI`
     // (not `PI:.5`); the spec lives in the format string, not the args.
     // (was 3-line broken raw-string form; collapsed to single-line)
-    const src = "f() { let x = if Foo { 1 } else { 2 }; let v = Vec3 { x: 1, y: 2, z: 3 };\n}";
+    const src = "fun main() {\n    let PI: f64 = 3.14;\n    print(\"{PI:.5}\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -4079,7 +4079,7 @@ test "codegen: full signature emits pub fn NAME(p: T, ...) RET_TYPE" {
 }
 
 test "codegen: void fun emits pub fn NAME(...) void" {
-    const src = "fun greet(name: str) {\n    print("hello, {name}\\n");\n}\n";
+    const src = "fun greet(name: str) {\n    print(\"hello, {name}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -4117,7 +4117,7 @@ test "codegen: closure emit shapes anonymous struct with call method" {
 }
 
 test "codegen: closure-typed call site rewrites double(5) to double.call(5)" {
-    const src = "fun main() {\n    let double = |x: i32| -> i32 { return x * 2; };\n    let result = double(5);\n    print("{result}\\n");\n}\n";
+    const src = "fun main() {\n    let double = |x: i32| -> i32 { return x * 2; };\n    let result = double(5);\n    print(\"{result}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -4143,6 +4143,7 @@ test "codegen: unannotated closure binding still rewrites call to .call(...)" {
         \\    print("{c(4)}\n");
         \\}
         \\;
+    ;
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
