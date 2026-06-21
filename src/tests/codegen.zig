@@ -1880,3 +1880,64 @@ test "codegen: unannotated closure binding still rewrites call to .call(...)" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "print({c(4)}") == null);
 }
 
+test "codegen: generic fun emits `comptime X: type` preamble" {
+    // docs/16 §1: `fun id<T>(x: T) -> T` must emit
+    //   `pub fn id(comptime T: type, x: T) T { return x; }`
+    // The `comptime T: type` arg slot is what lets zig treat T as a
+    // compile-time-monomorphized type paremeter (no boxing, no runtime
+    // dispatch). The preamble must appear BEFORE the regular params
+    // so zig's comptime-arg convention is honored.
+    const src = "fun id<T>(x: T) -> T {\n    return x;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn id(comptime T: type, x: T) T") != null);
+    // Sanity: name + return type round-tripped.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return x;") != null);
+}
+
+test "codegen: bounded generic fun emits `@hasDecl` + `@compileError` guard" {
+    // docs/16 §3: `fun max<T: Ordered>(a, b) -> T` must emit a guard at
+    // body entry that fails to compile if T does not expose a `compare`
+    // method (the canonical Ordered trait surface per the doc). Without
+    // the guard, an unsupported T would crash downstream at the
+    // `a > b` zig op, which is exactly what we want the user-facing
+    // source-line error to prevent.
+    const src = "fun max<T: Ordered>(a: T, b: T) -> T {\n    return a;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Guard must appear before the body returns.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (!@hasDecl(T, \"compare\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@compileError(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "must implement Ordered") != null);
+    // The signature still has the `comptime T: type` preamble.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn max(comptime T: type") != null);
+}test "codegen: const generic + type parameter emits `comptime T: type, comptime N: usize`" {
+    // docs/16 §4: `fun fill<T, const N: usize>(val: T) -> T` — the
+    // non-const TypeParam emits `comptime T: type` (same as §1), and
+    // the const TypeParam emits `comptime N: usize` (verbatim type
+    // text captured at parse time, NOT the bare `type` keyword).
+    // The return type is a bare `T` so the source does NOT depend on
+    // the `[<ident>]T` parse-time bracket-capture hole in
+    // collectCastType (a Phase 3 followup will close that).
+    const src = "fun fill<T, const N: usize>(val: T) -> T {\n    return val;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime T: type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime N: usize") != null);
+}
+

@@ -10,14 +10,21 @@ const Codegen = core.Codegen;
 // FILE-SCOPE methods (DECL bucket)
 // ============================================================
 
-    pub     fn genFreeMethod(self: *Codegen, target_type: []const u8, m: ast.MethodDecl) void {
+    pub     fn genFreeMethod(self: *Codegen, target_type: []const u8, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
         self.write("pub fn ");
         self.write(target_type);
         self.write("_");
         self.write(m.name);
         self.write("(");
+        // Generics impl-level type_params preamble. Mirrors genMethod
+        // and genFun so generic impl-blocks land as
+        // `pub fn List_T_push(comptime T: type, self: *List(T), value: T)`.
+        // The `*List(T)` receiver note: Phase 4 wires the codegen
+        // type-text rewrite (`*List<T>` → `*List(T)`); for Phase 2 this
+        // preamble only — receiver types stay verbatim until then.
+        const generics_preamble = self.genTypeParamsPreamble(impl_type_params);
         for (m.params, 0..) |p, i| {
-            if (i > 0) self.write(", ");
+            if (i > 0 or generics_preamble) self.write(", ");
             self.write(p.name);
             self.write(": ");
             self.write(p.type_text);
@@ -31,6 +38,10 @@ const Codegen = core.Codegen;
         self.match_counter = 0;
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
+        // Trait-bounds guards (docs/16 §3) — mirrors genFun's body
+        // entry so unresolved impl-block generic bounds surface
+        // as a zag compile-error at the user's source-line.
+        self.genBoundsGuards(impl_type_params);
         // Phase 2 var-params injection — mirrors genMethod/genFun.
         for (m.params) |p| {
             if (p.is_var) {
@@ -89,18 +100,29 @@ const Codegen = core.Codegen;
         for (all_impls) |impl| {
             if (!std.mem.eql(u8, impl.target_type, sd.name)) continue;
             for (impl.methods) |m| {
-                self.genMethod(m);
+                // Phase 2 tail: thread impl-level type_params so the
+                // nested method emits `comptime X: type` BEFORE its
+                // own params. Mirrors genFreeMethod's call update.
+                self.genMethod(m, impl.type_params);
             }
         }
         self.write("};\n\n");
     }
 
-    pub     fn genMethod(self: *Codegen, m: ast.MethodDecl) void {
+    pub     fn genMethod(self: *Codegen, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
         self.write("    pub fn ");
         self.write(m.name);
         self.write("(");
+        // Generics impl-level type_params preamble. Mirrors genFun
+        // — emits `comptime X: type` (or `comptime X: TYPE`) for each
+        // impl-block type-param BEFORE the method's own params. The
+        // matching call site (genStructDecl / genEnumDecl for the
+        // nested case; the orphan-impl loop in generate for the
+        // free-fn case via genFreeMethod) threads `impl.type_params`
+        // in. Phase 2 commit-scope.
+        const generics_preamble = self.genTypeParamsPreamble(impl_type_params);
         for (m.params, 0..) |p, i| {
-            if (i > 0) self.write(", ");
+            if (i > 0 or generics_preamble) self.write(", ");
             self.write(p.name);
             self.write(": ");
             self.write(p.type_text);
@@ -108,6 +130,8 @@ const Codegen = core.Codegen;
         self.write(") ");
         if (m.return_type) |rt| self.write(rt);
         self.write(" {\n");
+        // Trait-bounds guards (docs/16 §3) — see genFun's comment.
+        self.genBoundsGuards(impl_type_params);
         // Reset per-function counters before this method body's emission
         // so destructuring temps (`__destruct_<N>`) and `new` temps
         // (`__p_<N>`) and match scrutinees (`__m_<N>`) start fresh at
@@ -139,6 +163,95 @@ const Codegen = core.Codegen;
         for (m.body) |s| self.collectTypedBindings(s);
         for (m.body, 0..) |s, i| self.genStmt(s, self.fn_returns_value and i == m.body.len - 1);
         self.write("    }\n");
+    }
+
+    pub     fn genBoundsGuards(self: *Codegen, tps: []const ast.TypeParam) void {
+        // Generics trait-bounds (docs/16 §3): emit one
+        // `if (!@hasDecl(TP_name, "method_name")) @compileError(...);`
+        // guard per bounded TypeParam. Called at body entry (BEFORE
+        // var-p injection) so unresolved bounds surface as a zag
+        // compile-error at the user's source-line, not as a zig
+        // panic downstream.
+        //
+        // Unknown traits (not in boundToMethodName's canonical map)
+        // skip the guard emit entirely — Phase 3 will replace this
+        // pragmatic carve-out with a real trait-system wiring.
+        for (tps) |tp| {
+            for (tp.bounds) |b| {
+                const method = boundToMethodName(b);
+                if (std.mem.eql(u8, method, b)) continue;
+                self.write("    if (!@hasDecl(");
+                self.write(tp.name);
+                self.write(", \"");
+                self.write(method);
+                self.write("\")) @compileError(\"type ");
+                self.write(tp.name);
+                self.write(" must implement ");
+                self.write(b);
+                self.write(" (missing `");
+                self.write(method);
+                self.write("` method)\");\n");
+            }
+        }
+    }
+
+    pub     fn genTypeParamsPreamble(self: *Codegen, tps: []const ast.TypeParam) bool {
+        // Emit `comptime X: type` (non-const) or `comptime X: TYPE`
+        // (const-generic) for each type-param BEFORE the regular param
+        // emit. Returns true if any preamble was emitted so the
+        // caller can insert a `, ` separator between the last
+        // type-param and the first regular param.
+        //
+        // For `const N: TYPE` slots, the verbatim type_text is
+        // emitted directly (zig accepts `comptime N: usize` / `comptime
+        // N: *const usize` / etc., reusing collectCastType's
+        // multi-token capture pipeline).
+        var emitted = false;
+        for (tps) |tp| {
+            if (emitted) self.write(", ");
+            self.write("comptime ");
+            self.write(tp.name);
+            self.write(": ");
+            if (tp.is_const) {
+                // type_text is set by parseTypeParam when `is_const =
+                // true`. We panic on a missing type_text rather than
+                // fall back to a sentinel — a parser regression
+                // surfacing as a zag compile-time panic is the desired
+                // diagnostic, not a silently-wrong type at every
+                // const-param site.
+                self.write(tp.type_text.?);
+            } else {
+                self.write("type");
+            }
+            emitted = true;
+        }
+        return emitted;
+    }
+
+    pub     fn boundToMethodName(b: []const u8) []const u8 {
+        // Maps docs/16 §3 trait-bound names to the canonical method
+        // name that a conforming zig type would expose. Pinned
+        // mapping (from the user's review-confirmed spec):
+        //   Clone          → clone()
+        //   Default        → default()
+        //   Zero           → is_zero()
+        //   Ordered        → compare()  (used by sind, max, etc.)
+        //   Display        → display()
+        //   Iterator<T>    → next()  (v1 — the `<T>` form is ignored)
+        //   AsyncStream<T> → poll_next()  (v1 — same carve-out)
+        //
+        // Returns `b` (the input) verbatim when no mapping exists,
+        // which `genBoundsGuards` treats as "skip guard emit" so
+        // unspecified bounds pass through silently until the trait
+        // system wires in (Phase 3).
+        if (std.mem.eql(u8, b, "Clone")) return "clone";
+        if (std.mem.eql(u8, b, "Default")) return "default";
+        if (std.mem.eql(u8, b, "Zero")) return "is_zero";
+        if (std.mem.eql(u8, b, "Ordered")) return "compare";
+        if (std.mem.eql(u8, b, "Display")) return "display";
+        if (std.mem.eql(u8, b, "Iterator")) return "next";
+        if (std.mem.eql(u8, b, "AsyncStream")) return "poll_next";
+        return b;
     }
 
     pub     fn genEnumDecl(self: *Codegen, ed: ast.EnumDecl, all_impls: []const ast.ImplBlock) void {
@@ -223,7 +336,10 @@ const Codegen = core.Codegen;
         for (all_impls) |impl| {
             if (!std.mem.eql(u8, impl.target_type, ed.name)) continue;
             for (impl.methods) |m| {
-                self.genMethod(m);
+                // Phase 2 tail: thread impl-level type_params so the
+                // nested-on-enum method emits `comptime X: type`
+                // BEFORE its own params. Same path as genStructDecl.
+                self.genMethod(m, impl.type_params);
             }
         }
         self.write("};\n\n");
@@ -275,8 +391,17 @@ const Codegen = core.Codegen;
         self.write("pub fn ");
         self.write(fun.name);
         self.write("(");
+        // Generics (docs/16 §1, §4): emit `comptime X: type` or
+        // `comptime X: TYPE` for each TypeParam BEFORE the regular
+        // params. Zig's comptime-arg convention places compile-time
+        // values at the start of the signature, so the preprint goes
+        // here rather than at the end. Returns true if any
+        // preamble was emitted so the regex check below inserts a
+        // `, ` separator between the last type-param and the first
+        // regular param.
+        const generics_preamble = self.genTypeParamsPreamble(fun.type_params);
         for (fun.params, 0..) |p, i| {
-            if (i > 0) self.write(", ");
+            if (i > 0 or generics_preamble) self.write(", ");
             self.write(p.name);
             self.write(": ");
             self.write(p.type_text);
@@ -284,6 +409,12 @@ const Codegen = core.Codegen;
         self.write(") ");
         if (fun.return_type) |rt| self.write(rt) else self.write("void");
         self.write(" {\n");
+        // Trait-bounds guards (docs/16 §3): emit
+        // `if (!@hasDecl(T, "method")) @compileError(...)` BEFORE
+        // the var-params injection so unresolved bounds surface as a
+        // zag compile-error at the user's source-line rather than a
+        // sig validation panic downstream.
+        self.genBoundsGuards(fun.type_params);
         // Phase 2 (docs/15 §"Parameters"): inject `var p = p;` at body
         // entry for each `is_var = true` param so mutations to `p`
         // don't reach the caller's binding (zag's "mutable local copy"

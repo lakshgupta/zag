@@ -74,6 +74,8 @@ pub const Codegen = struct {
     pub const genStmt = @import("stmt.zig").genStmt;
     pub const genStructDecl = @import("decl.zig").genStructDecl;
     pub const genTemplateLit = @import("primary.zig").genTemplateLit;
+    pub const genTypeParamsPreamble = @import("decl.zig").genTypeParamsPreamble;
+    pub const genBoundsGuards = @import("decl.zig").genBoundsGuards;
     pub const generate = @import("core.zig").generate;
     pub const init = @import("core.zig").init;
     pub const isClosureBound = @import("core.zig").isClosureBound;
@@ -171,7 +173,11 @@ pub const Codegen = struct {
             }
             if (is_matched) continue;
             for (impl.methods) |m| {
-                self.genFreeMethod(impl.target_type, m);
+                // Phase 2 generics: thread impl-level type_params so the
+                // orphan free-fn emits `comptime X: type` BEFORE its own
+                // params. Same wire-up as genStructDecl/genEnumDecl on
+                // the nested-method path.
+                self.genFreeMethod(impl.target_type, m, impl.type_params);
             }
         }
 
