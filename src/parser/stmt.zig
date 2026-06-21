@@ -16,6 +16,8 @@ const Parser = core.Parser;
 const isLiteralInit = core.isLiteralInit;
 
 
+
+
 pub fn compoundOpForTag(tag: TokenTag) ?ast.Expr.BinaryOp {
         return switch (tag) {
             .plus_eq => .add,
@@ -69,7 +71,7 @@ pub fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
             // a `: T` annotation is REQUIRED for any init shape that doesn't
             // self-describe its type. The carve-out is the LITERAL Expr
             // kinds (int/float/bool/char/string/byte_string/null/undefined
-            // literals + tuple / array / template literals) — each carries
+            // literals + tuple / array / template literals) -- each carries
             // its type directly in the source form, so the binding is
             // statically typed even when no explicit `: T` annotation is
             // written. Non-literal inits (binary expressions, idents,
@@ -101,6 +103,67 @@ pub fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
                 }
                 type_name = collected;
             }
+            // Compile-time type-parameter evaluation block (docs/manual/16
+            // §6 "Compile-Time Type Parameters"): `const NAME: T = const {
+            // ... return EXPR; }`. Detected BEFORE the ordinary `=`
+            // expression path because the inner `{ … }` would either
+            // reach parseExpr as a struct-literal initializer (rejected
+            // because `const` is a reserved keyword in primary position)
+            // OR silently produce a `expected '=' after type annotation,
+            // got 'const'` parse error. Only valid on `.const_binding`;
+            // `let x = const { … }` and `var x = const { … }` fall
+            // through to the standard path and surface the same parse
+            // error so the rejection is uniform.
+            if (kind == .const_binding and
+                self.peek().tag == .equals and
+                self.peekAhead(1) == .const_kw)
+            {
+                self.expect(.equals);
+                self.advance(); // consume `const_kw`
+                const block_body = self.parseBlock();
+                if (block_body.len == 0 or block_body[block_body.len - 1] != .return_stmt) {
+                    std.debug.print("error:{d}:{d}: const block for '{s}' must end with `return EXPR;`\n", .{
+                        binding_loc.line,
+                        binding_loc.col,
+                        pattern.name,
+                    });
+                    std.process.exit(1);
+                }
+                // Reject bare `return;` (no value) -- the block's value
+                // is the binding's RHS and zig's `break :blk ;` rejects
+                // value-less breaks. The parse-by-parse ReturnStmt parser
+                // accepts `return;` (value=null) for void-returning fns,
+                // but const-blocks always need a value.
+                if (block_body[block_body.len - 1].return_stmt.value == null) {
+                    std.debug.print("error:{d}:{d}: const block for '{s}' `return` must carry a value (const blocks always evaluate to a value)\n", .{
+                        binding_loc.line,
+                        binding_loc.col,
+                        pattern.name,
+                    });
+                    std.process.exit(1);
+                }
+                // `init` stays null for const-block bindings -- the
+                // const-block path carries no value-level initializer
+                // because the body's tail `return EXPR;` becomes the
+                // binding's RHS at codegen time. Codegen gates on
+                // `b.block != null` first and never reads `b.init`
+                // for the const-block path (the null sentinel is the
+                // semantic representation of "this binding has no
+                // Expr init").
+                const result: Stmt.BindingStmt = .{
+                    .name = pattern.name,
+                    .type_name = type_name,
+                    .init = null,
+                    .block = block_body,
+                };
+                // Parser invariant documented in src/ast/stmt.zig
+                // BindingStmt doc comment (init=null iff block!=null).
+                // Codegen enforces it via the diagnostic + exit in
+                // src/codegen/stmt.zig:genBinding (destructuring + simple
+                // path arms), so we trust the helper's caller-control
+                // here rather than duplicating the check at parse time.
+                return result;
+            }
             self.expect(.equals);
             const initializer = self.parseExpr();
             if (type_name == null and !isLiteralInit(initializer)) {
@@ -113,11 +176,17 @@ pub fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
                 });
                 std.process.exit(1);
             }
-            return .{ .name = pattern.name, .type_name = type_name, .init = initializer };
+            const result: Stmt.BindingStmt = .{ .name = pattern.name, .type_name = type_name, .init = initializer };
+            // Parser invariant documented in src/ast/stmt.zig
+            // BindingStmt doc comment (init=null iff block!=null).
+            // Codegen enforces it via the diagnostic + exit in
+            // src/codegen/stmt.zig:genBinding, so the helper is not
+            // duplicated at parse time.
+            return result;
         }
         // Destructuring form: per the parser-level type-annotation rule, a
         // colon after the opening `(` or `[` IS NOT a binding-name annotation
-        // (those tokens select the destructuring shape) — pattern leaves are
+        // (those tokens select the destructuring shape) -- pattern leaves are
         // type-analyzed at codegen time using the source expression's literal
         // shape and the matching element's inferred zig type. We reject
         // colon-on-pattern here so the parser doesn't try to consume `:` as
@@ -134,7 +203,13 @@ pub fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
         }
         self.expect(.equals);
         const initializer = self.parseExpr();
-        return .{ .name = "", .type_name = null, .init = initializer, .pattern = pattern };
+        const result: Stmt.BindingStmt = .{ .name = "", .type_name = null, .init = initializer, .pattern = pattern };
+        // Parser invariant documented in src/ast/stmt.zig
+        // BindingStmt doc comment (init=null iff block!=null).
+        // Codegen enforces it via the diagnostic + exit in
+        // src/codegen/stmt.zig:genBinding, so the helper is not
+        // duplicated at parse time.
+        return result;
     }
 
 
@@ -151,7 +226,7 @@ pub fn parseBindingPattern(self: *Parser) ast.BindingPattern {
                 pat_count += 1;
                 while (self.peek().tag == .comma) {
                     self.advance();
-                    // `...NAME` rest-binding — must be the LAST pattern
+                    // `...NAME` rest-binding -- must be the LAST pattern
                     // in the destructuring tuple. Parsed inline so a
                     // trailing `,` is NOT consumed (rest is terminal).
                     // Phase 1 invokes `.rest = RestBinding` with
@@ -185,7 +260,7 @@ pub fn parseBindingPattern(self: *Parser) ast.BindingPattern {
             // emission time. The architectural symmetry with the tuple arm
             // (same `before_count = pat_count` numbering, same `rest` arm
             // dispatch in codegen) means no codegen changes are required for
-            // the array-with-rest surface beyond what already exists — both
+            // the array-with-rest surface beyond what already exists -- both
             // shapes lower to `__destruct_N[i][j..]` zig indexing, and zig
             // 0.16 accepts bracketed indexing on BOTH arrays and anonymous
             // structs.
@@ -198,7 +273,7 @@ pub fn parseBindingPattern(self: *Parser) ast.BindingPattern {
                 while (self.peek().tag == .comma) {
                     self.advance();
                     // Phase 2 mirror: `.ellipsis IDENT` triggers rest-binding.
-                    // Terminal (no trailing `,`) — break immediately so the
+                    // Terminal (no trailing `,`) -- break immediately so the
                     // closing `]` matches on the next expect().
                     if (self.peek().tag == .ellipsis) {
                         self.advance();
@@ -257,7 +332,7 @@ pub fn parseBlock(self: *Parser) []const Stmt {
 
 pub fn parseCompoundAssign(self: *Parser, op: ast.Expr.BinaryOp) Stmt.AssignStmt {
         const name = self.expectIdent();
-        // Consume the OP_EQ token — parseStmt's lookahead verified the
+        // Consume the OP_EQ token -- parseStmt's lookahead verified the
         // specific tag, but `advance` walks past whatever OP_EQ associate
         // matched the originalTokenTag` to the matching TokenTag forms.
         self.advance();
@@ -339,7 +414,7 @@ pub fn parseIfBranch(self: *Parser) Stmt.IfStmt {
         // default `allow_struct_lit = true` everywhere; the principled
         // carve-out is the EXACT list of "block-start `{` required" sites
         // (if-cond, while-cond, for-iter, match-scrutinee). `if Foo { ... }`
-        // should parse as cond=ident(Foo), body={...} — NOT as a
+        // should parse as cond=ident(Foo), body={...} -- NOT as a
         // struct-literal that swallows the if-body. Inside the body and
         // any chained else-if below (parseStmtList → parseExpr), the flag
         // reverts to default-true so `let v = Vec3 { ... }` inside the
@@ -364,7 +439,7 @@ pub fn parseIfBranch(self: *Parser) Stmt.IfStmt {
                 // The chain can be arbitrarily long because the recursive
                 // boxed `*IfStmt` desugars to a left-leaning list, not a
                 // self-referential recursion in the type system. NOTE: do
-                // NOT advance past `.if_kw` here — the nested call below
+                // NOT advance past `.if_kw` here -- the nested call below
                 // recurses into `parseIfBranch`, which begins with
                 // `expect(.if_kw)`. A premature advance skipped that token
                 // and surfaced as `expected if_kw, got <cond-ident>` in the
@@ -443,7 +518,7 @@ pub fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
             const body_buf = self.arena.alloc(Expr, 1);
             body_buf[0] = self.parseExpr();
             // Comma separator between arms. The trailing comma before `}`
-            // is optional — if rbrace is the immediate next token after the
+            // is optional -- if rbrace is the immediate next token after the
             // rbrace of the body, we accept it without error.
             if (self.peek().tag == .comma) self.advance();
             arms_buf[arm_count] = .{ .pat = pat, .guard = guard, .expr = &body_buf[0] };
@@ -513,13 +588,13 @@ pub fn parsePattern(self: *Parser) ast.Pattern {
                 // Enum-variant pattern detection (docs/manual/13). When the
                 // leading identifier is PascalCase (Rust/Zig convention for
                 // type + variant names), the three shapes are:
-                //   1. `Enum.Variant(args...)` — qualified; emits
+                //   1. `Enum.Variant(args...)` -- qualified; emits
                 //      enum_name="Enum", variant_name="Variant", bindings set.
-                //   2. `Variant(args...)` — unqualified, type-inferred per
+                //   2. `Variant(args...)` -- unqualified, type-inferred per
                 //      docs/13; emits enum_name="", variant_name="Variant",
                 //      bindings set.
                 //   3. `Variant` (bare, followed by `=>`, `if guard`,
-                //      `,`, `}`, newline, or eof) — bare variant pattern
+                //      `,`, `}`, newline, or eof) -- bare variant pattern
                 //      with bindings=null.
                 // Lowercase identifiers fall through to the existing
                 // ident-binding path (or `_` → discard).
@@ -558,7 +633,7 @@ pub fn parsePattern(self: *Parser) ast.Pattern {
                             .bindings = bindings,
                         } };
                     }
-                    // Unqualified shape: peek 0 = .lparen — type-inferred binding.
+                    // Unqualified shape: peek 0 = .lparen -- type-inferred binding.
                     if (self.pos + 1 < self.tokens.len and
                         self.tokens[self.pos + 1].tag == .lparen)
                     {
@@ -649,7 +724,7 @@ pub fn parseStmt(self: *Parser) Stmt {
         switch (tok.tag) {
             // Each binding-kind dispatch arm selects the kind AND the union
             // tag simultaneously so the AST carries both. parseBinding does
-            // not see the union tag — it just parses the common shape and
+            // not see the union tag -- it just parses the common shape and
             // returns a BindingStmt; the structural duplication that
             // motivated the refactor lives here at exactly three lines.
             .let => return .{ .let = self.parseBinding(.let) },
@@ -680,7 +755,7 @@ pub fn parseStmt(self: *Parser) Stmt {
                     // 3-token lookahead for `name . ident =` field-write.
                     // Pattern: ident (current) . dot (next) . ident (n+2) . equals (n+3).
                     // Only the canonical `bare-name . bare-name = value` form
-                    // is supported via this lookahead — for more complex LHSs
+                    // is supported via this lookahead -- for more complex LHSs
                     // like `(getBox()).x = …` or `arr[i].x = …`, the user can
                     // extract the value to a local first then field-assign.
                     if (next == .dot and

@@ -22,13 +22,22 @@ const getTopElements = @import("primary.zig").getTopElements;
         if (b.pattern != null) return;
         if (self.type_info_count >= self.type_info_buf.len) return;
         // Closure-typed binding — no `: T` annotation required.
-        if (b.init == .closure) {
-            self.type_info_buf[self.type_info_count] = .{
-                .name = b.name,
-                .type_name = "",
-                .is_closure = true,
-            };
-            self.type_info_count += 1;
+        // Const-block bindings (`b.init == null`) carry no Expr to
+        // inspect: skip the closure-detection branch and any subsequent
+        // type-info recording that relied on `b.init` shape. The
+        // `b.type_name` arm keeps recording (a const-block binding can
+        // carry an explicit `: T` annotation independent of `init`).
+        if (b.init) |init_val| {
+            if (init_val == .closure) {
+                self.type_info_buf[self.type_info_count] = .{
+                    .name = b.name,
+                    .type_name = "",
+                    .is_closure = true,
+                };
+                self.type_info_count += 1;
+                return;
+            }
+        } else {
             return;
         }
         const tn = b.type_name orelse return;
@@ -285,6 +294,23 @@ const getTopElements = @import("primary.zig").getTopElements;
 
     pub     fn genBinding(self: *Codegen, kw: []const u8, b: ast.Stmt.BindingStmt) void {
         if (b.pattern) |pattern| {
+            // Const-block bindings and pattern-bindings are mutually
+            // exclusive (parser rejects the latter combination), so
+            // reaching the destructuring path implies a non-null
+            // `b.init`. The parser invariant is enforced at parseBinding
+            // (see `validateBindingInvariant` below) — if a future parser
+            // regression ever lets a null `init` reach here, surface an
+            // actionable diagnostic naming the binding kind instead of
+            // crashing. Mirrors the `.rest`-arm shape of `genBindingLeaves`
+            // so all parser-invariant violations uniformly route to
+            // `std.debug.print` + `std.process.exit(1)`.
+            const init_expr = b.init orelse {
+                std.debug.print("error:codegen: {s} destructuring binding {s}: parser invariant violated — init is null on a non-const-block binding (b.pattern set)\n", .{
+                    kw,
+                    b.name,
+                });
+                std.process.exit(1);
+            };
             const idx = self.destructure_counter;
             self.destructure_counter += 1;
             var tmp_buf: [32]u8 = undefined;
@@ -292,15 +318,66 @@ const getTopElements = @import("primary.zig").getTopElements;
             self.write("    const ");
             self.write(tmp_name);
             self.write(" = ");
-            self.genExpr(b.init);
+            self.genExpr(init_expr);
             self.write(";\n");
             // Walk the init expression in parallel with the pattern so each
             // leaf can infer its type from the corresponding source literal
             // (e.g. `(1, 2)` → leaves get `: i32` for `var` destructurings).
-            self.genBindingLeaves(kw, tmp_name, pattern, getTopElements(b.init));
+            self.genBindingLeaves(kw, tmp_name, pattern, getTopElements(init_expr));
             return;
         }
-        // Simple path.
+        // Compile-time block form (docs/manual/16-generics.md §6): `const
+        // NAME: T = const { … return EXPR; };`. We emit the body as a zig
+        // labeled block `blk: { …stmts…; break :blk EXPR; }`, translating
+        // the parser-side `return EXPR;` terminator into `break :blk EXPR;`
+        // so the result of the block is the binding's RHS value (matching
+        // zig's native `return` (for fns) → `break :blk` (for blocks)
+        // difference). The block is evaluated at comptime when bound to a
+        // `const` so the entire payload collapses to a compile-time constant
+        // downstream. Body statements are emitted via the shared `genStmt`
+        // path so `for` / `if` / `var` / nested expressions all round-trip
+        // identically to their function-body counterparts.
+        if (b.block) |stmts| {
+            self.write("    const ");
+            self.write(b.name);
+            if (b.type_name) |t| {
+                self.write(": ");
+                self.write(t);
+            }
+            self.write(" = blk: {\n");
+            for (stmts) |s| {
+                if (s == .return_stmt) {
+                    // `return EXPR;` → `break :blk EXPR;` so zig's
+                    // labeled-block semantics carries the bind's RHS
+                    // value out. Bare `return;` (no value) is rejected
+                    // at parse time so this arm always has a value.
+                    self.write("        break :blk ");
+                    if (s.return_stmt.value) |v| {
+                        self.genExpr(v);
+                    }
+                    self.write(";\n");
+                } else {
+                    self.genStmt(s, false);
+                }
+            }
+            self.write("    };\n");
+            return;
+        }
+        // Simple path. Const-block bindings return above; reaching the
+        // simple path implies a non-null `b.init`. The parser invariant
+        // is enforced at parseBinding (see `validateBindingInvariant`
+        // below) — if a future parser regression ever lets a null `init`
+        // reach here, surface an actionable diagnostic naming the
+        // binding kind instead of crashing. Mirrors the destructuring-
+        // path arm above so both runtime-invariant violations uniformly
+        // route to `std.debug.print` + `std.process.exit(1)`.
+        const init_expr = b.init orelse {
+            std.debug.print("error:codegen: {s} plain binding {s}: parser invariant violated — init is null on a non-const-block binding (no pattern, no block)\n", .{
+                kw,
+                b.name,
+            });
+            std.process.exit(1);
+        };
         self.write("    ");
         self.write(kw);
         self.write(" ");
@@ -313,7 +390,7 @@ const getTopElements = @import("primary.zig").getTopElements;
             self.write(t);
         }
         self.write(" = ");
-        self.genExpr(b.init);
+        self.genExpr(init_expr);
         self.write(";\n");
     }
 

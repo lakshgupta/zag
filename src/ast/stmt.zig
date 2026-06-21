@@ -155,7 +155,13 @@ pub const Stmt = union(enum) {
         /// Optional type annotation parsed from `name: T = expr`.
         /// `null` for un-annotated bindings (type inferred from `init`).
         type_name: ?[]const u8,
-        init: Expr,
+        /// Initializer expression. `null` ONLY for compile-time block
+        /// bindings (`const NAME: T = const { … return EXPR; }`), where
+        /// the value-yielding body lives on `block`. Non-`null` for every
+        /// other binding kind (let / var / const plain + destructuring).
+        /// Codegen gates on `b.init != null` (and `b.block != null`
+        /// first) so a const-block binding's null init is never read.
+        init: ?Expr = null,
         /// Optional destructuring pattern. `null` for the plain
         /// `let NAME = INIT` form (codegen emits one zig binding per stmt).
         /// Non-`null` for destructuring forms like `let (a, b) = …` or
@@ -165,6 +171,20 @@ pub const Stmt = union(enum) {
         /// `: T` annotations on destructuring forms because the doc does
         /// not specify a syntax for them).
         pattern: ?BindingPattern = null,
+        /// `const NAME: T = const { … return EXPR; };` compile-time
+        /// block form (docs/manual/16-generics.md §6 "Compile-Time Type
+        /// Parameters"). `null` for ordinary value bindings. When set,
+        /// codegen emits the body as a zig labeled block
+        /// `const NAME: T = blk: { ...stmts... break :blk EXPR; };`,
+        /// translating the user's `return EXPR;` terminator into
+        /// `break :blk EXPR;`. Only valid on `.const_binding` AST tag;
+        /// the parser rejects `let x = const { … }` and `var x = const
+        /// { … }` at parse time. Mutually exclusive with `pattern`
+        /// (destructuring is not allowed on a const-block binding) and
+        /// with `init` (a non-null init on a const-block binding is a
+        /// codegen bug — the bind's value comes from `block`'s tail
+        /// `return EXPR;`).
+        block: ?[]const Stmt = null,
     };
 
     pub const AssignStmt = struct {
