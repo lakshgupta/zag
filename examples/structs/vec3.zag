@@ -1,8 +1,5 @@
-## Structs with methods and operator overloading
-##
-## Run: zag run vec3.zag
-
-import std.math
+## Structs with methods, struct-literal construction, and field access.
+## Run: zag run examples/structs/vec3.zag
 
 struct Vec3 {
     x: f64,
@@ -15,19 +12,16 @@ impl Vec3 {
         return Vec3 { x: x, y: y, z: z };
     }
 
-    pub fun length(self: *const Vec3) -> f64 {
-        return math.sqrt(self.x * self.x + self.y * self.y + self.z * self.z);
-    }
-
-    pub fun __add__(a: Vec3, b: Vec3) -> Vec3 {
-        return Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+    pub fun sumsq(self: *const Vec3) -> f64 {
+        return self.x * self.x + self.y * self.y + self.z * self.z;
     }
 }
 
 fun main() {
-    let v = Vec3.new(1.0, 2.0, 3.0);
-    print("length = {v.length()}\n");
+    let v: Vec3 = Vec3.new(1.0, 2.0, 3.0);
+    let v2: Vec3 = Vec3 { x: 4.0, y: 5.0, z: 6.0 };
 
-    let w = v + Vec3.new(4.0, 5.0, 6.0);
-    print("sum = ({w.x}, {w.y}, {w.z})\n");
+    print("v = ({v.x}, {v.y}, {v.z})\n");
+    print("v2 = ({v2.x}, {v2.y}, {v2.z})\n");
+    print("v.sumsq = {v.sumsq()}\n");
 }

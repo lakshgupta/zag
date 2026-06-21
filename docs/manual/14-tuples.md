@@ -41,6 +41,8 @@ let (a, b, ...rest) = (10, 20, 30, 40, 50);
 
 **Memory:** `rest` is a stack-allocated slice of the remaining elements. Zero cost — the compiler reuses the original tuple's memory.
 
+> **Runtime RHS caveat (Phase 2).** Rest binding on a *runtime* RHS (init is an `.ident` or call, not a literal tuple/array) emits an open-ended zig slice `__destruct_<N>[<before_count>..]`. This requires the RHS subject to be sliceable under zig 0.16: `var arr = [N]T {…}` or `let arr: []T = …`. Anonymous-struct tuple values (e.g. `let x = (1, 2, 3); let (a, ...rest) = x;`) cannot be sliced by zig and reject at compile time — use destructuring instead, or bind the value as a sized array.
+
 ## Named Tuple Fields
 
 Tuples can have named fields for documentation and access:

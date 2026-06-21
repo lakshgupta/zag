@@ -1,0 +1,66 @@
+# tuples.zag — Phase 1 tuple essentials demo.
+#
+# Demonstrates the three new tuple features:
+#   1. Single-element tuples `(42,)` — distinct from `(42)` paren-grouping.
+#   2. Named tuple fields `(x: 10, y: 20)` — behave like anonymous structs
+#      with named field access via `point.x` / `point.0`.
+#   3. Rest binding `(first, ...rest)` — captures trailing elements into
+#      a fresh (anonymous-struct) variable.
+
+fun main() {
+    # 1. Single-element tuple
+    let single = (42,);
+    print("single = {single}\n");
+
+    # 2. Named tuple fields. zig 0.16 accepts .NAME access on anonymous
+    #    structs of named-field init (`point.x`, `point.y`); numeric field
+    #    access (`pos.0`, `pos.1`) is REJECTED on anonymous-struct-of-
+    #    positional-init in zig 0.16, so the canonical user-facing pattern
+    #    is destructuring (`let (p0, p1) = pos;`) which codegen emits as
+    #    `__destruct_N[0]`/..[1]` `[k]` indexing (zig 0.16 accepted form).
+    let point = (x: 10, y: 20);
+    let pos = (1, 2);
+    print("point.x = {point.x}  point.y = {point.y}\n");
+    let (p0, p1) = pos;
+    print("p0 = {p0}  p1 = {p1}\n");
+
+    # 3. Rest binding splits the first element from the remaining tail
+    let (first, ...rest) = (1, 2, 3, 4);
+    print("{first}\n");
+    print("{rest}\n");
+
+    # Mixed: positional + named + single-element + rest in one body
+    let pair = (1, 2);
+    let triple_named = (a: 100, b: 200, c: 300);
+    let (head, ...tail) = (10, 20, 30, 40, 50);
+    print("{pair}\n");
+    print("{triple_named}\n");
+    # 1b. Single-element named `(x: 42,)` — trailing comma on a SINGLE
+    #     named-field tuple. zig emits `.{ .x = 42 }`. Phase 2 verifies the
+    #     2-gate parser accepts this without silently dropping the field
+    #     name. Note: trailing comma on a SINGLE positional `(42,)` still
+    #     routes to `.single_tuple_lit`, NOT `.named_tuple_lit` — the
+    #     difference is the IDENT prefix.
+    let single_named = (x: 42,);
+    print("single_named.x = {single_named.x}\n");
+
+    # 3b. Phase 2 — ARRAY patterns can use `...rest`, mirroring tuple
+    #     patterns. `let [a, ...more] = [10, 20, 30]` should emit `a = 10`
+    #     and `more = .{ 20, 30 }` (anonymous-struct-of-two ints in
+    #     zig 0.16). The same destructure-temp walker handles both.
+    let [aa, ...amore] = [3]i32 { 10, 20, 30 };
+    print("{aa}\n");
+    print("{amore}\n");
+
+    # 3c. NESTED rest-binding `(a, (b, ...ir)) = (1, (2, 3, 4))`.
+    #     The walker's recursive descent already carries the inner subtree's
+    #     elements via `src_path + "[" + i + "]"` recursion, so indices
+    #     reference the inner tuple's slot, not the outer container.
+    let (na, (nb, ...nrest)) = (1, (2, 3, 4, 5));
+    print("{na}\n");
+    print("{nb}\n");
+    print("{nrest}\n");
+
+    print("{head}\n");
+    print("{tail}\n");
+}

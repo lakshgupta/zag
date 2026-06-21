@@ -16,6 +16,20 @@ pub const Expr = union(enum) {
     null_lit: void,
     undefined_lit: void,
     tuple_lit: []const Expr,
+    /// Single-element tuple `(x,)` (trailing comma present).
+    /// Distinguishes from paren-grouping `(x)` which routes to just
+    /// `x` (no tuple). Single-element tuples at the codegen level
+    /// emit `.{ x }` (anonymous struct with one positional element).
+    /// `*Expr` pointer-typed to break Expr's size cycle with the
+    /// `Expr.NamedTupleLit.elements` induction — same cycle-breaking
+    /// convention as `BinaryExpr.lhs`.
+    single_tuple_lit: *Expr,
+    /// Named-tuple literal `(x: 10, y: 20)`. Fields have compile-time
+    /// names that disappear at the ABI level (the runtime value is a
+    /// positional anonymous struct). Codegen emits `. { .x = 10, .y = 20 }`
+    /// in zig 0.16 syntax. Distinct from `struct_lit` because there's
+    /// no typename — the named fields are anonymous-struct keys.
+    named_tuple_lit: NamedTupleLit,
     array_lit: ArrayLitExpr,
     ident: []const u8,
     call: CallExpr,
@@ -48,6 +62,31 @@ pub const Expr = union(enum) {
     /// expression-valued per the user-confirmed shape (single-expression
     /// arm bodies). Codegen emits a labeled-block if-else ladder.
     match_expr: MatchExpr,
+    /// `Type { f1: v1, f2: v2, }` struct-literal expression. Built by
+    /// `Parser.parsePrimary` when the leading token is an identifier
+    /// followed by `{` (the lexical discriminator between a bare
+    /// `.ident` and a struct-literal). Field-init list is preserved in
+    /// declaration order; codegen emits `.TypeName{ .f1 = …, .f2 = … }`
+    /// verbatim. NOTE: this field is declared BEFORE the `pub const`
+    /// block below because zig requires all union fields to be declared
+    /// before any non-field declarations — a `pub const NestedStruct`
+    /// between fields triggers a compile error. The backing
+    /// `StructLitExpr` and `FieldInit` types live near the other nested
+    /// payload struct definitions in this union. This field lives
+    /// BEFORE the `pub const` block to satisfy the ordering rule.
+    struct_lit: StructLitExpr,
+    member_access: MemberAccessExpr,
+    method_call: MethodCallExpr,
+    /// `Enum.Variant(args...)` or unqualified `Variant(args...)` — the
+    /// constructor form (RHS of `let`, call arg, return value, etc.).
+    /// `enum_name` is `null` when the parser saw only `Variant` (the
+    /// user is relying on type inference per docs/13; codegen forwards
+    /// the bare `Variant(args...)` form verbatim and lets zig's type
+    /// checker resolve the enum name). When `enum_name` is non-null
+    /// it's the verbatim captured identifier (e.g. `Option`). Built by
+    /// `Parser.parsePrimary`'s `.identifier` arm when an uppercase
+    /// PascalCase identifier is followed by `(`.
+    enum_variant_ctor: EnumVariantCtor,
 
     pub const BinaryExpr = struct {
         /// Operator tag. Stored as an enum so codegen can switch on the
@@ -136,6 +175,34 @@ pub const Expr = union(enum) {
     pub const IndexExpr = struct {
         target: *Expr,
         index: *Expr,
+    };
+
+    /// Postfix member-access — `target.name`. Built by
+    /// `Parser.parsePostfix` when the chain sees a `.identifier` (no
+    /// parens follow). Codegen emits `<target>.<name>` verbatim because
+    /// zig's struct-field-access syntax is identical to zag's
+    /// surface — the user's `v.x` round-trips to zig `v.x` and zig's
+    /// native type checker validates the field exists on `v`'s type.
+    /// The `target` is `*Expr` for the cycle-breaking reason
+    /// documented on `BinaryExpr.lhs`.
+    pub const MemberAccessExpr = struct {
+        target: *Expr,
+        name: []const u8,
+    };
+
+    /// Postfix method-call — `target.name(args...)`. Built by
+    /// `Parser.parsePostfix` when `.identifier` is followed by `(`.
+    /// Codegen emits `<target>.<name>(<args>)` verbatim because zig
+    /// natively distinguishes between value-receiver calls (`v.length()`,
+    /// `v: Vec3`) and type-static calls (`Vec3.new(...)`). No za-side type
+    /// resolver is required — zig's own type checking handles the dispatch.
+    /// Args are positional Exprs in order; named-arg form is reserved for
+    /// a future syntax (the current spec uses positional args for both
+    /// constructors and regular methods, mirroring zig's own convention).
+    pub const MethodCallExpr = struct {
+        target: *Expr,
+        name: []const u8,
+        args: []const Expr,
     };
 
     /// Range expression — `start..end` (inclusive=false) or `start...end`
@@ -276,6 +343,47 @@ pub const Expr = union(enum) {
         scrutinee: *Expr,
         arms: []const MatchArm,
     };
+
+    /// Backing struct for `Expr.struct_lit` — `Type { f1: v1, f2: v2, }`.
+    /// `type_name` carries the verbatim source text (e.g. `Vec3`); the
+    /// parser does not validate it against a struct-decl table because
+    /// zag has no module system. Codegen emits `.TypeName { .f1 = …, .f2 = … }`
+    /// verbatim — zig's anonymous-struct literal syntax accepts the
+    /// dotted-field form when the TypeName is a real declared struct
+    /// and the field names match. `FieldInit.value` is `*Expr` for the
+    /// same cycle-breaking reason as `BinaryExpr.lhs`.
+    pub const StructLitExpr = struct {
+        type_name: []const u8,
+        inits: []const FieldInit,
+    };
+
+    /// One field-init inside a struct-literal. The field name is preserved
+    /// verbatim so codegen can emit `.field_name = value` exactly as the
+    /// user wrote it. `value` is `*Expr` for cycle-breaking (see the
+    /// `StructLitExpr` doc).
+    pub const FieldInit = struct {
+        name: []const u8,
+        value: *Expr,
+    };
+
+    /// Backing struct for `Expr.enum_variant_ctor`. `args` uses the
+    /// `[]const Expr` slice convention (value-typed) because the
+    /// constructor is a leaf position in expression trees — não need
+    /// for cycle-breaking pointer indirection (unlike the pattern form,
+    /// which sits inside MatchArm and needs the *Expr pointer convention).
+    pub const EnumVariantCtor = struct {
+        enum_name: ?[]const u8,
+        variant_name: []const u8,
+        args: []const Expr,
+    };
+
+    /// Backing struct for `Expr.named_tuple_lit`. `names` is parallel
+    /// to `elements` by index (preserve order in code review per the
+    /// docs/14 tuples.md example). Lengths must match.
+    pub const NamedTupleLit = struct {
+        names: []const []const u8,
+        elements: []const Expr,
+    };
 };
 
 /// One arm of a `match` expression: a `Pattern`, an optional `if`-guard,
@@ -318,11 +426,36 @@ pub const Pattern = union(enum) {
     range: PatternRange,
     ident: []const u8,
     discard: void,
+    /// `Enum.Variant(b1, b2, ...)` or unqualified `Variant(b1, b2, ...)`
+    /// (when type is inferred per `docs/manual/13-enums.md`). Built by
+    /// `Parser.parsePattern` when the leading token is an identifier
+    /// (PascalCase-by-convention) optionally preceded by `Enum.`
+    /// (qualified) and optionally followed by `(` and a comma-separated
+    /// list of either binding-name idents or wildcard `_` tokens.
+    /// `bindings` is `null` for bare tag-only variants (e.g.
+    /// `Direction.North =>`); non-null for variants carrying a payload
+    /// and listing each binding name (and `_` for throw-away ones).
+    enum_variant: EnumVariantPattern,
 
     pub const PatternRange = struct {
         start: *Expr,
         end: *Expr,
         inclusive: bool,
+    };
+
+    /// Backing struct for `Pattern.enum_variant`. `enum_name` is the
+    /// verbatim parser-captured identifier (e.g. `Direction`); empty
+    /// string when the parser sees only `Variant` (the writeup is
+    /// "scheme supports unqualified variants when the type is
+    /// inferred"; at AST level we preserve the source text and let
+    /// codegen thread through the inferred-type surface). `bindings`
+    /// is `null` when the variant is bare (no `(...)` follows); when
+    /// present, each slot is a per-arg binding name (null = wildcard
+    /// `_`, non-null = ident text captured verbatim).
+    pub const EnumVariantPattern = struct {
+        enum_name: []const u8,
+        variant_name: []const u8,
+        bindings: ?[]?[]const u8,
     };
 };
 
@@ -357,6 +490,22 @@ pub const BindingPattern = union(enum) {
     discard: void,
     tuple: []const BindingPattern,
     array: []const BindingPattern,
+    /// `...NAME` rest-binding — collects the *remaining* tuple elements
+    /// after the previous leaves. Must be the LAST element in a tuple/
+    /// array pattern (parser enforces this). `before_count` is the
+    /// number of named/discard leaves that came before this rest in
+    /// the pattern, so codegen can slice the temp from `before_count`
+    /// to `init_len - 1`. Phase 1 supports rest-binding only when the
+    /// init expression is a literal `tuple_lit` whose length is known
+    /// at codegen time; runtime RHS is Phase 2.
+    rest: RestBinding,
+};
+
+/// Backing struct for `BindingPattern.rest`. See the doc on
+/// `BindingPattern.rest` for the `before_count` semantics.
+pub const RestBinding = struct {
+    name: []const u8,
+    before_count: u32,
 };
 
 pub const Stmt = union(enum) {
@@ -429,6 +578,15 @@ pub const Stmt = union(enum) {
     /// `pub fn main() !void` body return shape. If `value` is `null`,
     /// codegen emits `return;` (no value).
     return_stmt: ReturnStmt,
+    /// `name.field = expr` field-write statement. Distinct from
+    /// `.assign` because the RHS is a field on an aggregate rather
+    /// than a bare-name rebind. The 3-token lookahead at parseStmt's
+    /// identifier arm dispatches into this variant when the pattern
+    /// `identifier . identifier =` is detected. `target` is `*Expr`
+    /// so non-identifier receivers (e.g. `getBox().field = …`) parse
+    /// cleanly via parsePostfix; `value` is value-typed Expr because
+    /// it's the leaf of the assignment.
+    field_assign: FieldAssignStmt,
 
     /// Backing struct for all three binding kinds (`let`, `var`, `const`).
     /// The kind is carried *by the union tag* on `Stmt`, not duplicated here
@@ -527,6 +685,17 @@ pub const Stmt = union(enum) {
     pub const ReturnStmt = struct {
         value: ?Expr,
     };
+
+    /// `target.field = value` field-write. The receiver path is any
+    /// expression that parses via parsePostfix (ident, call result,
+    /// index, etc.), and the field name is the bare identifier after
+    /// the `.`. `target` is `*Expr` for cycle-breaking; `value` is
+    /// value-typed Expr (leaf position).
+    pub const FieldAssignStmt = struct {
+        target: *Expr,
+        field_name: []const u8,
+        value: Expr,
+    };
 };
 
 pub const FunDecl = struct {
@@ -536,8 +705,158 @@ pub const FunDecl = struct {
     doc: ?[]const u8,
 };
 
+/// One field in a struct declaration. Two shapes:
+/// - `.named { name, type_text }` — `field: T` form. The `type_text` is
+///   the verbatim source sequence after the colon (multi-token types
+///   like `*const Foo` are captured as a single slice so codegen can
+///   emit the type text without re-tokenizing).
+/// - `.embed { type_name }` — bare `Widget,` row that promotes the
+///   embedded type's fields + methods into the outer struct.
+///   Codegen emits a `{ type_name: TypeName }` anonymous-struct
+///   insertion so zig's `.field` access and `.method()` invocation
+///   resolve through the outer struct without explicit field prefixes
+///   in user code (the docs/12 embedding-promotes-fields contract).
+///
+/// The `idx` field on both arms records the position of THIS field
+/// within the parent struct's field list, so codegen/walkers can quickly
+/// map a field-init back to its declaration position if needed (the
+/// ordering is preserved so structural copies and struct-literal codegen
+/// stay byte-identical to the source declaration order).
+pub const StructField = struct {
+    /// 0-based position within the struct's field list.
+    idx: u32,
+    kind: StructFieldKind,
+
+    pub const StructFieldKind = union(enum) {
+        /// `name: T` field declaration. The `type_text` is captured
+        /// verbatim so multi-token types like `*const T` round-trip.
+        named: NamedField,
+        /// Bare-typed promotion row (`Widget,` in the docs/12
+        /// embedding example). `type_name` is the verbatim source
+        /// ident; codegen emits a single anonymous-struct field whose
+        /// value is a fresh instance of the embedded type.
+        embed: EmbedField,
+
+        pub const NamedField = struct {
+            name: []const u8,
+            type_text: []const u8,
+        };
+        pub const EmbedField = struct {
+            type_name: []const u8,
+        };
+    };
+};
+
+/// One struct declaration of the form
+/// `struct NAME { field-decl, ... }`. The `fields` slice preserves
+/// declaration order so codegen emits zig struct fields in the same
+/// sequence the user wrote them (preserves field-position assumptions
+/// like `arr[0]` returning the first declared field's named-init
+/// via spread). `loc` is carried so error messages on later uses of
+/// the name can anchor to the declaration site.
+pub const StructDecl = struct {
+    name: []const u8,
+    fields: []const StructField,
+    loc: Loc,
+};
+
+/// One parameter on a method declaration inside an impl block. The
+/// `name` is the verbatim source identifier; `type_text` is the verbatim
+/// type after the colon (e.g. `*const Vec3`, `f64`). The `is_self`
+/// flag distinguishes a `self`-prefixed receiver parameter from
+/// positional parameters used in the constructor pattern
+/// (`pub fun new(x: f64, y: f64) -> Vec3` — no `self`). Codegen
+/// treats `is_self`-true receivers specially (the receiver is moved
+/// to the first positional zig arg).
+pub const MethodParam = struct {
+    name: []const u8,
+    type_text: []const u8,
+    /// True iff this parameter is the receiver (`self: *const T` or
+    /// `self: *T`). Codegen passes `&<receiver_expr>` for the implicit
+    /// first-arg call from `.method_call` codegen (which doesn't expose
+    /// `self` to the source author — they write `v.length()` not
+    /// `v.length(self)`).
+    is_self: bool,
+};
+
+/// One method inside an `impl` block. The `params` slice preserves
+/// declaration order; `return_type` is `null` for bare constructor
+/// methods (the return-type annotation is required when the author
+/// wants typed return — when omitted, codegen falls through to zig's
+/// type-inference path which is fine for expression-bodied simple
+/// methods). The body is the same `[]const Stmt` shape as top-level
+/// `fun` declarations, so codegen reuses the body-emission path.
+pub const MethodDecl = struct {
+    name: []const u8,
+    params: []const MethodParam,
+    return_type: ?[]const u8,
+    body: []const Stmt,
+    loc: Loc,
+};
+
+/// One `impl NAME { … }` block. The methods are flattened to zig free
+/// functions by codegen (`pub fn Vec3_length(self: *const Vec3) f64`),
+/// preserving the source-level method shape for human reading.
+/// `target_type` is the verbatim source ident (e.g. `Vec3`); methods
+/// reference `self` typed against this name so codegen's emit
+/// translates structured source into accurately-typed zig free fns.
+pub const ImplBlock = struct {
+    target_type: []const u8,
+    methods: []const MethodDecl,
+    loc: Loc,
+};
+
+/// One enum declaration of the form
+/// `enum NAME { Variant1, Variant2, Variant3(T), ... }`. The `variants`
+/// slice preserves source declaration order so codegen emits zig's
+/// native `enum { Variant1, Variant2, ... }` form in that same order.
+/// Codegen also enables `Enum.Variant(arg)` constructor expressions by
+/// emitting the enum's tag variants verbatim and zig's own exhaustive-
+/// match checker enforces the docs/13 contract that every match must
+/// handle every variant (or fall through to `_`).
+pub const EnumDecl = struct {
+    name: []const u8,
+    variants: []const EnumVariant,
+    loc: Loc,
+};
+
+/// One variant inside an `enum NAME { ... }`. `payload_type` is `null`
+/// for bare tag-only variants (`Direction.North`); non-null for variants
+/// carrying a single value whose type is the captured verbatim text
+/// (`Shape.Circle` carries `payload_type = "f64"`). Multi-type payloads
+/// (`Rect(f64, f64)`) round-trip through `payload_type` verbatim as
+/// well — codegen emits the raw text inside the variant's parens.
+pub const EnumVariant = struct {
+    name: []const u8,
+    payload_type: ?[]const u8,
+    loc: Loc,
+};
+
 pub const Program = struct {
     functions: []const FunDecl,
+    /// Module-level struct declarations. Codegen walks `structs` BEFORE
+    /// `impls` and BEFORE `functions` so the order of zig emission matches
+    /// the source order (types declared before use). The slices are
+    /// ordered to match the parser's top-level walk (which interleaves
+    /// struct/impl/fun decls in source order); codegen preserves that
+    /// ordering by re-walking the source positions rather than relying
+    /// on slice order alone. Per the docs/12 contract, struct embedding
+    /// is resolved at codegen time by promoting embedded fields into
+    /// the outer struct (see `genStructDecl`).
+    structs: []const StructDecl = &[_]StructDecl{},
+    /// Module-level impl blocks. Codegen walks `impls` after `structs`
+    /// so zig's type checker sees the struct before its methods. Each
+    /// method is emitted as a top-level zig free function whose name
+    /// encodes the (target_type, method_name) pair so call-dispatch
+    /// from `.method_call` codegen can find the right implementation.
+    impls: []const ImplBlock = &[_]ImplBlock{},
+    /// Module-level enum declarations. Codegen walks `enums` alongside
+    /// `structs` and `impls` so types are declared before use in any
+    /// subsequent function body. Like structs/impls, enums preserve
+    /// source-order recording in the parser's main loop and are
+    /// emitted at codegen time in source order so any guarantee that
+    /// a downstream top-level fn or impl sees the type ahead of itself.
+    enums: []const EnumDecl = &[_]EnumDecl{},
 };
 
 pub const Arena = struct {

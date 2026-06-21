@@ -11,18 +11,56 @@ pub const Parser = struct {
     tokens: []const Token,
     pos: u32,
     arena: *ast.Arena,
+    /// Parse-context flag for struct-literal disambiguation in
+    /// `parsePrimary`. True (default) in every expression position
+    /// EXCEPT those where `{` MUST mean block-start: if-condition,
+    /// while-condition, for-iter, match-scrutinee. In those positions
+    /// the call site temporarily sets the flag to false (via a scoped
+    /// save/false/`defer`-restore pattern around the single parseExpr
+    /// call) so `if Foo { ... }` and `match Foo { ... }` parse as
+    /// `<cond>` + `{ <body> }` rather than swallowing the block as a
+    /// struct-literal.
+    ///
+    /// Why default-true (vs the earlier default-false): the user's
+    /// contract explicitly says struct-literal parsing should fire in
+    /// binding-init positions, return-value positions, field-assign
+    /// positions, AND any other expression-yielding position. The
+    /// principled carve-out is therefore the EXACT list of positions
+    /// where `{` must be block-start, NOT a whitelist of positions
+    /// where struct-literal is allowed. Implementing it via "suppress
+    /// at the boundaries" rather than "opt-in everywhere else" keeps
+    /// the precedence ladder untouched (no flag threading through
+    /// parseExpr → parsePrimary) and avoids the regression where
+    /// expressions like `return Vec3 { ... }` or
+    /// `print(Vec3 { ... })` — common idioms in the user's example
+    /// code — silently stop parsing as struct-literals.
+    ///
+    /// Two-gate disambiguation in parsePrimary: (a) this flag must be
+    /// true AND (b) the leading identifier must start with an
+    /// uppercase letter. The uppercase sub-clause is defense-in-depth
+    /// (Rust/Zig-style PascalCase-types convention) so an accidental
+    /// flag flip doesn't allow lower-case locals like `vec { ... }`
+    /// to silently swallow blocks.
+    allow_struct_lit: bool,
 
     pub fn init(tokens: []const Token, arena: *ast.Arena) Parser {
         return .{
             .tokens = tokens,
             .pos = 0,
             .arena = arena,
+            .allow_struct_lit = true,
         };
     }
 
     pub fn parse(self: *Parser) ast.Program {
         var functions_buf: [256]ast.FunDecl = undefined;
         var fun_count: usize = 0;
+        var structs_buf: [256]ast.StructDecl = undefined;
+        var struct_count: usize = 0;
+        var impls_buf: [256]ast.ImplBlock = undefined;
+        var impl_count: usize = 0;
+        var enums_buf: [256]ast.EnumDecl = undefined;
+        var enum_count: usize = 0;
 
         while (!self.eof()) {
             if (self.peek().tag == .newline) {
@@ -36,6 +74,38 @@ pub const Parser = struct {
                 while (self.peek().tag == .newline) self.advance();
             }
             if (self.eof()) break;
+            // Top-level dispatch: structs and impl blocks live alongside
+            // top-level functions. The dispatch is order-independent at
+            // codegen time (codegen re-walks and interleaves struct fields
+            // with their matching impl-method-NESTED-inside emission), so
+            // the parser simply records each decl in its appropriate slice
+            // and preserves source order across all three.
+            const lead = self.peek().tag;
+            if (lead == .struct_kw) {
+                // Struct decls at module-scope don't carry a doc slot
+                // (`StructDecl` has no `doc` field) — discarding the
+                // captured doc keeps the top-of-loop accumulator clean
+                // without forcing every decl-kind to accept it.
+                structs_buf[struct_count] = self.parseStructDecl();
+                struct_count += 1;
+                continue;
+            }
+            if (lead == .impl_kw) {
+                // Same rationale as the struct-decl branch — impl blocks
+                // don't carry doc at module scope.
+                impls_buf[impl_count] = self.parseImplBlock();
+                impl_count += 1;
+                continue;
+            }
+            if (lead == .enum_kw) {
+                // Top-level enum decl — recorded into `enums` so codegen
+                // emits `pub const NAME = enum { ... };` and consumers
+                // (functions, impls, other top-level decls) reference
+                // the name naturally.
+                enums_buf[enum_count] = self.parseEnumDecl();
+                enum_count += 1;
+                continue;
+            }
             functions_buf[fun_count] = self.parseFunDecl();
             functions_buf[fun_count].doc = doc;
             fun_count += 1;
@@ -43,7 +113,175 @@ pub const Parser = struct {
 
         const functions = self.arena.alloc(ast.FunDecl, fun_count);
         @memcpy(functions, functions_buf[0..fun_count]);
-        return .{ .functions = functions };
+        const structs = self.arena.alloc(ast.StructDecl, struct_count);
+        @memcpy(structs, structs_buf[0..struct_count]);
+        const impls = self.arena.alloc(ast.ImplBlock, impl_count);
+        @memcpy(impls, impls_buf[0..impl_count]);
+        const enums = self.arena.alloc(ast.EnumDecl, enum_count);
+        @memcpy(enums, enums_buf[0..enum_count]);
+        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums };
+    }
+
+    /// Parse `struct NAME { field-decl, ... }`. Two field shapes inside the
+    /// body:
+    /// - **Named**: `name: T,` — captured verbatim with the
+    ///   colon-stripped type text so multi-token types like `*const Foo`
+    ///   round-trip cleanly through codegen's struct-field emission.
+    /// - **Embed**: `TypeName,` (or `TypeName { … }` per the docs/12
+    ///   example) — promotes the embedded type's fields + methods into the
+    ///   outer struct. Codegen handles the field-promotion by emitting an
+    ///   embedded anonymous-struct field whose dotted-field access works
+    ///   straight through zig's `.field` resolution.
+    ///
+    /// Each field's `idx` records its position in the declaration order
+    /// so codegen can preserve order at the zig emission site (the
+    /// fields slice is otherwise order-preserving but the explicit `idx`
+    /// makes walker logic that needs to look up "this field-init's
+    /// declaration index" trivial to write).
+    fn parseStructDecl(self: *Parser) ast.StructDecl {
+        const start_loc = self.peek().loc;
+        self.expect(.struct_kw);
+        const name = self.expectIdent();
+        self.expect(.lbrace);
+        var fields_buf: [64]ast.StructField = undefined;
+        var field_count: usize = 0;
+        while (self.peek().tag != .rbrace and !self.eof()) {
+            if (self.peek().tag == .newline) {
+                self.advance();
+                continue;
+            }
+            // Pre-existing token is either an identifier (named or embed)
+            // OR a comma (skip as a separator between fields).
+            if (self.peek().tag == .comma) {
+                self.advance();
+                continue;
+            }
+            const field_name = self.expectIdent();
+            if (self.peek().tag == .colon) {
+                // Named field: `name: T`. Capture the type text via the
+                // same multi-token collector used by `as` casts so types
+                // like `*const T` and `[]T` round-trip cleanly. The
+                // collector arena-allocates its result, so the slice is
+                // stable after parseStructDecl returns.
+                self.advance();
+                const type_text = self.collectCastType();
+                if (type_text.len == 0) {
+                    std.debug.print("error:{d}:{d}: named struct field '{s}' requires a type after ':'\n", .{ start_loc.line, start_loc.col, field_name });
+                    std.process.exit(1);
+                }
+                fields_buf[field_count] = .{
+                    .idx = @intCast(field_count),
+                    .kind = .{ .named = .{ .name = field_name, .type_text = type_text } },
+                };
+                field_count += 1;
+            } else {
+                // Embed-form: bare `TypeName,` (no colon). Docs/12 covers
+                // `Widget,` inside `struct Button { Widget, label: String }`.
+                fields_buf[field_count] = .{
+                    .idx = @intCast(field_count),
+                    .kind = .{ .embed = .{ .type_name = field_name } },
+                };
+                field_count += 1;
+            }
+        }
+        self.expect(.rbrace);
+        const fields_src = fields_buf[0..field_count];
+        const fields = self.arena.dupe(ast.StructField, fields_src);
+        return .{ .name = name, .fields = fields, .loc = start_loc };
+    }
+
+    /// Parse `impl TYPE { method-decl, ... }`. Each method-decl is
+    /// `pub? fun NAME(params?) -> RET_TYPE? { body }`. The leading `pub`
+    /// keyword is accepted-and-ignored; codegen emits every body as a
+    /// `pub fn` regardless, matching the user-confirmed scope (privacy
+    /// enforcement is deferred to a followup commit).
+    ///
+    /// Method bodies share the same `[]const Stmt` slice shape as
+    /// top-level `fun` declarations, so codegen reuses the body-emission
+    /// path (`genFunDecl` → `genStmt` loop). The receiver (`self`) is
+    /// modelled as the first `MethodParam` with `is_self = true` and a
+    /// type like `*const Vec3` — see `parseMethod` for the discriminator.
+    fn parseImplBlock(self: *Parser) ast.ImplBlock {
+        const start_loc = self.peek().loc;
+        self.expect(.impl_kw);
+        const target_type = self.expectIdent();
+        self.expect(.lbrace);
+        var methods_buf: [64]ast.MethodDecl = undefined;
+        var method_count: usize = 0;
+        while (self.peek().tag != .rbrace and !self.eof()) {
+            if (self.peek().tag == .newline) {
+                self.advance();
+                continue;
+            }
+            methods_buf[method_count] = self.parseMethod();
+            method_count += 1;
+        }
+        self.expect(.rbrace);
+        const methods = self.arena.alloc(ast.MethodDecl, method_count);
+        @memcpy(methods, methods_buf[0..method_count]);
+        return .{ .target_type = target_type, .methods = methods, .loc = start_loc };
+    }
+
+    /// Parse one `pub? fun NAME(params) -> RET? { body }` method-decl.
+    /// Returns the inner payload `ast.MethodDecl` (NOT a `Stmt`) since
+    /// impl-block methods don't carry a stmt-union tag.
+    ///
+    /// Params are parsed comma-separated. Each param is `name: type`.
+    /// The discriminator to `is_self = true` is purely the param-name
+    /// being `self` — the type_text handles both `*const T` and `*T`
+    /// (mutable receiver) forms uniformly, since codegen emits the
+    /// type verbatim regardless of pointer-vs-pointer-to-const shape.
+    /// Trailing `-> RET_TYPE` is optional; when omitted, codegen defers
+    /// to zig's type inference downstream.
+    fn parseMethod(self: *Parser) ast.MethodDecl {
+        const start_loc = self.peek().loc;
+        // Accept-and-ignore `pub` (the keyword exists in the lexer so the
+        // grammar reserves it; privacy enforcement is deferred).
+        if (self.peek().tag == .pub_kw) self.advance();
+        self.expect(.fun);
+        const name = self.expectIdent();
+        self.expect(.lparen);
+        var params_buf: [16]ast.MethodParam = undefined;
+        var param_count: usize = 0;
+        if (self.peek().tag != .rparen) {
+            params_buf[param_count] = self.parseMethodParam();
+            param_count += 1;
+            while (self.peek().tag == .comma) {
+                self.advance();
+                params_buf[param_count] = self.parseMethodParam();
+                param_count += 1;
+            }
+        }
+        self.expect(.rparen);
+        var return_type: ?[]const u8 = null;
+        if (self.peek().tag == .arrow) {
+            self.advance();
+            const rt = self.collectCastType();
+            return_type = if (rt.len == 0) null else rt;
+        }
+        self.expect(.lbrace);
+        const body = self.parseStmtList();
+        self.expect(.rbrace);
+        const params = self.arena.alloc(ast.MethodParam, param_count);
+        @memcpy(params, params_buf[0..param_count]);
+        return .{ .name = name, .params = params, .return_type = return_type, .body = body, .loc = start_loc };
+    }
+
+    /// Parse one comma-separated method parameter: `name: type_text`.
+    /// `is_self` is set when the param name is exactly `self`
+    /// (the docs/12 receiver convention). The type text is captured
+    /// verbatim via `collectCastType` so multi-token types
+    /// (`*const Vec3`, `*Vec3`) round-trip cleanly.
+    fn parseMethodParam(self: *Parser) ast.MethodParam {
+        const name = self.expectIdent();
+        self.expect(.colon);
+        const type_text = self.collectCastType();
+        if (type_text.len == 0) {
+            std.debug.print("error:{d}:{d}: method parameter '{s}' requires a type after ':'\n", .{ self.peek().loc.line, self.peek().loc.col, name });
+            std.process.exit(1);
+        }
+        const is_self = std.mem.eql(u8, name, "self");
+        return .{ .name = name, .type_text = type_text, .is_self = is_self };
     }
 
     fn parseFunDecl(self: *Parser) ast.FunDecl {
@@ -92,6 +330,7 @@ pub const Parser = struct {
                 //   - `name = expr;`           → bare assign (.assign)
                 //   - `name OP_EQ rhs;`        → compound assign (desugared)
                 //   - `name[i] = x;`           → indexed write (.index_assign)
+                //   - `name.field = expr;`     → field-write (.field_assign)
                 //   - `name ...` (any other)   → expr_stmt (call / ident / index read)
                 //
                 // Without this lookahead, the identifier would be consumed
@@ -107,6 +346,20 @@ pub const Parser = struct {
                     }
                     if (next == .lbracket) {
                         return .{ .index_assign = self.parseIndexAssign() };
+                    }
+                    // 3-token lookahead for `name . ident =` field-write.
+                    // Pattern: ident (current) . dot (next) . ident (n+2) . equals (n+3).
+                    // Only the canonical `bare-name . bare-name = value` form
+                    // is supported via this lookahead — for more complex LHSs
+                    // like `(getBox()).x = …` or `arr[i].x = …`, the user can
+                    // extract the value to a local first then field-assign.
+                    if (next == .dot and
+                        self.pos + 2 < self.tokens.len and
+                        self.tokens[self.pos + 2].tag == .identifier and
+                        self.pos + 3 < self.tokens.len and
+                        self.tokens[self.pos + 3].tag == .equals)
+                    {
+                        return .{ .field_assign = self.parseFieldAssign() };
                     }
                 }
                 return .{ .expr_stmt = self.parseExpr() };
@@ -271,6 +524,20 @@ pub const Parser = struct {
                 pat_count += 1;
                 while (self.peek().tag == .comma) {
                     self.advance();
+                    // `...NAME` rest-binding — must be the LAST pattern
+                    // in the destructuring tuple. Parsed inline so a
+                    // trailing `,` is NOT consumed (rest is terminal).
+                    // Phase 1 invokes `.rest = RestBinding` with
+                    // `before_count = pat_count` (number of patterns
+                    // that came before this rest); codegen uses this
+                    // to materialise the leftover elements.
+                    if (self.peek().tag == .ellipsis) {
+                        self.advance();
+                        const rest_name = self.expectIdent();
+                        pats_buf[pat_count] = .{ .rest = .{ .name = rest_name, .before_count = @intCast(pat_count) } };
+                        pat_count += 1;
+                        break;
+                    }
                     pats_buf[pat_count] = self.parseBindingPattern();
                     pat_count += 1;
                 }
@@ -282,6 +549,19 @@ pub const Parser = struct {
         }
         if (tok.tag == .lbracket) {
             // Array destructuring: `[p0, p1, ..., pN]`. Recursive like tuple.
+            // Phase 2: mirror the tuple `.lparen` arm's `...NAME` rest-binding
+            // detection so balanced `[a, b, ...rest]` patterns parse cleanly.
+            // The rest-binding must be the LAST pattern in the array (the
+            // tuple walker enforces this with an early `break` after
+            // consuming the rest); codegen uses `before_count` to slice the
+            // originating array's remaining elements into a sub-tuple at
+            // emission time. The architectural symmetry with the tuple arm
+            // (same `before_count = pat_count` numbering, same `rest` arm
+            // dispatch in codegen) means no codegen changes are required for
+            // the array-with-rest surface beyond what already exists — both
+            // shapes lower to `__destruct_N[i][j..]` zig indexing, and zig
+            // 0.16 accepts bracketed indexing on BOTH arrays and anonymous
+            // structs.
             self.advance();
             var pats_buf: [16]ast.BindingPattern = undefined;
             var pat_count: usize = 0;
@@ -290,6 +570,16 @@ pub const Parser = struct {
                 pat_count += 1;
                 while (self.peek().tag == .comma) {
                     self.advance();
+                    // Phase 2 mirror: `.ellipsis IDENT` triggers rest-binding.
+                    // Terminal (no trailing `,`) — break immediately so the
+                    // closing `]` matches on the next expect().
+                    if (self.peek().tag == .ellipsis) {
+                        self.advance();
+                        const rest_name = self.expectIdent();
+                        pats_buf[pat_count] = .{ .rest = .{ .name = rest_name, .before_count = @intCast(pat_count) } };
+                        pat_count += 1;
+                        break;
+                    }
                     pats_buf[pat_count] = self.parseBindingPattern();
                     pat_count += 1;
                 }
@@ -342,16 +632,32 @@ pub const Parser = struct {
         return .{ .name = name, .value = bin_expr };
     }
 
-    // Parse `target[i] = value`. The full power is determined by
-    // parseStmt.identifier branch's lookahead — the only entry is when
-    // the current token is `.identifier` and the next is `.lbracket`.
-    // The target is parsed as a primary expression (NOT invoking the
-    // `[N]T { ... }` array-lit path because that's a leading-`[` only),
-    // then the bracketed index is expected, then `=`, then the value.
-    // Multi-dim index writes (`arr[i][j] = x`) are NOT supported here
-    // because they would require the chained-Index form on the LHS —
-    // supported only via explicit parens like `(arr[i])[j] = x` once
-    // chained Index parfactoring lands.
+    /// Parse `name.field = expr`. The lookahead at parseStmt's identifier
+    /// arm verified the pattern `name . field = `. The receiver is a
+    /// bare identifier (NOT a full expr), which keeps the dispatch
+    /// trivial. For complex LHSs (`arr[i].field = …`,
+    /// `getBox().field = …`), the user can extract to a local first.
+    fn parseFieldAssign(self: *Parser) Stmt.FieldAssignStmt {
+        const target_name = self.expectIdent();
+        const target = self.arena.alloc(Expr, 1);
+        target[0] = .{ .ident = target_name };
+        self.expect(.dot);
+        const field_name = self.expectIdent();
+        self.expect(.equals);
+        const value = self.parseExpr();
+        return .{ .target = &target[0], .field_name = field_name, .value = value };
+    }
+
+    /// Parse `target[i] = value`. The full power is determined by
+    /// parseStmt.identifier branch's lookahead — the only entry is when
+    /// the current token is `.identifier` and the next is `.lbracket`.
+    /// The target is parsed as a primary expression (NOT invoking the
+    /// `[N]T { ... }` array-lit path because that's a leading-`[` only),
+    /// then the bracketed index is expected, then `=`, then the value.
+    /// Multi-dim index writes (`arr[i][j] = x`) are NOT supported here
+    /// because they would require the chained-Index form on the LHS —
+    /// supported only via explicit parens like `(arr[i])[j] = x` once
+    /// chained Index parfactoring lands.
     fn parseIndexAssign(self: *Parser) Stmt.IndexAssignStmt {
         const target = self.parsePrimary();
         self.expect(.lbracket);
@@ -364,6 +670,117 @@ pub const Parser = struct {
         const index_buf = self.arena.alloc(Expr, 1);
         index_buf[0] = index;
         return .{ .target = &target_buf[0], .index = &index_buf[0], .value = value };
+    }
+
+    /// Parse one comma-separated enum-variant payload type: `name: type_text`
+    /// for `struct_field` style payloads, OR the inner type-list of an
+    /// enum variant (e.g. `Circle(f64, f64)`'s payload). This single helper
+    /// covers both via the same `collectCastType` machinery.
+    /// (OBSOLETE: kept for compile-time symbol preservation during the
+    /// enum refactor; the active parseEnumDecl uses collectCastType
+    /// directly for single-type payloads and a comma-loop for the
+    /// multi-type form. Will be removed in a followup commit.)
+    fn parseEnumVariantPayload(self: *Parser) ?[]const u8 {
+        _ = self;
+        return null;
+    }
+
+    /// Parse `enum NAME { Variant1, Variant2(T) | Circle(f64), Rectangle(f64, f64), ... }`.
+    /// Mirrors `parseStructDecl` for the brace-walk loop (newline/comma
+    /// tolerant). Variant payloads are captured via `collectCastType`
+    /// once or in a comma-separated slice — the joined verbatim text is
+    /// stored on `EnumVariant.payload_type` so codegen emits the source
+    /// exactly as written, including `*const` / `[]` / `?` shape.
+    fn parseEnumDecl(self: *Parser) ast.EnumDecl {
+        const start_loc = self.peek().loc;
+        self.expect(.enum_kw);
+        const name = self.expectIdent();
+        self.expect(.lbrace);
+        var variants_buf: [64]ast.EnumVariant = undefined;
+        var variant_count: usize = 0;
+        while (self.peek().tag != .rbrace and !self.eof()) {
+            if (self.peek().tag == .newline) {
+                self.advance();
+                continue;
+            }
+            if (self.peek().tag == .comma) {
+                self.advance();
+                continue;
+            }
+            const variant_loc = self.peek().loc;
+            const variant_name = self.expectIdent();
+            var payload: ?[]const u8 = null;
+            if (self.peek().tag == .lparen) {
+                // Multi-arg payload (e.g. `Rect(f64, f64)`): collect one or
+                // more comma-separated type-text segments and join them
+                // with ", " so codegen emits the source verbatim. Use the
+                // existing collectCastType so multi-token pointer types
+                // (`*const T`), slice prefixes (`[]T`), and nullable
+                // prefixes (`?*T`) round-trip cleanly through codegen.
+                self.advance(); // consume (
+                var type_texts_buf: [16][]const u8 = undefined;
+                var type_count: usize = 0;
+                type_texts_buf[type_count] = self.collectCastType();
+                type_count += 1;
+                while (self.peek().tag == .comma) {
+                    self.advance();
+                    type_texts_buf[type_count] = self.collectCastType();
+                    type_count += 1;
+                }
+                self.expect(.rparen);
+                var joined_buf: [512]u8 = undefined;
+                var joined_len: usize = 0;
+                // Manual-index `while` instead of `for (slice) |tt, i|` —
+                // the latter produced a "extra capture in for loop" error in
+                // zig 0.16 for this expression shape (only one such loop in
+                // the file; no impact on the other sites which iterate over
+                // string-text or arena slices with single captures).
+                var i: usize = 0;
+                while (i < type_count) : (i += 1) {
+                    const tt = type_texts_buf[i];
+                    if (i > 0) {
+                        if (joined_len + 2 <= joined_buf.len) {
+                            joined_buf[joined_len] = ',';
+                            joined_buf[joined_len + 1] = ' ';
+                            joined_len += 2;
+                        }
+                    }
+                    if (joined_len + tt.len <= joined_buf.len) {
+                        @memcpy(joined_buf[joined_len..][0..tt.len], tt);
+                        joined_len += tt.len;
+                    }
+                }
+                const payload_arena = self.arena.alloc(u8, joined_len);
+                @memcpy(payload_arena, joined_buf[0..joined_len]);
+                payload = payload_arena;
+            }
+            variants_buf[variant_count] = .{
+                .name = variant_name,
+                .payload_type = payload,
+                .loc = variant_loc,
+            };
+            variant_count += 1;
+        }
+        self.expect(.rbrace);
+        const variants = self.arena.alloc(ast.EnumVariant, variant_count);
+        @memcpy(variants, variants_buf[0..variant_count]);
+        return .{ .name = name, .variants = variants, .loc = start_loc };
+    }
+
+    /// Parse one comma-separated enum-variant pattern binding: either an
+    /// identifier (which becomes a binding in the arm body) OR a `_`
+    /// wildcard (which suppresses the binding). Returns `null` for the
+    /// wildcard case so the pattern's `[]?[]const u8` slot distinguishes
+    /// "discard this slot" from "capture this name verbatim". Mirrors the
+    /// `parseBindingPattern` distinction between `.name` and `.discard`
+    /// but for the pattern (not binding) surface.
+    fn parsePatternBinding(self: *Parser) ?[]const u8 {
+        const tok = self.peek();
+        if (tok.tag == .identifier and std.mem.eql(u8, tok.text, "_")) {
+            self.advance();
+            return null;
+        }
+        return self.expectIdent();
     }
 
     // Map a compound-assign TokenTag to its corresponding BinaryOp. Returns
@@ -435,7 +852,24 @@ pub const Parser = struct {
     fn parseIfBranch(self: *Parser) Stmt.IfStmt {
         const start_loc = self.peek().loc;
         self.expect(.if_kw);
-        const cond = self.parseExpr();
+        // Suppress struct-literal parsing in if-condition position. The
+        // default `allow_struct_lit = true` everywhere; the principled
+        // carve-out is the EXACT list of "block-start `{` required" sites
+        // (if-cond, while-cond, for-iter, match-scrutinee). `if Foo { ... }`
+        // should parse as cond=ident(Foo), body={...} — NOT as a
+        // struct-literal that swallows the if-body. Inside the body and
+        // any chained else-if below (parseStmtList → parseExpr), the flag
+        // reverts to default-true so `let v = Vec3 { ... }` inside the
+        // body still parses correctly. Scoped via `blk:` so the
+        // suppression is precise: enter-suppress, parse the single cond
+        // Expr, exit-restore via defer. See the `allow_struct_lit` field
+        // doc for the broader design rationale.
+        const cond = blk: {
+            const prev = self.allow_struct_lit;
+            defer self.allow_struct_lit = prev;
+            self.allow_struct_lit = false;
+            break :blk self.parseExpr();
+        };
         self.expect(.lbrace);
         const then_body = self.parseStmtList();
         self.expect(.rbrace);
@@ -477,8 +911,23 @@ pub const Parser = struct {
     // emits a clear error if missing.
     fn parseIfExpr(self: *Parser) Expr {
         self.expect(.if_kw);
+        // Suppress struct-literal parsing in if-expression's cond. The
+        // expression-form `let x = if Foo { 1 } else { 2 }` is an
+        // arbitrary-rhs use of `if`; without this scope the cond parseExpr
+        // flow sees `Foo` followed by `{` with `allow_struct_lit = true`
+        // (the new default) and routes into parseStructLit, silently
+        // swallowing the cond's body as a field-init list. Mirrors the
+        // same suppress wrap used in parseIfBranch / parseWhileStmt /
+        // parseForStmt / parseMatchExpr — and is the 5th and last
+        // carve-out this refactor needs. See `allow_struct_lit` field
+        // doc for the broader rationale.
         const cond_buf = self.arena.alloc(Expr, 1);
-        cond_buf[0] = self.parseExpr();
+        cond_buf[0] = blk: {
+            const prev = self.allow_struct_lit;
+            defer self.allow_struct_lit = prev;
+            self.allow_struct_lit = false;
+            break :blk self.parseExpr();
+        };
         self.expect(.lbrace);
         const then_buf = self.arena.alloc(Expr, 1);
         then_buf[0] = self.parseExpr();
@@ -507,7 +956,16 @@ pub const Parser = struct {
     // value into `.while_stmt = …` without a redundant re-wrap.
     fn parseWhileStmt(self: *Parser) Stmt.WhileStmt {
         self.expect(.while_kw);
-        const cond = self.parseExpr();
+        // Suppress struct-literal parsing in while-condition position.
+        // Mirrors parseIfBranch: the immediately-following `{` must be
+        // the while body, not a struct-literal payload. See
+        // `allow_struct_lit` field doc for the broader rationale.
+        const cond = blk: {
+            const prev = self.allow_struct_lit;
+            defer self.allow_struct_lit = prev;
+            self.allow_struct_lit = false;
+            break :blk self.parseExpr();
+        };
         const body = self.parseBlock();
         return .{ .cond = cond, .body = body };
     }
@@ -539,7 +997,16 @@ pub const Parser = struct {
             pat = .{ .ident = self.expectIdent() };
         }
         self.expect(.in_kw);
-        const iter = self.parseExpr();
+        // Suppress struct-literal parsing in for-iter position. Mirrors
+        // parseIfBranch / parseWhileStmt / parseMatchExpr: the
+        // immediately-following `{` must be the for-loop body, not a
+        // struct-literal payload. See `allow_struct_lit` field doc.
+        const iter = blk: {
+            const prev = self.allow_struct_lit;
+            defer self.allow_struct_lit = prev;
+            self.allow_struct_lit = false;
+            break :blk self.parseExpr();
+        };
         const body = self.parseBlock();
         return .{ .pattern = pat, .iter = iter, .body = body };
     }
@@ -556,8 +1023,17 @@ pub const Parser = struct {
     // cycle-breaking convention — see the `IfExpr` doc for why).
     fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
         self.expect(.match_kw);
+        // Suppress struct-literal parsing in match-scrutinee position.
+        // Mirrors parseIfBranch / parseWhileStmt: the immediately-
+        // following `{` must be the match-block arms list, not a
+        // struct-literal payload.
         const scrut_buf = self.arena.alloc(Expr, 1);
-        scrut_buf[0] = self.parseExpr();
+        scrut_buf[0] = blk: {
+            const prev = self.allow_struct_lit;
+            defer self.allow_struct_lit = prev;
+            self.allow_struct_lit = false;
+            break :blk self.parseExpr();
+        };
         self.expect(.lbrace);
         var arms_buf: [16]ast.MatchArm = undefined;
         var arm_count: usize = 0;
@@ -668,6 +1144,100 @@ pub const Parser = struct {
                 return .{ .literal = &lit_buf[0] };
             },
             .identifier => {
+                // Enum-variant pattern detection (docs/manual/13). When the
+                // leading identifier is PascalCase (Rust/Zig convention for
+                // type + variant names), the three shapes are:
+                //   1. `Enum.Variant(args...)` — qualified; emits
+                //      enum_name="Enum", variant_name="Variant", bindings set.
+                //   2. `Variant(args...)` — unqualified, type-inferred per
+                //      docs/13; emits enum_name="", variant_name="Variant",
+                //      bindings set.
+                //   3. `Variant` (bare, followed by `=>`, `if guard`,
+                //      `,`, `}`, newline, or eof) — bare variant pattern
+                //      with bindings=null.
+                // Lowercase identifiers fall through to the existing
+                // ident-binding path (or `_` → discard).
+                if (tok.text.len > 0 and tok.text[0] >= 'A' and tok.text[0] <= 'Z') {
+                    // Qualified shape: peek 0 = .dot, peek 1 = identifier.
+                    if (self.pos + 1 < self.tokens.len and
+                        self.tokens[self.pos + 1].tag == .dot and
+                        self.pos + 2 < self.tokens.len and
+                        self.tokens[self.pos + 2].tag == .identifier)
+                    {
+                        const enum_name = self.expectIdent();
+                        self.expect(.dot);
+                        const variant_name = self.expectIdent();
+                        var bindings: ?[]?[]const u8 = null;
+                        if (self.peek().tag == .lparen) {
+                            self.advance();
+                            var bind_buf: [16]?[]const u8 = undefined;
+                            var bind_count: usize = 0;
+                            if (self.peek().tag != .rparen) {
+                                bind_buf[bind_count] = self.parsePatternBinding();
+                                bind_count += 1;
+                                while (self.peek().tag == .comma) {
+                                    self.advance();
+                                    bind_buf[bind_count] = self.parsePatternBinding();
+                                    bind_count += 1;
+                                }
+                            }
+                            self.expect(.rparen);
+                            const bindings_arena = self.arena.alloc(?[]const u8, bind_count);
+                            @memcpy(bindings_arena, bind_buf[0..bind_count]);
+                            bindings = bindings_arena;
+                        }
+                        return .{ .enum_variant = .{
+                            .enum_name = enum_name,
+                            .variant_name = variant_name,
+                            .bindings = bindings,
+                        } };
+                    }
+                    // Unqualified shape: peek 0 = .lparen — type-inferred binding.
+                    if (self.pos + 1 < self.tokens.len and
+                        self.tokens[self.pos + 1].tag == .lparen)
+                    {
+                        const variant_name = self.expectIdent();
+                        self.expect(.lparen);
+                        var bind_buf: [16]?[]const u8 = undefined;
+                        var bind_count: usize = 0;
+                        if (self.peek().tag != .rparen) {
+                            bind_buf[bind_count] = self.parsePatternBinding();
+                            bind_count += 1;
+                            while (self.peek().tag == .comma) {
+                                self.advance();
+                                bind_buf[bind_count] = self.parsePatternBinding();
+                                bind_count += 1;
+                            }
+                        }
+                        self.expect(.rparen);
+                        const bindings_arena = self.arena.alloc(?[]const u8, bind_count);
+                        @memcpy(bindings_arena, bind_buf[0..bind_count]);
+                        return .{ .enum_variant = .{
+                            .enum_name = "",
+                            .variant_name = variant_name,
+                            .bindings = bindings_arena,
+                        } };
+                    }
+                    // Bare-variant shape: peek 0 is arm-terminator
+                    // (`=>`, `if`, `,`, `}`, newline, or eof). The
+                    // PascalCase gate plus the terminator check ensure we
+                    // don't accidentally swallow a downstream ident binding.
+                    if (self.pos + 1 < self.tokens.len) {
+                        const next_tag = self.tokens[self.pos + 1].tag;
+                        switch (next_tag) {
+                            .arrow, .if_kw, .comma, .rbrace, .newline, .eof => {
+                                const variant_name = self.expectIdent();
+                                return .{ .enum_variant = .{
+                                    .enum_name = "",
+                                    .variant_name = variant_name,
+                                    .bindings = null,
+                                } };
+                            },
+                            else => {},
+                        }
+                    }
+                }
+                // Existing path: `_` → discard, else → ident binding.
                 if (std.mem.eql(u8, tok.text, "_")) {
                     self.advance();
                     return .{ .discard = {} };
@@ -1225,71 +1795,113 @@ pub const Parser = struct {
     /// only.
     fn parsePostfix(self: *Parser) Expr {
         var lhs = self.parsePrimary();
-        while (self.peek().tag == .lbracket) {
-            self.advance(); // consume [
-            // Three valid shapes and one error follow the opening `[`:
-            // 1. empty start slice: peek `.range` or `.ellipsis`
-            // 2. malformed `[]`: peek `.rbracket` immediately
-            // 3. explicit start: parseAdditive, then range/ellipsis/bracket
-            // The single `inclusive` flag lives below the dispatch
-            // because every slice form shares the same end-bound logic
-            // (parseAdditive if peek isn't `.rbracket`, then expect `.rbracket`).
-            var inclusive: bool = false;
-            var start_opt: ?*Expr = null;
+        // The postfix chain interleaves two shapes:
+        //   - `[start..end]` (or single-index or no-bound variants) → `.index` / `.slice`
+        //   - `.name` (no parens) → `.member_access` | `.name(args...)` → `.method_call`
+        // Both shapes are checked in this single `while` so chains like
+        // `arr[i].len`, `(getBox()).field`, `obj.method().chain` interleave
+        // naturally — each iteration of the loop consumes one postfix
+        // token and re-emits `lhs` with the wrapping applied.
+        while (true) {
+            if (self.peek().tag == .lbracket) {
+                self.advance(); // consume [
+                // Three valid shapes and one error follow the opening `[`:
+                // 1. empty start slice: peek `.range` or `.ellipsis`
+                // 2. malformed `[]`: peek `.rbracket` immediately
+                // 3. explicit start: parseAdditive, then range/ellipsis/bracket
+                var inclusive: bool = false;
+                var start_opt: ?*Expr = null;
 
-            if (self.peek().tag == .range) {
-                inclusive = false;
-                self.advance();
-            } else if (self.peek().tag == .ellipsis) {
-                inclusive = true;
-                self.advance();
-            } else if (self.peek().tag == .rbracket) {
-                const tok = self.peek();
-                std.debug.print("error:{d}:{d}: empty slice form '[]' — write '[..]' for whole-array view or '[N..]' / '[..N]' for partial slices\n", .{ tok.loc.line, tok.loc.col });
-                std.process.exit(1);
-            } else {
-                const start_expr = self.parseAdditive();
                 if (self.peek().tag == .range) {
                     inclusive = false;
-                    const sb = self.arena.alloc(Expr, 1);
-                    sb[0] = start_expr;
-                    start_opt = &sb[0];
                     self.advance();
                 } else if (self.peek().tag == .ellipsis) {
                     inclusive = true;
-                    const sb = self.arena.alloc(Expr, 1);
-                    sb[0] = start_expr;
-                    start_opt = &sb[0];
                     self.advance();
+                } else if (self.peek().tag == .rbracket) {
+                    const tok = self.peek();
+                    std.debug.print("error:{d}:{d}: empty slice form '[]' — write '[..]' for whole-array view or '[N..]' / '[..N]' for partial slices\n", .{ tok.loc.line, tok.loc.col });
+                    std.process.exit(1);
                 } else {
-                    // Plain index: `[EXPR]`. Lift to meet IndexExpr's
-                    // `*Expr` slot convention.
-                    self.expect(.rbracket);
+                    const start_expr = self.parseAdditive();
+                    if (self.peek().tag == .range) {
+                        inclusive = false;
+                        const sb = self.arena.alloc(Expr, 1);
+                        sb[0] = start_expr;
+                        start_opt = &sb[0];
+                        self.advance();
+                    } else if (self.peek().tag == .ellipsis) {
+                        inclusive = true;
+                        const sb = self.arena.alloc(Expr, 1);
+                        sb[0] = start_expr;
+                        start_opt = &sb[0];
+                        self.advance();
+                    } else {
+                        self.expect(.rbracket);
+                        const target_buf = self.arena.alloc(Expr, 1);
+                        target_buf[0] = lhs;
+                        const idx_buf = self.arena.alloc(Expr, 1);
+                        idx_buf[0] = start_expr;
+                        lhs = .{ .index = .{ .target = &target_buf[0], .index = &idx_buf[0] } };
+                        continue;
+                    }
+                }
+
+                var end_opt: ?*Expr = null;
+                if (self.peek().tag != .rbracket) {
+                    const end_expr = self.parseAdditive();
+                    const eb = self.arena.alloc(Expr, 1);
+                    eb[0] = end_expr;
+                    end_opt = &eb[0];
+                }
+                self.expect(.rbracket);
+                const target_buf = self.arena.alloc(Expr, 1);
+                target_buf[0] = lhs;
+                lhs = .{ .slice = .{ .target = &target_buf[0], .start = start_opt, .end = end_opt, .inclusive = inclusive } };
+                continue;
+            }
+            // `.` postfix chain — `.name` (no parens) → `.member_access`,
+            // `.name(...)` → `.method_call`. The chain target is lifted to
+            // an arena slot so the resulting `.member_access`/`.method_call`
+            // payload's `*Expr` pointer points at stable storage (mirrors
+            // the cycle-breaking convention used everywhere else).
+            if (self.peek().tag == .dot) {
+                self.advance(); // consume .
+                const name = self.expectIdent();
+                if (self.peek().tag == .lparen) {
+                    // Method-call form: `.name(args...)`. Args are
+                    // comma-separated Exprs parsed via the top of the
+                    // precedence ladder so `obj.method(1 + 2)` works.
+                    self.advance(); // consume (
+                    var args_buf: [16]Expr = undefined;
+                    var arg_count: usize = 0;
+                    if (self.peek().tag != .rparen) {
+                        args_buf[arg_count] = self.parseExpr();
+                        arg_count += 1;
+                        while (self.peek().tag == .comma) {
+                            self.advance();
+                            args_buf[arg_count] = self.parseExpr();
+                            arg_count += 1;
+                        }
+                    }
+                    self.expect(.rparen);
+                    const args = self.arena.alloc(Expr, arg_count);
+                    @memcpy(args, args_buf[0..arg_count]);
                     const target_buf = self.arena.alloc(Expr, 1);
                     target_buf[0] = lhs;
-                    const idx_buf = self.arena.alloc(Expr, 1);
-                    idx_buf[0] = start_expr;
-                    lhs = .{ .index = .{ .target = &target_buf[0], .index = &idx_buf[0] } };
-                    continue;
+                    lhs = .{ .method_call = .{ .target = &target_buf[0], .name = name, .args = args } };
+                } else {
+                    // Property-access form: `.name` (no parens). Codegen
+                    // emits `<target>.<name>` verbatim — the user-facing
+                    // form on `v.x` is identical to zig's struct-field-
+                    // access syntax so no special conversion is needed.
+                    const target_buf = self.arena.alloc(Expr, 1);
+                    target_buf[0] = lhs;
+                    lhs = .{ .member_access = .{ .target = &target_buf[0], .name = name } };
                 }
+                continue;
             }
-
-            // Reaching here means: peek showed `.range`/`.ellipsis`. Parse
-            // optional end bound then expect `]`. Empty end (`[..]`,
-            // `[N..]`, `[N...]`) skips the bound parse entirely so we
-            // don't trigger parsePrimary on `.rbracket` and accidentally
-            // consume the slice's own closing bracket.
-            var end_opt: ?*Expr = null;
-            if (self.peek().tag != .rbracket) {
-                const end_expr = self.parseAdditive();
-                const eb = self.arena.alloc(Expr, 1);
-                eb[0] = end_expr;
-                end_opt = &eb[0];
-            }
-            self.expect(.rbracket);
-            const target_buf = self.arena.alloc(Expr, 1);
-            target_buf[0] = lhs;
-            lhs = .{ .slice = .{ .target = &target_buf[0], .start = start_opt, .end = end_opt, .inclusive = inclusive } };
+            break;
         }
         return lhs;
     }
@@ -1307,8 +1919,94 @@ pub const Parser = struct {
             .print, .identifier => {
                 const name = tok.text;
                 self.advance();
+                // Qualified enum-variant constructor `Enum.Variant(args...)`
+                // (docs/manual/13). Conservative gate: only enable the
+                // QUALIFIED form because the unqualified `Variant(args)`
+                // shape is ambiguous between variant-construction and
+                // function-call (the existing `.print, .identifier` arm
+                // already routes parenthetical idents to parseCallExpr).
+                // Pattern-context (match/if-let/while-let) is the ONLY
+                // surface where unqualified `Variant(args)` is unambiguous
+                // (handled in parsePattern's extension above).
+                //
+                // CRITICAL: BOTH the enum name AND the variant name must
+                // start with an uppercase letter (Rust/Zig PascalCase
+                // convention). Without the second uppercase check, the
+                // gate falsely matches `Direction.opposite(d)` —
+                // the `opposite` is a method name (lowercase), not a
+                // variant name. Without the second check, codegen routes
+                // the method call to enum_variant_ctor and emits
+                // `Direction{ .opposite = d }` (struct-init syntax),
+                // which zig 0.16 rejects with "type 'Direction' does
+                // not support struct initialization syntax" because the
+                // bare `enum { North, South, ... }` form doesn't have
+                // fields.
+                if (tok.tag == .identifier and name.len > 0 and name[0] >= 'A' and name[0] <= 'Z' and
+                    self.pos + 2 < self.tokens.len and
+                    self.tokens[self.pos].tag == .dot and
+                    self.tokens[self.pos + 1].tag == .identifier and
+                    self.tokens[self.pos + 1].text.len > 0 and
+                    self.tokens[self.pos + 1].text[0] >= 'A' and
+                    self.tokens[self.pos + 1].text[0] <= 'Z' and
+                    self.tokens[self.pos + 2].tag == .lparen)
+                {
+                    const variant_name = self.tokens[self.pos + 1].text;
+                    self.expect(.dot);
+                    _ = self.expectIdent();
+                    self.expect(.lparen);
+                    var args_buf: [16]Expr = undefined;
+                    var arg_count: usize = 0;
+                    if (self.peek().tag != .rparen) {
+                        args_buf[arg_count] = self.parseExpr();
+                        arg_count += 1;
+                        while (self.peek().tag == .comma) {
+                            self.advance();
+                            args_buf[arg_count] = self.parseExpr();
+                            arg_count += 1;
+                        }
+                    }
+                    self.expect(.rparen);
+                    const args = self.arena.alloc(Expr, arg_count);
+                    @memcpy(args, args_buf[0..arg_count]);
+                    return .{ .enum_variant_ctor = .{
+                        .enum_name = name,
+                        .variant_name = variant_name,
+                        .args = args,
+                    } };
+                }
                 if (self.peek().tag == .lparen) {
                     return self.parseCallExpr(name);
+                } else if (self.peek().tag == .lbrace and self.allow_struct_lit and
+                    name.len > 0 and name[0] >= 'A' and name[0] <= 'Z')
+                {
+                    // Struct-literal: `Type { name: value, ... }`. The
+                    // lexer already gave us an identifier followed by `{`,
+                    // so we discriminate against a bare `.ident` on this
+                    // single-token lookahead. The struct-literal payload
+                    // is captured in declaration order so codegen's
+                    // verbatim `.f1 = v1` emission matches source order.
+                    //
+                    // Two-gate disambiguation:
+                    //   1. `self.allow_struct_lit` — primary parse-context
+                    //      flag. `parseBinding` and `parseFieldAssign` set
+                    //      it true at scope entry and restore via `defer`.
+                    //      Anywhere else (if-conditions, while-conditions,
+                    //      call args, return RHS, expr-stmt RHS) the flag
+                    //      is false, so `if Foo { ... }` where Foo is a
+                    //      PascalCase local is correctly parsed as the
+                    //      if-condition `Foo` followed by its if-body
+                    //      `{ ... }` rather than swallowing the block as
+                    //      a struct-literal.
+                    //   2. Uppercase-first-letter — defense-in-depth
+                    //      heuristic (Rust/Zig-style convention for type
+                    //      names). Even inside a binding-init position,
+                    //      `vec { x: 1 }` is rejected as a struct-literal
+                    //      because the leading identifier isn't capitalized;
+                    //      lowercase type names must be constructed via
+                    //      `Type.new(...)` instead. Belt-and-suspenders so
+                    //      an accidental flag flip can't regress the
+                    //      parser's structural disambiguation.
+                    return self.parseStructLit(name);
                 } else {
                     return .{ .ident = name };
                 }
@@ -1375,6 +2073,37 @@ pub const Parser = struct {
                     const elements = self.arena.alloc(Expr, 0);
                     return .{ .tuple_lit = elements };
                 }
+                // Lookahead: named tuple `(name: expr, ...)`. Two-token
+                // discriminator: identifier followed by COLON. Distinct
+                // from struct-lit (which uses `{`) and from positional
+                // / single-element (which starts with a non-ident or an
+                // ident NOT followed by colon). Rust / Python tuple
+                // syntax convention.
+                if (self.peek().tag == .identifier and
+                    self.pos + 1 < self.tokens.len and
+                    self.tokens[self.pos + 1].tag == .colon)
+                {
+                    var names_buf: [32][]const u8 = undefined;
+                    var named_elems_buf: [32]Expr = undefined;
+                    var named_count: usize = 0;
+                    while (self.peek().tag != .rparen and !self.eof()) {
+                        names_buf[named_count] = self.expectIdent();
+                        self.expect(.colon);
+                        named_elems_buf[named_count] = self.parseExpr();
+                        named_count += 1;
+                        if (self.peek().tag == .comma) {
+                            self.advance();
+                            // Allow trailing comma `(x: 10, y: 20,)`.
+                            if (self.peek().tag == .rparen) break;
+                        } else break;
+                    }
+                    self.expect(.rparen);
+                    const names_alloc = self.arena.alloc([]const u8, named_count);
+                    @memcpy(names_alloc, names_buf[0..named_count]);
+                    const elements_alloc = self.arena.alloc(Expr, named_count);
+                    @memcpy(elements_alloc, named_elems_buf[0..named_count]);
+                    return .{ .named_tuple_lit = .{ .names = names_alloc, .elements = elements_alloc } };
+                }
                 // Parse first expression — delegate via the top of the
                 // precedence ladder so `(1 + 2)` is parsed as a full
                 // binary expression rather than just a primary.
@@ -1383,8 +2112,26 @@ pub const Parser = struct {
                 elements_buf[element_count] = self.parseExpr();
                 element_count += 1;
                 // If a comma follows, this is a tuple literal
+                // (multi-element or single-element `(expr,)`).
+                // The single-element form is captured via the
+                // dedicated `.single_tuple_lit` variant so codegen
+                // and downstream tests can distinguish it from
+                // paren-grouping `(expr)` at the AST level. The
+                // trailing-comma disambiguator follows Rust /
+                // Python tuple syntax conventions.
                 if (self.peek().tag == .comma) {
                     self.advance();
+                    // Single-element `(expr,)` — distinguishing
+                    // from `()` (empty tuple) and `(expr)`
+                    // (paren-group) is the trailing comma,
+                    // surfacing in zig as `.{ expr }` (one-field
+                    // anonymous struct).
+                    if (self.peek().tag == .rparen) {
+                        self.advance();
+                        const single = self.arena.alloc(Expr, 1);
+                        single[0] = elements_buf[0];
+                        return .{ .single_tuple_lit = &single[0] };
+                    }
                     elements_buf[element_count] = self.parseExpr();
                     element_count += 1;
                     while (self.peek().tag == .comma) {
@@ -1406,7 +2153,6 @@ pub const Parser = struct {
             },
         }
     }
-
     fn parseCallExpr(self: *Parser, name: []const u8) Expr {
         self.expect(.lparen);
         var args_buf: [32]Expr = undefined;
@@ -1425,6 +2171,40 @@ pub const Parser = struct {
         const args = self.arena.alloc(Expr, arg_count);
         @memcpy(args, args_buf[0..arg_count]);
         return .{ .call = .{ .name = name, .args = args } };
+    }
+
+    /// Parse `Type { f1: v1, f2: v2, }` — the `.struct_lit` Expr form.
+    /// Caller has already consumed the leading identifier (the type-name).
+    /// Field-inits are comma-separated `name: value` pairs. The body
+    /// bracket-len form `T { … }` is fully supported including the
+    /// trailing-comma case the parser accepts (parser is
+    /// comma-tolerant — extra trailing commas don't error so users can
+    /// line up the closing brace naturally).
+    fn parseStructLit(self: *Parser, type_name: []const u8) Expr {
+        self.expect(.lbrace);
+        var inits_buf: [16]ast.Expr.FieldInit = undefined;
+        var init_count: usize = 0;
+        while (self.peek().tag != .rbrace and !self.eof()) {
+            if (self.peek().tag == .newline) {
+                self.advance();
+                continue;
+            }
+            if (self.peek().tag == .comma) {
+                self.advance();
+                continue;
+            }
+            const field_name = self.expectIdent();
+            self.expect(.colon);
+            const value = self.parseExpr();
+            const value_buf = self.arena.alloc(Expr, 1);
+            value_buf[0] = value;
+            inits_buf[init_count] = .{ .name = field_name, .value = &value_buf[0] };
+            init_count += 1;
+        }
+        self.expect(.rbrace);
+        const inits = self.arena.alloc(ast.Expr.FieldInit, init_count);
+        @memcpy(inits, inits_buf[0..init_count]);
+        return .{ .struct_lit = .{ .type_name = type_name, .inits = inits } };
     }
 
     fn parseArrayLit(self: *Parser) Expr {
@@ -1686,18 +2466,40 @@ pub const Parser = struct {
     /// the user doesn't write `: T` explicitly.
     fn isLiteralInit(expr: Expr) bool {
         return switch (expr) {
-            .int_lit, .float_lit, .bool_lit, .char_lit, .string_lit, .byte_string_lit, .null_lit, .undefined_lit, .tuple_lit, .array_lit, .template_lit, .new_expr => true,
+            // NOTE: `.single_tuple_lit` (Phase 1 single-element tuple) and
+            // `.named_tuple_lit` (Phase 1 named-field tuple) intentionally
+            // read as "literal init" here even though their runtime type is
+            // an anonymous struct (`.{ EXPR }` / `.{ .name = expr }`). The
+            // carve-out above is only needed to surface a clear parser error
+            // when binding a NON-LITERAL expression whose type zig cannot
+            // infer to a primitive (specifically: `comptime_int` values that
+            // would silently coerce into the wrong shape downstream — see
+            // `codegen.needsIntDivShim` for the failure surface). Anonymous
+            // structs have a fully decidable type that zig accepts in any
+            // expression position, so allowing bare binding of these two
+            // variants is safe — the resulting zig code round-trips through
+            // downstream uses (print, member access, comparisons).
+            .int_lit, .float_lit, .bool_lit, .char_lit, .string_lit, .byte_string_lit, .null_lit, .undefined_lit, .tuple_lit, .array_lit, .template_lit, .new_expr, .struct_lit, .single_tuple_lit, .named_tuple_lit => true,
             else => false,
         };
     }
-
     fn expectIdent(self: *Parser) []const u8 {
         const tok = self.peek();
-        if (tok.tag != .identifier and tok.tag != .print) {
+        // Method/struct names can be any user-facing identifier PLUS
+        // the keyword tokens `print`/`new`/`free` because the docs/12
+        // common pattern is `impl Vec3 { pub fun new(...) -> Vec3 }`
+        // where `new` is the conventional constructor name. Without
+        // this concession the parser rejects `pub fun new(...)` even
+        // though the user's surface clearly distinguishes the method
+        // name from heap allocation via the surrounding `fun NAME(...)`
+        // syntax. Same reasoning for `print` (already accepted) and
+        // `free` (the docs/19 example `defer free(p)` uses `free` as
+        // both a heap-op and a potential method name without clash).
+        if (tok.tag != .identifier and tok.tag != .print and
+            tok.tag != .new and tok.tag != .free)
+        {
             std.debug.print("error:{d}:{d}: expected identifier, got '{s}'\n", .{
-                tok.loc.line,
-                tok.loc.col,
-                tok.text,
+                tok.loc.line, tok.loc.col, tok.text,
             });
             std.process.exit(1);
         }

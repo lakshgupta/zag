@@ -48,6 +48,17 @@ pub const Codegen = struct {
     /// existing counters here would create collisions with destructuring
     /// temps (`__destruct_<N>`) and `new` heap locals (`__p_<N>`).
     match_counter: u32,
+    /// Per-function flag: true when the currently-walked function body
+    /// has a non-void return type (only relevant for impl-block methods
+    /// because top-level `pub fun` declarations ALWAYS emit
+    /// `() !void` per the grammar's missing top-level-return-type carve-
+    /// out). Read by `genMethod` and `genFreeMethod` body loops and
+    /// passed to `genStmt` as the gate that decides whether a tail-
+    /// position `match_stmt` should be prefixed with `return` (so the
+    /// matched value is returned to the zig call site) vs emitted as a
+    /// bare indented `(blk: { ... });` statement (the value-discarding
+    /// form zig accepts at any other position).
+    fn_returns_value: bool,
 
     pub fn init() Codegen {
         return .{
@@ -58,6 +69,7 @@ pub const Codegen = struct {
             .type_info_count = 0,
             .alloc_counter = 0,
             .match_counter = 0,
+            .fn_returns_value = false,
         };
     }
 
@@ -84,11 +96,290 @@ pub const Codegen = struct {
             \\
         );
 
+        // Emit struct declarations BEFORE top-level functions so the
+        // emitted zig sees types declared before use. Each struct
+        // emission includes its matching impl methods NESTED INSIDE the
+        // struct body — this is the simplification that makes
+        // `v.length()` and `Vec3.new(...)` 1:1 round-trip to zig
+        // (no za-side type resolver needed; zig's own type checker
+        // handles receiver-vs-type dispatch natively).
+        //
+        // Same shape for enums: emit `pub const EnumName = enum {..}` (or
+        // `union(enum) {..}` when any variant carries payload) with any
+        // matching impl-block methods NESTED INSIDE so zig's native
+        // pattern matching supports them.
+        var matched_targets_buf: [512][]const u8 = undefined;
+        var matched_count: u32 = 0;
+        for (prog.enums) |ed| {
+            if (matched_count < matched_targets_buf.len) {
+                matched_targets_buf[matched_count] = ed.name;
+                matched_count += 1;
+            }
+            self.genEnumDecl(ed, prog.impls);
+        }
+        for (prog.structs) |sd| {
+            if (matched_count < matched_targets_buf.len) {
+                matched_targets_buf[matched_count] = sd.name;
+                matched_count += 1;
+            }
+            self.genStructDecl(sd, prog.impls);
+        }
+        // Orphan impls (target_type not declared as a struct) emit as
+        // module-level free functions with `_<target_type>_<name>` names
+        // so a stray `impl Foo { pub fun bar() -> i32 { ... } }` line
+        // without a matching `struct Foo` still produces callable zig
+        // instead of silently being dropped. This preserves the
+        // user-facing surface in source-level use cases while keeping
+        // the canonical struct+impl nesting simple for the common case.
+        // Codegen also passes a `&v` (address-of) prefix automatically
+        // when a receiver parameter is named `self` and the call site
+        // is a bare-method-call expression — see `.method_call` in
+        // `genExpr` for the dispatch surface.
+        for (prog.impls) |impl| {
+            var is_matched = false;
+            for (matched_targets_buf[0..matched_count]) |t| {
+                if (std.mem.eql(u8, t, impl.target_type)) {
+                    is_matched = true;
+                    break;
+                }
+            }
+            if (is_matched) continue;
+            for (impl.methods) |m| {
+                self.genFreeMethod(impl.target_type, m);
+            }
+        }
+
         for (prog.functions) |fun| {
             self.genFun(fun);
         }
 
         return self.out_buf[0..self.out_len];
+    }
+
+    /// Emit a single method as a module-level free function with a
+    /// `_<target_type>_<name>` qualified identifier. Used by orphan-impl
+    /// handling when no matching `struct NAME` decl exists. The fallback
+    /// shape preserves the user-facing method-call form
+    /// (`Vec3_length(&v)`) when callers explicitly qualify the
+    /// type+name pair. The body emission uses the same `genStmt` recursion
+    /// as nested-method-body or top-level-fn-body.
+    fn genFreeMethod(self: *Codegen, target_type: []const u8, m: ast.MethodDecl) void {
+        self.write("pub fn ");
+        self.write(target_type);
+        self.write("_");
+        self.write(m.name);
+        self.write("(");
+        for (m.params, 0..) |p, i| {
+            if (i > 0) self.write(", ");
+            self.write(p.name);
+            self.write(": ");
+            self.write(p.type_text);
+        }
+        self.write(") ");
+        if (m.return_type) |rt| self.write(rt);
+        self.write(" {\n");
+        // Reset per-function counters (matching `genMethod`/`genFun`).
+        self.destructure_counter = 0;
+        self.alloc_counter = 0;
+        self.match_counter = 0;
+        self.type_info_count = 0;
+        self.fn_returns_value = m.return_type != null;
+        for (m.body) |s| self.collectTypedBindings(s);
+        for (m.body, 0..) |s, i| self.genStmt(s, self.fn_returns_value and i == m.body.len - 1);
+        self.write("}\n");
+    }
+
+    /// Emit `pub const NAME = struct { fields + matching impl methods };`.
+    /// Fields are emitted in declaration order so any odo/zig struct
+    /// initializer (`Vec3 { .x = 1, … }`) round-trips the field-position
+    /// assumption naturally. Impl methods whose `target_type` matches
+    /// the struct name are nested inside so zig sees them as real
+    /// struct methods — this is what enables both the value-receiver
+    /// form `v.length()` and the type-static constructor form
+    /// `Vec3.new(...)` to compile against the same zig struct without
+    /// zag needing a type-resolver at codegen time.
+    fn genStructDecl(self: *Codegen, sd: ast.StructDecl, all_impls: []const ast.ImplBlock) void {
+        self.write("pub const ");
+        self.write(sd.name);
+        self.write(" = struct {\n");
+        for (sd.fields) |f| {
+            switch (f.kind) {
+                .named => |nf| {
+                    self.write("    ");
+                    self.write(nf.name);
+                    self.write(": ");
+                    self.write(nf.type_text);
+                    self.write(",\n");
+                },
+                .embed => |ef| {
+                    // Embedding promotion: docs/12 "embedded types promote
+                    // their fields + methods into the outer struct". The
+                    // simplifcation is to emit a named field whose type is
+                    // the embedded type itself; `.field` access then goes
+                    // through a one-level indirection (`btn.Widget.x`).
+                    // Strict Promotion (where `btn.x` resolves directly) is
+                    // deferred to a followup commit because zig 0.16 does
+                    // not expose anonymous-struct flattening macros — a
+                    // field-shorthand trick is plausible but breaks
+                    // struct-literal's `T { .f = … }` enforcement on
+                    // anonymous fields, so the indirection form is the
+                    // safe first-pass until the spread-flavor lands.
+                    self.write("    ");
+                    self.write(ef.type_name);
+                    self.write(": ");
+                    self.write(ef.type_name);
+                    self.write(" = .{}, // embedded (promote fields+methods via dot deref) \n");
+                },
+            }
+        }
+        // Nest matching impl methods inside the struct definition. The
+        // body emission path is shared with `genFun` so all the existing
+        // stmt/expr handling (destructuring, compound assign, if/match,
+        // etc.) works for methods too. Each method body sees a fresh
+        // counter set so destructuring temps + new-temporaries inside
+        // the method don't clash with sibling methods' temps.
+        for (all_impls) |impl| {
+            if (!std.mem.eql(u8, impl.target_type, sd.name)) continue;
+            for (impl.methods) |m| {
+                self.genMethod(m);
+            }
+        }
+        self.write("};\n\n");
+    }
+
+    /// Emit a single method as a zig struct-member function. Leading
+    /// `pub fn` regardless of the source's `pub` prefix (privacy is
+    /// accept-and-ignored per the user-confirmed scope). The body uses
+    /// the same `genStmt` recursion as `genFun` so all existing
+    /// primitives (let-bindings, if/match, etc.) work in method bodies.
+    fn genMethod(self: *Codegen, m: ast.MethodDecl) void {
+        self.write("    pub fn ");
+        self.write(m.name);
+        self.write("(");
+        for (m.params, 0..) |p, i| {
+            if (i > 0) self.write(", ");
+            self.write(p.name);
+            self.write(": ");
+            self.write(p.type_text);
+        }
+        self.write(") ");
+        if (m.return_type) |rt| self.write(rt);
+        self.write(" {\n");
+        // Reset per-function counters before this method body's emission
+        // so destructuring temps (`__destruct_<N>`) and `new` temps
+        // (`__p_<N>`) and match scrutinees (`__m_<N>`) start fresh at
+        // `_0`. These counters will be re-zeroed at the next `genFun`
+        // entry anyway, but resetting here ensures the method body
+        // inside a struct definition has its own local counter space.
+        self.destructure_counter = 0;
+        self.alloc_counter = 0;
+        self.match_counter = 0;
+        // Re-populate the per-function type-info map for any locally-
+        // declared typed bindings inside the method body so the
+        // div-shim predicate (`needsIntDivShim`) gets correct info
+        // for the method's own locals (not the enclosing pub fn's).
+        self.type_info_count = 0;
+        self.fn_returns_value = m.return_type != null;
+        for (m.body) |s| self.collectTypedBindings(s);
+        for (m.body, 0..) |s, i| self.genStmt(s, self.fn_returns_value and i == m.body.len - 1);
+        self.write("    }\n");
+    }
+
+    /// Emit `pub const NAME = enum { V1, V2, ... };` (or
+    /// `pub const NAME = union(enum) { V1: T, V2: T, ... };` when any
+    /// variant carries a payload type). Reuses `genMethod` to nest
+    /// matching impl-block methods inside the enum, mirroring the
+    /// struct-decl path. The enum-vs-union(enum) split matches docs/13:
+    /// bare tag-only variants map to zig's plain `enum { ... }` form
+    /// (1-byte tag-only payload slot), while data-carrying variants
+    /// (`Circle(f64)`) map to `union(enum) { ... }` so zig's native
+    /// pattern matching with `|payload|` capture can extract the data.
+    fn genEnumDecl(self: *Codegen, ed: ast.EnumDecl, all_impls: []const ast.ImplBlock) void {
+        self.write("pub const ");
+        self.write(ed.name);
+        self.write(" = ");
+        // Auto-detect payload form: any variant with non-null
+        // payload_type triggers the `union(enum)` form. All variants in
+        // a single enum share the same emission shape — mixing plain
+        // enum with union(enum) is not allowed in zig.
+        var any_payload = false;
+        for (ed.variants) |v| {
+            if (v.payload_type != null) {
+                any_payload = true;
+                break;
+            }
+        }
+        if (any_payload) {
+            self.write("union(enum) {\n");
+        } else {
+            self.write("enum {\n");
+        }
+        for (ed.variants) |v| {
+            self.write("    ");
+            self.write(v.name);
+            if (v.payload_type) |pt| {
+                // zig 0.16 rejects bare `Rect: f64, f64` (parsed as TWO
+                // variants, not one with a tuple type). Multi-arg
+                // payloads MUST be wrapped in an anonymous struct so
+                // zig's tagged-union parser sees one variant with a
+                // struct-typed payload. Single-arg payloads stay bare
+                // (`Circle: f64` is a valid union(enum) variant type).
+                //
+                // Detection: count commas in `pt`. Zero commas → single
+                // arg, emit verbatim. ≥1 comma → multi-arg, emit
+                // `struct { a: T0, b: T1, ... }` with sequential
+                // single-letter field names (a, b, c, …). The matching
+                // constructor emit (`.enum_variant_ctor` arm) uses
+                // positional init `.{ x, y }` which zig forwards to the
+                // struct's named fields in declaration order, so the
+                // emit-side letter sequence must align with the parse
+                // order of the source's comma-list.
+                var comma_count: usize = 0;
+                for (pt) |c| if (c == ',') {
+                    comma_count += 1;
+                };
+                if (comma_count == 0) {
+                    self.write(": ");
+                    self.write(pt);
+                } else {
+                    self.write(": struct { ");
+                    const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
+                    var seg_start: usize = 0;
+                    var idx: usize = 0;
+                    var i: usize = 0;
+                    while (i <= pt.len) : (i += 1) {
+                        if (i == pt.len or pt[i] == ',') {
+                            // Trim leading/trailing whitespace from the
+                            // captured type-text segment so
+                            // `f64, f64` doesn't emit `: a: f64, b:  f64`.
+                            var a: usize = seg_start;
+                            var b: usize = i;
+                            while (a < b and (pt[a] == ' ' or pt[a] == '\t')) a += 1;
+                            while (b > a and (pt[b - 1] == ' ' or pt[b - 1] == '\t')) b -= 1;
+                            if (idx > 0) self.write(", ");
+                            self.write(letters[idx]);
+                            self.write(": ");
+                            self.write(pt[a..b]);
+                            idx += 1;
+                            seg_start = i + 1;
+                        }
+                    }
+                    self.write(" }");
+                }
+            }
+            self.write(",\n");
+        }
+        // Nest matching impl methods inside the enum so zig's native
+        // pattern matching supports them. Same `genMethod` reuse as the
+        // struct decl's nested-impl path — the per-method counters and
+        // type-info map reset behaviour is identical.
+        for (all_impls) |impl| {
+            if (!std.mem.eql(u8, impl.target_type, ed.name)) continue;
+            for (impl.methods) |m| {
+                self.genMethod(m);
+            }
+        }
+        self.write("};\n\n");
     }
 
     fn genFun(self: *Codegen, fun: ast.FunDecl) void {
@@ -112,6 +403,13 @@ pub const Codegen = struct {
         // no-redeclaration rule is satisfied; sibling `pub fn`s reset
         // their own counters to start fresh at `_0`.
         self.match_counter = 0;
+        // Top-level `fun` ALWAYS emits `() !void` regardless of any
+        // source-side return annotation, because the grammar does not
+        // yet parse top-level return types. So `fn_returns_value` stays
+        // `false` here — every match-stmt in the top-level fn body
+        // emits as a value-discarding indented `(blk: { ... });`
+        // statement.
+        self.fn_returns_value = false;
         for (fun.body) |stmt| {
             self.collectTypedBindings(stmt);
         }
@@ -121,7 +419,7 @@ pub const Codegen = struct {
         self.write("() !void {\n");
 
         for (fun.body) |stmt| {
-            self.genStmt(stmt);
+            self.genStmt(stmt, false);
         }
 
         self.write("}\n\n");
@@ -210,7 +508,7 @@ pub const Codegen = struct {
         }
     }
 
-    fn genStmt(self: *Codegen, stmt: ast.Stmt) void {
+    fn genStmt(self: *Codegen, stmt: ast.Stmt, is_tail_pos: bool) void {
         switch (stmt) {
             // All three binding kinds funnel through `genBinding`, which
             // decides between the simple single-binding path (no `pattern`
@@ -255,7 +553,7 @@ pub const Codegen = struct {
                 // guarantee the structure is auditable in code review.
                 self.write("    // unsafe {\n");
                 for (stmts) |s| {
-                    self.genStmt(s);
+                    self.genStmt(s, false);
                 }
                 self.write("    // }\n");
             },
@@ -276,7 +574,7 @@ pub const Codegen = struct {
                 self.write("    if ");
                 self.genExpr(ifs.cond);
                 self.write(" {\n");
-                for (ifs.then_body) |s| self.genStmt(s);
+                for (ifs.then_body) |s| self.genStmt(s, false);
                 self.write("    }");
                 self.genElseBranch(ifs.else_kind);
                 self.write("\n");
@@ -293,7 +591,7 @@ pub const Codegen = struct {
                 self.write("    while ");
                 self.genExpr(ws.cond);
                 self.write(" {\n");
-                for (ws.body) |s| self.genStmt(s);
+                for (ws.body) |s| self.genStmt(s, false);
                 self.write("    }\n");
             },
             .for_stmt => |fs| {
@@ -326,15 +624,37 @@ pub const Codegen = struct {
                     },
                 }
                 self.write("| {\n");
-                for (fs.body) |s| self.genStmt(s);
+                for (fs.body) |s| self.genStmt(s, false);
                 self.write("    }\n");
             },
             .match_stmt => |m| {
-                // Match is always expression-valued per the user-confirmed
-                // shape; the statement-position wrapper just wraps the
-                // match_expr emission in `expr_stmt` semantics by emitting
-                // it inline and ignoring the discard (zig accepts unused
-                // expressions without error in statement position).
+                // CRITICAL: match-as-stmt emit shape. The MATCH form
+                // always emits a labelled `(blk: { ... });` block.
+                // Because that block sits on its own indented line in
+                // the generated zig (NOT inline with the function
+                // body's closing `}`), zig's implicit-return detection
+                // does NOT fire (zig 0.16 only treats the body's last
+                // expression as the return value when the expression
+                // is inline and not followed by `;`; a parenthesised
+                // block on its own line is read as a separate
+                // statement that needs a trailing `;`). When the match
+                // sits at the function-tail position AND the fn has a
+                // non-void return type, we therefore prefix the block
+                // with an explicit `return ` so the matched value gets
+                // returned. Otherwise (mid-fn match, OR last-in-a-void-
+                // fn match) we emit the bare indented
+                // `(blk: { ... });` — zig accepts the discared block
+                // value at statement position.
+                //
+                // The caller (`genFun`/`genMethod`/`genFreeMethod`)
+                // passes `is_tail_pos` already gated by
+                // `fn_returns_value and i == body.len - 1`, so we
+                // don't repeat the fn_returns_value check here.
+                if (is_tail_pos) {
+                    self.write("    return ");
+                } else {
+                    self.write("    ");
+                }
                 self.genMatchExpr(m);
                 self.write(";\n");
             },
@@ -378,6 +698,23 @@ pub const Codegen = struct {
             .expr_stmt => |e| {
                 self.write("    ");
                 self.genExpr(e);
+                self.write(";\n");
+            },
+            .field_assign => |fa| {
+                // `target.field = value;` — zig 0.16 accepts this
+                // verbatim for any receiver whose zig-type declares
+                // `field` as a `var` (struct field is always var-able).
+                // Note: zig REJECTS field-write to a `const` receiver,
+                // so the binding kind (`let` vs `var`) on `target`'s
+                // declaration determines correctness — which mirrors
+                // zag's own semantics (zig's `let` rejects field-write
+                // exactly because the binding is immutable).
+                self.write("    ");
+                self.genExpr(fa.target.*);
+                self.write(".");
+                self.write(fa.field_name);
+                self.write(" = ");
+                self.genExpr(fa.value);
                 self.write(";\n");
             },
         }
@@ -492,8 +829,113 @@ pub const Codegen = struct {
                 // the value; we just throw it away by not aliasing any
                 // user-visible name to it.
             },
+            .rest => |rb| {
+                // Phase 2: two emission shapes depending on whether the
+                // init expression's element count is statically known.
+                //
+                //   - Literal init (`elements.len > 0`): synthesize a
+                //     positional anonymous-struct sub-tuple
+                //     `const NAME = .{ __destruct_<N>[before_count],
+                //       __destruct_<N>[before_count+1], ...,
+                //       __destruct_<N>[elements.len-1] };`
+                //     No per-element types are needed because the
+                //     destructure temp is itself an anonymous struct of
+                //     matching positional types — zig 0.16 accepts bare
+                //     `.{ a, b, c }` against `__destruct_<N>: .{ ... }`
+                //     only when the temp's element types match each
+                //     sub-index's match target. The `before_count >
+                //     elements.len` guard catches malformed patterns
+                //     where the rest-binding's anchor exceeds the init
+                //     length (e.g. `(a, b, ...rest) = (1, 2)`).
+                //
+                //   - Runtime init (`elements.len == 0`): emit a
+                //     zig slice open-ended form
+                //     `const NAME = __destruct_<N>[<before_count>..];`
+                //     which works when the destructured runtime value's
+                //     zig type is sliceable (e.g. `[]T`, `[]const u8`,
+                //     user arrays). For anonymous-struct-of-positional-
+                //     types runtime values (the runtime-tuple case), zig
+                //     does NOT accept slice operations on anonymous
+                //     struct literals — the compiler will surface
+                //     `cannot slice type '(struct { ... })'` at the
+                //     generated call site, which IS the intended user
+                //     signal that runtime-tuple rest-binding needs the
+                //     literal-init surface or a slice-typed declaration.
+                //     The Phase 2 decision here is to ACCEPT the
+                //     runtime call (instead of rejecting at codegen
+                //     time as Phase 1 did) so this surface compiles for
+                //     the common slice/array cases.
+                self.write("    ");
+                self.write(kw);
+                self.write(" ");
+                self.write(rb.name);
+                if (elements.len == 0) {
+                    // Runtime slice form — see the doc above for the
+                    // slice-vs-anonymous-struct semantics.
+                    self.write(" = ");
+                    self.write(src_path);
+                    self.write("[");
+                    var idx_buf: [16]u8 = undefined;
+                    const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{rb.before_count}) catch "0";
+                    self.write(idx_str);
+                    self.write("..];\n");
+                    return;
+                }
+                if (rb.before_count > elements.len) {
+                    std.debug.print("error: rest-binding '{s}' before_count={d} exceeds init length {d}\n", .{ rb.name, rb.before_count, elements.len });
+                    std.process.exit(1);
+                }
+                self.write(" = .{");
+                var j: usize = rb.before_count;
+                while (j < elements.len) : (j += 1) {
+                    if (j > rb.before_count) self.write(",");
+                    self.write(" ");
+                    self.write(src_path);
+                    self.write("[");
+                    var idx_buf2: [16]u8 = undefined;
+                    const idx_str2 = std.fmt.bufPrint(&idx_buf2, "{d}", .{j}) catch "0";
+                    self.write(idx_str2);
+                    self.write("]");
+                }
+                self.write(" };\n");
+            },
             .tuple, .array => |pats| {
-                for (pats, 0..) |leaf, i| {
+                // Manual index counter (NOT `for (pats, 0..)`) so the .rest
+                // early-continue branch can skip emitting `new_path` (it does
+                // not use `i` for the recursive call's `src_path`) without
+                // triggering zig 0.16's "pointless discard of capture" error.
+                //
+                // Phase 2 NOTE: the `.rest` early-continue passes the
+                // CURRENT walker level's `src_path` and `elements` (the
+                // outer walker is called with `src_path = __destruct_0`,
+                // the inner walker IS called with `src_path = __destruct_0[1]`
+                // from the outer walker, AND its `elements` IS the inner
+                // tuple's literal elements). The .rest arm then emits
+                // `__destruct_<N>[i_or_j]` correctly for both top-level
+                // (using `__destruct_0`) and nested (using `__destruct_0[1]`)
+                // cases. The reason Phase 1's original logic was already
+                // correct: the recursion via `genBindingLeaves` carries the
+                // CHUNKED src_path DOWN one level, so when the inner
+                // walker hits `.rest`, it sees the inner tuple's path
+                // (`__destruct_0[1]`) and emits `__destruct_0[1][j]`.
+                var i: usize = 0;
+                for (pats) |leaf| {
+                    // Rest-binding is terminal: the leaf's .rest arm emits
+                    // a single binding whose indices reference the
+                    // ORIGINAL source positions, not the per-leaf `i`.
+                    // The recursive walk below would index-by-`i` (e.g.
+                    // turning `__destruct_0` into `__destruct_0[1]` for the
+                    // leaf at position 1) which make the rest arm emit
+                    // `__destruct_0[1][j]` instead of the desired
+                    // `__destruct_0[j]`. Re-invoke the .rest arm with the
+                    // current walker level's `src_path` and `elements` so
+                    // it can use the AST-recorded `before_count` for the
+                    // proper offset.
+                    if (leaf == .rest) {
+                        self.genBindingLeaves(kw, src_path, leaf, elements);
+                        i += 1;
+                        continue;
+                    }
                     var new_buf: [256]u8 = undefined;
                     const new_path = std.fmt.bufPrint(&new_buf, "{s}[{d}]", .{ src_path, i }) catch src_path;
                     // Hand each child the elements slice appropriate for
@@ -502,7 +944,10 @@ pub const Codegen = struct {
                     // destructurable Expr at this depth — idents, calls,
                     // etc. — so type inference skips and the leaf is emitted
                     // bare). See the doc header above for why these two
-                    // forms differ.
+                    // forms differ. The `.rest` arm below returns an empty
+                    // slice — it's only here to keep the switch exhaustive;
+                    // the early-continue above is the only path that reaches
+                    // this switch with `.rest` and skips the recursive call.
                     const sub_elements: []const ast.Expr = switch (leaf) {
                         .name, .discard => if (i < elements.len)
                             elements[i..][0..1]
@@ -512,8 +957,14 @@ pub const Codegen = struct {
                             getTopElements(elements[i])
                         else
                             &[_]ast.Expr{},
+                        .rest => &[_]ast.Expr{},
                     };
                     self.genBindingLeaves(kw, new_path, leaf, sub_elements);
+                    // Manual counter increment (matches the `i += 1;`
+                    // inside the `.rest` early-continue above). Without
+                    // this, every non-rest leaf would compute `new_path`
+                    // as `__destruct_<N>[0]` regardless of position.
+                    i += 1;
                 }
             },
         }
@@ -540,6 +991,8 @@ pub const Codegen = struct {
     fn getTopElements(expr: ast.Expr) []const ast.Expr {
         return switch (expr) {
             .tuple_lit => |els| els,
+            .single_tuple_lit => |el_ptr| @as([*]const ast.Expr, @ptrCast(el_ptr))[0..1],
+            .named_tuple_lit => |nt| nt.elements,
             .array_lit => |a| a.elements,
             else => &[_]ast.Expr{},
         };
@@ -654,6 +1107,34 @@ pub const Codegen = struct {
                     self.write(" }");
                 }
             },
+            .single_tuple_lit => |el_ptr| {
+                // Single-element tuple `(x,)` — emit `.{ x }`. The
+                // trailing-comma disambiguator from paren-grouping
+                // was detected at parse time; codegen just lifts the
+                // captured expression verbatim into a one-element
+                // anonymous-struct literal.
+                self.write(".{ ");
+                self.genExpr(el_ptr.*);
+                self.write(" }");
+            },
+            .named_tuple_lit => |nt| {
+                // Named-tuple literal `(x: 10, y: 20)` — emit
+                // `.{ .x = 10, .y = 20 }`. zig 0.16 accepts named-field
+                // init on anonymous-struct literals and field-name lookup
+                // via `.x` (which is the same shape as struct-field
+                // access). The names are emitted verbatim so the
+                // round-trip test (sources's `point.x` access → codegen's
+                // `.x = 10` literal) is byte-exact.
+                self.write(".{ ");
+                for (nt.elements, 0..) |el, i| {
+                    if (i > 0) self.write(", ");
+                    self.write(".");
+                    self.write(nt.names[i]);
+                    self.write(" = ");
+                    self.genExpr(el);
+                }
+                self.write(" }");
+            },
             .array_lit => |a| {
                 self.genArrayLit(a);
             },
@@ -755,16 +1236,30 @@ pub const Codegen = struct {
                 self.write("; }");
             },
             .cast => |c| {
-                // `expr as T` — verbatim passthrough because zig 0.16's
-                // `as` operator handles the same cast surface zag exposes
-                // (type widening, narrowing, pointer conversions, raw
-                // pointer casts). The parser's `collectCastType` joined
-                // multi-token types (`*raw c_void`, `*const T`) into the
-                // one `type_text` slice stored on the AST node.
-                self.write("(");
-                self.genExpr(c.expr.*);
-                self.write(" as ");
+                // `expr as T` — emit as Zig's `@as(T, expr)` builtin.
+                // zig 0.16 does not have an `as` keyword (it was a
+                // pre-0.14 deprecation; modern zig routes all explicit
+                // coercions through `@as(type, value)` and the related
+                // `@ptrCast` / `@intCast` family). Emitting the
+                // parenthesised `(expr as T)` form that the prior
+                // comment promised was rejected by zig 0.16 with
+                // `expected ')'` (the `as` token isn't a known infix op
+                // so zig parses `(` … saw `as` … saw `f32` and
+                // deduces an unfinished sub-expression).
+                //
+                // The parser's `collectCastType` joined multi-token
+                // types like `*raw c_void` / `*const T` into the one
+                // `type_text` slice stored on the AST node, so emitting
+                // `@as(*raw c_void, val)` / `@as(*const T, val)` works
+                // verbatim for far-cast paths. The expression side is
+                // emitted via the existing `genExpr` recursion so binary
+                // and unary LHSes (e.g. `(a + b) as f32`) surface as
+                // `@as(f32, (a + b))` with their internal precedence
+                // bindings intact.
+                self.write("@as(");
                 self.write(c.type_text);
+                self.write(", ");
+                self.genExpr(c.expr.*);
                 self.write(")");
             },
             .free_expr => |f| {
@@ -879,6 +1374,131 @@ pub const Codegen = struct {
                 // caller is embedding us in a larger expression (e.g. the
                 // RHS of a let binding).
                 self.genMatchExpr(m);
+            },
+            .struct_lit => |sl| {
+                // `Type { .f1 = v1, .f2 = v2, }` — emit zig's named-struct
+                // literal form (NO leading dot — `.TypeName { … }` is the
+                // anonymous-struct form, and `TypeName { .f = … }` is the
+                // named-struct form). The fields are emitted in
+                // declaration order so the emitted source preserves the
+                // user's initialization order (matters for tests that
+                // assert the exact field-position sequence).
+                self.write(sl.type_name);
+                self.write("{ ");
+                for (sl.inits, 0..) |fi, i| {
+                    if (i > 0) self.write(", ");
+                    self.write(".");
+                    self.write(fi.name);
+                    self.write(" = ");
+                    self.genExpr(fi.value.*);
+                }
+                self.write(" }");
+            },
+            .enum_variant_ctor => |evc| {
+                // zig 0.16 REJECTS the prior emission `Enum.Variant(arg)`
+                // for payload-bearing variants with `type '@typeInfo(...).@"union".tag_type.?' not a function`.
+                // The canonical form is the tagged-union-init literal:
+                //   bare variant   (args.len == 0)  → `Enum.Variant`            (works in 0.16)
+                //   single-arg payload             → `Enum{ .Variant = arg }`   (literal-arg form)
+                //   multi-arg payload              → `Enum{ .Variant = .{ a, b } }` (anonymous-struct arg)
+                // The unqualified case (enum_name == null) drops the `Enum`.
+                // prefix so zig's type-inference picks the enum from the
+                // binding's `: T` annotation when present.
+                if (evc.args.len == 0) {
+                    // Bare tag-only — function-style works as a value
+                    // expression in zig 0.16 (no parens).
+                    if (evc.enum_name) |en| {
+                        self.write(en);
+                        self.write(".");
+                    }
+                    self.write(evc.variant_name);
+                } else if (evc.enum_name) |en| {
+                    // Qualified payload variant — tagged-union-init.
+                    // zig 0.16 rejects positional `Shape{ .Rect = .{ 3.0, 4.0 } }`
+                    // (`type 'Shape__struct_NNNN' does not support array
+                    // initialization syntax`). The accepted form is NAMED-
+                    // field init `.Rect = .{ .a = x, .b = y }` because
+                    // genEnumDecl emits the payload struct with named
+                    // fields (a, b, c, ...) for multi-type payloads.
+                    self.write(en);
+                    self.write("{ .");
+                    self.write(evc.variant_name);
+                    self.write(" = ");
+                    if (evc.args.len == 1) {
+                        self.genExpr(evc.args[0]);
+                    } else {
+                        // Named-field init via letter sequence (a, b, c, ...)
+                        // matching `genEnumDecl`'s per-variant struct-field
+                        // naming. zig forwards each literal to the named
+                        // struct field at the matching letter position.
+                        const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
+                        self.write(".{ ");
+                        for (evc.args, 0..) |arg, i| {
+                            if (i > 0) self.write(", ");
+                            self.write(".");
+                            self.write(letters[i]);
+                            self.write(" = ");
+                            self.genExpr(arg);
+                        }
+                        self.write(" }");
+                    }
+                    self.write(" }");
+                } else {
+                    // Unqualified payload variant — zig infers target
+                    // type from the binding's `: T` annotation. Same
+                    // named-field init as the qualified branch.
+                    self.write(".{ .");
+                    self.write(evc.variant_name);
+                    self.write(" = ");
+                    if (evc.args.len == 1) {
+                        self.genExpr(evc.args[0]);
+                    } else {
+                        const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
+                        self.write(".{ ");
+                        for (evc.args, 0..) |arg, i| {
+                            if (i > 0) self.write(", ");
+                            self.write(".");
+                            self.write(letters[i]);
+                            self.write(" = ");
+                            self.genExpr(arg);
+                        }
+                        self.write(" }");
+                    }
+                    self.write(" }");
+                }
+            },
+            .member_access => |ma| {
+                // `target.name` — emit `target.name` verbatim because
+                // zig's struct-field-access syntax is the user-visible
+                // surface form (no transformation needed). For nested
+                // targets (calls, indices, other member-accesses), the
+                // recursive genExpr call walks the chain depth-first so
+                // `getBox().width` emits as `getBox().width`, `arr[i].len`
+                // as `arr[i].len`, etc.
+                self.genExpr(ma.target.*);
+                self.write(".");
+                self.write(ma.name);
+            },
+            .method_call => |mc| {
+                // `target.name(args...)` — emit verbatim because zig
+                // supports both the value-receiver form (e.g. `v.length()`
+                // where v: Vec3) and the type-static constructor form
+                // (e.g. `Vec3.new(1, 2, 3)`) natively without zag needing a
+                // type resolver. The struct emission NESTED the impl
+                // methods INSIDE `pub const Name = struct { pub fn … }`
+                // so zig sees the receiver method and the type-static
+                // constructor as distinct methods of the same zig type.
+                // Args are comma-separated and emitted verbatim via the
+                // existing `genExpr` recursion.
+                self.genExpr(mc.target.*);
+                self.write(".");
+                self.write(mc.name);
+                self.write("(");
+                for (mc.args, 0..) |a, i| {
+                    if (i > 0) self.write(", ");
+                    self.genExpr(a);
+                }
+                self.write(")");
             },
             .binary => |b| {
                 // zig 0.16 shim (see `needsIntDivShim` doc above). When the
@@ -1021,7 +1641,7 @@ pub const Codegen = struct {
             .none => {},
             .block => |stmts| {
                 self.write(" else {\n");
-                for (stmts) |s| self.genStmt(s);
+                for (stmts) |s| self.genStmt(s, false);
                 self.write("    }");
             },
             .if_chain => |ifs_ptr| {
@@ -1035,7 +1655,7 @@ pub const Codegen = struct {
                 self.write(" else if ");
                 self.genExpr(ifs_ptr.cond);
                 self.write(" {\n");
-                for (ifs_ptr.then_body) |s| self.genStmt(s);
+                for (ifs_ptr.then_body) |s| self.genStmt(s, false);
                 self.write("    }");
                 // Recurse for the chained else_kind (another else-if, a
                 // terminal else block, or none).
@@ -1172,6 +1792,29 @@ pub const Codegen = struct {
             },
             .ident => self.write("true"),
             .discard => self.write("true"),
+            .enum_variant => |ev| {
+                // zig 0.16 REJECTS every qualified form (`__m == .Direction.North`,
+                // `__m == @as(Direction, .Direction.North)`, ...) because the
+                // token `.Direction` is parsed as field-access on a comptime
+                // EnumLiteral, and EnumLiterals do not support field access
+                // in zig 0.16 — the compiler emits `type '@EnumLiteral()'
+                // does not support field access` and rejects the whole
+                // match arm.
+                //
+                // The only working form is the unqualified dotted name:
+                // `__m == .North`. zig resolves `.North` against the
+                // scrutinee's declared enum type (the per-function
+                // `__m_<N>` is declared via `const __m_N = <scrut_expr>;`
+                // and zig's compile-time tag-resolution picks
+                // `Direction.North` automatically). This works for both
+                // qualified and unqualified parser-side patterns because
+                // the codegen emits the SAME emit-side form (the runtime
+                // scrutinee's type drives the dot-name lookup, not the
+                // source-side qualifier).
+                self.write(scrut_name);
+                self.write(" == .");
+                self.write(ev.variant_name);
+            },
         }
     }
 

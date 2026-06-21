@@ -18,6 +18,28 @@ pub const TokenTag = enum {
     print,
     as_kw,
     return_kw,
+    /// `struct` keyword — introduces a struct declaration
+    /// (`struct Vec3 { x: f64, … }`). Distinct from `.struct_lit` AST
+    /// variant which lives downstream at the expression level.
+    struct_kw,
+    /// `impl` keyword — introduces an impl block
+    /// (`impl Vec3 { pub fun length(...) -> … { … } }`). Methods inside
+    /// the block are flattened to zig free functions by codegen.
+    impl_kw,
+    /// `enum` keyword — introduces an enum declaration
+    /// (`enum Direction { North, South, East, West }`). Variants are
+    /// tokenized as bare identifiers (PascalCase by convention) and
+    /// optionally carry a parenthesized payload type
+    /// (`Shape { Circle(f64), Rectangle(f64, f64) }`). Codegen emits the
+    /// declared enum as zig's native `enum { ... }` form so functions
+    /// over variants compile via zig's exhaustive match checking.
+    enum_kw,
+    /// `pub` keyword — visibility modifier on top-level decls and
+    /// methods. Spec framing reserves privacy enforcement to a followup;
+    /// current parser accepts-and-ignores it (the keyword is preserved
+    /// in the AST for future use but codegen does not gate emission on
+    /// `pub` because all generated decls already use zig's `pub fn`).
+    pub_kw,
     /// Reserved with `_kw` suffix because `if`/`else`/`while`/`for`/`match`/
     /// `break`/`continue` are reserved words in the Zig backend (the lexer
     /// cannot name a TokenTag literal `if`/`else`/etc. without colliding
@@ -95,6 +117,13 @@ pub const TokenTag = enum {
     /// to the rest of the type verbatim so the emitted zig type mirrors
     /// zag's surface (`?*T` → `?*T`, `?i32` → `?i32`).
     question,
+    /// `.` — the standalone dot operator. Used for postfix member access
+    /// (`v.x`), method call (`v.length()`, `Vec3.new(...)`), and as the
+    /// leading byte of `..` (range) and `...` (ellipsis). The parser
+    /// dispatches based on what follows the `.`: an identifier chains
+    /// into `.member_access` (no parens) or `.method_call` (parens); a
+    /// second `.` short-circuits into the range/ellipsis arms.
+    dot,
     newline,
     doc_comment,
     eof,
@@ -138,6 +167,23 @@ pub const Lexer = struct {
             if (ch == '#') {
                 if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '#') {
                     self.readDocComment(start_loc);
+                } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '[') {
+                    // `#[ ... ]` attribute (currently only `#[derive(...)]`
+                    // is in the grammar). Skip to the matching `]` so the
+                    // parser never sees `#[` as its own token. The brace
+                    // counting handles nested pairs like `#[derive(Eq)]`.
+                    // The attribute is otherwise ignored (full derive impl
+                    // is deferred per the user-confirmed scope); the parser
+                    // sees nothing where the attribute lived.
+                    self.advance(); // consume #
+                    self.advance(); // consume [
+                    var depth: u32 = 1;
+                    while (self.pos < self.src.len and depth > 0) {
+                        if (self.src[self.pos] == '[') depth += 1;
+                        if (self.src[self.pos] == ']') depth -= 1;
+                        self.pos += 1;
+                        self.col += 1;
+                    }
                 } else {
                     while (self.pos < self.src.len and self.src[self.pos] != '\n') {
                         self.pos += 1;
@@ -470,10 +516,13 @@ pub const Lexer = struct {
                         self.pos += 2;
                         self.col += 2;
                     } else {
-                        // Standalone `.` (e.g. method-call syntax not yet in
-                        // the language) is dropped on the floor to remain a
-                        // forward-compatible no-op. Members `.f` access
-                        // requires struct support first.
+                        // Standalone `.` (postfix chain: member access /
+                        // method call). Emit `.dot` token so the parser's
+                        // parsePostfix loop can dispatch `.name` (no
+                        // parens) to `.member_access` and `.name(...)` to
+                        // `.method_call`. Range/ellipsis were checked
+                        // above; we land here only for a single bare dot.
+                        self.addToken(.{ .tag = .dot, .loc = start_loc, .text = "." });
                         self.advance();
                     }
                 },
@@ -681,6 +730,14 @@ pub const Lexer = struct {
             .unsafe_kw
         else if (std.mem.eql(u8, text, "as"))
             .as_kw
+        else if (std.mem.eql(u8, text, "struct"))
+            .struct_kw
+        else if (std.mem.eql(u8, text, "impl"))
+            .impl_kw
+        else if (std.mem.eql(u8, text, "enum"))
+            .enum_kw
+        else if (std.mem.eql(u8, text, "pub"))
+            .pub_kw
         else if (std.mem.eql(u8, text, "new"))
             .new
         else if (std.mem.eql(u8, text, "free"))

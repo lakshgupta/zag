@@ -1,0 +1,43 @@
+# examples/types/enum.zag
+#
+# End-to-end demonstration of enum support (docs/manual/13-enums):
+#   - Bare tag-only enum with impl method
+#   - Payload-bearing enum (single-arg + multi-arg variants)
+#   - Exhaustive match with bare-variant patterns + `_` wildcard
+#   - Qualified variant construction in expression position
+#   - Impl flattened to a free function (`Direction_opposite`) by codegen
+
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+
+enum Shape {
+    Circle(f64),
+    Rect(f64, f64),
+}
+
+impl Direction {
+    pub fun opposite(d: Direction) -> Direction {
+        match d {
+            Direction.North => Direction.South,
+            Direction.South => Direction.North,
+            Direction.East => Direction.West,
+            _ => Direction.North,
+        }
+    }
+}
+
+fun main() {
+    let d: Direction = Direction.North;
+    let o: Direction = Direction.opposite(d);
+    print(o);
+
+    let s: Shape = Shape.Rect(3.0, 4.0);
+    print(s);
+
+    let c: Shape = Shape.Circle(2.0);
+    print(c);
+}
