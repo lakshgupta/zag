@@ -93,10 +93,36 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genFreeMethod(self: *Codegen, target_type: []const u8, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
+        // Trait-method rename (docs/17 §"Implementing"): when `m.trait_name`
+        // is set (the `Trait.method` source shape), the emitted free-fn name
+        // becomes `<TargetType>_<TraitName>_<MethodName>` so the vtable
+        // registration can reference the implementation by exact-name. The
+        // legacy orphan path emits `<TargetType>_<MethodName>` so trait-method
+        // and non-trait methods never collide (the renaming infix adds the
+        // trait-qualifier). The pre-trait shape (no trait_name) keeps the
+        // legacy 234-baseline path so all orphan-impl tests pin identically.
+        var name_buf: [256]u8 = undefined;
+        var name_len: usize = 0;
+        if (m.trait_name) |tn| {
+            @memcpy(name_buf[name_len..][0..target_type.len], target_type);
+            name_len += target_type.len;
+            name_buf[name_len] = '_';
+            name_len += 1;
+            @memcpy(name_buf[name_len..][0..tn.len], tn);
+            name_len += tn.len;
+            name_buf[name_len] = '_';
+            name_len += 1;
+            @memcpy(name_buf[name_len..][0..m.name.len], m.name);
+            name_len += m.name.len;
+        }
         self.write("pub fn ");
-        self.write(target_type);
-        self.write("_");
-        self.write(m.name);
+        if (m.trait_name != null) {
+            self.write(name_buf[0..name_len]);
+        } else {
+            self.write(target_type);
+            self.write("_");
+            self.write(m.name);
+        }
         self.write("(");
         // Generics impl-level type_params preamble. Mirrors genMethod
         // and genFun so generic impl-blocks land as
@@ -114,7 +140,7 @@ const Codegen = core.Codegen;
             self.rewriteReceiverType(zagTypeToZig(p.type_text), impl_type_params);
         }
         self.write(") ");
-        if (m.return_type) |rt| self.write(zagTypeToZig(rt));
+        if (m.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
         self.write(" {\n");
         // Reset per-function counters (matching `genMethod`/`genFun`).
         self.destructure_counter = 0;
@@ -213,11 +239,19 @@ const Codegen = core.Codegen;
         // cannot host nested methods (zig compiles each monomorphization
         // to a fresh anonymous type); see the doc above on the thunk
         // form. The orphan-impl routing in `generate` catches the
-        // matching impls and lands them at module scope.
+        // matching impls and lands them at module scope. TRAIT-method
+        // methods (Trait.method-prefixed impl methods whose
+        // `trait_name` is non-null) are SKIPPED here too — they emit
+        // as renamed free fns (Target_Trait_method) + vtable
+        // registration during the trait-handling pass, NEVER nested
+        // inside the struct body (the nested shape lacks the trait
+        // prefix in the zig fn name which the vtable registration
+        // references by exact-string).
         if (!is_generic) {
             for (all_impls) |impl| {
                 if (!std.mem.eql(u8, impl.target_type, sd.name)) continue;
                 for (impl.methods) |m| {
+                    if (m.trait_name != null) continue;
                     // Phase 2 tail: thread impl-level type_params so the
                     // nested method emits `comptime X: type` BEFORE its
                     // own params. Mirrors genFreeMethod's call update.
@@ -257,7 +291,7 @@ const Codegen = core.Codegen;
             self.rewriteReceiverType(zagTypeToZig(p.type_text), impl_type_params);
         }
         self.write(") ");
-        if (m.return_type) |rt| self.write(zagTypeToZig(rt));
+        if (m.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
         self.write(" {\n");
         // Trait-bounds guards (docs/16 §3) — see genFun's comment.
         self.genBoundsGuards(impl_type_params);
@@ -419,6 +453,214 @@ const Codegen = core.Codegen;
         return b;
     }
 
+    pub     fn rewriteSelfToT(self: *Codegen, text: []const u8) void {
+        // Docs/17 §"Self": `Self` refers to the implementing type. In
+        // trait method param + return types, `Self` is rewritten to the
+        // dispatch shim's generic `T` so a trait declared on multiple
+        // types shares one shim signature. Substring scan-and-replace
+        // is sufficient because `Self` always sits at the END of a
+        // type expression (it IS the type name, never a prefix) — the
+        // alternatives (`*Self`, `*const Self`, `[]Self`, `?Self`)
+        // are captured verbatim by `collectCastType` so the slice
+        // contains `Self` as a sub-token right before any trim point.
+        // Edge: `SelfIsLol` would collide, but no such identifier
+        // exists in zag's v1 surface and would conflict with type-name
+        // resolution if it did.
+        //
+        // After the Self→T substitution, the rewritten slice is fed
+        // through `zagTypeToZig` so trait-side type emits also honour
+        // the docs/07 transparent-alias contract (`str` becomes
+        // `[]const u8`). Chaining `.Self→T` THEN `.alias` works for
+        // all realistic shapes because no zag alias name contains
+        // `Self` AND no `Self` keyword passes through the alias
+        // table (which only matches the WHOLE text, not substrings).
+        // A local scratch buffer holds the intermediate result so
+        // `zagTypeToZig`'s value-return form can be composed with the
+        // stream-style Self→T scan-and-replace.
+        var scratch_buf: [256]u8 = undefined;
+        var scratch_len: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            const found = std.mem.indexOf(u8, text[i..], "Self");
+            if (found == null) {
+                const tail = text[i..];
+                if (scratch_len + tail.len <= scratch_buf.len) {
+                    @memcpy(scratch_buf[scratch_len..][0..tail.len], tail);
+                    scratch_len += tail.len;
+                }
+                break;
+            }
+            const abs = i + found.?;
+            const pre = text[i..abs];
+            if (scratch_len + pre.len <= scratch_buf.len) {
+                @memcpy(scratch_buf[scratch_len..][0..pre.len], pre);
+                scratch_len += pre.len;
+            }
+            if (scratch_len + 1 <= scratch_buf.len) {
+                scratch_buf[scratch_len] = 'T';
+                scratch_len += 1;
+            }
+            i = abs + "Self".len;
+        }
+        self.write(zagTypeToZig(scratch_buf[0..scratch_len]));
+    }
+
+    pub     fn genTraitDecl(self: *Codegen, td: ast.TraitDecl) void {
+        // Docs/17 §"Definition": `trait NAME { fun draw(self: *Self); ... }`
+        // compiles to a zig fat-pointer container holding (data ptr,
+        // vtable ptr), an inner VTable struct of function pointers keyed
+        // by method name, and a per-method dispatch shim that re-enters
+        // via T. The shape follows the user-confirmed ABI:
+        //
+        //   pub const NAME = struct {
+        //       pub const VTable = struct {
+        //           m1: *const fn (ptr: *anyopaque, ...) RET1,
+        //           m2: *const fn (ptr: *anyopaque, ...) RET2,
+        //       };
+        //       ptr: *anyopaque,
+        //       vtable: *const VTable,
+        //       pub fn m1(self: NAME, comptime T: type, ...) RET1 {
+        //           _ = T;
+        //           return self.vtable.m1(self.ptr, ...);
+        //       }
+        //       ...
+        //   };
+        //
+        // The `_ = T;` line is REQUIRED because zig 0.16 rejects unused
+        // comptime parameters as a compile error. The shim's body never
+        // touches T (the dispatch is purely runtime through the vtable),
+        // but the user-facing ABI carries it as a placeholder for the
+        // Phase 3 trait-bounds wiring (`where T: SomeBound`). Without
+        // `_ = T;` every trait dispatch shim errors out as
+        // `unused parameter: comptime T`.
+        //
+        // The receiver parameter (`self: *Self`) is always the FIRST
+        // param in a trait method signature per the docs/17 §"Definition"
+        // grammar. The dispatch path omits this slot because the receiver
+        // collapses to `self.ptr` (an `*anyopaque`) at the vtable signature
+        // and to `self: NAME` (the trait container type) at the dispatch
+        // shim signature. Subsequent params (additional user-declared args)
+        // round-trip through `rewriteSelfToT` so any `*Self`-typed arg
+        // within them converts to `*T` for the shim's per-call monomorph.
+        self.write("pub const ");
+        self.write(td.name);
+        self.write(" = struct {\n");
+        self.write("    pub const VTable = struct {\n");
+        for (td.methods) |m| {
+            self.write("        ");
+            self.write(m.name);
+            self.write(": *const fn (ptr: *anyopaque");
+            // Additional params (skip the always-first `self` receiver).
+            for (m.params[1..]) |p| {
+                self.write(", ");
+                self.write(p.name);
+                self.write(": ");
+                self.rewriteSelfToT(p.type_text);
+            }
+            self.write(") ");
+            if (m.return_type) |rt| self.rewriteSelfToT(rt) else self.write("void");
+            self.write(",\n");
+        }
+        self.write("    };\n");
+        // Fat-pointer container fields (data ptr + vtable ptr).
+        self.write("    ptr: *anyopaque,\n");
+        self.write("    vtable: *const VTable,\n");
+        // Per-method dispatch shim. Each shim is a thin wrapper that
+        // forwards to the trait-defined vtable slot; the extra comptime
+        // T arg keeps the user-facing ABI claims of Phase 1 intact even
+        // though zig's strict unused-parameter rule forces the `_ = T;`
+        // discard inside the shim body.
+        for (td.methods) |m| {
+            self.write("    pub fn ");
+            self.write(m.name);
+            self.write("(self: ");
+            self.write(td.name);
+            self.write(", comptime T: type");
+            for (m.params[1..]) |p| {
+                self.write(", ");
+                self.write(p.name);
+                self.write(": ");
+                self.rewriteSelfToT(p.type_text);
+            }
+            self.write(") ");
+            if (m.return_type) |rt| self.rewriteSelfToT(rt) else self.write("void");
+            self.write(" {\n");
+            self.write("        _ = T;\n");
+            self.write("        return self.vtable.");
+            self.write(m.name);
+            self.write("(self.ptr");
+            for (m.params[1..]) |p| {
+                self.write(", ");
+                self.write(p.name);
+            }
+            self.write(");\n");
+            self.write("    }\n");
+        }
+        self.write("};\n\n");
+    }
+
+    pub     fn genTraitRegistration(self: *Codegen, trait_name: []const u8, target_type: []const u8, methods: []const ast.MethodDecl) void {
+        // Docs/17 §"Implementing" — emit a per-(trait, target_type)
+        // vtable instantiation so a future `x.draw()` call site (Phase 3
+        // — fat-pointer cast encoding) dispatches through THIS
+        // registration. The shape:
+        //
+        //   pub const Trait_VTable_for_Type: Trait.VTable = .{
+        //       .method = @ptrCast(
+        //           *const fn (ptr: *anyopaque, ...) RET,
+        //           &Type_Trait_method,
+        //       ),
+        //       ...
+        //   };
+        //
+        // The `@ptrCast` with explicit destination fn-pointer type
+        // bridges the receiver-type difference: the implementation
+        // free-fn's signature is `*const fn (self: *Type) RET`
+        // (concrete-receiver) while the vtable slot expects
+        // `*const fn (ptr: *anyopaque) RET`. zig 0.16 requires the
+        // destination type arg explicitly (no context-inference), so
+        // both the type and the source pointer appear in the call.
+        self.write("pub const ");
+        self.write(trait_name);
+        self.write("_VTable_for_");
+        self.write(target_type);
+        self.write(": ");
+        self.write(trait_name);
+        self.write(".VTable = .{\n");
+        for (methods) |m| {
+            self.write("    .");
+            self.write(m.name);
+            self.write(" = @ptrCast(*const fn (ptr: *anyopaque");
+            // The destination fn-pointer type MUST be explicit - zig
+            // 0.16's `@ptrCast(T: type, ptr: anytype)` requires both
+            // args (no context-inference from struct-literal field
+            // assignment). The destination shape mirrors the VTable
+            // entry's exact declared type so the cast resolves:
+            // skip the receiver slot (the VTable repackages it as
+            // `ptr`), flip `Self` -> `T` on additional params via
+            // `rewriteSelfToT`, and apply the same rewrite to the
+            // return type. Tests passed on substring-presence
+            // assertions while the prior `(@ptrCast(&...)` emit was
+            // broken at zig 0.16's strict type-check phase.
+            for (m.params[1..]) |p| {
+                self.write(", ");
+                self.write(p.name);
+                self.write(": ");
+                self.rewriteSelfToT(p.type_text);
+            }
+            self.write(") ");
+            if (m.return_type) |rt| self.rewriteSelfToT(rt) else self.write("void");
+            self.write(", &");
+            self.write(target_type);
+            self.write("_");
+            self.write(trait_name);
+            self.write("_");
+            self.write(m.name);
+            self.write("),\n");
+        }
+        self.write("};\n\n");
+    }
+
     pub     fn genEnumDecl(self: *Codegen, ed: ast.EnumDecl, all_impls: []const ast.ImplBlock) void {
         self.write("pub const ");
         self.write(ed.name);
@@ -497,10 +739,15 @@ const Codegen = core.Codegen;
         // Nest matching impl methods inside the enum so zig's native
         // pattern matching supports them. Same `genMethod` reuse as the
         // struct decl's nested-impl path — the per-method counters and
-        // type-info map reset behaviour is identical.
+        // type-info map reset behaviour is identical. TRAIT-method
+        // methods are SKIPPED here too (same reason as
+        // genStructDecl): they emit as renamed free fns (Target_Trait_
+        // method) + vtable registration during the trait-handling
+        // pass, NEVER nested inside the enum body.
         for (all_impls) |impl| {
             if (!std.mem.eql(u8, impl.target_type, ed.name)) continue;
             for (impl.methods) |m| {
+                if (m.trait_name != null) continue;
                 // Phase 2 tail: thread impl-level type_params so the
                 // nested-on-enum method emits `comptime X: type`
                 // BEFORE its own params. Same path as genStructDecl.

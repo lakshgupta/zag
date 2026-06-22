@@ -74,9 +74,12 @@ pub const Codegen = struct {
     pub const genStmt = @import("stmt.zig").genStmt;
     pub const genStructDecl = @import("decl.zig").genStructDecl;
     pub const genTemplateLit = @import("primary.zig").genTemplateLit;
+    pub const genTraitDecl = @import("decl.zig").genTraitDecl;
+    pub const genTraitRegistration = @import("decl.zig").genTraitRegistration;
     pub const genTypeParamsPreamble = @import("decl.zig").genTypeParamsPreamble;
     pub const genBoundsGuards = @import("decl.zig").genBoundsGuards;
     pub const rewriteReceiverType = @import("decl.zig").rewriteReceiverType;
+    pub const rewriteSelfToT = @import("decl.zig").rewriteSelfToT;
     pub const generate = @import("core.zig").generate;
     pub const init = @import("core.zig").init;
     pub const isClosureBound = @import("core.zig").isClosureBound;
@@ -174,7 +177,12 @@ pub const Codegen = struct {
         // Codegen also passes a `&v` (address-of) prefix automatically
         // when a receiver parameter is named `self` and the call site
         // is a bare-method-call expression — see `.method_call` in
-        // `genExpr` for the dispatch surface.
+        // `genExpr` for the dispatch surface. TRAIT-method methods
+        // (Trait.method-prefixed impl methods whose `trait_name` is
+        // non-null) are SKIPPED here so they fall through to the
+        // trait-handling pass below which emits the renamed
+        // `<Target>_<Trait>_<Method>` shape and the vtable
+        // registration a Phase-3 trait-cast call site will reference.
         for (prog.impls) |impl| {
             var is_matched = false;
             for (matched_targets_buf[0..matched_count]) |t| {
@@ -185,12 +193,89 @@ pub const Codegen = struct {
             }
             if (is_matched) continue;
             for (impl.methods) |m| {
+                if (m.trait_name != null) continue;
                 // Phase 2 generics: thread impl-level type_params so the
                 // orphan free-fn emits `comptime X: type` BEFORE its own
                 // params. Same wire-up as genStructDecl/genEnumDecl on
                 // the nested-method path.
                 self.genFreeMethod(impl.target_type, m, impl.type_params);
             }
+        }
+
+        // Traits (docs/17 §"Definition"): emit each trait declaration
+        // AFTER structs/impls/regular-functions so any code that
+        // references the trait name (a vtable-instantiation typed
+        // declaration OR a future trait-cast expression site) sees the
+        // declared type. The Phase-3 trait-cast work is the only
+        // consumer at the moment; emitting here keeps the AST pipeline
+        // round-trippable even without the cast surface wired up.
+        for (prog.traits) |td| {
+            self.genTraitDecl(td);
+        }
+
+        // Trait-method orphan free fns (Phase 2): walk prog.impls a
+        // second time, this time filtering for `Trait.method`-prefixed
+        // methods whose `trait_name` is non-null. Each match emits as a
+        // module-scope free fn via `genFreeMethod`, which automatically
+        // applies the `<Target>_<Trait>_<Method>` rename when
+        // `m.trait_name` is set (see `genFreeMethod`'s doc above).
+        // Concurrently, group by `(trait, target_type)` so the next
+        // step emits exactly one `<Trait>_VTable_for_<Type>` per unique
+        // pair (multiple methods on the same pair tile into one
+        // registration, dedupe-stable across zig's compile-error-prone
+        // redeclaration check).
+        var trait_reg_buf: [64]struct {
+            trait: []const u8,
+            target: []const u8,
+            methods: [16]ast.MethodDecl,
+            method_count: usize,
+        } = undefined;
+        var trait_reg_count: usize = 0;
+        for (prog.impls) |impl| {
+            for (impl.methods) |m| {
+                const trait_name = m.trait_name orelse continue;
+                // Emit the renamed free fn (genFreeMethod applies the
+                // <Target>_<Trait>_<Method> shape itself).
+                self.genFreeMethod(impl.target_type, m, impl.type_params);
+                // Group (trait, target_type) for the vtable registration.
+                var found = false;
+                var fi: usize = 0;
+                while (fi < trait_reg_count) : (fi += 1) {
+                    if (std.mem.eql(u8, trait_reg_buf[fi].trait, trait_name) and
+                        std.mem.eql(u8, trait_reg_buf[fi].target, impl.target_type))
+                    {
+                        if (trait_reg_buf[fi].method_count < trait_reg_buf[fi].methods.len) {
+                            trait_reg_buf[fi].methods[trait_reg_buf[fi].method_count] = m;
+                            trait_reg_buf[fi].method_count += 1;
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    if (trait_reg_count < trait_reg_buf.len) {
+                        trait_reg_buf[trait_reg_count].trait = trait_name;
+                        trait_reg_buf[trait_reg_count].target = impl.target_type;
+                        trait_reg_buf[trait_reg_count].method_count = 1;
+                        trait_reg_buf[trait_reg_count].methods[0] = m;
+                        trait_reg_count += 1;
+                    }
+                }
+            }
+        }
+        // VTable registrations: emit one `<Trait>_VTable_for_<Type>`
+        // per unique (trait, target_type) pair, populating each
+        // registration with the grouped method names. The order of
+        // registration emission follows the trait_reg_buf's append
+        // order (effectively source-decl order), which matches the
+        // user's mental model ("what I declared first comes out first").
+        var ri: usize = 0;
+        while (ri < trait_reg_count) : (ri += 1) {
+            self.genTraitRegistration(
+                trait_reg_buf[ri].trait,
+                trait_reg_buf[ri].target,
+                trait_reg_buf[ri].methods[0..trait_reg_buf[ri].method_count],
+            );
         }
 
         for (prog.functions) |fun| {

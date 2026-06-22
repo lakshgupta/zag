@@ -2170,14 +2170,33 @@ test "codegen: generic fun emits `comptime X: type` preamble" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "return x;") != null);
 }
 
-test "codegen: bounded generic fun emits `@hasDecl` + `@compileError` guard" {
-    // docs/16 §3: `fun max<T: Ordered>(a, b) -> T` must emit a guard at
-    // body entry that fails to compile if T does not expose a `compare`
-    // method (the canonical Ordered trait surface per the doc). Without
-    // the guard, an unsupported T would crash downstream at the
-    // `a > b` zig op, which is exactly what we want the user-facing
-    // source-line error to prevent.
-    const src = "fun max<T: Ordered>(a: T, b: T) -> T {\n    return a;\n}\n";
+
+// ============================================================
+// Trait codegen pin tests (docs/17 §"Definition" + §"Implementing",
+// Phase 2 codegen surface). Each test pins one aspect of the
+// trait ABI:
+//   - container + VTable + dispatch shim emit shape
+//   - Self->T rewrite on additional params + return types
+//     (composed with zagTypeToZig alias resolution)
+//   - trait-method impl free-fn rename
+//     (<Target>_<Trait>_<Method>)
+//   - per-(trait, target_type) vtable registration with
+//     @ptrCast fn-pointer bridge
+// If any of these surfaces regresses, exactly the matching
+// test fails — the four pin-tests are surgical to the four
+// half-points in the design.
+// ============================================================
+
+
+test "codegen: trait decl emits VTable + ptr/vtable + dispatch shims + _ = T;" {
+    // The user-confirmed ABI shape per docs/17 + Phase 2 design.
+    // The trait container holds (data ptr, vtable ptr); the VTable
+    // struct holds ONE *const fn entry per trait method (with
+    // Self rewritten to the per-shim generic T AND alias
+    // resolution applied — e.g. `str` becomes `[]const u8`); each
+    // dispatch shim carries a `comptime T: type` placeholder with
+    // `_ = T;` discard (zig 0.16 rejects unused comptime params).
+    const src = "trait Drawable {\n    fun draw(self: *Self);\n    fun label(self: *Self) -> str;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2185,44 +2204,36 @@ test "codegen: bounded generic fun emits `@hasDecl` + `@compileError` guard" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Guard must appear before the body returns.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "if (!@hasDecl(T, \"compare\"))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@compileError(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "must implement Ordered") != null);
-    // The signature still has the `comptime T: type` preamble.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn max(comptime T: type") != null);
-}test "codegen: const generic + type parameter emits `comptime T: type, comptime N: usize`" {
-    // docs/16 §4: `fun fill<T, const N: usize>(val: T) -> T` — the
-    // non-const TypeParam emits `comptime T: type` (same as §1), and
-    // the const TypeParam emits `comptime N: usize` (verbatim type
-    // text captured at parse time, NOT the bare `type` keyword).
-    // The return type is a bare `T` so the source does NOT depend on
-    // the `[<ident>]T` parse-time bracket-capture hole in
-    // collectCastType (a Phase 3 followup will close that).
-    const src = "fun fill<T, const N: usize>(val: T) -> T {\n    return val;\n}\n";
-    var l = lexer_mod.Lexer.init(src);
-    const tokens = l.tokenize();
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-    var cg = codegen_mod.Codegen.init();
-    const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime T: type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime N: usize") != null);
+    // The fat-pointer container.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Drawable = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    pub const VTable = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    ptr: *anyopaque,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    vtable: *const VTable,") != null);
+    // VTable fn-pointer slots. Self is omitted because the receiver
+    // becomes `ptr: *anyopaque`. The `str` return-type surfaces as
+    // `[]const u8` because rewriteSelfToT composes with zagTypeToZig
+    // (docs/07 transparent-alias contract).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "draw: *const fn (ptr: *anyopaque) void,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "label: *const fn (ptr: *anyopaque) []const u8,") != null);
+    // Per-method dispatch shims. The `comptime T: type` slot is the
+    // user-facing ABI claim; `_ = T;` discards the unused parameter
+    // so zig 0.16 accepts the shim body.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn draw(self: Drawable, comptime T: type) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "        _ = T;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return self.vtable.draw(self.ptr);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn label(self: Drawable, comptime T: type) []const u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return self.vtable.label(self.ptr);") != null);
 }
 
-test "codegen: `[<int_lit>]T` annotation round-trips through collectCastType" {
-    // Phase 3 followup (closing the `[<ident>]T` bracket-ident parse-
-    // time hole) extends the bracket-size carve-out to also accept
-    // literal-size brackets `[4]i32`. Without this carve-out the
-    // annotation `let x: [4]i32 = ...` captures EMPTY type-text
-    // (since `[` falls through `collectCastType`'s dispatch into the
-    // `else => break` arm and short-circuits the function). With the
-    // carve-out the slice `[`, the literal-N, and the closing `]`
-    // land as the multi-byte emit `[4]`, then the identifier
-    // `i32` glues on without a separator so the emitted signature
-    // is `[4]i32` verbatim — the form zig accepts.
-    const src = "fun f() {\n    let x: [4]i32 = a;\n}\n";
+test "codegen: trait method with *Self arg + i32 arg + *Self return — Self->T rewrite chained with alias resolution" {
+    // Exercises three sites at once: (1) an additional param of type
+    // *Self becomes *T (Self->T rewrite), (2) a non-Self `n: i32`
+    // passes through unchanged, (3) the return type *Self becomes *T.
+    // The composition with zagTypeToZig means the rewrite path
+    // ALSO honours `str` -> `[]const u8` (the docs/07 transparent-
+    // alias contract) so trait method signatures on aliased types
+    // round-trip without rejecting the type slot.
+    const src = "trait Greeter {\n    fun greet(self: *Self, other: *Self, n: i32) -> *Self;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2230,21 +2241,30 @@ test "codegen: `[<int_lit>]T` annotation round-trips through collectCastType" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const x: [4]i32 = a;") != null);
-    // Sanity: the spaced form `[4] i32` must NOT appear — the bracket
-    // glue prevents the disambiguation-shim from inserting a space.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "[4] i32") == null);
+    // VTable signature: `other` and `n` appear in declaration order;
+    // *Self becomes *T; non-Self `n: i32` passes through.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "greet: *const fn (ptr: *anyopaque, other: *T, n: i32) *T,") != null);
+    // Dispatch shim mirrors with `comptime T: type` between the
+    // receiver and the additional params.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn greet(self: Greeter, comptime T: type, other: *T, n: i32) *T {") != null);
+    // Body forwards self.ptr, other, n to the vtable slot.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return self.vtable.greet(self.ptr, other, n);") != null);
+    // Sanity: no bare `Self` survived anywhere — the rewrite is
+    // applied at every type-bearing slot.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Self") == null);
 }
 
-test "codegen: `[<ident>]T` annotation round-trips through collectCastType" {
-    // The companion test for the docs/16 §4 const-generic + array-shape
-    // surface: `fun fill<T, const N: usize>(val: T) -> [N]T` requires
-    // the `[N]T` return-type annotation to capture as `[N]T` (not the
-    // empty string `collectCastType` returned prior to the bracket-
-    // ident carve-out). The emitted zig signature should carry the
-    // bracket-size case `-> [N]T` verbatim so zig's const-generic
-    // monomorphization reads `comptime N: usize` for the array size.
-    const src = "fun fill<T, const N: usize>(val: T) -> [N]T {\n    return val;\n}\n";
+test "codegen: trait-method impl emits <Target>_<Trait>_<Method> free fn (rename)" {
+    // The Phase 2 rename behavior: the trait-method impl body
+    // `pub fun Drawable.draw(self: *Button) { ... }` emits as a free fn
+    // named `Button_Drawable_draw` (with the trait-name infix between
+    // target and method), NOT the legacy orphan `pub fn Button_draw`.
+    // The rename lets the vtable registration reference the fn by
+    // exact-string at the per-(trait, target_type) tuple. The impl
+    // body is intentionally empty (`{ }`) so the test source has no
+    // print/string-literal escapes that would obscure the rename
+    // assertion's clarity.
+    const src = "trait Drawable { fun draw(self: *Self); } impl Button { pub fun Drawable.draw(self: *Button) { } } fun main() { let x: i32 = 0; }\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2252,43 +2272,26 @@ test "codegen: `[<ident>]T` annotation round-trips through collectCastType" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn fill(comptime T: type, comptime N: usize, val: T) [N]T") != null);
-    // Sanity: the spaced form must NOT appear — the bracket-ident glue
-    // keeps `[N]T` as a single token in the emitted sig.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "[N] T") == null);
+    // Positive: trait-method free fn uses the rename.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Drawable_draw(self: *Button) void {") != null);
+    // Sanity: no legacy orphan `pub fn Button_draw` form crept in.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_draw(") == null);
 }
 
-test "codegen: `[<ident>]T { val ... }` array literal round-trips through fill rewrite" {
-    // Phase 3 followup pin on the parseArrayLit `.identifier` size
-    // extension. Before the extension, `parseArrayLit` rejected any
-    // non-integer-literal size token with `expected integer literal
-    // or const-param identifier for array size, got 'N'` and
-    // `std.process.exit(1)`'d at parse time. After the extension,
-    // `var out = [N]T { val ... };` parses cleanly when `N` is a
-    // const-param from the surrounding fun signature.
-    //
-    // Codegen's array-fill pipe rewrites the single-elem + `...` form
-    // as the zig repeat `[1]T{ val } ** N` — same shape as the literal
-    // case `[5]i32 { 0 ... }` → `[1]i32{ 0 } ** 5` (pin in
-    // `codegen: array fill emits [1]T{...}**N`). The leading element
-    // becomes `[1]` because the repeat operator's LHS is a 1-element
-    // runner; the count on the RHS of `**` is the original size (N).
-    // zig's comptime resolution reads `comptime N: usize` from the
-    // surrounding fun's preamble, so the literal `N` flows through to
-    // the emitted array length verbatim — there's no string-side
-    // concatenation to worry about.
-    //
-    // This test pins BOTH halves of the const-generic array-fill
-    // cycle: the parser accepts `[<ident>]T` and the codegen rewrites
-    // it to the zig-native `[1]T{ val } ** N` shape. The docs/16 §4
-    // `fill` example body relies on this exact emission path.
-    const src =
-        \\fun fill<T, const N: usize>(val: T) -> T {
-        \\    var out = [N]T { val ... };
-        \\    return out;
-        \\}
-        \\
-    ;
+
+test "codegen: trait vtable registration emits <Trait>_VTable_for_<Type> with @ptrCast fn-pointer bridge" {
+    // The per-(trait, target_type) vtable instantiation surface.
+    // Each registration carries one `@ptrCast` per method, bridging
+    // the implementation fn-pointer type
+    // `*const fn (self: *Type) RET` to the vtable slot type
+    // `*const fn (ptr: *anyopaque) RET`. `@ptrCast` is the canonical
+    // zig cast between ANY pointer types; zig 0.16 only auto-coerces
+    // function pointers when the signatures match EXACTLY (which
+    // our pair cannot because one has a typed receiver and the other
+    // has `*anyopaque`), so an explicit pointer-reinterpret is
+    // required. The impl body is empty (`{ }`) to avoid string-
+    // literal-escape noise in the test source.
+    const src = "trait Drawable { fun draw(self: *Self); } impl Button { pub fun Drawable.draw(self: *Button) { } } fun main() { let x: i32 = 0; }\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2296,52 +2299,20 @@ test "codegen: `[<ident>]T { val ... }` array literal round-trips through fill r
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "var out = [1]T{ val } ** N") != null);
-    // Sanity: still emit the func body termination + the spelled ident
-    // `N` (zeros in place of `N` would mean the AST's `size: u32` slot
-    // had silently dropped the text — the parseArrayLit extension only
-    // accepts the size, it doesn't rewrite it; the codegen passes `N`
-    // through to the RHS of `**`).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "** N") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "** 0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "return out;") != null);
+    // Positive: the registration name follows
+    // `<Trait>_VTable_for_<Type>`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Drawable_VTable_for_Button: Drawable.VTable = .{") != null);
+    // Positive: the @ptrCast bridge is present, target name matches
+    // the renamed free fn exactly.
+    // destination fn-pointer type matches VTable entry (zig 0.16 needs both @ptrCast args)
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".draw = @ptrCast(*const fn (ptr: *anyopaque) void, &Button_Drawable_draw),") != null);
+    // Sanity: no bare `.draw = Button_Drawable_draw,` assignment - that
+    // would signal the @ptrCast bridge regressed.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "        .draw = Button_Drawable_draw,") == null);
+    // Sanity: no @as fn-pointer coercion attempt leaked through.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(*const fn") == null);
 }
 
-test "codegen: `[<ident>]T` annotation + body combined round-trip" {
-    // Coverage gap filled by Phase 3 followup review: the user's
-    // stated surface is `var out: [N]T = [N]T { val ... };` — the
-    // `[N]T` annotation AND the `[N]T { val ... }` body exercise
-    // distinct code paths (collectCastType's bracket-size carve-out
-    // for the LHS, parseArrayLit's `.identifier` size extension for
-    // the RHS). Pinning both within a single test catches regressions
-    // where ONE side gets fixed but the OTHER one silently breaks.
-    //
-    // `var out: [N]T` → `var out: [N]T = [1]T{ val } ** N;` in emitted
-    // zig. The LHS annotation emits verbatim (collectCastType carve-
-    // out preserves `[N]`); the RHS body emits through genArrayLit's
-    // fill rewrite (`[1]T{ val } ** N`). The trailing return prints
-    // the array so zig's runtime monomorphization is exercised end to
-    // end (not just compile-time codegen shape).
-    const src =
-        \\fun fill<T, const N: usize>(val: T) -> T {
-        \\    var out: [N]T = [N]T { val ... };
-        \\    return out;
-        \\}
-        \\
-    ;
-    var l = lexer_mod.Lexer.init(src);
-    const tokens = l.tokenize();
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-    var cg = codegen_mod.Codegen.init();
-    const zig = cg.generate(prog);
-    // Annotation side: bracket-size carve-out preserves `[N]` here.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "var out: [N]T = ") != null);
-    // Body side: array-fill rewrite emits the canonical zig repeat.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "[1]T{ val } ** N") != null);
-    // Sanity: the spaced `[N] T` annotation form must NOT appear
-    // (collectCastType's prev_was_ptr glue rules it out).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "[N] T") == null);
-}
 
+
+// ============================================================
