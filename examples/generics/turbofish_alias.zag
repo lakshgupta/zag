@@ -1,0 +1,68 @@
+## Turbofish call sites + alias-resolution chain (docs/16 §1 "Turbofish" +
+## docs/07 "Type Aliases" + docs/11 "Borrowed string view").
+##
+## Surfaces exercised end-to-end:
+##   - §1 Generic fun decl side: `fun identity<T>(arg: T) -> T` (one type-param,
+##     one runtime param, identity return).
+##   - §1 Turbofish at the call site: `identity<i32>(42)` rewrites through the
+##     genExpr `.call` turbofish arm to `identity(i32, 42)` in zig (type-args
+##     before runtime-args per zig's comptime-arg convention).
+##   - §1 Turbofish carrying an alias type-arg: `identity<str>("hi")` rewrites
+##     `str` to `[]const u8` via the `zagTypeToZig` alias-resolution helper
+##     BEFORE the call expression emits, so zig sees
+##     `identity([]const u8, "hi")` — the alias is transparent at the call
+##     site exactly as it is at declaration sites (param annotations, struct
+##     field types, enum payload types, binding annotations, etc.).
+##
+## Why this lives in its own file:
+##   The broader surface (§1-§4 generic-function shapes, §2 generic structs,
+##   §5 generic impl blocks) is exercised by `examples/generics/generic_fun.zag`.
+##   This file isolates the alias-resolution chain at the call site so a
+##   regression in either half of the cycle-closure (commit 35412fb's parsePostfix
+##   turbofish-precondition parser fix OR commit 6bc1c38's `zagTypeToZig` codegen
+##   wrap) surfaces as a single-file failure under `examples/run_all.sh` —
+##   cleanly pointing at the alias chain rather than entangling it with the
+##   generic_fun.zag's order/traits/const surface.
+##
+## Running `examples/run_all.sh --check` (or `--build && run`) executes:
+##     1. zag lexer + parser + codegen-emit on this file
+##     2. zig build-exe on the emitted source
+##   Any regression in the alias-resolution chain produces a step-2 zig
+##   compile error (e.g. `unknown type name 'str'` if the wrap regresses, or
+##   `expected gt, got '<'` if the parser precondition bug regresses).
+
+# §1: single-type-param generic fun. Codegen emits
+#     `pub fn identity(comptime T: type, arg: T) T { return arg; }`. The
+#     `comptime T: type` slot is what lets zig treat T as a monomorphized
+#     compile-time type parameter; the runtime `arg: T` is matched against
+#     the call site's runtime arg. Without the bracket generic, every
+#     call site would need a runtime `T` argument; turbofish at the call
+#     site handles the dispatch by lifting the type-arg into the comptime
+#     slot ahead of the runtime args.
+fun identity<T>(arg: T) -> T {
+    return arg;
+}
+
+fun main() {
+    # Default-typed turbofish call site (no alias resolution needed —
+    # i32 round-trips verbatim through `zagTypeToZig` because the helper
+    # returns non-matching text unchanged). This call demonstrates that
+    # the same plumbing path works for any type-arg, not just aliases.
+    let int_val: i32 = 42;
+    print("identity<i32>(int_val) = {identity<i32>(int_val)}\n");
+
+    # Alias-typed turbofish call site. This is the surface the parser
+    # precondition fix (commit 35412fb) unblocked + the codegen alias
+    # wrap (commit 6bc1c38) keeps resolving. Pre-bind `s` so the template
+    # interpolation is clean (no nested quote escapes inside `{...}`).
+    let s: str = "hi";
+    print("identity<str>(s) = {identity<str>(s)}\n");
+
+    # Direct invocation without template-literal wrapping — exercises the
+    # `.call` turbofish arm at expr_stmt position (no binding carve-out
+    # applies, so the call result is consumed directly via print). Identical
+    # alias-resolution path to the interpolated form above; demonstrates the
+    # helper fires uniformly across expression contexts.
+    print(identity<str>("hi"));
+    print("\n");
+}

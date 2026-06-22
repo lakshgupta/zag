@@ -1950,6 +1950,50 @@ test "codegen: `<str>(arg)` turbofish type-arg expands str in (`[](const u8)`, a
     // mode regression that emits `identity(str, ...)` would surface here.
     try std.testing.expect(std.mem.indexOf(u8, zig, "identity(str, \"hi\")") == null);
 }
+test "codegen: turbofish_alias example main() — direct-invocation alias resolution pin (template-interp + decl-side preamble via examples/run_all.sh)" {
+    // The example file examples/generics/turbofish_alias.zag pins the
+    // full alias-resolution cycle-closure at the call site. This test
+    // pins the example's PIPELINE-EQUIVALENT shape (sans the comments
+    // and template-interp alias variant) so the file remains valid under
+    // the AST pipeline even when examples/run_all.sh isn't exercised.
+    // A regression in either half of the alias chain (parser
+    // precondition at src/parser/primary.zig's parsePostfix call site,
+    // OR zagTypeToZig wrap on src/codegen/expr.zig's `.call`
+    // c.type_args loop) surfaces as a surgical assertion failure tied
+    // to the example's exact source shape.
+    //
+    // The template-interp variant `print("identity<str>(s) = {identity<str>(s)}")`
+    // is INTENTIONALLY omitted from this test — both call-site paths
+    // (template-interp & direct-invocation) route through the same
+    // `zagTypeToZig` helper fire and cannot diverge unless someone refs
+    // the call-site emission. Pinning only the direct-invocation path
+    // keeps the assertion surface tight (3 asserts total) and the
+    // template-interp variant is exercised in the example file itself
+    // when examples/run_all.sh is run.
+    const src = "fun identity<T>(arg: T) -> T {\n    return arg;\n}\n\nfun main() {\n    let int_val: i32 = 42;\n    print(\"identity<i32>(int_val) = {identity<i32>(int_val)}\\n\");\n    let s: str = \"hi\";\n    print(\"identity<str>(s) = {identity<str>(s)}\\n\");\n    print(identity<str>(\"hi\"));\n    print(\"\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: direct-invocation turbofish call site resolves `str` alias.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "identity([]const u8, \"hi\")") != null);
+    // Negative: passthrough regression at the .call c.type_args loop must
+    // not appear. A regression that bypasses `zagTypeToZig` for turbofish
+    // type-args would surface here (either as `identity(str, "hi")` from a
+    // bare emit, OR as zig's `unknown type name "str"` compile failure
+    // downstream when run via `examples/run_all.sh`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "identity(str, \"hi\")") == null);
+    // Note: the `comptime T: type` decl-side preamble is intentionally
+    // NOT pinned here. The convention in this section is positive+negative
+    // pairs; a positive-only preamble sanity would break that pattern. The
+    // preamble is implicitly covered by test #5 (`codegen: \\`&lt;str&gt;(arg)\\`
+    // turbofish type-arg expands...`) just above, and the example file
+    // exercises the decl-side path through examples/run_all.sh.
+}
+
 test "codegen: struct field `name: str` expands to `name: []const u8`" {
     // alias-resolution site: genStructDecl .named arm (nf.type_text).
     // A struct decl's named fields are emitted verbatim per field;
