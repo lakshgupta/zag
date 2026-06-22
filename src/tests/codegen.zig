@@ -1860,18 +1860,21 @@ test "codegen: unannotated closure binding still rewrites call to .call(...)" {
     // rewrites `c(args)` to `c.call(args)`. This test locks the
     // wire against a future regression that gates closure detection
     // on the typed-binding precondition.
-    // Parser workaround (tracked as followup
-    // `feat(parser): recognize closure-typed call in isLiteralInit`):
-    // the `r: i32` annotation on the result binding works around
-    // `isLiteralInit` (src/parser/core.zig), which currently rejects a
-    // `.call` RHS without an explicit type annotation. The closure `c`
-    // itself remains unannotated -- the property this test pins -- so
-    // the unannotated-binding -> call-rewrite tracing still exercises
-    // the closure-detection path end to end.
+    //
+    // Both bindings are unannotated: `c` (closure value) and `r`
+    // (its `.call` RHS). `isLiteralInit` in src/parser/core.zig
+    // accepts the `.call` RHS because `isClosureBound` recognises
+    // `c` as closure-bound in the surrounding fn body — planted by
+    // commit cd33c86 (`feat(parser): recognize closure-typed call
+    // in isLiteralInit`), which superseded the workaround branch
+    // that 071f221 (`fix(tests): unannotated-closure test source
+    // restructure...`) had introduced. The unannotated-binding ->
+    // call-rewrite tracing therefore exercises the closure-detection
+    // path end to end without any explicit `: T`.
     const src =
         \\fun f() {
         \\    let c = |x: i32| -> i32 { return x + 1; };
-        \\    let r: i32 = c(4);
+        \\    let r = c(4);
         \\    print("{r}\n");
         \\}
         \\;
