@@ -280,6 +280,41 @@ pub fn parsePostfix(self: *Parser) Expr {
                             // back to non-turbofish path (the `a < b` form).
                             if (idx + 1 < self.tokens.len - tps_start and self.tokens[tps_start + idx + 1].tag == .lparen) {
                                 const name = lhs.ident;
+                                // Generics turbofish chain followup (docs/16
+                                // §\"Turbofish\"): the OUTER while-loop above
+                                // walks tokens by INDEX (`self.tokens[tps_start
+                                // + idx].tag`) without advancing self.pos, so
+                                // by the time the success-branch fires self.pos
+                                // is STILL at the leading `<`. parseTurbofishArgs'
+                                // docblock requires \"Caller has verified the
+                                // ident-`<`-typename-`>`-`(` shape and consumed
+                                // the leading ident + `<`\" — so we self.advance()
+                                // past `<` here to satisfy the contract. Without
+                                // this advance, parseTurbofishArgs's first token
+                                // check (`self.peek().tag == .identifier`) fails,
+                                // falls through to collectCastType() (which makes
+                                // no progress on the `<` token), and finally
+                                // self.expect(.gt) reports `expected gt, got '<'`
+                                // — the parse-time hole that left the turbofish
+                                // call-site wrap in src/codegen/expr.zig's
+                                // `.call` c.type_args loop on the
+                                // `c.type_args, 0.. |ta, i|` arm unreachable
+                                // from any v1 source until commit
+                                // `fix(parser): advance past turbofish < before
+                                // calling parseTurbofishArgs` (this commit)
+                                // closed the gap. Mirrors parseFunDecl's
+                                // bracketed-generic call to parseTypeParams
+                                // (which already self.expect(.lt)s the leading
+                                // `<` on entry per its docblock's caller
+                                // contract) — the turbofish call-site path now
+                                // matches that precedent. After
+                                // parseTurbofishArgs returns, self.pos is past
+                                // `>` because its final `self.expect(.gt)`
+                                // consumed it, which is why the
+                                // `self.expect(.lparen)` immediately below
+                                // sees the verified-precondition `.lparen`
+                                // token without re-scanning.
+                                self.advance();
                                 const tps_args = self.parseTurbofishArgs();
                                 self.expect(.lparen);
                                 var call_args_buf: [16]Expr = undefined;

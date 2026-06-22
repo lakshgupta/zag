@@ -1902,83 +1902,53 @@ test "codegen: `<const N: str>` const-generic type-param expands str in comptime
     try std.testing.expect(std.mem.indexOf(u8, zig, "comptime N: str") == null);
 }
 
-test "codegen: `<str>(arg)` turbofish type-arg — DEFERRED (parser precondition) [SKIP active runtime]" {
+test "codegen: `<str>(arg)` turbofish type-arg expands str in (`[](const u8)`, arg) emission" {
     // alias-resolution site: genExpr .call turbofish (c.type_args
-    // loop on the `.call` arm, src/codegen/expr.zig ~line 185).
+    // loop on the `.call` arm at src/codegen/expr.zig ~line 185).
+    // The full turbofish call site emits
+    // `name(type_args..., regular_args...)` so `identity<str>("hi")`
+    // round-trips to `identity([]const u8, "hi")` — type-args and
+    // runtime-args live INSIDE ONE parenthesised argument list per
+    // zig's comptime-arg convention (NOT two pairs of parens). Wrap
+    // through `zagTypeToZig(ta)` keeps the docs/07 transparent-alias
+    // contract (`str` is transparent alias for `[]const u8`) holding
+    // at this final emit site.
     //
-    // DEFERRED: this site is unreachable from any v1 source because
-    // the parser has a precondition bug. Active runtime verification
-    // is deferred until the parser is patched; the test below
-    // asserts the wrap line PRESENCE in src/codegen/expr.zig so a
-    // silent regression (wrap deletion) crashes the suite loudly.
+    // CYCLE-CLOSED: this test was previously a deferred `@embedFile`
+    // existence-check against the wrap line in expr.zig because the
+    // parsePostfix turbofish-precondition block (src/parser/primary.zig)
+    // did not self.advance() past the leading `<` before invoking
+    // parseTurbofishArgs (which requires its caller to have consumed
+    // the leading `<` per the function's docblock contract in
+    // src/parser/decl.zig). That bug made the turbofish call-site
+    // path unreachable from any v1 source, so the wrap line sat
+    // dormant. Commit `fix(parser): advance past turbofish < before
+    // calling parseTurbofishArgs` (this commit's preceding commit)
+    // closed the gap by adding the `self.advance()` and unblocking
+    // the runtime path. This test now exercises the round-trip
+    // end-to-end.
     //
-    // Wrap PRESERVED as forward-compat: when the parsePostfix
-    // `self.advance()` fix lands, the wrap fires immediately without
-    // any further codegen work. Reverting the wrap now would require
-    // re-coordinating both halves (codegen wrap + parser fix) when
-    // the parser-side v1 of the deferred test re-activates.
-    //
-    // Diagnosis of the parser precondition bug:
-    //   1. src/parser/primary.zig:256-302 — parsePostfix's turbofish-
-    //      precondition block detects IDENT-`<` and verifies that the
-    //      next-after-`>` token is `.lparen`. But it does NOT call
-    //      self.advance() past `<` before invoking parseTurbofishArgs.
-    //      The OUTER scan reads tokens by INDEX (`self.tokens[tps_start + idx]`)
-    //      without advancing self.pos.
-    //   2. src/parser/decl.zig:144-166 — parseTurbofishArgs' docblock
-    //      states "Caller has verified the ident-`<`-typename-`>`-
-    //      `(` shape and consumed the leading ident + `<`", but the
-    //      caller (parsePostfix above) left self.pos pointing AT the
-    //      leading `<`. The function's first typename discriminator
-    //      (`self.peek().tag == .identifier`) fails, falls through to
-    //      collectCastType() (which makes no progress on the `<`
-    //      token), and finally `self.expect(.gt)` reports `expected
-    //      gt, got '<'` — the parse error observed when this test
-    //      was first added.
-    //
-    // Because no v1 source can reach this codegen wrap path, the
-    // active runtime test (the user's enumerated 9th pin-test for
-    // `identity<str>(s)` round-tripping to `identity([]const u8, s)`)
-    // cannot be exercised until the precondition is fixed. The
-    // existence-only check below preserves the regression-detection
-    // contract for the wrap itself: if anyone deletes the wrap line
-    // (silent regression), this test fails. If anyone renames the
-    // helper or the loop target (semantic drift), this test fails.
-    //
-    // To RE-ACTIVATE the active runtime test once parsePostfix is
-    // patched (commit recipe — keep this comment block in lockstep):
-    //   1. Patch src/parser/primary.zig's turbofish-precondition
-    //      block to call self.advance() past the leading `<` BEFORE
-    //      invoking parseTurbofishArgs (one-line fix; consult the
-    //      git log of this commit for the surrounding context).
-    //   2. Replace the @embedFile asserts below with the standard
-    //      runtime pattern. Use a source shape that satisfies the
-    //      static-typed-coercion carve-out (which requires `: T` on
-    //      non-closure, non-tuple bindings): the cleanest carve-out-
-    //      compatible source is to consume the turbofish call result
-    //      directly without binding it —
-    //         fun main() { print(identity<str>("hi")); }
-    //      This keeps the binding count zero so the carve-out doesn't
-    //      fire, while still routing through the wrap on the `.call`
-    //      arm. The `.call` arm emits type_args AND runtime_args
-    //      inside ONE `(` ... `)` pair (NOT two), so the positive
-    //      assertion uses single-paren form: `identity([]const u8, "hi")`
-    //      (positive); negative: `identity(str, "hi")` (the
-    //      unwrapped passthrough form). The user's enumerated 9th
-    //      pin-test example mentioned `max<str>(...) round-trips to
-    //      max([]const u8)(...)` — note that description was slightly
-    //      off (the actual emit places type-args + runtime-args inside
-    //      a single paren pair, not two), so use the single-paren
-    //      form for the re-activated test's assertions.
-    //
-    // Existence-check: the wrap line must REMAIN in expr.zig (relocating
-    // the wrap to decl.zig or stmt.zig would require re-pointing the
-    // embedded-file path AND updating this comment). Substring
-    // `zagTypeToZig(ta)` matches the actual emit write in the turbofish
-    // loop; substring `c.type_args, 0..` matches the loop header.
-    const expr_zig_text = @embedFile("../codegen/expr.zig");
-    try std.testing.expect(std.mem.indexOf(u8, expr_zig_text, "zagTypeToZig(ta)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, expr_zig_text, "c.type_args, 0..") != null);
+    // Source shape: `print(identity<str>("hi"))` consumes the turbofish
+    // call result without a binding, dodging the static-typed-coercion
+    // carve-out's `: T` requirement for non-closure binding-init
+    // positions. `print` itself takes one arg and routes through
+    // genPrintCall's `else` fallback (the inner call isn't a literal-
+    // shaped arg), so the inner `identity([]const u8, "hi")` substring
+    // surfaces verbatim in the generated output.
+    const src = "fun main() {\n    print(identity<str>(\"hi\"));\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: type-arg resolved through zagTypeToZig and interleaved
+    // with the runtime-arg inside a single paren pair.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "identity([]const u8, \"hi\")") != null);
+    // Negative: bare type-arg passthrough must NOT appear — a passthrough-
+    // mode regression that emits `identity(str, ...)` would surface here.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "identity(str, \"hi\")") == null);
 }
 test "codegen: struct field `name: str` expands to `name: []const u8`" {
     // alias-resolution site: genStructDecl .named arm (nf.type_text).
