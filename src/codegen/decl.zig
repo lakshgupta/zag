@@ -111,10 +111,10 @@ const Codegen = core.Codegen;
             if (i > 0 or generics_preamble) self.write(", ");
             self.write(p.name);
             self.write(": ");
-            self.rewriteReceiverType(p.type_text, impl_type_params);
+            self.rewriteReceiverType(zagTypeToZig(p.type_text), impl_type_params);
         }
         self.write(") ");
-        if (m.return_type) |rt| self.write(rt);
+        if (m.return_type) |rt| self.write(zagTypeToZig(rt));
         self.write(" {\n");
         // Reset per-function counters (matching `genMethod`/`genFun`).
         self.destructure_counter = 0;
@@ -179,7 +179,7 @@ const Codegen = core.Codegen;
                     self.write("    ");
                     self.write(nf.name);
                     self.write(": ");
-                    self.write(nf.type_text);
+                    self.write(zagTypeToZig(nf.type_text));
                     self.write(",\n");
                 },
                 .embed => |ef| {
@@ -254,10 +254,10 @@ const Codegen = core.Codegen;
             if (i > 0 or generics_preamble) self.write(", ");
             self.write(p.name);
             self.write(": ");
-            self.rewriteReceiverType(p.type_text, impl_type_params);
+            self.rewriteReceiverType(zagTypeToZig(p.type_text), impl_type_params);
         }
         self.write(") ");
-        if (m.return_type) |rt| self.write(rt);
+        if (m.return_type) |rt| self.write(zagTypeToZig(rt));
         self.write(" {\n");
         // Trait-bounds guards (docs/16 §3) — see genFun's comment.
         self.genBoundsGuards(impl_type_params);
@@ -347,8 +347,10 @@ const Codegen = core.Codegen;
                 // fall back to a sentinel — a parser regression
                 // surfacing as a zag compile-time panic is the desired
                 // diagnostic, not a silently-wrong type at every
-                // const-param site.
-                self.write(tp.type_text.?);
+                // const-param site. Wrap through `zagTypeToZig` so
+                // `fun foo(comptime N: str)` round-trips to `comptime
+                // N: []const u8` (docs/07 transparent-alias contract).
+                self.write(zagTypeToZig(tp.type_text.?));
             } else {
                 self.write("type");
             }
@@ -356,6 +358,40 @@ const Codegen = core.Codegen;
         }
         return emitted;
     }
+
+    pub     fn zagTypeToZig(text: []const u8) []const u8 {
+        // Type aliases (docs/07 "Type Aliases"): zag provides
+        //     type str = []const u8;
+        // and "Aliases are transparent" — the type and its alias are
+        // the same type under the v1 type system. Codegen expands
+        // the alias at emit time so downstream zig sees the canonical
+        // `[]const u8` directly rather than the bare `str` ident
+        // (which zig has no type slot for and would reject with
+        // `unknown type name "str"` once any user writes a `str`-
+        // typed annotation, param, return, cast, struct field, enum
+        // payload, or binding annotation).
+        //
+        // v1 alias set is intentionally narrow (`str` only — the
+        // borrowed-string-view alias documented in docs/11). Primitive
+        // aliasing (`i32`, `f64`, `bool`, ...) is unnecessary because
+        // those already are zig's native types and round-trip verbatim.
+        // This helper returns `text` unchanged for any non-matching
+        // input so callers don't need a `if (text == "str")` guard
+        // at every emit site — the function call itself is the guard.
+        //
+        // The pin-test for this resolution path is
+        // `codegen: void fun emits pub fn NAME(...) void` in
+        // src/tests/codegen.zig (source: `fun greet(name: str) {
+        // print("hello, {name}\n"); }` must emit `pub fn
+        // greet(name: []const u8) void`). Any future alias
+        // (docs/07 Phase 2: numeric type aliases, generic type
+        // aliases, etc.) follows the same `if (eql(u8, t, NAME))
+        // return CANONICAL;` pattern; do NOT site-specialize the
+        // alias to a single emit location.
+        if (std.mem.eql(u8, text, "str")) return "[]const u8";
+        return text;
+    }
+
 
     pub     fn boundToMethodName(b: []const u8) []const u8 {
         // Maps docs/16 §3 trait-bound names to the canonical method
@@ -429,7 +465,7 @@ const Codegen = core.Codegen;
                 };
                 if (comma_count == 0) {
                     self.write(": ");
-                    self.write(pt);
+                    self.write(zagTypeToZig(pt));
                 } else {
                     self.write(": struct { ");
                     const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
@@ -448,7 +484,7 @@ const Codegen = core.Codegen;
                             if (idx > 0) self.write(", ");
                             self.write(letters[idx]);
                             self.write(": ");
-                            self.write(pt[a..b]);
+                            self.write(zagTypeToZig(pt[a..b]));
                             idx += 1;
                             seg_start = i + 1;
                         }
@@ -533,10 +569,10 @@ const Codegen = core.Codegen;
             if (i > 0 or generics_preamble) self.write(", ");
             self.write(p.name);
             self.write(": ");
-            self.write(p.type_text);
+            self.write(zagTypeToZig(p.type_text));
         }
         self.write(") ");
-        if (fun.return_type) |rt| self.write(rt) else self.write("void");
+        if (fun.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
         self.write(" {\n");
         // Trait-bounds guards (docs/16 §3): emit
         // `if (!@hasDecl(T, "method")) @compileError(...)` BEFORE

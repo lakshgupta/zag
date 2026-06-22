@@ -7,6 +7,18 @@ const core = @import("core.zig");
 const Codegen = core.Codegen;
 const inferZigTypeFromExpr = @import("primary.zig").inferZigTypeFromExpr;
 const getTopElements = @import("primary.zig").getTopElements;
+// Cross-bucket alias-resolution import (docs/07 "Type Aliases",
+// docs/11 borrowed-string-view). Same pattern as the
+// `inferZigTypeFromExpr` / `getTopElements` imports above: a
+// sibling-bucket helper made available by file-scope re-export
+// rather than re-implementing. See `zagTypeToZig` in
+// src/codegen/decl.zig for the alias set and the in-line-guard
+// rationale. Used at the `b.type_name` emit sites (block-form
+// compile-time binding + simple-path binding) so that
+// `let s: str = ...;` / `const x: str = const { ... };` round-
+// trip to `let s: []const u8 = ...;` / `const x: []const u8 =
+// ...;` without zig ever seeing a bare `str` ident.
+const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 
 // ============================================================
 // FILE-SCOPE methods (STMT bucket)
@@ -342,7 +354,7 @@ const getTopElements = @import("primary.zig").getTopElements;
             self.write(b.name);
             if (b.type_name) |t| {
                 self.write(": ");
-                self.write(t);
+                self.write(zagTypeToZig(t));
             }
             self.write(" = blk: {\n");
             for (stmts) |s| {
@@ -387,7 +399,7 @@ const getTopElements = @import("primary.zig").getTopElements;
         // infer from the initializer (which still produces a `const`/`var`).
         if (b.type_name) |t| {
             self.write(": ");
-            self.write(t);
+            self.write(zagTypeToZig(t));
         }
         self.write(" = ");
         self.genExpr(init_expr);

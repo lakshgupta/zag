@@ -6,6 +6,18 @@ const core = @import("core.zig");
 // the extraction script for rationale.
 const Codegen = core.Codegen;
 const needsIntDivShim = @import("primary.zig").needsIntDivShim;
+// Cross-bucket alias-resolution import (docs/07 "Type Aliases",
+// docs/11 borrowed-string-view). Same pattern as the
+// `needsIntDivShim` import above: a sibling-bucket helper made
+// available by file-scope re-export rather than re-implementing.
+// See `zagTypeToZig` in src/codegen/decl.zig for the alias set
+// and the in-line-guard rationale. Used at the closure-literal
+// emit site (params + return) and the `.cast` emit site so that
+// `|x: str| -> str { ... }` round-trips to `pub fn call(x:
+// []const u8) []const u8 { ... }` and `x as str` to
+// `@as([]const u8, x)` without zig ever seeing a bare `str`
+// ident.
+const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 
 // ============================================================
 // FILE-SCOPE methods (EXPR bucket)
@@ -113,10 +125,10 @@ const needsIntDivShim = @import("primary.zig").needsIntDivShim;
                     if (i > 0) self.write(", ");
                     self.write(p.name);
                     self.write(": ");
-                    self.write(p.type_text);
+                    self.write(zagTypeToZig(p.type_text));
                 }
                 self.write(") ");
-                if (cl.return_type) |rt| self.write(rt) else self.write("void");
+                if (cl.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
                 self.write(" {\n");
                 for (cl.body) |s| self.genStmt(s, false);
                 self.write("    } }){}");
@@ -159,12 +171,18 @@ const needsIntDivShim = @import("primary.zig").needsIntDivShim;
                     // `["i32"]` for `max<i32>(3, 5)` or `["i32", "10"]`
                     // for `fill<i32, 10>(0)`); corgen passes them
                     // through unchanged so zig's compile-time arg
-                    // matching handles the dispatch.
+                    // matching handles the dispatch. Wrap through
+                    // `zagTypeToZig` so the v1 alias contract
+                    // (docs/07: `str` is transparent alias for
+                    // `[]const u8`) extends to turbofish sites — a
+                    // hypothetical `max<str>(...)` round-trips to
+                    // `max([]const u8)(...)` instead of zig rejecting
+                    // with `unknown type name "str"`.
                     self.write(c.name);
                     self.write("(");
                     for (c.type_args, 0..) |ta, i| {
                         if (i > 0) self.write(", ");
-                        self.write(ta);
+                        self.write(zagTypeToZig(ta));
                     }
                     if (c.args.len > 0 and c.type_args.len > 0) self.write(", ");
                     for (c.args, 0..) |arg, i| {
@@ -204,7 +222,7 @@ const needsIntDivShim = @import("primary.zig").needsIntDivShim;
                 } else {
                     self.write(" = try std.heap.page_allocator.create(");
                 }
-                self.write(n.type_name);
+                self.write(zagTypeToZig(n.type_name));
                 self.write("); ");
                 self.write(name);
                 self.write(".* = ");
@@ -235,7 +253,7 @@ const needsIntDivShim = @import("primary.zig").needsIntDivShim;
                 // `@as(f32, (a + b))` with their internal precedence
                 // bindings intact.
                 self.write("@as(");
-                self.write(c.type_text);
+                self.write(zagTypeToZig(c.type_text));
                 self.write(", ");
                 self.genExpr(c.expr.*);
                 self.write(")");
