@@ -304,6 +304,14 @@ pub fn parseFunDecl(self: *Parser) ast.FunDecl {
             const rt = self.collectCastType();
             return_type = if (rt.len == 0) null else rt;
         }
+        // Reset closure_bindings so each fn accumulates only the
+        // closures lexically declared inside its body. Mirrors
+        // codegen's per-fn `type_info_buf` scoping (see
+        // `collectTypedBindings` in src/codegen/stmt.zig). Setting
+        // count = 0 is sufficient because `isClosureBound` only
+        // consults indices 0..closure_binding_count; array contents
+        // beyond the count are ignored.
+        self.closure_binding_count = 0;
         const body = self.parseBlock();
         const params = self.arena.alloc(ast.MethodParam, param_count);
         @memcpy(params, params_buf[0..param_count]);
@@ -374,6 +382,11 @@ pub fn parseMethod(self: *Parser) ast.MethodDecl {
             const rt = self.collectCastType();
             return_type = if (rt.len == 0) null else rt;
         }
+        // Reset closure_bindings per-method body. Mirrors the
+        // parseFunDecl reset above; codegen's per-method
+        // collectTypedBindings pass also resets its type_info_count
+        // at genMethod entry.
+        self.closure_binding_count = 0;
         self.expect(.lbrace);
         const body = self.parseStmtList();
         self.expect(.rbrace);

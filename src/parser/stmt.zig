@@ -166,7 +166,18 @@ pub fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
             }
             self.expect(.equals);
             const initializer = self.parseExpr();
-            if (type_name == null and !isLiteralInit(initializer)) {
+            // Track closure-typed bindings so subsequent `.call` RHS
+            // can resolve the callee's type via isClosureBound without
+            // an explicit `: T` annotation. Mirrors codegen's
+            // `collectTypedBindings` (src/codegen/stmt.zig) which
+            // seeds `is_closure = true` for closure init literals.
+            if (initializer == .closure) {
+                if (self.closure_binding_count < self.closure_bindings.len) {
+                    self.closure_bindings[self.closure_binding_count] = pattern.name;
+                    self.closure_binding_count += 1;
+                }
+            }
+            if (type_name == null and !isLiteralInit(self, initializer)) {
                 std.debug.print("error:{d}:{d}: {s} requires an explicit type annotation when binding non-tuple values (e.g. {s} {s}: T = …)\n", .{
                     binding_loc.line,
                     binding_loc.col,

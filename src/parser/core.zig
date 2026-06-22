@@ -126,7 +126,7 @@ pub fn expect(self: *Parser, tag: TokenTag) void {
     }
 
 
-pub fn isLiteralInit(expr: Expr) bool {
+pub fn isLiteralInit(self: *Parser, expr: Expr) bool {
         return switch (expr) {
             // NOTE: `.single_tuple_lit` (Phase 1 single-element tuple) and
             // `.named_tuple_lit` (Phase 1 named-field tuple) intentionally
@@ -150,8 +150,38 @@ pub fn isLiteralInit(expr: Expr) bool {
             // rationale as the anonymous-struct (single/named-tuple-lit)
             // variants above, just dispatched through a different
             // codegen slot.
+            //
+            // .call: when the callee is in the per-fn `closure_bindings`
+            // set (populated by parseBinding when init == .closure), the
+            // call expression is also self-describing. Codegen's genExpr
+            // `.call` arm (src/codegen/expr.zig) routes `name(args)` to
+            // `name.call(args)` because `name`'s type_info_buf.is_closure
+            // = true. The runtime shape is determined without an explicit
+            // `: T` annotation, matching the `.closure` case directly
+            // above. The per-fn scoping of closure_bindings (reset at
+            // parseFunDecl / parseMethod body entry) keeps bindings
+            // visible only inside their declaring fn/method body,
+            // mirroring codegen's per-fn type_info_buf scoping.
+            .call => |c| isClosureBound(self, c.name),
             else => false,
         };
+    }
+
+
+pub fn isClosureBound(self: *Parser, name: []const u8) bool {
+        // Linear scan over the per-fn closure_bindings stack. The stack
+        // is small (typically 0-5 entries per fn for the common
+        // single-closure pattern; the 256-slot cap is a defensive bound
+        // against pathological cases) so a simple while-loop is the
+        // right shape vs. a hash-set or sorted insertion. Mirrors the
+        // codegen-side isClosureBound lookup (src/codegen/expr.zig
+        // genExpr's `.call` arm) which iterates type_info_buf the same
+        // way.
+        var i: u32 = 0;
+        while (i < self.closure_binding_count) : (i += 1) {
+            if (std.mem.eql(u8, self.closure_bindings[i], name)) return true;
+        }
+        return false;
     }
 
 
@@ -215,6 +245,18 @@ pub const Parser = struct {
     /// flag flip doesn't allow lower-case locals like `vec { ... }`
     /// to silently swallow blocks.
     allow_struct_lit: bool,
+
+    /// Per-function set of binding names that hold closure-typed values
+    /// (`let NAME = |...| -> T { ... };`). Populated by parseBinding
+    /// when init == .closure; consulted by isLiteralInit's `.call` arm
+    /// so subsequent closure-typed call sites (`let r = NAME(args)`)
+    /// parse without an explicit `: T` annotation. Reset at
+    /// parseFunDecl / parseMethod body entry (src/parser/decl.zig) so
+    /// closure_bindings accumulates only within the declaring scope --
+    /// mirrors codegen's per-fn type_info_buf scoping (see
+    /// collectTypedBindings in src/codegen/stmt.zig).
+    closure_bindings: [256][]const u8 = undefined,
+    closure_binding_count: u32 = 0,
 
 
     // ----- Method aliases -----
