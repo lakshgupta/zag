@@ -43,6 +43,14 @@ pub const MethodDecl = ast_decl.MethodDecl;
 pub const ImplBlock = ast_decl.ImplBlock;
 pub const EnumDecl = ast_decl.EnumDecl;
 pub const EnumVariant = ast_decl.EnumVariant;
+// Traits (docs/17). TraitDecl + TraitMethodDecl are the decl-side
+// AST nodes for trait declarations. Phase 1 (this commit) scaffolds
+// only lexer/AST/parser; codegen for vtable + dispatch shims lives
+// in Phase 2. The aggregator re-exports here so `ast.TraitDecl` and
+// `ast.TraitMethodDecl` (referenced from Program and parser) resolve
+// uniformly with the existing decl-side types above.
+pub const TraitDecl = ast_decl.TraitDecl;
+pub const TraitMethodDecl = ast_decl.TraitMethodDecl;
 // Generics (docs/16). The TypeParam struct lives next to FunDecl
 // in decl.zig and is referenced from parser/decl.zig helpers
 // (`parseTypeParam`, `parseTypeParams`). The aggregator re-export

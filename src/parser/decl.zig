@@ -256,6 +256,85 @@ pub fn parseEnumVariantPayload(self: *Parser) ?[]const u8 {
     }
 
 
+pub fn parseTraitMethodDecl(self: *Parser) ast.TraitMethodDecl {
+        const start_loc = self.peek().loc;
+        // Accept-and-ignore `pub` (mirrors how parseMethod treats
+        // impl-decl privacy; the keyword is preserved at the AST surface
+        // for any future privacy wiring without re-routing the parser).
+        if (self.peek().tag == .pub_kw) self.advance();
+        self.expect(.fun);
+        const name = self.expectIdent();
+        self.expect(.lparen);
+        var params_buf: [16]ast.MethodParam = undefined;
+        var param_count: usize = 0;
+        if (self.peek().tag != .rparen) {
+            params_buf[param_count] = self.parseMethodParam();
+            param_count += 1;
+            while (self.peek().tag == .comma) {
+                self.advance();
+                params_buf[param_count] = self.parseMethodParam();
+                param_count += 1;
+            }
+        }
+        self.expect(.rparen);
+        var return_type: ?[]const u8 = null;
+        if (self.peek().tag == .arrow) {
+            self.advance();
+            const rt = self.collectCastType();
+            return_type = if (rt.len == 0) null else rt;
+        }
+        // Phase 1+2 minimum subset: REQUIRED-only methods (no default
+        // bodies). The docs/17 `fun NAME(...) { body }` form is a
+        // default-method surface, deferred to Phase 3+. Parsing the
+        // optional `{ body }` here would silently accept a default
+        // method that codegen then has no path for, so we reject any
+        // trailing `{` post-signature as `expected '}' or newline`.
+        if (self.peek().tag == .lbrace) {
+            std.debug.print("error:{d}:{d}: trait method '{s}' is REQUIRED-only in v1 minimum subset; default-method bodies are deferred (omit the {{ body }})\n", .{ start_loc.line, start_loc.col, name });
+            std.process.exit(1);
+        }
+        const params = self.arena.alloc(ast.MethodParam, param_count);
+        if (param_count > 0) @memcpy(params, params_buf[0..param_count]);
+        return .{
+            .name = name,
+            .params = params,
+            .return_type = return_type,
+            .body = null,
+            .loc = start_loc,
+        };
+    }
+
+
+pub fn parseTraitDecl(self: *Parser) ast.TraitDecl {
+        // Mirrors parseEnumDecl's surface: open-brace then a comma/newline
+        // separated list of methods until close-brace. Each method is
+        // parsed via parseTraitMethodDecl (the `pub fun NAME(...) -> RET`
+        // signature only; no default bodies in v1 minimum subset).
+        const start_loc = self.peek().loc;
+        self.expect(.trait_kw);
+        const name = self.expectIdent();
+        self.expect(.lbrace);
+        var methods_buf: [64]ast.TraitMethodDecl = undefined;
+        var method_count: usize = 0;
+        while (self.peek().tag != .rbrace and !self.eof()) {
+            if (self.peek().tag == .newline) {
+                self.advance();
+                continue;
+            }
+            if (self.peek().tag == .comma) {
+                self.advance();
+                continue;
+            }
+            methods_buf[method_count] = self.parseTraitMethodDecl();
+            method_count += 1;
+        }
+        self.expect(.rbrace);
+        const methods = self.arena.alloc(ast.TraitMethodDecl, method_count);
+        @memcpy(methods, methods_buf[0..method_count]);
+        return .{ .name = name, .methods = methods, .loc = start_loc };
+    }
+
+
 pub fn parseFunDecl(self: *Parser) ast.FunDecl {
         const start = self.peek().loc;
         self.expect(.fun);
@@ -362,6 +441,27 @@ pub fn parseMethod(self: *Parser) ast.MethodDecl {
         // grammar reserves it; privacy enforcement is deferred).
         if (self.peek().tag == .pub_kw) self.advance();
         self.expect(.fun);
+        // Trait-qualified impl method (docs/17 §"Implementing"). The
+        // `Trait.method` shape (`pub fun Drawable.draw(self: *Button) { ... }`)
+        // inserts a 3-token lookahead immediately after `pub fun`: when
+        // `IDENT . IDENT` follows, the first ident is the trait name and
+        // the post-dot ident is the method name. Without the lookahead
+        // parseMethod would consume `Drawable` as a malformed method
+        // name and the postfix `.draw(...)` would surface as a
+        // `.method_call` codegen error (or — worse — silently produce
+        // a free-fn with the trait name baked into the identifier
+        // string). Codegen reads `trait_name` to dual-emit the regular
+        // free-fn AND the trait-method registration (the per-(trait,
+        // target_type) vtable instantiation lands in Phase 2; here
+        // we just carry the qualifier on the AST).
+        var trait_name: ?[]const u8 = null;
+        if (self.peek().tag == .identifier and
+            self.peekAhead(1) == .dot and
+            self.peekAhead(2) == .identifier)
+        {
+            trait_name = self.expectIdent();
+            self.expect(.dot);
+        }
         const name = self.expectIdent();
         self.expect(.lparen);
         var params_buf: [16]ast.MethodParam = undefined;
@@ -392,7 +492,7 @@ pub fn parseMethod(self: *Parser) ast.MethodDecl {
         self.expect(.rbrace);
         const params = self.arena.alloc(ast.MethodParam, param_count);
         @memcpy(params, params_buf[0..param_count]);
-        return .{ .name = name, .params = params, .return_type = return_type, .body = body, .loc = start_loc };
+        return .{ .name = name, .params = params, .return_type = return_type, .body = body, .loc = start_loc, .trait_name = trait_name };
     }
 
 

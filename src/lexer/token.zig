@@ -34,6 +34,14 @@ pub const TokenTag = enum {
     /// declared enum as zig's native `enum { ... }` form so functions
     /// over variants compile via zig's exhaustive match checking.
     enum_kw,
+    /// `trait` keyword — introduces a trait declaration
+    /// (`trait Drawable { fun draw(self: *Self); fun name(self: *Self) -> str; }`).
+    /// Phase 1 (this commit) scaffolds only the lexer/parser surface;
+    /// codegen lives in Phase 2 (Methods with required-only bodies; no
+    /// default-method bodies; no `Self` keyword — `Self` is captured
+    /// verbatim into MethodParam.type_text and rewrite happens at
+    /// codegen time so we don't add a new lexer token in Phase 1).
+    trait_kw,
     /// `pub` keyword — visibility modifier on top-level decls and
     /// methods. Spec framing reserves privacy enforcement to a followup;
     /// current parser accepts-and-ignores it (the keyword is preserved

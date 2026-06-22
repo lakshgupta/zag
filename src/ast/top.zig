@@ -7,6 +7,12 @@ const FunDecl = decl.FunDecl;
 const StructDecl = decl.StructDecl;
 const ImplBlock = decl.ImplBlock;
 const EnumDecl = decl.EnumDecl;
+// Traits (docs/17, Phase 1): Program.traits carries the trait-decl
+// surface so codegen can walk trait types alongside structs/impls/
+// enums. Imported via the same `decl.TraitDecl` chain as the other
+// decl-side types; the `&[_]TraitDecl{}` empty default preserves the
+// non-trait source-shape compatibility for the 235+ baseline tests.
+const TraitDecl = decl.TraitDecl;
 
 // ============================================================
 // top.zig — top-level types from src/ast.zig
@@ -43,6 +49,16 @@ pub const Program = struct {
     /// emitted at codegen time in source order so any guarantee that
     /// a downstream top-level fn or impl sees the type ahead of itself.
     enums: []const EnumDecl = &[_]EnumDecl{},
+    /// Module-level trait declarations (docs/17 §"Definition"). Parsed
+    /// by `Parser.parseTraitDecl` (scaffolded in Phase 1; codegen
+    /// lives in Phase 2). The parser records them in source-decl
+    /// order alongside structs/impls/enums; codegen walks the slice
+    /// before any impl that might register a trait-method so the trait
+    /// type is declared before any vtable instantiation references it.
+    /// `[]const TraitDecl{}` default empty preserves the
+    /// pre-traits-source-shape compatibility (none of the existing
+    /// 235+ tests reference trait decls).
+    traits: []const TraitDecl = &[_]TraitDecl{},
 };
 
 pub const Arena = struct {

@@ -27,6 +27,8 @@ pub fn parse(self: *Parser) ast.Program {
         var impl_count: usize = 0;
         var enums_buf: [256]ast.EnumDecl = undefined;
         var enum_count: usize = 0;
+        var traits_buf: [256]ast.TraitDecl = undefined;
+        var trait_count: usize = 0;
 
         while (!self.eof()) {
             if (self.peek().tag == .newline) {
@@ -72,6 +74,18 @@ pub fn parse(self: *Parser) ast.Program {
                 enum_count += 1;
                 continue;
             }
+            if (lead == .trait_kw) {
+                // Top-level trait decl (docs/17 §"Definition"). Phase 1
+                // scaffolds the AST/parser surface only; Phase 2 wires
+                // the codegen (vtable struct + dispatch shims). Trait
+                // decls at module scope don't carry a doc slot — same
+                // rationale as the `struct` branch above. Recorded in
+                // source-order alongside structs/enums/impls so codegen
+                // can walk the slice in declaration order at emit time.
+                traits_buf[trait_count] = self.parseTraitDecl();
+                trait_count += 1;
+                continue;
+            }
             functions_buf[fun_count] = self.parseFunDecl();
             functions_buf[fun_count].doc = doc;
             fun_count += 1;
@@ -85,7 +99,9 @@ pub fn parse(self: *Parser) ast.Program {
         @memcpy(impls, impls_buf[0..impl_count]);
         const enums = self.arena.alloc(ast.EnumDecl, enum_count);
         @memcpy(enums, enums_buf[0..enum_count]);
-        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums };
+        const traits = self.arena.alloc(ast.TraitDecl, trait_count);
+        @memcpy(traits, traits_buf[0..trait_count]);
+        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits };
     }
 
 
@@ -275,6 +291,8 @@ pub const Parser = struct {
     pub const parseClosureExpr = @import("decl.zig").parseClosureExpr;
     pub const parseEnumDecl = @import("decl.zig").parseEnumDecl;
     pub const parseEnumVariantPayload = @import("decl.zig").parseEnumVariantPayload;
+    pub const parseTraitDecl = @import("decl.zig").parseTraitDecl;
+    pub const parseTraitMethodDecl = @import("decl.zig").parseTraitMethodDecl;
     pub const parseFunDecl = @import("decl.zig").parseFunDecl;
     pub const parseImplBlock = @import("decl.zig").parseImplBlock;
     pub const parseMethod = @import("decl.zig").parseMethod;

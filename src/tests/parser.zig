@@ -1665,3 +1665,105 @@ test "parser: closure expression |x:T|->T{} produces Expr.closure" {
     try std.testing.expect(std.mem.eql(u8, let_stmt.init.?.closure.return_type.?, "i32"));
 }
 
+// ============================================================
+// Trait scaffolding tests (Phase 1; docs/17).
+//
+// Phase 1 adds only the lexer/AST/parser surface for trait decls
+// + Trait.method-qualified impl methods. Codegen (vtable struct +
+// dispatch shims + cast encoding) lands in Phase 2. These tests
+// pin the AST shape so Phase 2 codegen can rely on the parser
+// invariants: (a) trait decls land on `Program.traits` with the
+// method slots correctly recorded, (b) trait methods always have
+// `body == null` (required-only v1 minimum subset), (c) impl-method
+// `Trait.method` shape populates `MethodDecl.trait_name` via the
+// 3-token lookahead in `parseMethod`.
+// ============================================================
+
+
+test "parser: trait decl records name + methods on Program.traits" {
+    // The simplest trait decl shape from docs/17 §"Definition":
+    // name + body + required-only method signature. Parser surface
+    // only — codegen lives in Phase 2.
+    const src = "trait Drawable {\n    fun draw(self: *Self);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.traits.len == 1);
+    try std.testing.expect(std.mem.eql(u8, prog.traits[0].name, "Drawable"));
+    try std.testing.expect(prog.traits[0].methods.len == 1);
+}
+
+test "parser: trait method captures required-only signature with null body" {
+    // Phase 1+2 minimum subset: trait methods are REQUIRED-only.
+    // Parser pins `body == null` so Phase 2 codegen can decide
+    // required vs default by inspecting the optional slot. The `self`
+    // receiver typed as `*Self` is captured verbatim into
+    // `MethodParam.type_text` (codegen rewrites the Self literal to
+    // the per-shim generic `T` at emit time; the z-side parser keeps
+    // it as a verbatim identifier without a dedicated `.self_kw`
+    // token in Phase 1).
+    const src = "trait Drawable {\n    fun draw(self: *Self);\n    fun name(self: *Self) -> str;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const td = prog.traits[0];
+    try std.testing.expect(td.methods.len == 2);
+    try std.testing.expect(std.mem.eql(u8, td.methods[0].name, "draw"));
+    try std.testing.expect(td.methods[0].body == null);
+    try std.testing.expect(td.methods[0].params.len == 1);
+    try std.testing.expect(std.mem.eql(u8, td.methods[0].params[0].name, "self"));
+    try std.testing.expect(td.methods[0].params[0].is_self);
+    try std.testing.expect(std.mem.eql(u8, td.methods[0].params[0].type_text, "*Self"));
+    try std.testing.expect(td.methods[0].return_type == null);
+    try std.testing.expect(std.mem.eql(u8, td.methods[1].name, "name"));
+    try std.testing.expect(td.methods[1].return_type != null);
+    try std.testing.expect(std.mem.eql(u8, td.methods[1].return_type.?, "str"));
+}
+
+test "parser: Trait.method-prefixed impl method sets MethodDecl.trait_name" {
+    // The `fun Trait.method` lookahead inside parseMethod captures the
+    // trait name as a non-null `MethodDecl.trait_name` slot while the
+    // post-dot ident becomes the method name. Companion regression
+    // check: a NON-trait-prefixed method in the same impl block has
+    // `trait_name == null` so Phase 2 codegen's trait-aware free-fn
+    // emit can branch on the slot. The impl-block AST records all
+    // methods together; the slot is the only differential between
+    // trait-scoped and free-floating methods inside the same block.
+    const src =
+        \\trait Drawable {
+        \\    fun draw(self: *Self);
+        \\}
+        \\struct Button {
+        \\    label: str,
+        \\}
+        \\impl Button {
+        \\    pub fun Drawable.draw(self: *Button) {
+        \\        print("Button: ");
+        \\        print(self.label);
+        \\    }
+        \\    pub fun regular_method() -> i32 {
+        \\        return 7;
+        \\    }
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.traits.len == 1);
+    try std.testing.expect(prog.impls.len == 1);
+    try std.testing.expect(prog.impls[0].methods.len == 2);
+    const trait_m = prog.impls[0].methods[0];
+    try std.testing.expect(trait_m.trait_name != null);
+    try std.testing.expect(std.mem.eql(u8, trait_m.trait_name.?, "Drawable"));
+    try std.testing.expect(std.mem.eql(u8, trait_m.name, "draw"));
+    const regular_m = prog.impls[0].methods[1];
+    try std.testing.expect(regular_m.trait_name == null);
+    try std.testing.expect(std.mem.eql(u8, regular_m.name, "regular_method"));
+}
+

@@ -188,6 +188,17 @@ pub const MethodDecl = struct {
     return_type: ?[]const u8,
     body: []const Stmt,
     loc: Loc,
+    /// Trait-qualified marker (docs/17 §"Implementing"). When non-null,
+    /// the method is registered as `Trait.method` against the trait
+    /// named in this slot so codegen emits the vtable-for-Type
+    /// registration alongside (or instead of) the regular free-fn
+    /// shape. `null` when the method is a regular impl-block method
+    /// with no trait binding. Populated by `Parser.parseMethod`'s
+    /// 3-token lookahead (`IDENT . IDENT`) immediately after the
+    /// leading `pub fun` token: when the lookahead matches, the first
+    /// ident is consumed as `trait_name` and the post-dot ident
+    /// becomes `name`.
+    trait_name: ?[]const u8 = null,
 };
 
 /// One `impl NAME { … }` block. The methods are flattened to zig free
@@ -233,6 +244,44 @@ pub const EnumDecl = struct {
 pub const EnumVariant = struct {
     name: []const u8,
     payload_type: ?[]const u8,
+    loc: Loc,
+};
+
+/// One trait declaration of the form
+/// `trait NAME { fun draw(self: *Self); fun name(self: *Self) -> str; ... }`
+/// (docs/17 §"Definition"). Methods inside the trait are
+/// REQUIRED-only in v1 minimum subset (Phase 1+2 scope); the
+/// optional `body` field on each `TraitMethodDecl` stays null and
+/// is reserved for the default-method surface (deferred). Phase 1
+/// (this commit) scaffolds the lexer/AST/parser surface only; codegen
+/// lives in Phase 2. `Self` inside trait method params is captured
+/// as a verbatim identifier into `MethodParam.type_text` and rewritten
+/// to the per-shim generic `T` at codegen time — no new `.self_kw`
+/// TokenTag is added in Phase 1.
+pub const TraitDecl = struct {
+    name: []const u8,
+    methods: []const TraitMethodDecl,
+    loc: Loc,
+};
+
+/// One method inside a `trait NAME { ... }` block. Phase 1 minimum
+/// subset has REQUIRED-only methods (no default bodies), so `body` is
+/// always null. The `body` field is reserved on the AST so a later
+/// Phase can wire default-method emission without changing the
+/// `TraitDecl.methods` slice shape — codegen will branch on
+/// `body == null` to decide whether a method is required (must be
+/// implemented in `impl`) or default (overrideable in `impl`). Params
+/// and return_type share the `MethodParam` / `?[]const u8` shape with
+/// `MethodDecl` so codegen can transform one into the other with the
+/// existing per-method helpers.
+pub const TraitMethodDecl = struct {
+    name: []const u8,
+    params: []const MethodParam,
+    return_type: ?[]const u8,
+    /// Always null in Phase 1+2 minimum subset. Reserved for the
+    /// default-method surface (Phase 3+); null IS the
+    /// required-method marker.
+    body: ?[]const Stmt,
     loc: Loc,
 };
 
