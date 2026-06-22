@@ -1870,12 +1870,12 @@ test "codegen: unannotated closure binding still rewrites call to .call(...)" {
     // that 071f221 (`fix(tests): unannotated-closure test source
     // restructure...`) had introduced. The unannotated-binding ->
     // call-rewrite tracing therefore exercises the closure-detection
-    // path end to end without any explicit `: T`.
+    // path end to end without any explicit `: T`. The `r` binding is
+    // intentionally unreferenced.
     const src =
         \\fun f() {
         \\    let c = |x: i32| -> i32 { return x + 1; };
         \\    let r = c(4);
-        \\    print("{r}\n");
         \\}
         \\;
     ;
