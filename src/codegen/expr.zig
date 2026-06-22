@@ -232,6 +232,64 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("; }");
             },
             .cast => |c| {
+                // Phase 3 trait-cast (docs/17 §"Using Traits"): when
+                // the cast's `type_text` matches a tracked trait name
+                // (populated from `prog.traits` at `generate()`
+                // entry) AND the operand is an `.ident` whose
+                // source-type was captured by `collectTypedBindings`
+                // (so we can identify the vtable registration's
+                // `<SourceType>` slot), the user-facing cast
+                // `btn as Drawable` produces a fat-pointer container:
+                //
+                //     Drawable {
+                //         .ptr = @ptrCast(&btn),  // or @ptrCast(btn_p) for pointer source
+                //         .vtable = &Drawable_VTable_for_Button,
+                //     }
+                //
+                // The trait-cast branch fires BEFORE the legacy
+                // `@as(T, expr)` emit so non-trait casts (e.g.
+                // `x as i32`, `x as *T`) preserve their old shape
+                // byte-identical. The pointer detection strips a
+                // leading `*`/`*const` from `source_type` to derive the
+                // bare type name used in the vtable registration
+                // (`<Trait>_VTable_for_<BareType>`). Source-tokens
+                // without a `*` prefix get an implicit `&` so the
+                // `@ptrCast` accepts the resulting `*T` slot. v1
+                // minimum subset restricts the operand to `.ident`
+                // only — more complex sources like `get_btn().as Trait`
+                // would require a type-inferer to identify the
+                // source; deferred to a Phase 4 widening.
+                if (self.isTrackedTrait(c.type_text) and c.expr.* == .ident) {
+                    const source_ident = c.expr.*.ident;
+                    if (self.getSourceTypeName(source_ident)) |source_type| {
+                        // Strip leading `*` markers and the `const`
+                        // qualifier from the source-type so the
+                        // vtable registration name uses the bare
+                        // type name (`*Button` → `Button`,
+                        // `*const Foo` → `Foo`). Mutability never
+                        // affects vtable layout so the `const` is
+                        // safe to drop.
+                        var base_type = source_type;
+                        while (base_type.len > 0 and base_type[0] == '*') base_type = base_type[1..];
+                        if (base_type.len >= 6 and std.mem.eql(u8, base_type[0..6], "const ")) base_type = base_type[6..];
+                        const is_pointer_source = base_type.len < source_type.len;
+                        // Emit fat-pointer container — the cast
+                        // itself (no `@as` wrapper) because zig's
+                        // struct-literal type inference picks up
+                        // `Drawable` from the trailing-without-dot
+                        // leading-identifier in the cast-arm shape.
+                        self.write(c.type_text);
+                        self.write("{ .ptr = @ptrCast(");
+                        if (!is_pointer_source) self.write("&");
+                        self.write(source_ident);
+                        self.write("), .vtable = &");
+                        self.write(c.type_text);
+                        self.write("_VTable_for_");
+                        self.write(base_type);
+                        self.write(" }");
+                        return;
+                    }
+                }
                 // `expr as T` — emit as Zig's `@as(T, expr)` builtin.
                 // zig 0.16 does not have an `as` keyword (it was a
                 // pre-0.14 deprecation; modern zig routes all explicit
@@ -486,10 +544,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // constructor as distinct methods of the same zig type.
                 // Args are comma-separated and emitted verbatim via the
                 // existing `genExpr` recursion.
+                //\n                // Phase 3 trait dispatch (docs/17 §"Using Traits"): the\n                // user supplies the vtable's source-type via turbofish\n                // at the call site so the dispatch shim's `comptime T:\n                // type` parameter resolves to the registered\n                // source-type — `d.draw<Button>()` emits `d.draw(Button)`\n                // which binds Button to the shim's `T` placeholder\n                // (the shim discards T via `_ = T;` and forwards to\n                // the vtable slot). Empty type_args keeps the verbatim\n                // `target.method(args)` emit shape so non-turbofish\n                // call sites round-trip byte-identical with the\n                // pre-Phase-3 baseline. Wrap through `zagTypeToZig`\n                // so turbofish on a trait call site honours the\n                // docs/07 transparent-alias contract (`str` becomes\n                // `[]const u8`) identically to the `.call` arm.
                 self.genExpr(mc.target.*);
                 self.write(".");
                 self.write(mc.name);
                 self.write("(");
+                for (mc.type_args, 0..) |ta, i| {
+                    if (i > 0) self.write(", ");
+                    self.write(zagTypeToZig(ta));
+                }
+                if (mc.args.len > 0 and mc.type_args.len > 0) self.write(", ");
                 for (mc.args, 0..) |a, i| {
                     if (i > 0) self.write(", ");
                     self.genExpr(a);

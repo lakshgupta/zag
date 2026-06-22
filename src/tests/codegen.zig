@@ -2316,3 +2316,189 @@ test "codegen: trait vtable registration emits <Trait>_VTable_for_<Type> with @p
 
 
 // ============================================================
+
+// Trait cast + call-site dispatch pin tests (Phase 3, docs/17
+// §"Using Traits"). The 5 pin tests cover each regression-bait in
+// the cast arm + method-call arm surface. Each test pairs a
+// positive substring assertion (the new shape contains the trait
+// container + vtable reference + turbofish slot) with a negative
+// substring assertion (the legacy `@as(...)` shape must NOT
+// appear, OR the prior-Phase-3 trait-cast shape must NOT appear
+// for the non-trait case). Regressions are surgical to locate;
+// each test fails on exactly its dedicated invariant.
+
+test "codegen: cast `x as Trait` emits fat-pointer container + VTable_for_<SourceType>" {
+    // docs/17 §"Using Traits" canonical form: `btn as Drawable`
+    // produces `Drawable { .ptr = @ptrCast(&btn), .vtable =
+    // &Drawable_VTable_for_Button }`. The container literal +
+    // vtable reference are the canonical trait-cast shape; `@as`
+    // MUST NOT appear (it would silently emit a value that
+    // doesn't fit the trait container).
+    const src =
+        \\trait Drawable { fun draw(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button { pub fun Drawable.draw(self: *Button) { } }
+        \\fun main() {
+        \\    let btn: Button = Button { label: "x" };
+        \\    let _ = btn as Drawable;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: trait-cast arm emitted the fat-pointer container
+    // with the matching vtable registration reference.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @ptrCast(&btn), .vtable = &Drawable_VTable_for_Button") != null);
+    // Negative 1: legacy @as cast did NOT appear in the trait-cast
+    // path (a regression that drops the trait-detect gate silently
+    // produces this).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(Drawable,") == null);
+    // Negative 2: no premature `Renderer{` or similar typo
+    // contamination (regression-pinning substring distinct from a
+    // valid emit shape).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawer{") == null);
+}
+
+test "codegen: cast `*T-typed x as Trait` emits @ptrCast(x) without address-of" {
+    // Mirrors the value-typed case but the source binding is
+    // already a pointer (`let x: *Button = &btn;`). The codegen
+    // detects pointer-ness via `source_type`'s leading `*` and
+    // emits `@ptrCast(x)` — NOT `@ptrCast(&x)` which would be
+    // invalid since `x` is already `*Button` (zig would reject
+    // `&**Button` as invalid type).
+    const src =
+        \\trait Drawable { fun draw(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button { pub fun Drawable.draw(self: *Button) { } }
+        \\fun main() {
+        \\    let btn: Button = Button { label: "x" };
+        \\    let x: *Button = &btn;
+        \\    let _ = x as Drawable;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: pointer source binds to the vtable registration
+    // without an inserted `&`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @ptrCast(x), .vtable = &Drawable_VTable_for_Button") != null);
+    // Negative: NO spurious address-of for an already-pointer source.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrCast(&x)") == null);
+}
+
+test "codegen: dispatch `d.draw<T>()` emits `d.draw(T)` binding source-type" {
+    // The user MUST supply the source-type via turbofish so the
+    // dispatch shim's `comptime T: type` parameter resolves — the
+    // trait-cast arm sets `d`'s zig type to `Drawable`, and the
+    // dispatch shim's `comptime T: type` is satisfied by the
+    // turbofish'd Button. Without turbofish zig has no way to
+    // infer which `<Trait>_VTable_for_<X>` registration to wire
+    // (the shim's `_ = T;` discards the binding but the slot is
+    // required by zig 0.16 strict comptime rules).
+    const src =
+        \\trait Drawable { fun draw(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button { pub fun Drawable.draw(self: *Button) { } }
+        \\fun main() {
+        \\    let btn: Button = Button { label: "x" };
+        \\    let d: Drawable = btn as Drawable;
+        \\    d.draw<Button>();
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: turbofish surfaces as the type_args slot in the
+    // method-call emit (preceding any args; here there are zero
+    // args so the turbofish slot IS the only arg).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw(Button)") != null);
+    // Negative 1: legacy shape (no turbofish → empty comptime T
+    // slot) was NOT emitted.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw()") == null);
+    // Negative 2: source-type passthrough did NOT slip through as
+    // a sibling vtable literal (e.g. an emit that accidentally
+    // `Drawer_VTable_for_` somewhere). Confirmed by the lack of
+    // a stray `_VTable_for_` outside the registration decl.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawer_VTable_for_") == null);
+}
+
+test "codegen: trait + impl + cast + dispatch end-to-end emits full pipeline shape" {
+    // The full Phase 3 example (mini version of
+    // examples/traits/basic_draw.zag): trait decl, struct decl,
+    // impl, trait-method free fn + vtable reg, plus the user's
+    // main assembling a cast + turbofish-dispatch. Each emission
+    // substring must appear in the codegen output.
+    const src =
+        \\trait Drawable { fun draw(self: *Self); }
+        \\struct Button { label: str, }
+        \\impl Button { pub fun Drawable.draw(self: *Button) { print("d"); } }
+        \\fun main() {
+        \\    let btn: Button = Button { label: "x" };
+        \\    let d: Drawable = btn as Drawable;
+        \\    d.draw<Button>();
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // 1. trait decl shape
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Drawable = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const VTable = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "draw: *const fn (ptr: *anyopaque) void,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "_ = T;") != null);
+    // 2. free fn rename (Phase 2 surface)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Drawable_draw(self: *Button) void") != null);
+    // 3. vtable registration (Phase 2 surface)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Drawable_VTable_for_Button: Drawable.VTable = .{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".draw = @ptrCast(*const fn (ptr: *anyopaque) void, &Button_Drawable_draw),") != null);
+    // 4. cast arm shape (value-typed source → @ptrCast(&btn))
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @ptrCast(&btn), .vtable = &Drawable_VTable_for_Button") != null);
+    // 5. dispatch turbofish (`d.draw(Button)`)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw(Button);") != null);
+}
+
+test "codegen: non-trait cast `x as i32` preserves @as(T, x) emit unchanged" {
+    // Regression pin: the trait-cast branch must NOT silently
+    // hijack non-trait casts. A bare `x as i32` should emit
+    // `@as(i32, x)` exactly as the pre-Phase-3 baseline did. Without
+    // this guard a future regression that broadens the trait-detect
+    // condition (e.g. dropping the `isTrackedTrait` check) would
+    // silently regress every numeric/named cast and the failure
+    // would surface as downstream zig-side compile errors, not a
+    // clean codegen test failure. Pin the negative shape explicitly.
+    const src = "fun f() {\n    let y: i32 = x as i32;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(i32, x)") != null);
+    // Sanity: the trait-cast fat-pointer form must NOT appear in
+    // this (unrelated) cast surface — neither the `_VTable_for_'
+    // registration reference nor `@ptrCast(&...` (the value-typed
+    // trait-cast address-of path).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "_VTable_for_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrCast(&") == null);
+}

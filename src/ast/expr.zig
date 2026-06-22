@@ -231,6 +231,18 @@ pub const Expr = union(enum) {
         target: *Expr,
         name: []const u8,
         args: []const Expr,
+        /// Generics turbofish (Phase 3 trait dispatch, docs/17 §"Using Traits"):
+        /// the user must supply the vtable's source-type via turbofish at the
+        /// call site so the dispatch shim's `comptime T: type` parameter
+        /// resolves to the registered source-type (e.g.
+        /// `d.draw<Button>()` emits `d.draw(Button)` which binds Button to the
+        /// shim's `T`). Empty default slice preserves the non-generic call
+        /// shape — existing tests that never used turbofish on `.method_call`
+        /// keep round-tripping byte-identical. Set by Parser.parsePostfix's
+        /// `.dot` arm when the leading `(<types...)` follows the method's own
+        /// `(args...)` paren-pair; mirrors CallExpr.type_args so the same
+        /// `Parser.parseTurbofishArgs` helper drives both call shapes.
+        type_args: []const []const u8 = &[_][]const u8{},
     };
 
     /// Range expression — `start..end` (inclusive=false) or `start...end`

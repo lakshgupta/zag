@@ -55,6 +55,25 @@ pub const Codegen = struct {
     /// bare indented `(blk: { ... });` statement (the value-discarding
     /// form zig accepts at any other position).
     fn_returns_value: bool,
+    /// Tracked trait-decl names (Phase 3 trait-cast, docs/17 §"Using
+    /// Traits"): populated at `generate()` entry from `prog.traits`
+    /// so the `.cast` arm in `genExpr` can detect `x as Trait` forms
+    /// by string-equality against the SET of declared trait names.
+    /// Each slot is parsed-verbatim (e.g. `"Drawable"` from the
+    /// source). The buffer reset lives in `init()`. The cast arm
+    /// consults this set FIRST — if the cast's `type_text` matches a
+    /// tracked name AND the source operand is an `.ident` whose
+    /// `type_info_buf` entry exists, the trait-cast branch fires
+    /// (emit fat-pointer container + vtable registration lookup);
+    /// otherwise the legacy `@as(T, expr)` emit runs unchanged so
+    /// non-trait cast surface is preserved byte-identical.
+    tracked_trait_names: [256][]const u8,
+    /// Count of valid entries in `tracked_trait_names` (Phase 3).
+    /// Reset to 0 in `init()`; populated as `prog.traits` is walked
+    /// at `generate()` entry, BEFORE any function body emits its
+    /// first stmt (so the cast arm in `genExpr` sees the populated
+    /// set when traversing function-local casts).
+    tracked_trait_count: u32,
 
 
     pub const collectTypedBindings = @import("stmt.zig").collectTypedBindings;
@@ -84,6 +103,8 @@ pub const Codegen = struct {
     pub const init = @import("core.zig").init;
     pub const isClosureBound = @import("core.zig").isClosureBound;
     pub const isFloatIdentType = @import("core.zig").isFloatIdentType;
+    pub const isTrackedTrait = @import("core.zig").isTrackedTrait;
+    pub const getSourceTypeName = @import("core.zig").getSourceTypeName;
     pub const needsIntDivShim = @import("primary.zig").needsIntDivShim;
     pub const write = @import("core.zig").write;
 };
@@ -102,6 +123,15 @@ pub const Codegen = struct {
             .alloc_counter = 0,
             .match_counter = 0,
             .fn_returns_value = false,
+            // Phase 3 trait-cast: the tracked trait-name set starts
+            // empty; generate() populates from prog.traits before any
+            // function body emits its first stmt. The array content
+            // is `undefined` until the population pass writes into
+            // indices 0..tracked_trait_count; readers (isTrackedTrait)
+            // only consult indices 0..count so the undefined bytes are
+            // never observed.
+            .tracked_trait_names = undefined,
+            .tracked_trait_count = 0,
         };
     }
 
@@ -167,6 +197,24 @@ pub const Codegen = struct {
             }
             self.genStructDecl(sd, prog.impls);
         }
+        // Phase 3 trait-cast: populate `tracked_trait_names` from
+        // `prog.traits` BEFORE any function body emits so the cast
+        // arm in `genExpr` sees the populated set when traversing
+        // function-local `x as Trait` expressions. The populate
+        // happens AFTER struct/enum-impl broadcasting (so any
+        // forward-reference quirks on the struct side don't bleed
+        // into the trait-side lookup) but before the trait-decl
+        // emission loop below (the trait declarations are emitted
+        // into the output buffer, but the codegen-side tracking can
+        // happen any time since it just records the source-decl name
+        // verbatim — independent of zig-side type resolution).
+        for (prog.traits) |td| {
+            if (self.tracked_trait_count < self.tracked_trait_names.len) {
+                self.tracked_trait_names[self.tracked_trait_count] = td.name;
+                self.tracked_trait_count += 1;
+            }
+        }
+
         // Orphan impls (target_type not declared as a struct) emit as
         // module-level free functions with `_<target_type>_<name>` names
         // so a stray `impl Foo { pub fun bar() -> i32 { ... } }` line
@@ -307,4 +355,38 @@ pub const Codegen = struct {
             }
         }
         return false;
+    }
+
+    /// Phase 3 trait-cast: lookup helper for the trait-name set
+    /// populated at generate() entry. Returns true iff `name` appears
+    /// as a declared trait decl in this program's `prog.traits` slice.
+    /// O(N) walk over `tracked_trait_names[0..tracked_trait_count]`
+    /// — for v1 surface this is bounded (typically 1-3 traits per
+    /// file) so the linear cost is acceptable; a future Phase could
+    /// swap to a hash-set if the trait count grows past 16.
+    /// Called by `.cast` arm in `genExpr` (only when the cast's
+    /// `type_text` is a single identifier — multi-token types like
+    /// `*const Trait` never enter the trait-cast branch).
+    pub     fn isTrackedTrait(self: *Codegen, name: []const u8) bool {
+        for (self.tracked_trait_names[0..self.tracked_trait_count]) |tn| {
+            if (std.mem.eql(u8, tn, name)) return true;
+        }
+        return false;
+    }
+
+    /// Phase 3 trait-cast: returns the source-type recorded for the
+    /// binding named `name` in this function's `type_info_buf`. The
+    /// traced type is the verbatim source text from the user's
+    /// `let x: T = ...` annotation (e.g. `"Button"`, `"*Button"`,
+    /// `"*const Button"`) — interpreted by the cast arm's pointer-
+    /// detection branch. Returns null when no entry exists (the
+    /// source binding is unannotated, or the source is a more
+    /// complex expression than a single ident). Mirrors
+    /// `isClosureBound`'s type_info walk shape so v1's typed-binding
+    /// surface is consistent across both call sites.
+    pub     fn getSourceTypeName(self: *Codegen, name: []const u8) ?[]const u8 {
+        for (self.type_info_buf[0..self.type_info_count]) |ti| {
+            if (std.mem.eql(u8, ti.name, name)) return ti.type_name;
+        }
+        return null;
     }

@@ -1,0 +1,29 @@
+# Phase 3 trait-cast end-to-end demo (docs/17 §"Using Traits").
+# Demonstrates the minimum-subset round-trip:
+#   1. trait decl with required method
+#   2. struct decl with field
+#   3. impl block providing the trait-method
+#   4. cast arm: `btn as Drawable` emitting the fat-pointer container
+#   5. dispatch arm: `d.draw<Button>()` calling through the vtable
+
+trait Drawable {
+    fun draw(self: *Self);
+}
+
+struct Button {
+    label: str,
+}
+
+impl Button {
+    pub fun Drawable.draw(self: *Button) {
+        print("button: ");
+        print(self.label);
+        print("\n");
+    }
+}
+
+fun main() {
+    let btn: Button = Button { label: "click me" };
+    let d = btn as Drawable;
+    d.draw<Button>();
+}

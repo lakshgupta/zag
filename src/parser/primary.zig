@@ -444,6 +444,42 @@ pub fn parsePostfix(self: *Parser) Expr {
                     const target_buf = self.arena.alloc(Expr, 1);
                     target_buf[0] = lhs;
                     lhs = .{ .method_call = .{ .target = &target_buf[0], .name = name, .args = args } };
+                } else if (self.peek().tag == .lt) {
+                    // Method-call turbofish (Phase 3 trait dispatch,
+                    // docs/17 §"Using Traits"). After `.name`, a `.lt`
+                    // token can ONLY be the start of a turbofish call
+                    // site — `obj.draw < a` would have `.draw` fall
+                    // back to member_access (no parens after `.draw`),
+                    // so reaching this arm with `.lt` after `.name` is
+                    // unambiguous. Mirrors the `.call` turbofish
+                    // surface (parsePrimary's ident path) but applied
+                    // to `.method_call` so the dispatch shim's `comptime
+                    // T: type` resolves at the call site to the
+                    // registered source-type — `d.draw<Button>()`
+                    // emits `d.draw(Button)` which binds Button to the
+                    // shim's `T` placeholder, and the shim body
+                    // discards T (the `_ = T;` in `genTraitDecl`) and
+                    // forwards to the vtable slot.
+                    self.advance(); // consume leading `<`
+                    const mc_type_args = self.parseTurbofishArgs();
+                    self.expect(.lparen);
+                    var args_buf: [16]Expr = undefined;
+                    var arg_count: usize = 0;
+                    if (self.peek().tag != .rparen) {
+                        args_buf[arg_count] = self.parseExpr();
+                        arg_count += 1;
+                        while (self.peek().tag == .comma) {
+                            self.advance();
+                            args_buf[arg_count] = self.parseExpr();
+                            arg_count += 1;
+                        }
+                    }
+                    self.expect(.rparen);
+                    const ta_args = self.arena.alloc(Expr, arg_count);
+                    @memcpy(ta_args, args_buf[0..arg_count]);
+                    const ta_target_buf = self.arena.alloc(Expr, 1);
+                    ta_target_buf[0] = lhs;
+                    lhs = .{ .method_call = .{ .target = &ta_target_buf[0], .name = name, .args = ta_args, .type_args = mc_type_args } };
                 } else {
                     // Property-access form: `.name` (no parens). Codegen
                     // emits `<target>.<name>` verbatim — the user-facing
