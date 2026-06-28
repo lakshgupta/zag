@@ -838,6 +838,7 @@ comptime {
     _ = @import("tests/parser.zig");
     _ = @import("tests/codegen.zig");
     _ = @import("tests/toolchain.zig");
+    _ = @import("tests/env_path.zig");
     // Phase 1 single-file staging: toolchain.zig's top-level
     // `@embedFile("../vendor/zig/zig.empty")` must fire so a future
     // materialize call site can consult `has_payload()`. Today's

@@ -216,3 +216,52 @@ pub fn resolveZagCacheDir(buf: []u8, comptime_fallback: []const u8) []const u8 {
     }
     return comptime_fallback;
 }
+
+/// Test-only helper. Resets `environ_count` and populates
+/// `environ_entries` from `entries` literally: each entry's bytes
+/// (including its trailing NUL sentinel) is written into the
+/// caller-provided `backing` buffer, and `environ_entries[i]` is set
+/// to a sentinel-terminated slice pointing into `backing`. Tests
+/// typically pass a stack-allocated byte buffer sized for a handful
+/// of entries -- production code never calls this fn, so the test-
+/// only shape stays localised at the bottom of the module.
+///
+/// Why `backing` is caller-provided rather than writing into the
+/// module-private `environ_buf`: the (c) cleanup that tightened
+/// `environ_buf`'s visibility to module-private (no `pub`) is
+/// preserved by letting tests bring their own backing bytes. Prod
+/// code still writes to `environ_buf`'s 131 KB reserve at startup
+/// via `readEnviron`; tests routinely use a much smaller stack-
+/// allocated scratch (e.g. 4 KB suffices for ~30 short entries).
+///
+/// Coercion walkthrough (the zig 0.16 slice-to-many-pointer shape
+/// `readEnviron` already exercises): `backing[offset.. :0]` produces
+/// a sentinel-terminated slice typed `[]const u8` with the `:0`
+/// sentinel byte at index `offset + entry.len` (i.e. `backing[offset
+/// + entry.len] == 0`). Subscripting `[0..entry.len]` narrows to
+/// the entry's payload, dropping the sentinel byte from the slice's
+/// length (the sentinel byte still lives in `backing` and is what
+/// zig reads when a future call runs `std.mem.span(entry_ptr)`).
+/// The `?[*:0]const u8` slot auto-wraps the slice as `Some(...)` on
+/// assignment.
+pub fn setEnvironForTesting(entries: []const []const u8, backing: []u8) void {
+    environ_count = 0;
+    var offset: usize = 0;
+    for (entries) |entry| {
+        if (environ_count >= environ_entries.len) break;
+        const total = entry.len + 1;
+        if (offset + total > backing.len) break;
+        @memcpy(backing[offset..][0..entry.len], entry);
+        backing[offset + entry.len] = 0;
+        // Subscript first, then `:0` annotate at the tail -- mirrors
+        // `readEnviron`'s `environ_buf[start..i :0]` shape verbatim so
+        // the subscript order matches zig's `[a..b :0]` coercion path.
+        // The reverse ordering `[a.. :0][0..n]` would yield a plain
+        // `[]const u8` (sentinel annotation lost) that fails to coerce
+        // into the `?[*:0]const u8` slot under zig 0.16's stricter
+        // pointer-type rules.
+        environ_entries[environ_count] = backing[offset..][0..entry.len :0];
+        offset += total;
+        environ_count += 1;
+    }
+}
