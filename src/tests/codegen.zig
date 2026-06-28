@@ -1,6 +1,22 @@
 // Auto-extracted from src/main.zig. Tests live here so main.zig
 // stays focused on CLI plumbing. Zigs `test "..." {}` discovery
 // follows the comptime imports at the bottom of main.zig.
+//
+// v1→v2 enum/union taxonomy note: The v1 compiler parses both bare
+// enumerations and payload-bearing tagged unions via the `enum` keyword.
+// v2 splits the surface: `enum` becomes bare-only, and `union` is the
+// keyword for tagged unions (variants may carry payloads OR be bare,
+// mixed is allowed). The tests in this file still exercise the v1
+// `enum` parser path — they are forward-compatible because both:
+//   1. `enum X { bare_variant, bare_variant }` will read identically
+//      in v2 (`enum` keyword still valid for bare-only forms).
+//   2. `enum X { payload_variant(T), payload_variant(U) }` becomes
+//      `union X { payload_variant(T), payload_variant(U) }` in v2, but
+//      the codegen emits the same zig `union(enum) { ... }` shape.
+// When v2 lands, the payload-bearing tests should be migrated to write
+// `union X { ... }` in their source strings and the test docstrings
+// updated to match — but no behavioural pin changes.
+// Docs: docs/spec.md §3.3, docs/manual/13-enums.md, docs/manual/14-unions.md.
 
 const std = @import("std");
 const lexer_mod = @import("../lexer.zig");

@@ -1,10 +1,12 @@
 # Enums
 
+> **v1→v2 migration note.** In the unified v2 taxonomy, `enum` is reserved for **bare enumerations** (variants carry no payload). For any type whose variants carry payload — or for a type mixing bare and payload variants — use `union` instead; see [Unions](14-unions.md). For v1 (the current compiler), the `enum` keyword continues to accept bare and payload forms alike: `enum Direction { North, South }` and `enum Option<T> { Some(T), None }` both compile today. The split is forward-looking — once the v2 `union` keyword lands, payload-bearing declarations move to `union`.
+
 ## Definition
 
-Enums are tagged unions (algebraic data types):
+Enums are bare enumerations. Each variant is a name with no associated data:
 
-```
+```zag
 enum Direction {
     North,
     South,
@@ -15,74 +17,51 @@ enum Direction {
 let dir = Direction.North;
 ```
 
-**Memory:** Tagged union. Size = tag size + largest variant. `Direction` is 1 byte (1-byte tag).
+**Memory:** The variants of a bare enumeration reduce to a tag. `Direction` is 1 byte (4 variants, fits in a `u8` tag). For ≤256 variants the size is 1 byte; for larger enumerations the tag widens to `u16` / `u32`.
 
-## Enums with Data
+## Color Example
 
-```
-enum Shape {
-    Circle(f64),                    # radius
-    Rectangle(f64, f64),           # width, height
-    Triangle([3]f64),              # vertices
+```zag
+enum Color {
+    Red,
+    Green,
+    Blue,
 }
-```
 
-**Memory:** `Shape` is `max(sizeof(f64), sizeof([3]f64))` + tag = 24 + 1 = 25 bytes (with alignment).
+let c: Color = Color.Red;
+```
 
 ## Pattern Matching
 
-```
-match shape {
-    Shape.Circle(r) => {
-        let area = 3.14159 * r * r;
-        print("circle area: {area}\n");
-    }
-    Shape.Rectangle(w, h) => {
-        let area = w * h;
-        print("rect area: {area}\n");
-    }
-    Shape.Triangle(pts) => {
-        print("triangle\n");
-    }
-}
-```
-
-## Option and Result
-
-The standard library defines these core enums:
-
-```
-enum Option<T> {
-    Some(T),
-    None,
-}
-
-enum Result<T, E> {
-    Ok(T),
-    Err(E),
+```zag
+match dir {
+    Direction.North => print("up\n"),
+    Direction.South => print("down\n"),
+    Direction.East  => print("right\n"),
+    Direction.West  => print("left\n"),
 }
 ```
 
 ## Exhaustiveness
 
-`match` must be exhaustive — every variant must be handled:
+`match` on an enum value must be exhaustive — every variant must be handled. Omitting a variant is a compile error:
 
-```
+```zag
 match dir {
     Direction.North => ...,
     Direction.South => ...,
     Direction.East  => ...,
     Direction.West  => ...,
+    # omitting any of the four is a compile error
 }
-# omitting a variant is a compile error
 ```
 
-Use `_` for a catch-all:
+Use `_` for a catch-all (covers all unlisted variants):
 
-```
+```zag
 match dir {
     Direction.North => ...,
-    _ => ...,
+    _               => ...,    # catches South, East, West
 }
 ```
 
@@ -90,25 +69,37 @@ match dir {
 
 When the type is inferred, variants can be unqualified:
 
-```
-match result {
-    Ok(val) => process(val),       # unqualified
-    Err(e) => handle_error(e),     # unqualified
+```zag
+fun is_north(d: Direction) -> bool {
+    match d {
+        North => true,
+        _     => false,
+    }
 }
 ```
 
-## Custom Error Enums
+Use qualified names when the type is ambiguous or for clarity.
 
-```
-enum MyError {
-    NotFound,
-    Timeout,
-    Custom(str),
+## Repr Control
+
+`#[repr(C, T)]` constrains an enum's tag width and layout to match a C-compatible representation:
+
+```zag
+#[repr(C, i32)]
+enum CError {
+    Ok = 0,
+    NotFound = 1,
+    Permission = 2,
 }
-
-fun risky() -> Result<i32, MyError> {
-    return Err(MyError.Timeout);
-}
 ```
 
-**Memory:** Enums are stack-allocated. No heap allocation unless a variant contains a heap type (`String`, etc.).
+The tag type follows `T`; explicit `= N` discriminants pin specific values. FFI requires `#[repr(C, T)]` if a C-side enum is involved.
+
+## `Error` Type
+
+The canonical error type in the standard library is an `enum Error { NotFound, Permission, Io, Parse, InvalidInput, Unavailable, Other }` — all bare variants, hence `enum`, not `union`. See [Error Handling](18-error-handling.md) for the full discussion.
+
+## See Also
+
+- [Unions](14-unions.md) — tagged unions / sum types
+- [Pattern Matching](27-pattern-matching.md) — full `match` syntax

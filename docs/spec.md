@@ -32,7 +32,7 @@ as        async     await     break     catch     const     continue
 defer     else      enum      errdefer  extern    false     for
 fun       if        impl      import    in        let       match
 null      pub       return    select    struct    trait     true
-type      undefined unsafe    var       void      while
+type      undefined union     unsafe    var       void      while
 ```
 
 `Self` is a contextual identifier referring to the current type in an `impl` block. `self` is the conventional name for a method's first parameter.
@@ -390,20 +390,42 @@ let modified = Vec3 { ...base, z: 10.0 };   # { x: 1.0, y: 2.0, z: 10.0 }
 
 **Field visibility:** Struct fields are **private by default**. Access from outside the module requires getter/setter methods. There is no `pub` on fields — this keeps structs encapsulated and makes OOP boundaries explicit. Because all fields are private, struct literals (`Button { x: 0, y: 0, ... }`) can only be constructed **within the same module**. External construction requires a constructor method (a `pub` function that returns the struct).
 
-**Enums** — tagged unions (ADTs); variants are PascalCase
+**Enums** — bare enumerations; variants are PascalCase. `Color`, `Direction`, and `Error` are typical cases. Variants carry no payload — for any variant that holds data, or for a type with a mix of bare and payload variants, use `union` (§3.3 Unions). The v1 compiler currently accepts the older `enum X { Variant(T) }` syntax as a payload-bearing tagged union; v2 splits this surface so bare enumerations stay under `enum` and the payload-bearing forms migrate to `union`.
 ```
-enum Option<T> {
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+```
+
+**Unions** — tagged unions / sum types. Variants may carry payloads, be bare, or a mix of both. Constructor syntax follows the variant name: `Variant()` for a bare variant, `Variant(arg1, arg2, …)` for a payload variant. Pattern matching destructures the payload per variant. Variants are PascalCase.
+```
+union Option<T> {
     Some(T),
     None,
 }
 
-enum Result<T, E> {
+union Result<T, E> {
     Ok(T),
     Err(E),
 }
+
+union Shape {
+    Circle(f64),
+    Rect(f64, f64),
+    Empty,
+}
 ```
 
-**Error type** — the canonical error type is an enum defined in the stdlib (§11.1). `Error` has variants `NotFound`, `Permission`, `Io`, `Parse`, `InvalidInput`, `Unavailable`, and `Other`. The compiler enforces exhaustiveness in `catch |err|` blocks that match on `err` directly. `Error` is **zero-alloc** — no heap-allocated message field.
+**Error type** — the canonical error type is an `enum` defined in the stdlib (§11.1). Its variants are all bare, so it is written with `enum`, not `union`. `Error` has variants `NotFound`, `Permission`, `Io`, `Parse`, `InvalidInput`, `Unavailable`, and `Other`. The compiler enforces exhaustiveness in `catch |err|` blocks that match on `err` directly. `Error` is **zero-alloc** — no heap-allocated message field. For custom error types that carry data, use `union MyError { NotFound, Timeout, Custom(str) }` — see below.
 
 **Error context** — for cases needing context (HTTP handlers, database queries), use `std.error.Context`, a separate type that wraps an `Error` with an optional message. It is only allocated when explicitly created:
 
@@ -441,9 +463,9 @@ catch |ctx: Context| {
 
 `Result<T, Context>` works with `?` because `Context` wraps `Error`. The `catch |ctx: Context|` form binds the full context.
 
-Defining a custom error type:
+Defining a custom error type — use `union` because one of the variants carries a payload:
 ```zag
-enum MyError {
+union MyError {
     NotFound,
     Timeout,
     Custom(str),
@@ -452,7 +474,7 @@ enum MyError {
 
 Custom error types work with `Result<T, MyError>` and `catch |err| { match err { ... } }` identically to the built-in `Error`. They can also be wrapped in `Context` via the same `ErrorExt` trait (implemented for any error enum).
 
-**Unions** — use `unsafe transmute<T, U>(val: T) -> U` for type-punning. `transmute` reinterprets the bytes of a value as a different type. The source and target types must have the same size.
+**Byte reinterpretation** — use `unsafe transmute<T, U>(val: T) -> U` for type-punning. `transmute` reinterprets the bytes of a value as a different type. The source and target types must have the same size. (Renamed from "Unions" so the section title isn't confused with the new `union` keyword (§3.3 Unions) for tagged-union types.)
 
 ```
 unsafe {

@@ -1,11 +1,20 @@
 # examples/types/enum.zag
 #
-# End-to-end demonstration of enum support (docs/manual/13-enums):
+# End-to-end demonstration of enum support (docs/manual/13-enums + 14-unions):
 #   - Bare tag-only enum with impl method
 #   - Payload-bearing enum (single-arg + multi-arg variants)
 #   - Exhaustive match with bare-variant patterns + `_` wildcard
 #   - Qualified variant construction in expression position
 #   - Impl flattened to a free function (`Direction_opposite`) by codegen
+#
+# v1→v2 migration: The v1 compiler uses the `enum` keyword for both bare
+# enumerations and payload-bearing tagged unions. v2 splits the surface:
+#   - `enum Direction { ... }` stays `enum` (all bare variants).
+#   - `enum Shape { Circle(f64), Rect(f64, f64) }` becomes `union Shape { ... }`
+#     in v2 because at least one variant carries a payload.
+# This file is kept in the v1 form so it continues to compile against the
+# current compiler. The taxonomy is documented in docs/manual/13-enums.md
+# (bare enumerations) and docs/manual/14-unions.md (tagged unions).
 
 enum Direction {
     North,

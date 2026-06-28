@@ -97,7 +97,7 @@ Generic impl blocks emit one orphan free function per method at module scope:
 pub fn List_T_push(comptime T: type, self: *List(T), value: T) void { ... }
 ```
 
-The compiler rewrites each `<TYPE>` segment in receiver and parameter types to `(TYPE)` when the segment matches one of the impl's declared type-param names (`T`, `U`, `K`, `V`, …). Segments that don't match a type-param name on the enclosing impl (e.g. nested generic-enum monomorphizations) pass through verbatim.
+The compiler rewrites each `<TYPE>` segment in receiver and parameter types to `(TYPE)` when the segment matches one of the impl's declared type-param names (`T`, `U`, `K`, `V`, …). Segments that don't match a type-param name on the enclosing impl (e.g. nested generic-union monomorphizations) pass through verbatim.
 
 ## No Trait Bounds on Associated Types
 

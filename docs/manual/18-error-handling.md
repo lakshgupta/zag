@@ -4,14 +4,16 @@ Zag uses `Result<T, E>` and `Option<T>` for error handling. No exceptions.
 
 ## Result
 
-```
-enum Result<T, E> {
+`Result` is a `union` (tagged union) because its variants carry payloads:
+
+```zag
+union Result<T, E> {
     Ok(T),
     Err(E),
 }
 ```
 
-```
+```zag
 fun divide(a: f64, b: f64) -> Result<f64, str> {
     if b == 0.0 {
         return Err("division by zero");
@@ -27,14 +29,18 @@ match divide(10.0, 3.0) {
 
 ## Option
 
-```
-enum Option<T> {
+`Option` is a `union` because it mixes a payload variant (`Some(T)`) with a bare variant (`None`):
+
+```zag
+union Option<T> {
     Some(T),
     None,
 }
 ```
 
-```
+**Mixed bare + payload variants** are fully supported by `union`. The bare form `None` is constructed without parentheses (`Option.None`); the payload form `Some(x)` carries the value (`Option.Some(42)`). Pattern matching destructures per variant: `match opt { Option.Some(x) => use(x), Option.None => bail() }`.
+
+```zag
 fun find(arr: []i32, target: i32) -> Option<usize> {
     for i in 0..arr.len {
         if arr[i] == target {
@@ -114,9 +120,9 @@ let val = risky() catch |err| {
 
 ## Error Type
 
-The canonical error type is zero-alloc:
+The canonical error type is `enum` (used bare, no payloads), and is zero-alloc:
 
-```
+```zag
 enum Error {
     NotFound,
     Permission,
@@ -139,7 +145,7 @@ import std.error
 
 fun read_config(path: str) -> Result<Config, Context> {
     let data = fs.read(path)?
-        .context_str("failed to read config")?;
+        .context_str("failed to read config file")?;
     let config = parse(data)?
         .context("failed to parse config")?;
     return Ok(config);
@@ -150,8 +156,10 @@ fun read_config(path: str) -> Result<Config, Context> {
 
 ## Custom Error Types
 
-```
-enum MyError {
+When an error type carries data on any variant, use `union` instead of `enum`:
+
+```zag
+union MyError {
     NotFound,
     Timeout,
     Custom(str),

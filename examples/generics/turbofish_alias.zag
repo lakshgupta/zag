@@ -12,7 +12,7 @@
 ##     BEFORE the call expression emits, so zig sees
 ##     `identity([]const u8, "hi")` — the alias is transparent at the call
 ##     site exactly as it is at declaration sites (param annotations, struct
-##     field types, enum payload types, binding annotations, etc.).
+##     field types, union payload types, binding annotations, etc.).
 ##
 ## Why this lives in its own file:
 ##   The broader surface (§1-§4 generic-function shapes, §2 generic structs,

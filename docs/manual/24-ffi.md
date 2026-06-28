@@ -57,6 +57,8 @@ enum CError {
 }
 ```
 
+`enum` is the right keyword here because all variants are bare. For tagged unions crossing the FFI boundary, `#[repr(C, T)] union X { VariantA, VariantB(T) }` works the same way: the discriminant type follows `T` (default `u8` if omitted), and only explicitly assigned variants pin a specific tag — bare unassigned variants take the next successive value, payload-bearing unassigned variants still get distinct tag values per the ADT contract. **C ABI detail:** the C consumer of a `union` FFI type sees only the discriminant field; decoding a payload variant on the C side requires the caller to know the variant shape, which is why the explicit `= N` pins matter for any variant whose tag is part of the C-visible contract.
+
 ## Importing C Libraries
 
 ```

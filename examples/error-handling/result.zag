@@ -1,6 +1,14 @@
 ## Error handling with Result, Option, and ?
 ##
 ## Run: zag run result.zag
+##
+## v1→v2 migration: `Result<T, E>` and `Option<T>` are `union`s in the v2
+## taxonomy (they carry payloads and may mix bare and payload variants).
+## The v1 compiler parses `union X { ... }` via the `enum` keyword pending
+## the v2 `union` keyword being wired in, so this file does not declare
+## `Result` / `Option` itself — those types are supplied by the standard
+## library. Each is written with `union` in docs/manual/14-unions.md and
+## docs/manual/18-error-handling.md.
 
 fun divide(a: i32, b: i32) -> Result<i32, str> {
     if b == 0 {

@@ -34,7 +34,8 @@ let y: f32 = 3.14;           # f32, not the inferred f64
 | Slices | `[]T`, `[]const T` | Stack (ptr + len) |
 | Arrays | `[N]T` | Stack, fixed size |
 | Structs | `struct { ... }` | Stack (by value) |
-| Enums | `enum { ... }` | Stack (tagged union) |
+| Enums | `enum { ... }` | Stack (bare enumeration — tag only) |
+| Unions | `union { ... }` | Stack (tagged union — tag + max payload) |
 | Tuples | `(T, U)` | Stack |
 | SIMD | `f32x4`, `i8x32` | Stack (register) |
 
@@ -75,7 +76,7 @@ let t = s;          # s is moved — s is invalid after this
 - `*const T`, `*raw T`, `[]T`, `[]const T`, `?*T`, `?*const T`, `?*raw T` are `Copy`
 - `*T` (owning mutable pointer) is NOT `Copy`
 - `String` is NOT `Copy`
-- Structs/enums are `Copy` iff all fields are `Copy`
+- Structs, bare enums, and `union`s are `Copy` iff all fields/variants are `Copy`
 
 ## `as` — Type Conversion
 

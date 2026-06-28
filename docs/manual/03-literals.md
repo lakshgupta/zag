@@ -96,7 +96,7 @@ let unit                   = ();          # void / unit tuple — zero-sized
 let named                  = (x: 10, y: 20); # field names compile away; same ABI as (10, 20)
 ```
 
-**Memory:** Stack-allocated. Size is sum of element sizes (with padding). Names vanish at the ABI level — `(x: 10, y: 20)` and `(10, 20)` are identical in memory. See [Tuples](14-tuples.md) for destructuring.
+**Memory:** Stack-allocated. Size is sum of element sizes (with padding). Names vanish at the ABI level — `(x: 10, y: 20)` and `(10, 20)` are identical in memory. See [Tuples](15-tuples.md) for destructuring.
 
 ## Null and Undefined
 

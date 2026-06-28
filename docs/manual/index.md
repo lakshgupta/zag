@@ -20,8 +20,9 @@ A comprehensive guide to the Zag programming language.
 - [Arrays and Slices](10-arrays-and-slices.md) — Fixed-size arrays, slicing, SIMD conversion
 - [Strings](11-strings.md) — String vs str, interpolation, memory
 - [Structs](12-structs.md) — Structs, embedding, methods, derive
-- [Enums](13-enums.md) — Tagged unions, Option, Result
-- [Tuples](14-tuples.md) — Tuple types and destructuring
+- [Enums](13-enums.md) — Bare enumerations
+- [Unions](14-unions.md) — Tagged unions, Option, Result
+- [Tuples](15-tuples.md) — Tuple types and destructuring
 
 ## Operations
 
