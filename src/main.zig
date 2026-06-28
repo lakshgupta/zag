@@ -9,27 +9,39 @@ const build_options = @import("build_options");
 
 var zig_path: []const u8 = undefined;
 
-/// Zag-managed zig cache directory. Overridable at build time
-/// via `-Dz_install=<dir>` (default: `/home/lex/.local/zag`);
-/// `build_options.z_install` carries the value through
-/// `build.zig`'s `addOption` plumbing. The materialize
-/// destination `zag_cache_zig_path` is parameterized as
-/// `<zag_cache_dir>/zig` via the existing comptime `++` concat
-/// below -- keeping the override at the directory level (rather
-/// than full-path) so the runtime `std.os.linux.mkdir` on the
-/// cache parent stays verbatim and the bytes-on-disk layout
-/// users can `ls` is unchanged.
+/// Zag-managed zig cache directory. The materialize destination
+/// `zag_cache_zig_path` is parameterized as `<zag_cache_dir>/zig`
+/// so the runtime `std.os.linux.mkdir` on the cache parent stays
+/// verbatim and the bytes-on-disk layout users can `ls` is
+/// unchanged (one file, named `zig`, inside the dir).
+///
+/// Resolution (Phase 3 -- order matters):
+///   1. `$ZAG_HOME` if set (explicit user override; wins,
+///      populated verbatim, trailing-slash tolerant via fs calls
+///      that ignore double slashes)
+///   2. `$XDG_CACHE_HOME/zag` if set (freedesktop.org cache
+///      convention -- semantically correct for a reproducible
+///      binary payload that can be re-materialized at any time)
+///   3. `$HOME/.cache/zag` if neither above is set (POSIX-friendly
+///      HOME fallback that honours XDG_CACHE_HOME's `~/.cache`
+///      convention)
+///   4. `build_options.z_install` (compile-time `-Dz_install=<dir>`
+///      default, `/home/lex/.local/zag` out of the box)
+///
+/// Stored as `var` because env-pass + resolution happen at
+/// startup in `main()` (between `readEnviron` and the `mkdir`+
+/// materialize steps). The comptime `++ "/zig"` shape is preserved
+/// as the initial value so the runtime fallback to
+/// `options.z_install` still produces a syntactically correct
+/// `<dir>/zig` materialize path without an extra format step.
 ///
 /// The user-installed zig at `zig_install_path` is unchanged and
 /// remains the no-payload / materialize-failure fallback -- a
 /// separate concern from the zag-managed cache dir this overrides.
-/// TODO(XDG_DATA_HOME-based): when main.zig generalises to
-/// user-portable installs, replace this direct path with a
-/// $ZAG_HOME / XDG_DATA_HOME lookup. Stays at the directory level
-/// (not full-path) so the existing `++ "/zig"` shape keeps working
-/// and the runtime `mkdir` stays verbatim.
-const zag_cache_dir = build_options.z_install;
-const zag_cache_zig_path = zag_cache_dir ++ "/zig";
+var zag_cache_dir: []const u8 = build_options.z_install;
+var zag_cache_zig_path: []const u8 = build_options.z_install ++ "/zig";
+var zag_cache_dir_buf: [4096]u8 = undefined;
+var zag_cache_zig_path_buf: [4096]u8 = undefined;
 
 /// User-installed zig runtime -- the fallback `zig_path` used
 /// when `toolchain.tryMaterialize` is a no-op (default empty-
@@ -53,16 +65,30 @@ const usage =
 ;
 
 pub fn main() !void {
-    // Phase 1 followup (single-file staging): zig_path is
-    // resolved by the materialize block below -- the embedded
-    // payload at `zag_cache_zig_path` if `tryMaterialize`
-    // succeeded (future `-Dzig_payload=<path>` option), or
-    // the user's installed fallback at
-    // /home/lex/.local/zig/zig otherwise. Today's empty
-    // sentinel folds `has_payload()` to false at comptime
-    // and `tryMaterialize` early-returns without touching
-    // disk, so the fallback path stays active under the
-    // default build.
+    // Phase 1 followup: zig_path is resolved by the materialize
+    // block below -- the embedded payload at `zag_cache_zig_path`
+    // if `tryMaterialize` succeeded (when `build_options.zig_payload`
+    // is non-empty), or the user's installed fallback at
+    // /home/lex/.local/zig/zig otherwise. The empty sentinel
+    // folds `has_payload()` to false at comptime and
+    // `tryMaterialize` early-returns without touching disk, so
+    // the fallback path stays active under the default build.
+
+    // Phase 3 followup: read /proc/self/environ FIRST so the
+    // env-pass arrays consulted by `runCommand` (later) AND
+    // `resolveZagCacheDir` (right after) are populated. The order
+    // matters: `getenv` walks `environ_entries`, so resolveZagCacheDir
+    // must run AFTER readEnviron, AND resolveZagCacheDir must run
+    // BEFORE mkdir+materialize so the materialize destination
+    // matches what the resolved cache dir says it should be.
+    readEnviron();
+    zag_cache_dir = resolveZagCacheDir(&zag_cache_dir_buf);
+    const zig_path_formatted = std.fmt.bufPrint(
+        &zag_cache_zig_path_buf,
+        "{s}/zig",
+        .{zag_cache_dir},
+    ) catch build_options.z_install ++ "/zig";
+    zag_cache_zig_path = zig_path_formatted;
 
     // Best-effort mkdir of the cache parent. EEXIST (common
     // case after first install) is silently absorbed because
@@ -93,8 +119,6 @@ pub fn main() !void {
         std.debug.print("{s}", .{usage});
         return;
     }
-
-    readEnviron();
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -158,6 +182,45 @@ fn readEnviron() void {
         environ_count += 1;
         i += 1;
     }
+}
+
+/// Walk `environ_entries` (populated by `readEnviron`) for an
+/// entry whose key matches `name`. Returns the value slice
+/// (everything after the first `=`) if found, else `null`. Empty
+/// values (e.g. `FOO=`) are returned as an empty slice.
+fn getenv(name: []const u8) ?[]const u8 {
+    for (environ_entries[0..environ_count]) |maybe_entry| {
+        const entry_ptr = maybe_entry orelse continue;
+        // `entry_ptr` is a many-pointer [*:0]const u8; zig 0.16's
+        // `std.mem.indexOfScalar` and `std.mem.eql` both require
+        // `[]const T` slices (not pointers), so we materialise a
+        // `[]const u8` from the NUL sentinel up-front.
+        const entry_slice = std.mem.span(entry_ptr);
+        const sep = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
+        if (sep == name.len and std.mem.eql(u8, entry_slice[0..sep], name)) {
+            return entry_slice[sep + 1..];
+        }
+    }
+    return null;
+}
+
+/// Resolve the zag-managed cache directory at runtime per the
+/// priority chain documented on `zag_cache_dir` above. Writes
+/// any `$XDG_CACHE_HOME`- or `$HOME`-derived result into `buf`
+/// (via `bufPrint`); `$ZAG_HOME` and the `build_options.z_install`
+/// fallback are returned as comptime slice values -- no buffer
+/// write needed for those branches. `buf` should be at least
+/// `PATH_MAX`-ish; we use a 4096-byte scratch at the call site
+/// for headroom over the typical 4 KB PATH_MAX / `PATH=...` length.
+fn resolveZagCacheDir(buf: []u8) []const u8 {
+    if (getenv("ZAG_HOME")) |home| return home;
+    if (getenv("XDG_CACHE_HOME")) |cache| {
+        return std.fmt.bufPrint(buf, "{s}/zag", .{cache}) catch build_options.z_install;
+    }
+    if (getenv("HOME")) |home| {
+        return std.fmt.bufPrint(buf, "{s}/.cache/zag", .{home}) catch build_options.z_install;
+    }
+    return build_options.z_install;
 }
 
 fn cmdRun(path: []const u8) !void {

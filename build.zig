@@ -51,8 +51,15 @@ pub fn build(b: *std.Build) void {
     // fallback) is unchanged and remains the no-payload / materialize-
     // failure path. Default `/home/lex/.local/zag` matches the
     // pre-Phase-2 hardcode so an unoption'd build behaves identically.
-    // Phase 3 will swap this for an XDG_DATA_HOME / $ZAG_HOME lookup
-    // at runtime.
+    // -------------------------------------------------------------------
+    // Phase 3 (delivered): the runtime in `src/main.zig` (and its
+    // mirror in `tests/smoke.zig`'s `resolveZagCacheDir`) consults
+    // `$ZAG_HOME` > `$XDG_CACHE_HOME/zag` > `$HOME/.cache/zag`
+    // BEFORE this build-time default. This `-Dz_install` only acts
+    // as the no-env fallback (e.g. when running on a stripped CI
+    // container, or for projects that pin the cache to a non-
+    // standard path). See `src/main.zig`'s `zag_cache_dir` doc
+    // block for the full priority chain and reasoning.
     // -------------------------------------------------------------------
     const z_install_path = b.option(
         []const u8,

@@ -67,18 +67,19 @@ const build_options = @import("build_options");
 /// returns. To smoke a different path, edit this constant.
 const fixture_default = "vendor/zig/zig.test";
 
-/// Default materialize path. Threaded through `build_options.z_install`
-/// (set by `zig build smoke -Dz_install=<dir>` in `build.zig`'s
-/// `smoke_runner_mod.addOptions("build_options", options)` wiring) and
-/// shaped as `<z_install>/zig` via comptime `++` to mirror
-/// `src/main.zig`'s `zag_cache_zig_path` shape exactly. Without
-/// `-Dz_install`, both default to `/home/lex/.local/zag/zig/zig` (the
-/// pre-Phase-2 hardcode), so smoke's Step 4 (materialize-path exists)
-/// + Step 6 (byte-equality fixture vs materialize) keep matching main
-/// under the all-defaults build; with `-Dz_install=<dir>`, they
-/// track the override together. Symmetry-by-construction: any
-/// future zig version that relaxes the hardcode constraint can swap
-/// only main.zig + smoke.zig in lockstep.
+/// Comptime fallback for the materialize path. Initial value
+/// for `materialize` (declared below) before `resolveZagCacheDir`
+/// overrides it at smoke startup. Same shape + same `build_options`
+/// source-of-truth as the main zag binary's `zag_cache_zig_path`,
+/// so Phase 2's `-Dz_install=<dir>` wiring still threads through
+/// unchanged on the env-var-fallback path.
+///
+/// See `src/main.zig`'s `zag_cache_dir` doc for the runtime
+/// resolution chain (`$ZAG_HOME` > `$XDG_CACHE_HOME/zag` >
+/// `$HOME/.cache/zag` > `build_options.z_install`). The smoke
+/// mirrors that resolution at startup so smoke's paths track
+/// main's paths under env-var overrides -- symmetry by
+/// construction.
 const materialize_default = build_options.z_install ++ "/zig";
 
 /// Path to the produced (and pre-built) `zag` binary. Hardcoded
@@ -107,6 +108,20 @@ const zig_dev_local = "/home/lex/.local/zig/zig";
 /// wrong path into the smoke binary at compile-time when the user
 /// has installed but also has a legacy dev-machine zig.
 var zig_path: []const u8 = undefined;
+
+/// Phase 3 mirror of `src/main.zig`'s `zag_cache_dir` +
+/// `zag_cache_zig_path` + scratch buffers. Initialised to
+/// `build_options.z_install`-derived comptime fallback; overridden
+/// at startup by `resolveZagCacheDir` after `readEnviron` populates
+/// `environ_entries`. Tracking main.zig's resolution at runtime
+/// (instead of statically `const`-baking at compile time) is what
+/// keeps smoke's Step 4 + Step 6 byte-equality assertions coherent
+/// with the main zag binary's materialize destination under any
+/// env-var override.
+var materialize_dir: []const u8 = build_options.z_install;
+var materialize: []const u8 = materialize_default;
+var materialize_dir_buf: [4096]u8 = undefined;
+var materialize_buf: [4096]u8 = undefined;
 
 /// Pick the runnable zig for the pre-build invocation: vendored (when
 /// install.sh populated `vendor/zig/zig` during a clone-aware install)
@@ -198,6 +213,50 @@ fn readEnviron() void {
     }
 }
 
+/// Walk `environ_entries` (populated by `readEnviron`) for an
+/// entry whose key matches `name`. Returns the value slice
+/// (without `:0` sentinel — `[]const u8`, since downstream
+/// `bufPrint` `{s}` formatters take that). Uses `std.mem.span`
+/// once at the top of the iteration to materialise a `[]const u8`
+/// from the NUL-terminated many-pointer (`*[*:0]const u8` ->
+/// `[]const u8`), then slices/eql/index from there. Mirrors
+/// `src/main.zig`'s `getenv` verbatim so a future refactor that
+/// lifts one and re-exports it can swap both in lockstep.
+fn getenv(name: []const u8) ?[]const u8 {
+    for (environ_entries[0..environ_count]) |maybe_entry| {
+        const entry_ptr = maybe_entry orelse continue;
+        // `entry_ptr` is a many-pointer [*:0]const u8; zig 0.16's
+        // `std.mem.indexOfScalar` and `std.mem.eql` both require
+        // `[]const T` slices (not pointers), so we materialise a
+        // `[]const u8` from the NUL sentinel up-front.
+        const entry_slice = std.mem.span(entry_ptr);
+        const sep = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
+        if (sep == name.len and std.mem.eql(u8, entry_slice[0..sep], name)) {
+            return entry_slice[sep + 1..];
+        }
+    }
+    return null;
+}
+
+/// Resolve the zag-managed cache directory at smoke-runner
+/// startup. Mirrors `src/main.zig`'s `resolveZagCacheDir` so the
+/// smoke binary tracks the main zag binary's resolution at runtime
+/// -- `$ZAG_HOME` > `$XDG_CACHE_HOME/zag` > `$HOME/.cache/zag` >
+/// `build_options.z_install`. `buf` is sized 4096 at the call
+/// site; the fallback to `build_options.z_install` on
+/// `bufPrint` failure (paths > 4096 bytes) keeps the smoke
+/// panic-free.
+fn resolveZagCacheDir(buf: []u8) []const u8 {
+    if (getenv("ZAG_HOME")) |home| return home;
+    if (getenv("XDG_CACHE_HOME")) |cache| {
+        return std.fmt.bufPrint(buf, "{s}/zag", .{cache}) catch build_options.z_install;
+    }
+    if (getenv("HOME")) |home| {
+        return std.fmt.bufPrint(buf, "{s}/.cache/zag", .{home}) catch build_options.z_install;
+    }
+    return build_options.z_install;
+}
+
 pub fn main() !u8 {
     // One-shot smoke binary; leaked allocations are reclaimed by
     // the OS at process exit. zig 0.16 removed both
@@ -212,10 +271,10 @@ pub fn main() !u8 {
     const allocator = std.heap.page_allocator;
 
     // Paths hardcoded for zig 0.16 stdsurface compatibility. Override
-    // by editing these constants -- CLI override is staged until
-    // `std.process.argsAlloc` returns to zig's surface map.
+    // by editing `fixture_default` / `materialize_default` / etc --
+    // CLI override is staged until `std.process.argsAlloc` returns
+    // to zig's surface map.
     const fixture = fixture_default;
-    const materialize = materialize_default;
 
     // Resolve the runnable zig for the pre-build invocation: prefer
     // `vendor/zig/zig` (populated by `scripts/install.sh` on
@@ -225,18 +284,37 @@ pub fn main() !u8 {
     // populated the vendored path.
     zig_path = resolveZigPath();
 
-    // Read /proc/self/environ into the file-scope env-pass arrays.
-    // `runProgram` consumes them via `envp_z` and forwards to
-    // execve, so the forked zig-build-install child gets the
-    // parent's PATH/HOME/LANG -- important for its recursive
-    // grandchildren (cc, `ld`, etc) which DO need PATH. execve
-    // itself does NOT do PATH lookup; `pre_build_argv[0]` is the
-    // absolute `zig_path` from `resolveZigPath`, so the immediate
-    // execve doesn't depend on env. (Phase-2-env-pass followup
-    // confirmed the historical "execve ENOENT despite env read"
-    // was a POSIX `execve(2)` semantics misunderstanding, not an
-    // env-pass bug -- execve(2) never did PATH lookup; that's
-    // `execvpe(3)`'s domain.)
+    // Phase 3 followup: resolve `materialize` from $ZAG_HOME /
+    // $XDG_CACHE_HOME / $HOME (mirrors src/main.zig) so the smoke's
+    // Step 4 + Step 6 byte-equality assertions track the main
+    // binary's materialize destination under any env-var override.
+    // Resolved path goes through the same 4096-byte scratch buffer
+    // shape as main.zig so the two stay coherent at startup.
+    // `readEnviron()` is called immediately after to populate the
+    // env arrays consulted by `getenv` (called transitively via
+    // `resolveZagCacheDir`).
+    readEnviron();
+    materialize_dir = resolveZagCacheDir(&materialize_dir_buf);
+    materialize = std.fmt.bufPrint(&materialize_buf, "{s}/zig", .{materialize_dir}) catch materialize_default;
+
+    // The `readEnviron()` call itself fired above (alongside
+    // `resolveZagCacheDir` + `bufPrint`) so `getenv` saw a
+    // populated env-pass array at startup. This comment block
+    // stays to document the env-pass / runProgram semantics
+    // referenced elsewhere:
+    //
+    // `runProgram` consumes `environ_entries` via its `envp_z`
+    // and forwards to execve, so the forked zig-build-install
+    // child gets the parent's PATH/HOME/LANG -- important for
+    // its recursive grandchildren (cc, `ld`, etc) which DO need
+    // PATH. execve itself does NOT do PATH lookup;
+    // `pre_build_argv[0]` is the absolute `zig_path` from
+    // `resolveZigPath`, so the immediate execve doesn't depend
+    // on env. (Phase-2-env-pass followup confirmed the historical
+    // "execve ENOENT despite env read" was a POSIX `execve(2)`
+    // semantics misunderstanding, not an env-pass bug --
+    // execve(2) never did PATH lookup; that's `execvpe(3)`'s
+    // domain.)
     //
     // Note: the SKIP branch (Step 1's early-return on missing
     // fixture) fires on every smoke invocation today -- the
@@ -249,7 +327,6 @@ pub fn main() !u8 {
     // Either way, the read is a single `openat`-`read`-`close`
     // triple (<1ms), and "read once at startup" is worth more
     // than per-branch early-exit savings.
-    readEnviron();
 
     // Self-cleanup: unlink the materialize path on every exit path
     // (success, skip, failure mid-assertion). Mirrors `src/tests/toolchain.zig`'s
