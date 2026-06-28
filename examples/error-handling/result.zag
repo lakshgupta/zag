@@ -2,13 +2,18 @@
 ##
 ## Run: zag run result.zag
 ##
-## v1→v2 migration: `Result<T, E>` and `Option<T>` are `union`s in the v2
-## taxonomy (they carry payloads and may mix bare and payload variants).
-## The v1 compiler parses `union X { ... }` via the `enum` keyword pending
-## the v2 `union` keyword being wired in, so this file does not declare
-## `Result` / `Option` itself — those types are supplied by the standard
-## library. Each is written with `union` in docs/manual/14-unions.md and
-## docs/manual/18-error-handling.md.
+## v1→v2 taxonomy note: this file uses the stdlib types `Result<T, E>` and
+## `Option<T>` via their unqualified ctors `Ok(...)` / `Err(...)` /
+## `Some(...)` / `None`. It does NOT declare these types itself — the
+## declarations live in the stdlib. In the v2 taxonomy (docs/14-unions,
+## docs/18-error-handling) those declarations read:
+##     union Result<T, E> { Ok(T), Err(E) }
+##     union Option<T>    { Some(T), None }
+## because both carry payloads (Result) or mix bare + payload (Option).
+## The v1 compiler uses the `enum` keyword for both bare enumerations
+## and payload-bearing tagged unions pending the v2 `union` keyword
+## landing — so the stdlib declarations are still authored under `enum`
+## today.
 
 fun divide(a: i32, b: i32) -> Result<i32, str> {
     if b == 0 {
