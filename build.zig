@@ -36,6 +36,30 @@ pub fn build(b: *std.Build) void {
     // resolving via that API is staged for a zig-bump follow-up.)
     const zig_payload_bytes = readPayloadFile(b, zig_payload_path);
 
+    // -------------------------------------------------------------------
+    // Phase 2 -Dz_install wiring.
+    //
+    // Override the zag-managed zig cache directory at build time. The
+    // materialize destination `zag_cache_zig_path` in src/main.zig
+    // is parameterized as `<z_install_path>/zig` via comptime `++`
+    // -- keeping the override at the directory level (rather than
+    // full-path) so the runtime `std.os.linux.mkdir` on the cache
+    // parent in main.zig stays verbatim and the bytes-on-disk layout
+    // (`<dir>/zig`) users can `ls` is unchanged.
+    //
+    // The user-installed zig at `zig_install_path` (the dev-machine
+    // fallback) is unchanged and remains the no-payload / materialize-
+    // failure path. Default `/home/lex/.local/zag` matches the
+    // pre-Phase-2 hardcode so an unoption'd build behaves identically.
+    // Phase 3 will swap this for an XDG_DATA_HOME / $ZAG_HOME lookup
+    // at runtime.
+    // -------------------------------------------------------------------
+    const z_install_path = b.option(
+        []const u8,
+        "z_install",
+        "Path to the zag-managed zig cache directory (default: /home/lex/.local/zag)",
+    ) orelse "/home/lex/.local/zag";
+
     const mod = b.addModule("zag", .{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -44,6 +68,7 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "zig_payload", zig_payload_bytes);
+    options.addOption([]const u8, "z_install", z_install_path);
     mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
@@ -93,6 +118,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Wire build_options into the smoke-runner module so `tests/smoke.zig`
+    // can read the same `build_options.z_install` value the main zag
+    // module reads. Without this, smoke's `materialize_default` would
+    // diverge from main's `zag_cache_zig_path` under any non-default
+    // `-Dz_install=<dir>` -- the produced zag binary writes to
+    // `<dir>/zig` while smoke's check stays hardcoded at
+    // `/home/lex/.local/zag/zig/zig`, breaking Step 4 + Step 6 of
+    // the assertion pipeline. Sharing the same `options` instance
+    // keeps the smoke binary coherent with the main binary at compile
+    // time (one fewer invariant to keep in sync across phases).
+    smoke_runner_mod.addOptions("build_options", options);
     const smoke_runner_exe = b.addExecutable(.{
         .name = "smoke-runner",
         .root_module = smoke_runner_mod,

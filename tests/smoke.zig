@@ -59,6 +59,7 @@
 // already captures.
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 /// Default fixture path. Hardcoded at compile time: zig 0.16
 /// removed `std.process.argsAlloc` from its surface map, so a CLI
@@ -66,10 +67,19 @@ const std = @import("std");
 /// returns. To smoke a different path, edit this constant.
 const fixture_default = "vendor/zig/zig.test";
 
-/// Default materialize path. Mirrors `main.zig`'s
-/// `zag_cache_zig_path` constant; keep these in sync when the
-/// Phase 2 env-var indirection followup runs.
-const materialize_default = "/home/lex/.local/zag/zig/zig";
+/// Default materialize path. Threaded through `build_options.z_install`
+/// (set by `zig build smoke -Dz_install=<dir>` in `build.zig`'s
+/// `smoke_runner_mod.addOptions("build_options", options)` wiring) and
+/// shaped as `<z_install>/zig` via comptime `++` to mirror
+/// `src/main.zig`'s `zag_cache_zig_path` shape exactly. Without
+/// `-Dz_install`, both default to `/home/lex/.local/zag/zig/zig` (the
+/// pre-Phase-2 hardcode), so smoke's Step 4 (materialize-path exists)
+/// + Step 6 (byte-equality fixture vs materialize) keep matching main
+/// under the all-defaults build; with `-Dz_install=<dir>`, they
+/// track the override together. Symmetry-by-construction: any
+/// future zig version that relaxes the hardcode constraint can swap
+/// only main.zig + smoke.zig in lockstep.
+const materialize_default = build_options.z_install ++ "/zig";
 
 /// Path to the produced (and pre-built) `zag` binary. Hardcoded
 /// to the `b.installArtifact` destination.
@@ -150,14 +160,32 @@ var environ_entries: [512]?[*:0]const u8 = undefined;
 var environ_count: usize = 0;
 
 /// Read /proc/self/environ into `environ_buf` and split on null
-/// terminators into `environ_entries`. Best-effort: any openat /
-/// read error leaves `environ_count == 0`. Currently called once
-/// at smoke startup but its output is unused (see the doc above);
-/// retained verbatim for the zig-0.16-stabilisation followup.
+/// terminators into `environ_entries`. Best-effort: any
+/// openat/read error leaves `environ_count == 0` (= empty envp,
+/// equivalent to a detached child).
+///
+/// Note: `runProgram` consumes `environ_entries` via its `envp_z`
+/// and forwards to execve, so the forked zig-build-install child
+/// gets a copy of the parent's PATH/HOME/LANG/etc. execve itself
+/// does NOT do PATH lookup; the *immediate* execve uses the
+/// absolute `zig_path` argv[0] from `resolveZigPath` so it does
+/// not depend on env at that level. env-pass matters for the
+/// recursive build's children (cc, `ld`, etc), which DO need
+/// PATH resolution.
+///
+/// Defensive OOB paint: BSS-`undefined` Debug/ReleaseSafe
+/// memory is 0xaa, not 0. POSIX /proc/self/environ ends with a
+/// final NUL terminator and the kernel returns it in `n`, so
+/// the loop normally terminates cleanly. But for a really-large
+/// env where the read consumed exactly N bytes whose last byte
+/// is non-NUL, the byte right after the kernel-returned bytes
+/// (`environ_buf[n]`) is BSS-junk and the last entry's `:0`
+/// sentinel would be a lie. Paint 0 here as a safety net.
 fn readEnviron() void {
     const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
     const n = std.os.linux.read(fd, &environ_buf, environ_buf.len);
     _ = std.os.linux.close(fd);
+    if (n < environ_buf.len) environ_buf[n] = 0;
 
     environ_count = 0;
     var i: usize = 0;
@@ -197,13 +225,18 @@ pub fn main() !u8 {
     // populated the vendored path.
     zig_path = resolveZigPath();
 
-    // Populate the file-scope env-pass arrays (`environ_buf`,
-    // `environ_entries`, `environ_count`). Output is NOT currently
-    // consumed by `runProgram` -- `pre_build_argv[0]` is the
-    // absolute `zig_path` so execve never has to resolve a PATH-only
-    // name. The read is retained for the staged follow-up that
-    // re-investigates envpass once zig 0.16's fork+execve surface
-    // stabilises; see `readEnviron`'s doc for the full context.
+    // Read /proc/self/environ into the file-scope env-pass arrays.
+    // `runProgram` consumes them via `envp_z` and forwards to
+    // execve, so the forked zig-build-install child gets the
+    // parent's PATH/HOME/LANG -- important for its recursive
+    // grandchildren (cc, `ld`, etc) which DO need PATH. execve
+    // itself does NOT do PATH lookup; `pre_build_argv[0]` is the
+    // absolute `zig_path` from `resolveZigPath`, so the immediate
+    // execve doesn't depend on env. (Phase-2-env-pass followup
+    // confirmed the historical "execve ENOENT despite env read"
+    // was a POSIX `execve(2)` semantics misunderstanding, not an
+    // env-pass bug -- execve(2) never did PATH lookup; that's
+    // `execvpe(3)`'s domain.)
     //
     // Note: the SKIP branch (Step 1's early-return on missing
     // fixture) fires on every smoke invocation today -- the
@@ -375,10 +408,13 @@ fn bytesEqual(allocator: std.mem.Allocator, a: []const u8, b: []const u8) !bool 
 /// `/proc/self/environ`). Slimmed from `main.zig` only by the
 /// hardcoded `zig_path` (no runtime PATH lookup -- the pre-build
 /// forked child uses an absolute path so execve never has to
-/// resolve "zig"). The env-pass machinery is currently retained but
-/// never exercises successfully; see the `readEnviron` doc for the
-/// staged follow-up. Returns the child's exit code (or 255 if killed
-/// by signal).
+/// resolve "zig"). The env-pass IS active: `envp_z` (populated
+/// from `environ_entries` below) is passed to execve, so the
+/// recursive zig-build-install child's grandchildren (cc, `ld`,
+/// etc) can PATH-resolve naturally. execve itself doesn't do PATH
+/// lookup -- the immediate execve uses the absolute `zig_path`
+/// argv[0]. Returns the child's exit code (or 255 if killed by
+/// signal).
 fn runProgram(allocator: std.mem.Allocator, argv: []const []const u8) !u8 {
     if (argv.len == 0) return error.NoArgs;
     if (argv.len > 14) return error.TooManyArgs;

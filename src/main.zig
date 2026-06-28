@@ -5,21 +5,30 @@ const parser_mod = @import("parser.zig");
 const codegen_mod = @import("codegen.zig");
 const ast = @import("ast.zig");
 const toolchain = @import("toolchain.zig");
+const build_options = @import("build_options");
 
 var zig_path: []const u8 = undefined;
 
-/// Zag-managed zig cache directory + artifact path. When the
-/// build is staged with a non-empty `-Dzig_payload=<path>`
-/// (future option), `pub fn main` materializes the embedded
-/// payload at `zag_cache_zig_path` and uses it for
-/// transpile+build, falling back to `zig_install_path`
-/// otherwise. Sibling-directory convention to the runtime zig
-/// install so users can `ls` either path without surprise.
-/// TODO(dev-machine path): replace with $ZAG_HOME/zig/zig (or
-/// XDG_DATA_HOME-based) lookup once main.zig generalises to
-/// user-portable installs. Matches the existing
-/// /home/lex/.local/zig/zig hardcode style in the meantime.
-const zag_cache_dir = "/home/lex/.local/zag/zig";
+/// Zag-managed zig cache directory. Overridable at build time
+/// via `-Dz_install=<dir>` (default: `/home/lex/.local/zag`);
+/// `build_options.z_install` carries the value through
+/// `build.zig`'s `addOption` plumbing. The materialize
+/// destination `zag_cache_zig_path` is parameterized as
+/// `<zag_cache_dir>/zig` via the existing comptime `++` concat
+/// below -- keeping the override at the directory level (rather
+/// than full-path) so the runtime `std.os.linux.mkdir` on the
+/// cache parent stays verbatim and the bytes-on-disk layout
+/// users can `ls` is unchanged.
+///
+/// The user-installed zig at `zig_install_path` is unchanged and
+/// remains the no-payload / materialize-failure fallback -- a
+/// separate concern from the zag-managed cache dir this overrides.
+/// TODO(XDG_DATA_HOME-based): when main.zig generalises to
+/// user-portable installs, replace this direct path with a
+/// $ZAG_HOME / XDG_DATA_HOME lookup. Stays at the directory level
+/// (not full-path) so the existing `++ "/zig"` shape keeps working
+/// and the runtime `mkdir` stays verbatim.
+const zag_cache_dir = build_options.z_install;
 const zag_cache_zig_path = zag_cache_dir ++ "/zig";
 
 /// User-installed zig runtime -- the fallback `zig_path` used
@@ -126,6 +135,19 @@ fn readEnviron() void {
     const fd = posix.openat(posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
     const n = std.os.linux.read(fd, &environ_buf, environ_buf.len);
     _ = std.os.linux.close(fd);
+    // Defensive NUL termination: the read loop's per-entry `:0`
+    // sentinel annotation assumes `environ_buf[i] == 0` at the
+    // post-loop position. POSIX `/proc/self/environ` ends with
+    // a final NUL terminator and the kernel returns that final
+    // byte in `n`, so the loop normally terminates cleanly. But
+    // the byte right *after* the kernel-returned bytes
+    // (`environ_buf[n]` if `n < environ_buf.len`) is BSS-
+    // `undefined` (Debug/ReleaseSafe paint 0xaa, not 0), so a
+    // really-large env where the read consumed N bytes whose
+    // last byte is non-NUL would silently corrupt the last
+    // entry's `:0` sentinel and trigger downstream
+    // sentinel-mismatch UB. Paint 0 here as a safety net.
+    if (n < environ_buf.len) environ_buf[n] = 0;
 
     environ_count = 0;
     var i: usize = 0;
