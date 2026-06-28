@@ -39,19 +39,77 @@ zag run
 
 - **[Language Manual](docs/manual/index.md)** — start here to learn Zag
 - **[Examples](examples/)** — runnable `.zag` files with a test harness
-- **[Building from Source](docs/manual/31-building.md)** — build, test, and release
+- **[Installation](docs/manual/00-overview.md#installation)** — install pre-built binary or build from source
 - **[Specification](docs/spec.md)** — formal language reference
 
-## Building
+## Installation
 
-Zag targets the Zig toolchain. You'll need Zig installed, then:
+Zag ships as a pre-built binary on Linux, macOS, and Windows. A working Zig toolchain is the only prerequisite, since the compiler emits Zig source for native code generation and linking.
 
-```bash
-# Build and test examples
-cd examples && ./run_all.sh --release --build
+### Prerequisites
 
-# Package for distribution
-./scripts/package.sh dev
+Install Zig 0.16+ from [ziglang.org/download](https://ziglang.org/download/) and verify it is on your `PATH`:
+
+```
+zig version
 ```
 
-See [manual/31-building.md](docs/manual/31-building.md) for detailed build instructions.
+### Install a pre-built binary
+
+Linux or macOS:
+
+```
+curl -sS https://zag-lang.org/install.sh | bash
+```
+
+Windows (PowerShell):
+
+```
+powershell -c "irm https://zag-lang.org/install.ps1 | iex"
+```
+
+The installer downloads the platform release into `~/.zag/bin/zag`, appends `export PATH="$PATH:$HOME/.zag/bin"` to your shell profile (`.bashrc`, `.zshrc`, `.profile`, or `~/.config/fish/config.fish`), and prints `Zag installed successfully!`. To pin a version, download first and pass `--version`:
+
+```
+curl -sSO https://zag-lang.org/install.sh
+bash install.sh --version 0.1.0
+```
+
+Or with a custom install location:
+
+```
+ZAG_HOME=$HOME/local bash install.sh
+```
+
+### Build from source
+
+If no release binary is available for your platform, clone the repository and use the build scripts:
+
+```
+git clone https://github.com/zag-lang/zag
+cd zag
+./scripts/build.sh --release     # debug build by default; --release sets -Doptimize=ReleaseFast
+./scripts/install-local.sh       # copy zig-out/bin/zag-<os>-<arch> to ~/.zag/bin and configure PATH
+```
+
+`build.sh` runs `zig build`, copies the result into `zig-out/bin/zag-<os>-<arch>`, and `install-local.sh` configures your `PATH` the same way `install.sh` does.
+
+### Verify
+
+Restart your shell (or `source ~/.bashrc`), then:
+
+```
+zag version
+```
+
+You should see the installed version string.
+
+### Uninstall
+
+```
+bash install.sh --uninstall             # Linux / macOS
+./scripts/install.ps1 -Uninstall        # Windows (PowerShell)
+./scripts/install-local.sh --uninstall  # Build-from-source install
+```
+
+Removes `~/.zag` and the `# Zag Language` / `# zag` PATH entry from your shell profile.

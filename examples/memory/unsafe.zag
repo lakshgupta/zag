@@ -13,7 +13,7 @@ fun main() {
         # Raw pointer arithmetic on `*raw u8` — allowed in zig 0.16
         # unconditionally but the `unsafe { }` marker makes the audit
         # boundary explicit.
-        let buf = alloc(4);
+        let buf: []u8 = alloc(4);
         let p: *raw u8 = buf;
         *p = 'a';
         *((p + 1) as *raw u8) = 'b';

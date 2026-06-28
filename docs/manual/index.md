@@ -5,6 +5,7 @@ A comprehensive guide to the Zag programming language.
 ## Getting Started
 
 - [Overview](00-overview.md) — Language philosophy and hello world
+- [Hello World](01-hello-world.md) — Quickstart: run your first program
 - [Comments](02-comments.md) — Line comments and doc comments
 
 ## Literals and Types
