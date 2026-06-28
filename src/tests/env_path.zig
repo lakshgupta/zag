@@ -346,3 +346,71 @@ test "env_path: setEnvironForTesting caps at environ_entries capacity" {
     // when 600 entries are written into a 512-slot array.
     try std.testing.expect(env_path.environ_count == 512);
 }
+
+test "env_path: getenv does not match underscore-suffixed keys (KEY != KEY_)" {
+    // Mirror of the F/FOO prefix-collision test, but with `KEY`
+    // and `KEY_` -- an underscore-suffix extension. POSIX env
+    // keys are alphanumeric+underscore, so `ZAG` and `ZAG_HOME`
+    // are BOTH valid keys, and the walker must distinguish the
+    // shorter key from the longer one's body via the
+    // length-equality guard `if (sep == name.len)` rather than
+    // prefix-matching: when walking `ZAG_HOME=/explicit` looking
+    // for `ZAG`, the `=` is at position 8 (not at position 3),
+    // so the guard rejects the entry, and getenv correctly
+    // continues to look at `ZAG=base`.
+    //
+    // Without this pin, a regression that dropped the
+    // length-equality guard (or used prefix-matching) would
+    // surface as `ZAG` spuriously returning "/explicit" instead
+    // of "base" (or null), since the longer entry's first 3 chars
+    // are also "ZAG".
+    const env = [_][]const u8{
+        "ZAG=base",
+        "ZAG_HOME=/explicit",
+    };
+    env_path.setEnvironForTesting(&env, &env_buf);
+    try std.testing.expectEqualStrings("base", env_path.getenv("ZAG").?);
+    try std.testing.expectEqualStrings("/explicit", env_path.getenv("ZAG_HOME").?);
+    // Sanity: a partial-underscore prefix (longer than the lookup
+    // but missing the trailing `_`) also must NOT match -- this
+    // is the `_`-aware extension of the F/FOO case above.
+    try std.testing.expect(env_path.getenv("ZAG_HO") == null);
+    try std.testing.expect(env_path.getenv("ZAG_") == null);
+}
+
+test "env_path: getenv embedded NUL in value truncates at NUL (POSIX env semantics)" {
+    // An entry's payload could in principle contain an embedded
+    // NUL byte (e.g. buggy user code that wrote a partial env to
+    // the procfile). POSIX env defines an entry's content as
+    // everything up to the first NUL -- bytes beyond are either
+    // garbage or the start of the next entry. getenv walks via
+    // `std.mem.span(entry_ptr)`, which traverses from the
+    // pointer until it hits a NUL byte (whichever comes first).
+    // So an embedded NUL truncates the value cleanly, without
+    // aliasing the next entry's bytes.
+    //
+    // The embedded NUL is constructed via the `\x00` hex escape
+    // in a string literal: `"KEY1=foo\x00bar"` is 12 bytes with
+    // the NUL at position 7 (between `foo` and `bar`). The
+    // sentinel-terminated slot (`[*:0]const u8`) preserves every
+    // byte through `setEnvironForTesting`'s `@memcpy`; the
+    // helper paints an additional sentinel at `backing[offset +
+    // entry.len]` so the slot has explicit NUL-terminated form.
+    // On the getenv side, `std.mem.span` walks the bytes and
+    // hits the embedded NUL first, returning the 7-byte prefix
+    // `KEY1=foo`. `indexOfScalar` then finds `=` at position 4
+    // of that span and the value slice `entry_slice[5..]` is
+    // `"foo"` -- the bytes `bar` past the embedded NUL must NOT
+    // leak into the value (would surface as `"foobar"` instead).
+    const entry_with_nul: []const u8 = "KEY1=foo\x00bar";
+    const env = [_][]const u8{entry_with_nul};
+    env_path.setEnvironForTesting(&env, &env_buf);
+    const result = env_path.getenv("KEY1");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("foo", result.?);
+    // Sanity: the result's byte length must match "foo" (3 bytes),
+    // NOT "foobar" (6 bytes) which would indicate the embedded
+    // NUL terminator failed to truncate the value at the right
+    // byte boundary.
+    try std.testing.expectEqual(@as(usize, 3), result.?.len);
+}
