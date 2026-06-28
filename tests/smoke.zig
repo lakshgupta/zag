@@ -60,6 +60,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const env_path = @import("env_path");
 
 /// Default fixture path. Hardcoded at compile time: zig 0.16
 /// removed `std.process.argsAlloc` from its surface map, so a CLI
@@ -149,113 +150,15 @@ fn resolveZigPath() []const u8 {
     return zig_dev_local;
 }
 
-/// `readEnviron` infrastructure (currently unused, retained for the
-/// zig-0.16-stabilisation followup). When the smoke was first wired,
-/// `runProgram` empty-envp caused the forked `zig build install`
-/// child to exit 127 (execve could not resolve the PATH-only `zig`
-/// name). We added this machinery — read `/proc/self/environ` at
-/// startup, parse NUL-separated entries into `[:0]u8` slices, pass
-/// them through `runProgram`'s `envp_z` — mirroring `src/main.zig`'s
-/// verified-working `readEnviron` pattern. Empirically, the env was
-/// read correctly into `environ_entries` (PATH was present and pointed
-/// at the right directory), but execve from the forked child still
-/// returned ENOENT. The exact root cause was not isolated (the
-/// plausible candidates are zig 0.16 fork+execve surface interactions
-/// around sentinel-terminated BSS slices and the envp-many-pointer
-/// coercion, but a controlled binary-search diagnostic was not run
-/// before pivoting). The pragmatic mitigation was to hardcode
-/// `zig_path` to the absolute path of the user's zig install, which
-/// sidesteps execve's PATH lookup entirely. The infrastructure stays
-/// in place so a future followup can re-investigate the env-pass
-/// approach (refine the read, swap to `execvpe`, or trim if
-/// unneeded); buffer sizes match `src/main.zig`'s so the same 131 KB /
-/// 512-entries upper bounds apply if the followup reactivates the read.
-var environ_buf: [131072]u8 = undefined;
-var environ_entries: [512]?[*:0]const u8 = undefined;
-var environ_count: usize = 0;
-
-/// Read /proc/self/environ into `environ_buf` and split on null
-/// terminators into `environ_entries`. Best-effort: any
-/// openat/read error leaves `environ_count == 0` (= empty envp,
-/// equivalent to a detached child).
-///
-/// Note: `runProgram` consumes `environ_entries` via its `envp_z`
-/// and forwards to execve, so the forked zig-build-install child
-/// gets a copy of the parent's PATH/HOME/LANG/etc. execve itself
-/// does NOT do PATH lookup; the *immediate* execve uses the
-/// absolute `zig_path` argv[0] from `resolveZigPath` so it does
-/// not depend on env at that level. env-pass matters for the
-/// recursive build's children (cc, `ld`, etc), which DO need
-/// PATH resolution.
-///
-/// Defensive OOB paint: BSS-`undefined` Debug/ReleaseSafe
-/// memory is 0xaa, not 0. POSIX /proc/self/environ ends with a
-/// final NUL terminator and the kernel returns it in `n`, so
-/// the loop normally terminates cleanly. But for a really-large
-/// env where the read consumed exactly N bytes whose last byte
-/// is non-NUL, the byte right after the kernel-returned bytes
-/// (`environ_buf[n]`) is BSS-junk and the last entry's `:0`
-/// sentinel would be a lie. Paint 0 here as a safety net.
-fn readEnviron() void {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
-    const n = std.os.linux.read(fd, &environ_buf, environ_buf.len);
-    _ = std.os.linux.close(fd);
-    if (n < environ_buf.len) environ_buf[n] = 0;
-
-    environ_count = 0;
-    var i: usize = 0;
-    while (i < n and environ_count < 512) {
-        const start = i;
-        while (i < n and environ_buf[i] != 0) : (i += 1) {}
-        environ_entries[environ_count] = environ_buf[start..i :0];
-        environ_count += 1;
-        i += 1;
-    }
-}
-
-/// Walk `environ_entries` (populated by `readEnviron`) for an
-/// entry whose key matches `name`. Returns the value slice
-/// (without `:0` sentinel — `[]const u8`, since downstream
-/// `bufPrint` `{s}` formatters take that). Uses `std.mem.span`
-/// once at the top of the iteration to materialise a `[]const u8`
-/// from the NUL-terminated many-pointer (`*[*:0]const u8` ->
-/// `[]const u8`), then slices/eql/index from there. Mirrors
-/// `src/main.zig`'s `getenv` verbatim so a future refactor that
-/// lifts one and re-exports it can swap both in lockstep.
-fn getenv(name: []const u8) ?[]const u8 {
-    for (environ_entries[0..environ_count]) |maybe_entry| {
-        const entry_ptr = maybe_entry orelse continue;
-        // `entry_ptr` is a many-pointer [*:0]const u8; zig 0.16's
-        // `std.mem.indexOfScalar` and `std.mem.eql` both require
-        // `[]const T` slices (not pointers), so we materialise a
-        // `[]const u8` from the NUL sentinel up-front.
-        const entry_slice = std.mem.span(entry_ptr);
-        const sep = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
-        if (sep == name.len and std.mem.eql(u8, entry_slice[0..sep], name)) {
-            return entry_slice[sep + 1..];
-        }
-    }
-    return null;
-}
-
-/// Resolve the zag-managed cache directory at smoke-runner
-/// startup. Mirrors `src/main.zig`'s `resolveZagCacheDir` so the
-/// smoke binary tracks the main zag binary's resolution at runtime
-/// -- `$ZAG_HOME` > `$XDG_CACHE_HOME/zag` > `$HOME/.cache/zag` >
-/// `build_options.z_install`. `buf` is sized 4096 at the call
-/// site; the fallback to `build_options.z_install` on
-/// `bufPrint` failure (paths > 4096 bytes) keeps the smoke
-/// panic-free.
-fn resolveZagCacheDir(buf: []u8) []const u8 {
-    if (getenv("ZAG_HOME")) |home| return home;
-    if (getenv("XDG_CACHE_HOME")) |cache| {
-        return std.fmt.bufPrint(buf, "{s}/zag", .{cache}) catch build_options.z_install;
-    }
-    if (getenv("HOME")) |home| {
-        return std.fmt.bufPrint(buf, "{s}/.cache/zag", .{home}) catch build_options.z_install;
-    }
-    return build_options.z_install;
-}
+// `readEnviron` / env-pass arrays / `getenv` / `resolveZagCacheDir`
+// all live in `@import("env_path")` -- the lift that landed them
+// in `src/env_path.zig` removed the byte-for-byte-identical copies
+// that previously sat as file-scope globals in this smoke binary.
+// `runProgram` reads `env_path.environ_count` + `env_path.environ_entries`
+// for its fork+execve envp_z propagation. See `src/env_path.zig`'s
+// top-of-file comment for the build-side wiring and the inherited
+// rationale (Phase-1/2 env-pass followup + Phase-3 priority chain
+// + dup-`readEnviron` cleanup -> single shared module).
 
 pub fn main() !u8 {
     // One-shot smoke binary; leaked allocations are reclaimed by
@@ -293,8 +196,8 @@ pub fn main() !u8 {
     // `readEnviron()` is called immediately after to populate the
     // env arrays consulted by `getenv` (called transitively via
     // `resolveZagCacheDir`).
-    readEnviron();
-    materialize_dir = resolveZagCacheDir(&materialize_dir_buf);
+    env_path.readEnviron();
+    materialize_dir = env_path.resolveZagCacheDir(&materialize_dir_buf, build_options.z_install);
     materialize = std.fmt.bufPrint(&materialize_buf, "{s}/zig", .{materialize_dir}) catch materialize_default;
 
     // The `readEnviron()` call itself fired above (alongside
@@ -516,8 +419,8 @@ fn runProgram(allocator: std.mem.Allocator, argv: []const []const u8) !u8 {
     // environ_count == 0 (read failed) the array stays all-null,
     // equivalent to empty-envp behaviour.
     var envp_z: [513]?[*:0]const u8 = .{ null } ** 513;
-    const env_count = @min(environ_count, envp_z.len - 1);
-    for (environ_entries[0..env_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
+    const env_count = @min(env_path.environ_count, envp_z.len - 1);
+    for (env_path.environ_entries[0..env_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
     const argv_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&argv_z);
     const envp_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&envp_z);
 

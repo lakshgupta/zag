@@ -6,6 +6,7 @@ const codegen_mod = @import("codegen.zig");
 const ast = @import("ast.zig");
 const toolchain = @import("toolchain.zig");
 const build_options = @import("build_options");
+const env_path = @import("env_path");
 
 var zig_path: []const u8 = undefined;
 
@@ -47,8 +48,13 @@ var zag_cache_zig_path_buf: [4096]u8 = undefined;
 /// when `toolchain.tryMaterialize` is a no-op (default empty-
 /// payload build, where `has_payload()` folds to false at
 /// comptime) OR when it returns a labelled-block catch error
-/// (write-permission issue on a read-only HOME, etc.).
-/// TODO(env-var indirection): see TODO on `zag_cache_dir` above.
+/// (write-permission issue on a read-only HOME, etc.). Stays a
+/// hardcoded dev-machine path because it is the user-side
+/// convention (not the zag-managed cache dir that env_path's
+/// priority chain resolves); a future env-var indirection
+/// followup could extend the priority chain to cover the user-
+/// installed fallback too, but it's not in scope for Phase 3
+/// or the env_path lift.
 const zig_install_path = "/home/lex/.local/zig/zig";
 
 const usage =
@@ -81,8 +87,8 @@ pub fn main() !void {
     // must run AFTER readEnviron, AND resolveZagCacheDir must run
     // BEFORE mkdir+materialize so the materialize destination
     // matches what the resolved cache dir says it should be.
-    readEnviron();
-    zag_cache_dir = resolveZagCacheDir(&zag_cache_dir_buf);
+    env_path.readEnviron();
+    zag_cache_dir = env_path.resolveZagCacheDir(&zag_cache_dir_buf, build_options.z_install);
     const zig_path_formatted = std.fmt.bufPrint(
         &zag_cache_zig_path_buf,
         "{s}/zig",
@@ -151,77 +157,24 @@ pub fn main() !void {
     }
 }
 
-var environ_entries: [512]?[*:0]const u8 = undefined;
-var environ_buf: [131072]u8 = undefined;
-var environ_count: usize = 0;
-
-fn readEnviron() void {
-    const fd = posix.openat(posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
-    const n = std.os.linux.read(fd, &environ_buf, environ_buf.len);
-    _ = std.os.linux.close(fd);
-    // Defensive NUL termination: the read loop's per-entry `:0`
-    // sentinel annotation assumes `environ_buf[i] == 0` at the
-    // post-loop position. POSIX `/proc/self/environ` ends with
-    // a final NUL terminator and the kernel returns that final
-    // byte in `n`, so the loop normally terminates cleanly. But
-    // the byte right *after* the kernel-returned bytes
-    // (`environ_buf[n]` if `n < environ_buf.len`) is BSS-
-    // `undefined` (Debug/ReleaseSafe paint 0xaa, not 0), so a
-    // really-large env where the read consumed N bytes whose
-    // last byte is non-NUL would silently corrupt the last
-    // entry's `:0` sentinel and trigger downstream
-    // sentinel-mismatch UB. Paint 0 here as a safety net.
-    if (n < environ_buf.len) environ_buf[n] = 0;
-
-    environ_count = 0;
-    var i: usize = 0;
-    while (i < n and environ_count < 512) {
-        const start = i;
-        while (i < n and environ_buf[i] != 0) : (i += 1) {}
-        environ_entries[environ_count] = environ_buf[start..i :0];
-        environ_count += 1;
-        i += 1;
-    }
-}
-
-/// Walk `environ_entries` (populated by `readEnviron`) for an
-/// entry whose key matches `name`. Returns the value slice
-/// (everything after the first `=`) if found, else `null`. Empty
-/// values (e.g. `FOO=`) are returned as an empty slice.
-fn getenv(name: []const u8) ?[]const u8 {
-    for (environ_entries[0..environ_count]) |maybe_entry| {
-        const entry_ptr = maybe_entry orelse continue;
-        // `entry_ptr` is a many-pointer [*:0]const u8; zig 0.16's
-        // `std.mem.indexOfScalar` and `std.mem.eql` both require
-        // `[]const T` slices (not pointers), so we materialise a
-        // `[]const u8` from the NUL sentinel up-front.
-        const entry_slice = std.mem.span(entry_ptr);
-        const sep = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
-        if (sep == name.len and std.mem.eql(u8, entry_slice[0..sep], name)) {
-            return entry_slice[sep + 1..];
-        }
-    }
-    return null;
-}
-
-/// Resolve the zag-managed cache directory at runtime per the
-/// priority chain documented on `zag_cache_dir` above. Writes
-/// any `$XDG_CACHE_HOME`- or `$HOME`-derived result into `buf`
-/// (via `bufPrint`); `$ZAG_HOME` and the `build_options.z_install`
-/// fallback are returned as comptime slice values -- no buffer
-/// write needed for those branches. `buf` should be at least
-/// `PATH_MAX`-ish; we use a 4096-byte scratch at the call site
-/// for headroom over the typical 4 KB PATH_MAX / `PATH=...` length.
-fn resolveZagCacheDir(buf: []u8) []const u8 {
-    if (getenv("ZAG_HOME")) |home| return home;
-    if (getenv("XDG_CACHE_HOME")) |cache| {
-        return std.fmt.bufPrint(buf, "{s}/zag", .{cache}) catch build_options.z_install;
-    }
-    if (getenv("HOME")) |home| {
-        return std.fmt.bufPrint(buf, "{s}/.cache/zag", .{home}) catch build_options.z_install;
-    }
-    return build_options.z_install;
-}
+// Env-pass and cache-dir resolution live in `@import("env_path")`.
+// The pre-lift code had inline `var environ_buf` / `var environ_entries`
+// / `var environ_count` file-scope globals plus `readEnviron` / `getenv`
+// / `resolveZagCacheDir` function bodies identical to `src/env_path.zig`'s
+// copies -- a maintenance hazard where any signature change had to land
+// in both `src/main.zig` and `tests/smoke.zig` in lockstep. The lift to
+// `env_path` exposed the underlying state as `pub var` so this binary's
+// `runCommand` envp_z builder can read the same arrays directly.
+//
+// Call sites updated to use the module:
+//   - `readEnviron()`          -> `env_path.readEnviron()`
+//   - `resolveZagCacheDir(&b)` -> `env_path.resolveZagCacheDir(&b)`
+//   - `environ_count`          -> `env_path.environ_count`
+//   - `environ_entries[i]`     -> `env_path.environ_entries[i]`
+//
+// All four are wired through `build.zig`'s `mod.addImport("env_path",
+// env_path_mod)` so this binary's BSS-initialised copy is reachable
+// without renaming the call shape.
 
 fn cmdRun(path: []const u8) !void {
     const source = try readFile(path);
@@ -324,8 +277,8 @@ fn runCommand(argv: []const []const u8) !u8 {
     }
 
     var envp_z: [513]?[*:0]const u8 = .{null} ** 513;
-    const env_count = @min(environ_count, envp_z.len - 1);
-    for (environ_entries[0..env_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
+    const env_count = @min(env_path.environ_count, envp_z.len - 1);
+    for (env_path.environ_entries[0..env_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
 
     // std.os.linux.fork() returns usize in zig 0.16, but waitpid's pid
     // parameter expects i32 (pid_t). std.math.cast gives a clean overflow-safe

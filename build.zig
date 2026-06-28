@@ -58,8 +58,8 @@ pub fn build(b: *std.Build) void {
     // BEFORE this build-time default. This `-Dz_install` only acts
     // as the no-env fallback (e.g. when running on a stripped CI
     // container, or for projects that pin the cache to a non-
-    // standard path). See `src/main.zig`'s `zag_cache_dir` doc
-    // block for the full priority chain and reasoning.
+    // standard path). See `src/env_path.zig`'s `resolveZagCacheDir`
+    // for the full priority chain and reasoning.
     // -------------------------------------------------------------------
     const z_install_path = b.option(
         []const u8,
@@ -77,6 +77,33 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "zig_payload", zig_payload_bytes);
     options.addOption([]const u8, "z_install", z_install_path);
     mod.addOptions("build_options", options);
+
+    // -------------------------------------------------------------------
+    // Shared `env_path` module: lift of inline-duplicated getenv +
+    // resolveZagCacheDir + readEnviron + env-array globals from
+    // src/main.zig and tests/smoke.zig.
+    //
+    // Registered as an independent Module so it can be `addImport`-ed
+    // into both main.zig's `zag` root (via `mod.addImport("env_path",
+    // env_path_mod)` below) AND tests/smoke.zig's `smoke-runner` root
+    // (further down). build_options is wired in here too --
+    // `resolveZagCacheDir`'s no-env branch returns
+    // `build_options.z_install`, so the env_path module needs its own
+    // `addOptions("build_options", options)` call. Sharing the same
+    // `options` instance across `mod` (zag main) + `env_path_mod` +
+    // `smoke_runner_mod` keeps the three binaries on the same compile-
+    // time `-Dz_install` value so main.zig's `zag_cache_dir` (Phase 2
+    // wiring) and env_path's resolveZagCacheDir fallback never diverge.
+    // Without this wiring, smoke and main could disagree on the
+    // no-env fallback path under non-default -Dz_install.
+    // -------------------------------------------------------------------
+    const env_path_mod = b.addModule("env_path", .{
+        .root_source_file = b.path("src/env_path.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // env_path_mod.addOptions removed -- see comment block above (env_path.zig uses comptime_fallback parameter instead)
+    mod.addImport("env_path", env_path_mod);
 
     const exe = b.addExecutable(.{
         .name = "zag",
@@ -136,6 +163,16 @@ pub fn build(b: *std.Build) void {
     // keeps the smoke binary coherent with the main binary at compile
     // time (one fewer invariant to keep in sync across phases).
     smoke_runner_mod.addOptions("build_options", options);
+    // Share the same `env_path` module instance with the smoke-runner
+    // binary so smoke's @import("env_path") resolves to the SAME
+    // priority chain (and falls back to the SAME `build_options.z_install`
+    // value via the shared `options` instance) as main.zig. Mirrors
+    // the `mod.addImport("env_path", env_path_mod)` line above; the
+    // `smoke_runner_mod.addOptions("build_options", options)` already
+    // ensures build_options transitive reachability, so smoke's
+    // `materialize_default = build_options.z_install ++ "/zig"` keeps
+    // tracking main.zig's compile-time fallback.
+    smoke_runner_mod.addImport("env_path", env_path_mod);
     const smoke_runner_exe = b.addExecutable(.{
         .name = "smoke-runner",
         .root_module = smoke_runner_mod,
