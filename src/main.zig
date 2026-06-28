@@ -4,8 +4,31 @@ const lexer_mod = @import("lexer.zig");
 const parser_mod = @import("parser.zig");
 const codegen_mod = @import("codegen.zig");
 const ast = @import("ast.zig");
+const toolchain = @import("toolchain.zig");
 
 var zig_path: []const u8 = undefined;
+
+/// Zag-managed zig cache directory + artifact path. When the
+/// build is staged with a non-empty `-Dzig_payload=<path>`
+/// (future option), `pub fn main` materializes the embedded
+/// payload at `zag_cache_zig_path` and uses it for
+/// transpile+build, falling back to `zig_install_path`
+/// otherwise. Sibling-directory convention to the runtime zig
+/// install so users can `ls` either path without surprise.
+/// TODO(dev-machine path): replace with $ZAG_HOME/zig/zig (or
+/// XDG_DATA_HOME-based) lookup once main.zig generalises to
+/// user-portable installs. Matches the existing
+/// /home/lex/.local/zig/zig hardcode style in the meantime.
+const zag_cache_dir = "/home/lex/.local/zag/zig";
+const zag_cache_zig_path = zag_cache_dir ++ "/zig";
+
+/// User-installed zig runtime -- the fallback `zig_path` used
+/// when `toolchain.tryMaterialize` is a no-op (default empty-
+/// payload build, where `has_payload()` folds to false at
+/// comptime) OR when it returns a labelled-block catch error
+/// (write-permission issue on a read-only HOME, etc.).
+/// TODO(env-var indirection): see TODO on `zag_cache_dir` above.
+const zig_install_path = "/home/lex/.local/zig/zig";
 
 const usage =
     \\zag — a small, fast systems language
@@ -21,7 +44,39 @@ const usage =
 ;
 
 pub fn main() !void {
-    zig_path = "/home/lex/.local/zig/zig";
+    // Phase 1 followup (single-file staging): zig_path is
+    // resolved by the materialize block below -- the embedded
+    // payload at `zag_cache_zig_path` if `tryMaterialize`
+    // succeeded (future `-Dzig_payload=<path>` option), or
+    // the user's installed fallback at
+    // /home/lex/.local/zig/zig otherwise. Today's empty
+    // sentinel folds `has_payload()` to false at comptime
+    // and `tryMaterialize` early-returns without touching
+    // disk, so the fallback path stays active under the
+    // default build.
+
+    // Best-effort mkdir of the cache parent. EEXIST (common
+    // case after first install) is silently absorbed because
+    // `std.os.linux.mkdir` returns a raw usize rc we discard.
+    // Other errors (EACCES on a root-restricted HOME, etc.)
+    // surface as the openat ENOENT during the tryMaterialize
+    // call below and the catch fallback routes to the
+    // installed zig.
+    _ = std.os.linux.mkdir(@ptrCast(zag_cache_dir.ptr), 0o755);
+
+    // Materialize-error handling: any openat/chmod/write error
+    // is logged and treated as "no materialize" so HOME-dir
+    // write issues don't block `zag run` entirely -- they fall
+    // through to the installed-zig path. The labeled-block
+    // catch `blk:` lets us print a diagnostic before yielding
+    // a fallback `false`. The diagnostic includes the
+    // materialize destination so multi-developer-machine
+    // debugging can attribute the failure to the right HOME.
+    const materialized = toolchain.tryMaterialize(zag_cache_zig_path) catch |err| blk: {
+        std.debug.print("warning: embedded zig materialize at {s} failed: {s}; using installed zig\n", .{ zag_cache_zig_path, @errorName(err) });
+        break :blk false;
+    };
+    zig_path = if (materialized) zag_cache_zig_path else zig_install_path;
 
     const args = try parseArgs();
 
@@ -744,4 +799,11 @@ comptime {
     _ = @import("tests/lexer.zig");
     _ = @import("tests/parser.zig");
     _ = @import("tests/codegen.zig");
+    _ = @import("tests/toolchain.zig");
+    // Phase 1 single-file staging: toolchain.zig's top-level
+    // `@embedFile("../vendor/zig/zig.empty")` must fire so a future
+    // materialize call site can consult `has_payload()`. Today's
+    // embedded payload is empty (sentinel at project root); the
+    // installer-script path is still the active zig-fetch flow.
+    _ = @import("toolchain.zig");
 }
