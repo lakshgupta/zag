@@ -71,18 +71,42 @@ pub fn main() !u8 {
     const allocator = std.heap.page_allocator;
 
     // ---- Step 1+2+3: lex + parse + codegen in-process ----
-    // The minimal source has no `pub import` decls, so the emitted
-    // zig module's preamble contains only `const std = @import...`
-    // + the print_fn helper + the __zag_interp_buf scratch -- no
-    // `__zag_imported_<i>` lines for the scrubber to be non-trivial
-    // on. The scrub STILL RUNS (unifies the e2e contract: a richer
-    // future test source with `pub import std.X` decls automatically
-    // gets its preamble scrubbed to a no-op struct impl). One-shot
-    // binary: leak-tolerant `page_allocator` mirrors `tests/smoke.zig`'s
-    // choice and sidesteps `std.testing.allocator`'s leak-check panic
-    // over the child-process buffers we cannot reason about as
+    // The richer source has one `pub import std.string.{String as MyStr}`
+    // decl that exercises BOTH of `scrubImportLines`'s rules in vivo:
+    //   Rule 1 (preamble, 4-space indented): codegen emits
+    //     `    const __zag_imported_0 = @import("lib/std/string.zag");`
+    //     -- scrubber finds the prefix substring (NOT at the line
+    //     start, because of the indent) and rewrites the RHS to
+    //     `struct{};`. After scrubbing:
+    //     `    const __zag_imported_0 = struct{};`
+    //   Rule 2 (alias, no indent): codegen emits
+    //     `const MyStr = __zag_imported_0.String;`
+    //     -- scrubber truncates at `=` (preserving `const MyStr = `)
+    //     and rewrites RHS to ` struct{};`. After scrubbing:
+    //     `const MyStr = struct{};`
+    // Together: both rules fire in vivo in the e2e step, replacing
+    // any /tmp/zag_e2e/hello.zig dependency on lib/std/string.zag
+    // with a no-op struct{} stub. The produced binary compiles
+    // regardless of whether lib/std/string.zag exists on disk
+    // (the alias+preamble pair is byte-identical regardless of
+    // lib/std presence -- the scrubber collapses both lines to
+    // `= struct{};` before the produced binary reaches zig's
+    // import resolver).
+    //
+    // Alias `MyStr` is intentionally unreferenced from `main()` --
+    // the goal is to land a structurally-valid `const MyStr =
+    // struct{};` in the produced binary that zig's compiler
+    // accepts, not to give the alias any dynamic runtime use. An
+    // unused module-scope `const` binding is removed by zig's
+    // dead-code elimination at compile time (zero runtime cost).
+    //
+    // One-shot binary: leak-tolerant `page_allocator` mirrors
+    // `tests/smoke.zig`'s choice and sidesteps
+    // `std.testing.allocator`'s leak-check panic over the child-
+    // process buffers we cannot reason about as
     // "either-allocated-or-freed" in this code.
     const src =
+        \\pub import std.string.{String as MyStr}
         \\pub fun main() -> void {
         \\    print("hello, E2E\n");
         \\}
@@ -296,16 +320,65 @@ fn scrubImportLines(src: []const u8, dst: *[65536]u8) !usize {
 
         var matched: bool = false;
 
-        // Rule 1: preamble line begins with `const __zag_imported_`
-        // AND the line contains an `=` (else the form is malformed
-        // and we fall through to passthrough).
-        if (src_i + prefix.len <= line_end and
-            std.mem.eql(u8, src[src_i..][0..prefix.len], prefix))
-        {
-            var eq_i: usize = src_i;
+        // Rule 1: preamble line contains `const __zag_imported_` as
+        // a substring ANYWHERE on the line (not strictly at the
+        // line start). The codegen preamble emit adds a 4-space
+        // indent (see src/codegen/core.zig's preamble block: the
+        // `self.write("    const __zag_imported_")` line), so a
+        // strict startsWith-only check would MISS the indented
+        // shape entirely -- the line would passthrough verbatim
+        // and the produced binary would still try to `@import`
+        // the lib/std/X.zag path. The fix is a line-bounded
+        // substring search: walk positions from src_i to line_end
+        // looking for the 18-byte marker; once found, scan
+        // forward for the next `=` byte on the same line and
+        // truncate there, preserving any leading whitespace in
+        // the output (so 4-space-indented preambles stay indented
+        // in the scrubbed form). Same discipline as Rule 2: the
+        // `__zag_imported_` token cannot cross the LF because the
+        // search is bounded by `line_end`.
+        //
+        // Rule 1 must come before Rule 2 because both could
+        // theoretically match the same line (the preamble's
+        // `const __zag_imported_<i> = ...` does not contain the
+        // `= __zag_imported_` substring; the alias' `const MyStr
+        // = __zag_imported_<i>.X;` does not contain the
+        // `const __zag_imported_` substring). They're
+        // disjoint shape-wise so ordering is documentation, not
+        // correctness.
+        //
+        // CAVEAT (mirrors Rule 2): the codegen reserves `__zag_`
+        // against user identifiers but NOT against byte sequences
+        // inside string literals. A future e2e source containing
+        // the literal substring `const __zag_imported_` inside a
+        // zag `print("...")` string would have Rule 1 mangle it.
+        // Out of scope for v1 (no such string in the current
+        // richer source); revisit if a more sophisticated source
+        // lands.
+        var prefix_pos: usize = src_i;
+        var prefix_hit: bool = false;
+        while (prefix_pos + prefix.len <= line_end) {
+            if (std.mem.eql(u8, src[prefix_pos..][0..prefix.len], prefix)) {
+                prefix_hit = true;
+                break;
+            }
+            prefix_pos += 1;
+        }
+        if (prefix_hit) {
+            // Find `=` on the line AFTER prefix_pos -- preamble
+            // shape is `const __zag_imported_<i> = @import(...)`;
+            // there's exactly one `=` per line for the codegen's
+            // preamble emit pattern.
+            var eq_i: usize = prefix_pos;
             while (eq_i < line_end and src[eq_i] != '=') : (eq_i += 1) {}
             if (eq_i < line_end and src[eq_i] == '=') {
-                const copy_len = eq_i + 1 - src_i; // includes '='
+                // Copy from line start (preserving any leading
+                // whitespace) through `=` inclusive, then append
+                // ` struct{};`. Indented preambles keep their
+                // 4-space indent in the output; unindented
+                // variants (probe input) keep their zero-space
+                // shape.
+                const copy_len = eq_i + 1 - src_i;
                 if (dst_i + copy_len > dst.len) return error.ScrubBufferOverflow;
                 @memcpy(dst[dst_i..][0..copy_len], src[src_i..][0..copy_len]);
                 dst_i += copy_len;
