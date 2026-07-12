@@ -1,0 +1,48 @@
+[package]
+name    = "cfgtool"
+edition = "2024"
+version = "0.1.0"
+
+[project]
+description = "Tiny CLI that reads JSON config files"
+license     = "MIT"
+repository  = "https://github.com/example/cfgtool"
+authors     = ["Lex <e@example.com>"]
+
+[lib]
+root = "src/lib.zag"
+
+[[bin]]
+name = "cfgtool"
+root = "src/main.zag"
+
+[build]
+target   = "native"
+optimize = "Debug"
+output   = "zig-out"
+check    = ["bounds", "ref"]
+
+[dependencies]
+# Remote, pinned tag (will produce a deterministic SHA in zag.lock):
+json = { git = "https://github.com/zag-lang/json", rev = "v0.2.4" }
+
+# Remote, tracking a branch head (resolver will pin it to the current
+# branch HEAD's SHA at `zag install` time):
+log = { git = "https://github.com/zag-lang/log", branch = "main" }
+
+# Local sibling package at ../sibling-tls (workspaces-style, never
+# appears in zag.lock; integrity is verified against the local
+# filesystem each build):
+internal-tls = { path = "../sibling-tls" }
+
+[dev-dependencies]
+# Only on the `zag test` / `zag bench` DAG, not the `zag build` DAG:
+zig-assert = { git = "https://github.com/example/zig-assert", rev = "v0.3.1" }
+
+[scripts]
+build = { deps = [], command = "" }
+test  = { deps = ["build"], filter = ".*", failures = "fail-fast" }
+bench = { deps = ["build"], warmup = 10, runs = 100 }
+
+[modules]
+include = ["json/*", "log/*"]          # restrict what's reachable from `deps/`

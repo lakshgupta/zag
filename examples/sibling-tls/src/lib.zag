@@ -1,0 +1,29 @@
+## src/lib.zag — sibling-tls library root.
+##
+## Trivial stub for the worked-example path-dep. Real TLS implementation
+## is unrelated to the fixture role -- this sibling exists so that
+## `internal-tls = { path = "../sibling-tls" }` in
+## `examples/project_layout/zag.toml` resolves to a real .zag file under
+## the on-disk tree, and so the `examples/run_all.sh` harness finds a
+## valid runnable program if it walks into this directory.
+##
+## The `fun main()` below is a harness-friendly stub: `examples/run_all.sh`
+## runs `zag run <file>` on every file it finds; this sibling's
+## production entry point is to be invoked via the path-dep resolver,
+## which is not yet wired. Until that lands, we expose a no-op main() so
+## the harness stays green if it walks into this directory.
+##
+## ASYMMETRY: hard-coded "ok" instead of `{tls_marker()}`. Both Display
+## branches are wired in today's compiler (per docs/spec.md §4.5, bool
+## renders as `true`/`false` like every primitive); the asymmetry is a
+## legibility choice, not a Display gap. `lib_marker` interpolates
+## because showing the integer value is the demo; `tls_marker` hard-codes
+## "ok" because in a fixture status line, "true"/"false" is less readable
+## than an explicit confirm. Compare [`examples/project_layout/src/lib.zag`](../project_layout/src/lib.zag) for the integer branch.
+pub fun tls_marker() -> bool {
+    return true;
+}
+
+fun main() {
+    print("tls_marker ok\n");
+}

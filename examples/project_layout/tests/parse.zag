@@ -1,0 +1,12 @@
+## tests/parse.zag — placeholder for the fixture's test block.
+##
+## The worked example references real `test "..."` blocks here,
+## but the v0.1 compiler does not yet expose a `zag test` subcommand
+## (it's part of the upcoming v0.1 dep-CLI work). The fixture ships
+## with a `fun main()` so `examples/run_all.sh` runs it today without
+## harness changes; once `zag test` lands, replace the body with the
+## real test blocks.
+
+fun main() {
+    print("cfgtool tests placeholder\n");
+}

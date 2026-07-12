@@ -1,0 +1,22 @@
+## src/lib.zag — library root for cfgtool.
+##
+## Per [lib].root in zag.toml, this is the library entry point.
+## In the worked example this lib re-exports the json parser's
+## stable surface; the fixture stays minimal so that
+## `examples/run_all.sh` can compile it standalone today
+## (the dep-resolver's path-dep import machinery is not yet wired).
+##
+## The `fun main()` below exists SOLELY to keep the harness
+## harness-compatible: `examples/run_all.sh` does `find … -name
+## '*.zag' | sort` and runs `zag run <file>` on every match. The
+## cfgtool project's real entry point is `src/main.zag`
+## (`[[bin]].root`); this lib's `main()` is a no-op stub so the
+## harness's `zag run` invocation exits 0 if it lands here.
+
+pub fun lib_marker() -> i32 {
+    return 7;
+}
+
+fun main() {
+    print("lib_marker = {lib_marker()}\n");
+}

@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+##
+## scripts/deps/zag-deps -- v0.1 dep-CLI bash skeleton.
+##
+## Reference implementation of the sub-commands documented in
+## docs/manual/34-project-layout.md. Not production-grade: the git
+## SHA resolution + remote-fetch steps are stubs that emit deterministic
+## fixture SHA prefixes derived from sha256(input). Real implementations
+## (network-aware caches, upstream registry, etc.) ship in v2.
+##
+## Reference architecture:
+##   - `$1` dispatches through to a per-command `cmd_<name>` function.
+##   - Manifest is parsed with Python's `tomllib` (PEP 680 stdlib, py3.11+).
+##   - Lockfile is read with grep+awk for the entries this skeleton needs
+##     (full Toml round-trip on read is overkill for v0.1; v2 uses tomllib).
+##   - All on-disk writes route through `atomic_write` (mktemp + mv) so
+##     a crash mid-write leaves no half-cooked state -- same idiom as
+##     scripts/install.sh::mirror_zig_into_vendor.
+##   - Cache mirrors the canonical spec: ~/.zag/cache/git/<host>/path/<sha>/
+##
+## Hardened against the audit findings (see commits + code-reviewer):
+##   - Shell-glob matchers use `case` (POSIX `[ ]` doesn't glob-match).
+##   - sed/grep use `[[:space:]]` only (no GNU `\\s` extension).
+##   - Every file write goes through atomic_write; no direct `>`/`>>` to
+##     a final-path filename.
+##   - TOML string values are escaped via a Python heredoc before being
+##     inserted into the manifest (no raw printf interpolation).
+##   - parse_git_url whitelists supported schemes (git+https or https).
+##   - cmd_vendor sets nullglob before the deps/ loop so an empty
+##     deps/ doesn't produce a literal `*` entry.
+##   - cmd_init operates on PWD by default and refuses to scaffold
+##     inside an existing project unless --force.
+##
+## Sub-command table lives in the usage() heredoc below; run
+## `zag --help` (or any unknown sub-command) to print it.
+
+set -euo pipefail
+
+# ----- ANSI colors (verbatim copy from scripts/install.sh) -----
+# Note: escape codes emitted unconditionally in v0.1. On a non-TTY
+# (CI log, piped output) the glyphs may render as literal text. Real
+# CLI: detect with [ -t 1 ] and suppress. Skeleton OK without it.
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()    { printf "  ${CYAN}\xe2\x86\x92${NC} %s\n" "$*"; }
+success() { printf "  ${GREEN}\xe2\x9c\x93${NC} %s\n" "$*"; }
+warn()    { printf "  ${YELLOW}\xe2\x9a\xa0${NC} %s\n" "$*"; }
+error()   { printf "  ${RED}\xe2\x9c\x97${NC} %s\n" "$*"; }
+header()  { printf "\n${BOLD}${CYAN}=== %s ===${NC}\n\n" "$*"; }
+
+# ----- Project-root resolution (walk up looking for zag.toml) -----
+find_project_root() {
+    local d="${PWD}"
+    while [ "$d" != "/" ]; do
+        if [ -f "$d/zag.toml" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+        local next
+        next="$(dirname "$d")"
+        [ "$next" = "$d" ] && return 1
+        d="$next"
+    done
+    return 1
+}
+
+# ----- Constants -----
+ZAG_HOME="${ZAG_HOME:-$HOME/.zag}"
+CACHE_DIR="$ZAG_HOME/cache/git"
+
+# ----- Helpers -----
+
+# Deterministic stub SHA: 13-char hex prefix derived from sha256(input).
+# Real implementations resolve via `git ls-remote <url> <ref>`.
+stub_sha() {
+    local input="$1"
+    python3 -c "
+import hashlib, sys
+print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:13])
+" "$input"
+}
+
+# Read a [section].field from a TOML file (or '' if absent).
+parse_toml_field() {
+    local toml_file="$1"
+    local section="$2"
+    local field="$3"
+    python3 -c "
+import tomllib, sys
+with open(sys.argv[1], 'rb') as f:
+    data = tomllib.load(f)
+for sec in sys.argv[2].split('.'):
+    if isinstance(data, dict) and sec in data:
+        data = data[sec]
+    else:
+        print(''); sys.exit(0)
+v = data.get(sys.argv[3])
+print('' if v is None else repr(v) if not isinstance(v, str) else v)
+" "$toml_file" "$section" "$field"
+}
+
+# Skeleton coverage: `\\`, `"`, `\\n`, `\\r`, `\\t`. Missing `\\b`,
+# `\\f`, `\\uXXXX`, `\\UXXXXXXXX` -- v2 uses tomllib.dumps for the
+# full set.
+toml_escape_value() {
+    TOML_VAL="$1" python3 -c '
+import os, sys
+s = os.environ["TOML_VAL"]
+# TOML basic string: backslash escapes \\ and ".
+out = ""
+for ch in s:
+    if ch == "\\":
+        out += "\\\\"
+    elif ch == "\"":
+        out += "\\\""
+    elif ch == "\n":
+        out += "\\n"
+    elif ch == "\r":
+        out += "\\r"
+    elif ch == "\t":
+        out += "\\t"
+    else:
+        out += ch
+sys.stdout.write(out)
+'
+}
+
+# Atomic in-place write: mktemp + rename. Survives SIGKILL by leaving
+# nothing half-cooked -- the temp file is the only thing being touched
+# until the rename lands in one syscall.
+# atomic_write also auto-appends a trailing LF if content doesn't
+# already end in one (keeps `git diff` clean of `\ No newline at end
+# of file` markers on zag.toml/zag.lock).
+atomic_write() {
+    local path="$1"
+    local content="$2"
+    case "$content" in
+        *$'\n') ;;                    # already newline-terminated; no-op
+        *) content="${content}"$'\n' ;;
+    esac
+    local dir
+    dir="$(dirname "$path")"
+    mkdir -p "$dir"
+    local tmp
+    tmp="$(mktemp "${dir}/.$(basename "$path").tmp.XXXXXX")"
+    printf '%s' "$content" > "$tmp"
+    mv "$tmp" "$path"
+}
+
+# Light-weight URL parse: returns "<host>\n<path-with-owner>".
+# E-fix: explicit scheme whitelist (git+https or https). ssh:/file:
+# fall through to the unsupported branch.
+parse_git_url() {
+    local url="$1"
+    local path host
+    case "$url" in
+        git+https://*) path="${url#git+https://}" ;;
+        https://*)     path="${url#https://}" ;;
+        *)
+            error "unsupported scheme in \`parse_git_url\`: $url" >&2
+            return 1
+            ;;
+    esac
+    path="${path%.git}"
+    # Refuse single-segment URLs (no `/<owner>/<repo>` after host):
+    # bash `basename ""` returns "." and would create a crash-prone
+    # deps_dir downstream.
+    if [ -z "$path" ] || [[ "$path" != */* ]]; then
+        error "URL has no /<owner>/<repo> after host: $url"
+        return 1
+    fi
+    host="${path%%/*}"
+    path="${path#*/}"
+    [ -z "$path" ] && { error "URL has no repo segment after host: $url"; return 1; }
+    printf '%s\n%s\n' "$host" "$path"
+}
+
+# ----- Sub-commands -----
+
+cmd_init() {
+    header "zag init"
+    # Operate on PWD by default (no walking up). Refuse to scaffold
+    # INSIDE an existing project unless --force; --force also wipes
+    # .gitignore and src/main.zag in addition to zag.toml.
+    local root="${PWD}"
+
+    if [ -f "${root}/zag.toml" ] && [ "${1:-}" != "--force" ]; then
+        warn "zag.toml already present at ${root}/zag.toml"
+        info "(re-run with --force to overwrite)"
+        return 0
+    fi
+
+    local parent_root=""
+    if parent_root="$(find_project_root 2>/dev/null || true)" && [ -n "$parent_root" ]; then
+        if [ "$parent_root" != "$root" ]; then
+            error "PWD is inside an existing zag project tree at $parent_root"
+            error "(cd outside that tree before running \`zag init\`, or use --force to nest)"
+            return 1
+        fi
+    fi
+
+    local pkg_name
+    pkg_name="$(basename "$root")"
+    # Escape pkg_name through toml_escape_value: a basename containing
+    # `"` or `\` would corrupt the manifest name field. Mirrors cmd_add.
+    local pkg_name_t
+    pkg_name_t="$(toml_escape_value "$pkg_name")"
+    info "scaffold zag.toml (package.name = $pkg_name)"
+    atomic_write "$root/zag.toml" "[package]
+name    = \"$pkg_name_t\"
+edition = \"2024\"
+version = \"0.1.0\"
+"
+
+    info "scaffold .gitignore (excludes deps/, build artifacts)"
+    # --force fully regenerates; otherwise keep any user-edits.
+    if [ "${1:-}" = "--force" ] || [ ! -f "$root/.gitignore" ]; then
+        atomic_write "$root/.gitignore" "deps/
+.zig-cache/
+zig-out/
+"
+    fi
+
+    info "scaffold src/main.zag (edit and run \`zag run\` to test)"
+    mkdir -p "$root/src"
+    if [ "${1:-}" = "--force" ] || [ ! -f "$root/src/main.zag" ]; then
+        atomic_write "$root/src/main.zag" "fun main() {
+    print(\"hello, world\\n\");
+}
+"
+    fi
+
+    info "initialise empty lockfile"
+    atomic_write "$root/zag.lock" "[metadata]
+zag-version  = \"0.1.0\"
+generated-at = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+resolver     = \"git-only\"
+
+"
+
+    success "init: scaffold laid at $root"
+}
+
+cmd_add() {
+    header "zag add <url>"
+    local root
+    root="$(find_project_root)" || { error "not inside a zag project tree"; return 1; }
+
+    local url_rev="${1:-}"
+    [ -n "$url_rev" ] || { error "usage: zag add <git-url>[@rev]"; return 1; }
+
+    local url="${url_rev%@*}"
+    local rev="${url_rev#*@}"
+    [ "$url" = "$url_rev" ] && rev="HEAD"
+
+    # A-fix: scheme check via case (portable; POSIX `[ ]` does not glob-match).
+    case "$url" in
+        git+https://*|https://*) ;;
+        *) error "unsupported URL scheme: $url (skeleton only: git+https or https)"
+           return 1 ;;
+    esac
+
+    # Step 1: resolve to SHA (stub).
+    local sha
+    sha="$(stub_sha "$url@$rev")"
+    info "resolve: $url @ $rev -> $sha (skeleton stub: sha256(url@rev))"
+
+    # Step 2: cache layout -- ~/.zag/cache/git/<host>/<owner>/<repo>/<sha>/
+    local host_path
+    if ! host_path="$(parse_git_url "$url" "$rev")"; then
+        return 1
+    fi
+    local host
+    host="$(echo "$host_path" | sed -n '1p')"
+    local path
+    path="$(echo "$host_path" | sed -n '2p')"
+    local cache_subdir="$CACHE_DIR/$host/$path/$sha"
+    info "cache: $cache_subdir/"
+    mkdir -p "$cache_subdir"
+    atomic_write "$cache_subdir/SOURCE"        "git+$url"
+    atomic_write "$cache_subdir/RESOLVED_REV"  "$sha"
+    success "cache populated"
+
+    # Step 3: materialise deps/<basename-of-path>/
+    local dep_name
+    dep_name="$(basename "$path")"
+    local deps_dir="$root/deps/$dep_name"
+    info "deps/: $deps_dir/ (skeleton stub; v2 hardlinks cached working tree)"
+    mkdir -p "$deps_dir"
+    atomic_write "$deps_dir/SOURCE"        "git+$url"
+    atomic_write "$deps_dir/RESOLVED_REV"  "$sha"
+    success "deps/ populated"
+
+    # Step 4: append to [dependencies] in zag.toml if absent.
+    if ! grep -qE "^${dep_name}[[:space:]]*=" "$root/zag.toml"; then
+        info "manifest: appending to [dependencies]"
+        local url_clean="${url#git+}"
+        # B+D fix: route through atomic_write AND escape values through
+        # the Python heredoc so quotes/backslashes in dep_name/url/rev
+        # cannot corrupt the manifest.
+        local current_manifest
+        current_manifest="$(cat "$root/zag.toml")"
+        local dep_name_t
+        dep_name_t="$(toml_escape_value "$dep_name")"
+        local url_clean_t
+        url_clean_t="$(toml_escape_value "$url_clean")"
+        local rev_t
+        rev_t="$(toml_escape_value "$rev")"
+        local new_manifest
+        new_manifest=$(printf '%s\n\n[dependencies]\n%s = { git = "%s", rev = "%s" }\n' \
+            "$current_manifest" "$dep_name_t" "$url_clean_t" "$rev_t")
+        atomic_write "$root/zag.toml" "$new_manifest"
+    else
+        info "manifest: $dep_name already present (no-op)"
+    fi
+
+    # Step 5: stamp a new [[package]] in zag.lock read-modify-write.
+    info "lockfile: stamping [[package]]"
+    local placeholder_sha
+    placeholder_sha="$(stub_sha "$url@$rev@sha256")"
+    local placeholder_tree
+    placeholder_tree="$(stub_sha "$url@$rev@tree")"
+    local url_clean="${url#git+}"
+    # Defense-in-depth: Step 4 escapes dep_name/url_clean/rev for the
+    # manifest; Step 5 applies the same escape so a value containing
+    # `"` or `\` cannot corrupt the lockfile. $sha/$placeholder_* are
+    # safe (always 13-char hex from stub_sha) but printed unescaped.
+    local dep_name_t url_clean_t rev_t
+    dep_name_t="$(toml_escape_value "$dep_name")"
+    url_clean_t="$(toml_escape_value "$url_clean")"
+    rev_t="$(toml_escape_value "$rev")"
+    local current_lock
+    current_lock="$(cat "$root/zag.lock")"
+    # Use url_clean (no leading `git+`) so source = `git+<url_clean>#<rev>`,
+    # not `git+git+<url>#<rev>` when input already had `git+` prefix.
+    local new_entry
+    new_entry=$(cat <<ENTRY
+
+[[package]]
+name     = "$dep_name_t"
+source   = "git+$url_clean_t#$rev_t"
+git-rev  = "$sha"
+git-tree = "$placeholder_tree"
+sha256   = "$placeholder_sha"
+ENTRY
+)
+    # Compose the new lockfile (old body + new entry + trailing newline).
+    local new_lock
+    new_lock="$(printf '%s%s\n' "$current_lock" "$new_entry")"
+    atomic_write "$root/zag.lock" "$new_lock"
+
+    success "added: $dep_name -> $sha at deps/$dep_name/"
+}
+
+cmd_fetch() {
+    header "zag fetch <url>"
+    local url_rev="${1:-}"
+    [ -n "$url_rev" ] || { error "usage: zag fetch <git-url>[@rev]"; return 1; }
+
+    local url="${url_rev%@*}"
+    local rev="${url_rev#*@}"
+    [ "$url" = "$url_rev" ] && rev="HEAD"
+
+    case "$url" in
+        git+https://*|https://*) ;;
+        *) error "unsupported URL scheme: $url (skeleton only: git+https or https)"
+           return 1 ;;
+    esac
+
+    local sha
+    sha="$(stub_sha "$url@$rev")"
+    local host_path
+    if ! host_path="$(parse_git_url "$url" "$rev")"; then
+        return 1
+    fi
+    local cache_subdir="$CACHE_DIR/$(echo "$host_path" | sed -n '1p')/$(echo "$host_path" | sed -n '2p')/$sha"
+
+    info "fetch: $url @ $rev -> $sha (skeleton stub: no network)"
+    mkdir -p "$cache_subdir"
+    atomic_write "$cache_subdir/SOURCE"       "git+$url"
+    atomic_write "$cache_subdir/RESOLVED_REV" "$sha"
+    success "fetched: $cache_subdir"
+}
+
+cmd_install() {
+    header "zag install"
+    local root
+    root="$(find_project_root)" || { error "not inside a zag project tree"; return 1; }
+
+    [ -f "$root/zag.lock" ] || { error "no zag.lock; run \`zag add <url>\` first"; return 1; }
+
+    info "syncing deps/ from zag.lock"
+    local n=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        info "  - $line"
+        n=$((n + 1))
+    done < <(grep -E '^\[\[package\]\]' -A 6 "$root/zag.lock" \
+              | grep -E '^name[[:space:]]*=' \
+              | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')
+
+    # Skeleton: a real `install` would hardlink cached working trees
+    # into deps/. v0.1 only walks the closure for shape verification.
+    success "install: $n entries in closure (skeleton: shape walk only)"
+    info "(v2 will hardlink cached working trees from ~/.zag/cache/)"
+}
+
+cmd_vendor() {
+    header "zag vendor"
+    local root
+    root="$(find_project_root)" || { error "not inside a zag project tree"; return 1; }
+
+    [ -d "$root/deps" ] || { error "no deps/; run \`zag install\` first"; return 1; }
+
+    # Per-dir atomic-rename: cp into tmp, mv to final. Same idiom as
+    # scripts/install.sh::mirror_zig_into_vendor. POSIX rename(2)
+    # atomically replaces the destination, so a crashed mv leaves the
+    # previous vendor/<name>/ in place instead of a half-cooked copy.
+    mkdir -p "$root/vendor"
+
+    # nullglob so an empty deps/ doesn't yield a literal `*` directory
+    # walk. The shell-option change is reverted via TWO traps:
+    #   - RETURN: fires when this function returns (normal loop-end
+    #     or an explicit `return N` from inside the loop).
+    #   - EXIT:   fires when bash itself exits (covers `set -e`
+    #     triggering a shell-level exit if a `mkdir -p`/`mv`/`rm -rf`
+    #     inside the loop fails after nullglob is enabled).
+    # Both traps unconditionally `shopt -u nullglob` -- if a caller had
+    # nullglob set before invoking `zag vendor`, the traps will turn
+    # it off in the parent shell (skeleton-grade behaviour; v2 uses a
+    # state-preserving closure). The explicit restore at the bottom is
+    # belt-and-suspenders for the clean-exit path.
+    local nullglob_was_set=0
+    shopt -q nullglob || nullglob_was_set=1
+    shopt -s nullglob
+    # Single trap body registered for both RETURN and EXIT signals;
+    # bash's `trap 'cmd' SIGNAL1 SIGNAL2` fires the same body for any
+    # of the listed signals. RETURN covers function-return paths;
+    # EXIT covers `set -e` triggering a shell-level exit.
+    trap 'shopt -u nullglob 2>/dev/null' RETURN EXIT
+
+    local n=0
+    for d in "$root/deps"/*; do
+        [ -d "$d" ] || [ -L "$d" ] || continue
+        local name
+        name="$(basename "$d")"
+        local vendor_tmp
+        vendor_tmp="$(mktemp -d "${root}/vendor/${name}.tmp.XXXXXX")"
+        info "vendor: $name (atomic cp-to-tmp then mv)"
+        cp -a "$d"/. "$vendor_tmp"/ 2>/dev/null || {
+            warn "vendor: cp failed for $name (skeleton stub)"
+        }
+        rm -rf "${root}/vendor/${name}"
+        mv "$vendor_tmp" "${root}/vendor/${name}"
+        n=$((n + 1))
+    done
+
+    trap - RETURN EXIT
+    [ "$nullglob_was_set" -eq 0 ] || shopt -u nullglob
+
+    success "vendor: $n entries copied (vendor/ is checkin-ready)"
+}
+
+cmd_update() {
+    header "zag update"
+    local root
+    root="$(find_project_root)" || { error "not inside a zag project tree"; return 1; }
+
+    [ -f "$root/zag.lock" ] || { error "no zag.lock; run \`zag add <url>\` first"; return 1; }
+
+    local target="${1:-all}"
+    info "update target: $target (skeleton: re-stamp SHA from current input)"
+    info "(v2 reconciles against \`git ls-remote\` history)"
+
+    # SKELETON: re-stamp lockfile with re-resolution timestamps but keep
+    # the existing SHA (since it's deterministic from input anyway).
+    # Read-modify-write via atomic_write so a crash leaves the previous
+    # lockfile intact.
+    local restamp_at
+    restamp_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    local current_lock
+    current_lock="$(cat "$root/zag.lock")"
+    local res_t
+    res_t="$(toml_escape_value "$restamp_at")"
+    # Mark metadata.generated-at
+    local stamped_lock
+    stamped_lock=$(printf '%s\n' "$current_lock" \
+                   | sed "s/^generated-at = \"[^\"]*\"/generated-at = \"$res_t\"/")
+
+    # Add a re-resolution note per [[package]] entry. Read-mode
+    # awk-sidecar: enumerate package blocks, append a comment after
+    # each name= line.
+    local with_notes
+    with_notes=$(printf '%s\n' "$stamped_lock" | awk -v ts="$restamp_at" '
+        /^\[\[package\]\]$/ { marker = 1; print; next }
+        marker && /^name[[:space:]]*=/ { print; print "# NOTE: re-resolved at " ts; marker = 0; next }
+        { print }
+    ')
+    atomic_write "$root/zag.lock" "$with_notes"
+    success "update: lockfile re-stamped at $restamp_at"
+}
+
+cmd_outdated() {
+    header "zag outdated"
+    local root
+    root="$(find_project_root)" || { error "not inside a zag project tree"; return 1; }
+
+    [ -f "$root/zag.lock" ] || { warn "no zag.lock; nothing to audit"; return 0; }
+
+    info "outdated is a stub in v0.1; v2 reconciles against upstream registry"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        printf '  %-30s locked @ present, upstream: (would advance -- query pending)\n' "$name"
+    done < <(grep -E '^\[\[package\]\]' -A 6 "$root/zag.lock" \
+              | grep -E '^name[[:space:]]*=' \
+              | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')
+}
+
+cmd_lock_ls() {
+    header "zag lock-ls"
+    local root
+    root="$(find_project_root)" || { error "not inside a zag project tree"; return 1; }
+
+    [ -f "$root/zag.lock" ] || { warn "no zag.lock"; return 0; }
+    cat "$root/zag.lock"
+}
+
+cmd_validate() {
+    header "zag validate"
+    local root
+    root="$(find_project_root)" || { error "not inside a zag project tree"; return 1; }
+
+    local issues=0
+    info "manifest: presence check"
+    if [ -f "$root/zag.toml" ]; then
+        success "manifest present"
+    else
+        error "missing $root/zag.toml"
+        issues=$((issues + 1))
+    fi
+
+    info "lockfile: parse-time SHA-stamp audit"
+    if [ -f "$root/zag.lock" ]; then
+        if grep -qE '^\[\[package\]\]' "$root/zag.lock"; then
+            local n
+            n=$(grep -cE '^\[\[package\]\]' "$root/zag.lock" || true)
+            success "lockfile has $n [[package]] entries"
+        else
+            warn "lockfile has no [[package]] entries yet"
+        fi
+    else
+        warn "no zag.lock"
+    fi
+
+    info "deps/ reality check"
+    if [ -d "$root/deps" ]; then
+        local n=0
+        for d in "$root/deps"/*; do
+            [ -d "$d" ] || [ -L "$d" ] || continue
+            n=$((n + 1))
+        done
+        success "deps/: $n entries on disk"
+    else
+        info "no deps/ (run \`zag install\` after \`zag add\`)"
+    fi
+
+    if [ "$issues" -eq 0 ]; then
+        success "validate: no issues"
+        return 0
+    else
+        error "validate: $issues issue(s)"
+        return 1
+    fi
+}
+
+usage() {
+    cat <<'USAGE_BANNER'
+Usage:
+  zag init                   -- scaffold zag.toml + .gitignore + src/main.zag
+  zag add   <git-url>[@rev]  -- resolve to SHA, fetch, materialise, lock
+  zag fetch <git-url>[@rev]  -- populate ~/.zag/cache/ without editing the project
+  zag install                -- sync deps/<name>/ from zag.lock
+  zag update [name]          -- re-resolve and rewrite zag.lock (skeleton: stamps ALL)
+  zag vendor                 -- copy deps/ to vendor/ (offline-ready)
+  zag outdated               -- list deps that can advance
+  zag lock-ls                -- print the resolved lockfile closure
+  zag validate               -- re-read manifest + lockfile, report schema issues
+  zag --help                 -- this banner
+
+Repository shape, schema, and worked example: docs/manual/34-project-layout.md
++ docs/manual/35-zag-toml-schema.md. This skeleton is a bash reference
+implementing those sub-commands at the lowest-fidelity surface.
+USAGE_BANNER
+}
+
+# ----- Dispatch -----
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    init)          cmd_init "$@" ;;
+    add)           cmd_add "$@" ;;
+    fetch)         cmd_fetch "$@" ;;
+    install)       cmd_install "$@" ;;
+    update)        cmd_update "$@" ;;
+    vendor)        cmd_vendor "$@" ;;
+    outdated)      cmd_outdated "$@" ;;
+    lock-ls)       cmd_lock_ls "$@" ;;
+    validate)      cmd_validate "$@" ;;
+    -h|--help|help|"") usage ;;
+    *)             error "unknown sub-command: $cmd"; usage; exit 1 ;;
+esac

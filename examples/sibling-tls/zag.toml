@@ -1,0 +1,7 @@
+[package]
+name    = "sibling-tls"
+edition = "2024"
+version = "0.0.1"
+
+[lib]
+root = "src/lib.zag"

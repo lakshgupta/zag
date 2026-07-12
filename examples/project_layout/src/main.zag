@@ -1,0 +1,14 @@
+## src/main.zag — binary entry point for cfgtool.
+##
+## Stands alone in the fixture: the worked example imports
+## `internal_tls` here, but the current compiler does not yet plumb
+## `path = "..."` deps through the import resolver (that work ships
+## alongside the v0.1 dep CLI). Until then, the fixture's main.zag
+## is intentionally dep-free so `examples/run_all.sh` keeps passing.
+##
+## The metafiles (zag.toml + zag.lock) carry the project-layout
+## story; the .zag source stays trivially runnable.
+
+fun main() {
+    print("cfgtool v0.1.0\n");
+}
