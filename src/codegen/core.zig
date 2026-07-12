@@ -1,5 +1,25 @@
 const std = @import("std");
 const ast = @import("../ast.zig");
+// CYCLE ANCHOR: parser → codegen → parser. Codegen uses
+// `Parser.resolveStdImport` and `Parser.joinDottedPath` for the
+// import-preamble emit at `generate()` entry. The mirror
+// re-export lives at src/parser.zig (`pub const Codegen =
+// @import("codegen.zig").Codegen;`) so the e2e test module
+// (tests/e2e.zig) can share the scaffold_parser_helper_mod
+// rooted there without creating a file-membership collision on
+// `src/lexer/token.zig` (which a separate codegen module root
+// would introduce). zig 0.16's module DAG accepts the cycle.
+//
+// IMPORTANT: do NOT remove either end of the cycle in isolation.
+// If you remove the codegen side here, the e2e breaks silently
+// (its `parser_mod.Codegen.init()` lookup now dangles). If you
+// remove the parser side, the e2e breaks with a file-membership
+// collision on `src/lexer/token.zig`. Both ends must stay in
+// lockstep; either remove BOTH (and refactor the e2e to use a
+// separate module) or keep BOTH. The cycle is anchored here AND
+// at src/parser.zig's re-export; cross-reference the parser-side
+// docblock before any edit.
+const parser = @import("../parser.zig");
 
 /// Lightweight per-function type-info map entry. Lives next to
 /// `Codegen` rather than in `ast.zig` because the caller has no
@@ -157,6 +177,114 @@ pub const Codegen = struct {
             \\var __zag_interp_buf: [4096]u8 = undefined;
             \\
         );
+
+        // Module imports (docs/manual/22-modules.md §Imports): walk
+        // `prog.imports` at generate() entry and emit one preamble
+        // line per resolved entry:
+        //   const __zag_imported_<i> = @import("<resolved_path>");
+        // The line lands AFTER `const std = @import("std");` and
+        // BEFORE `pub fn print_fn` so the produced zig module's
+        // stdlib imports are top-of-module (the codegen-emit
+        // preamble). Index-based names (always-bumped) guarantee
+        // uniqueness across duplicate `import std.X` lines in user
+        // source — zig rejects `const` redeclarations with a
+        // hard-error at the use site. Misses against
+        // KNOWN_STD_MODULES are skipped silently (same
+        // null-on-miss contract that `resolveStdImport` already
+        // exposes); v1 use-site wiring (Phase 2+) is the place
+        // where unresolved paths become a user-facing diagnostic.
+        //
+        // Scratch buffer (256 bytes) is sized for the longest v1
+        // entry (`std.arch.x86.avx2` = 18 bytes including
+        // separators) — see `joinDottedPath`'s doc for the
+        // truncation-tolerant fallback contract.
+        //
+        // Order: AFTER the existing `const std = @import("std")`
+        // preamble write but BEFORE the struct/enum/impl/fun
+        // walks below. The loop's full scope wraps in a labeled
+        // block to bound `import_scratch` + `idx_buf` stack
+        // lifetimes — neither leak past the loop; both are
+        // consumed during the iteration that produced them.
+        // (`resolveStdImport` returns a slice into a comptime-static
+        // table so the resolved_path is independent of any
+        // scratch-locality concerns.)
+        {
+            var import_scratch: [256]u8 = undefined;
+            var import_i: usize = 0;
+            while (import_i < prog.imports.len) : (import_i += 1) {
+                const imp = prog.imports[import_i];
+                const dotted = parser.Parser.joinDottedPath(&import_scratch, imp.path_nodes);
+                if (parser.Parser.resolveStdImport(dotted)) |resolved_path| {
+                    self.write("const __zag_imported_");
+                    var idx_buf: [16]u8 = undefined;
+                    const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{import_i}) catch "X";
+                    self.write(idx_str);
+                    self.write(" = @import(\"");
+                    self.write(resolved_path);
+                    self.write("\");\n");
+                    // Per-selector use-site forwarding
+                    // (docs/manual/22-modules.md §Imports): for each
+                    // entry in the selective `{A, B as C}` list,
+                    // emit
+                    //   const <alias orelse name> = __zag_imported_<i>.<canonical>;
+                    // so user references to `MyStr` or `Display`
+                    // resolve at the zig level through zig's own
+                    // type-alias mechanism — no codegen-side AST
+                    // rewrite needed. Whole-module imports
+                    // (`selectors.len == 0`) skip this pass; users
+                    // access those bindings via the bare
+                    // `__zag_imported_<i>.Foo` form until a future
+                    // Phase adds macro-/reflection-based namespace
+                    // emission (deferred — would require knowing the
+                    // source module's decl list at codegen-emit
+                    // time, which is not available at this point in
+                    // the pipeline).
+                    //
+                    // The canonical name on the RHS is `sel.name`
+                    // (the source-side identifier from the source
+                    // module being imported), NOT `alias orelse
+                    // name`. zig's alias indirection (`const MyStr =
+                    // __zag_imported_0.String`) is the bridge that
+                    // lets the user's `MyStr` reference resolve
+                    // cleanly through the type-alias path.
+                    //
+                    // Misses against KNOWN_STD_MODULES SKIP both
+                    // the preamble AND the aliases — alias emit
+                    // without a preamble would dangle (zig would
+                    // error "use of undeclared identifier"). The
+                    // `if (parser.Parser.resolveStdImport(dotted))
+                    // |resolved_path|` guard at the outer level
+                    // already enforces this: the alias loop runs
+                    // inside that block, so a miss cleanly skips
+                    // both passes.
+                    //
+                    // The same `idx_str` formatted once at the top
+                    // of the iteration is reused here — zig accepts
+                    // duplicate `idx_str` slices that point to the
+                    // same bytes because both writes resolve
+                    // through `self.write`, which copies them into
+                    // `out_buf` immediately.
+                    //
+                    // `is_pub` is NOT honored at v1: the alias emit
+                    // is unconditionally `const`, not `pub const`,
+                    // matching the preamble's "module-local binding"
+                    // contract. Re-exporting aliases via `pub const
+                    // MyStr = ...` is a Phase 2+ widening that the
+                    // user can opt into once `pub fun` / `pub
+                    // struct` re-exports are wired the same way.
+                    for (imp.selectors) |sel| {
+                        const user_name = sel.alias orelse sel.name;
+                        self.write("const ");
+                        self.write(user_name);
+                        self.write(" = __zag_imported_");
+                        self.write(idx_str);
+                        self.write(".");
+                        self.write(sel.name);
+                        self.write(";\n");
+                    }
+                }
+            }
+        }
 
         // Emit struct declarations BEFORE top-level functions so the
         // emitted zig sees types declared before use. Each struct
