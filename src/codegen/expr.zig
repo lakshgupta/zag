@@ -863,24 +863,73 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("; }");
             },
             .fs_read_file => {
-                // Runtime-fail placeholder (Phase 1 defer). The
-                // builtins.zig table already has `read_file` routing
-                // to `.fs_read_file` so the codegen-router surface
-                // is wired end-to-end; the emit itself stays
-                // @panic'd until Phase 2 lands the real emit. Phase 2
-                // will route through zig 0.16's `std.Io.Dir.readFileAlloc`
-                // (note: NOT `std.fs.cwd().readFileAlloc`, which the
-                // vendored 0.16 stdlib no longer exposes -- the 21-line
-                // `vendor/zig/lib/std/fs.zig` is a deprecation stub).
-                // The `std.Io.Dir.readFileAlloc` signature requires an
-                // `Io` event-loop instance, which the codegen-router
-                // cannot safely emit as a blocking call today -- the
-                // Phase 2 work introduces the codegen-router-aware
-                // `Io` context first, then this arm's emit swap.
+                // Phase 2 router: real emit shape for the fs_read_file
+                // dispatch. zig 0.16's `std.Io.Dir.readFileAlloc` (which
+                // RETIRED the legacy `std.fs.cwd().readFileAlloc` form —
+                // the 21-line `vendor/zig/lib/std/fs.zig` is a deprecation
+                // stub) requires an active `Io` event-loop instance. We
+                // construct one per call via `std.Io.Threaded.init` so
+                // each `read_file(path)` invocation owns a fresh Io
+                // context, leveraging zig's per-scope-stack-allocation
+                // for the `Threaded` struct itself + RAII via `defer
+                // __io_threaded.deinit()` to tear down the thread pool,
+                // signal handlers (`SIG.IO` / `SIG.PIPE`), environ scan
+                // scratch, and the random/pipe/null file handles the
+                // Threaded impl caches.
                 //
-                // NOTE: no `_ = args` suppression is needed --
-                // mirror the rationale on `.argv_get` above.
-                @panic("fs_read_file not wired (Phase 1)");
+                // Allocator: `std.heap.page_allocator` mirrors the
+                // existing `.new_expr` codegen path so heap-owned
+                // ownership policy stays consistent (user must free via
+                // `std.heap.page_allocator.free(slice)` before
+                // discarding; Phase 2.1 widening will add a `free
+                // <slice>` overload to `.free_expr` so the .zag
+                // surface gets a cleaner `defer free data` syntax).
+                // Memory ownership of the returned `[]u8` is the
+                // caller; page-aligned leaks at process exit are
+                // acceptable for short-lived zag binaries.
+                //
+                // Error collapse: `catch &[_]u8{}` silently coalesces
+                // every path of the triple-union error set
+                // (`Io.Dir.Reader.Error || std.mem.Allocator.Error ||
+                // Io.UnexpectedError`) into an empty-slice. The docs/18
+                // error-propagation contract isn't here yet — Phase 3
+                // may add a sibling `read_file_or` builtin that bubbles
+                // `error.FileNotFound` etc. via zag's `?` operator. v1
+                // surface keeps read_file simple: empty slice on
+                // failure, heap-allocated bytes on success, no error
+                // channel.
+                //
+                // Per-call scoping: each fs_read_file invocation steps
+                // fs_counter and emits a fresh `__fs_<N>` scratch —
+                // sibling read_file calls in the same body produce
+                // distinct names (zig's no-redeclaration rule would
+                // reject a clash). The counter is reset at the top of
+                // each function body (genFun + genMethod +
+                // genFreeMethod in decl.zig).
+                //
+                // NOTE: no `_ = args` suppression is needed — mirror
+                // the rationale on `.argv_get` and `.env_var` above.
+                const id = self.fs_counter;
+                self.fs_counter += 1;
+                var name_buf: [16]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "__fs_{d}", .{id}) catch "__fs_0";
+
+                // Init order is LIFO at scope exit: `defer
+                // __io_threaded.deinit()` registers at construction
+                // time and runs AFTER `break :blk` captures the slice
+                // into the call site, so the Io's thread pool +
+                // signal handlers outlive the readFileAlloc call but
+                // are torn down before the surrounding block exits.
+                // The init is infallible (any CpuCountError is stored
+                // on `t.cpu_count_error`, NOT raised); no `catch` is
+                // needed.
+                self.write("blk: { var __io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); defer __io_threaded.deinit(); const ");
+                self.write(name);
+                self.write(": []u8 = std.Io.Dir.cwd().readFileAlloc(__io_threaded.io(), ");
+                self.genExpr(args[0]);
+                self.write(", std.heap.page_allocator, .unlimited) catch &[_]u8{}; break :blk ");
+                self.write(name);
+                self.write("; }");
             },
         }
     }

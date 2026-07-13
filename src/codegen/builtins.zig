@@ -92,36 +92,66 @@ pub const BuiltinDispatch = enum {
     /// control-flow primitive.
     env_var,
 
-    /// `fs_read_file` -- DEFERRED to Phase 2.
+    /// `fs_read_file` -- Phase 2 real emit.
     ///
-    /// The historical Phase 0 docblock promised
-    /// `std.fs.cwd().readFileAlloc(...)` as the emit shape, but zig
-    /// 0.16 retired `vendor/zig/lib/std/fs.zig` to a 21-line
+    /// zig 0.16 retired `vendor/zig/lib/std/fs.zig` to a 21-line
     /// deprecation-stub file (every entry there is just
     /// `Deprecated, use std.Io.Dir.<X>`) and relocated the real fs
     /// surface to `std.Io.Dir.readFileAlloc(dir, io, allocator,
-    /// sub_path, max_bytes)`, which requires a new `std.Io` event-loop
-    /// instance. Emitting a `readFileAlloc` call today would require
-    /// either (a) threading an `Io` instance through every function
-    /// parameter (Phase 2 widening; not yet implemented), or (b)
-    /// passing a per-fn `std.Io.Threaded` singleton via a comptime
-    /// global (thread-unsafe under async fun).
+    /// sub_path, limit)`. The signature requires a `std.Io`
+    /// event-loop instance.
     ///
-    /// Until the event-loop wiring lands, the `.fs_read_file` arm in
-    /// `genBuiltinCall` keeps its `@panic("fs_read_file not wired
-    /// (Phase 2 — see src/codegen/builtins.zig docblock)")` runtime
-    /// stub so a future Phase that adds a `read_file` row to the
-    /// table WITHOUT wiring the arm fails LOUDLY at the user's
-    /// host invocation rather than silently emitting wrong data.
-    /// The generous error message ("Phase 2 — see …") points the
-    /// developer at the docblock here so they understand WHY the
-    /// surface is deferred (it's a zig 0.16 stdlib API change, not
-    /// a Zag limitation).
+    /// Per-call blk wrapper shape (the design that landed in
+    /// Phase 2 commit):
+    ///   ```
+    ///   blk: {
+    ///       var __io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    ///       defer __io_threaded.deinit();
+    ///       const __fs_<N>: []u8 = std.Io.Dir.cwd().readFileAlloc(
+    ///           __io_threaded.io(),
+    ///           <args[0]>,
+    ///           std.heap.page_allocator,
+    ///           .unlimited,
+    ///       ) catch &[_]u8{};
+    ///       break :blk __fs_<N>;
+    ///   }
+    ///   ```
     ///
-    /// The lim-cap figure (`65536` in legacy docs) and the
-    /// `catch &[_]u8{}` error-collapse path both stay documented for
-    /// the eventual Phase 2 emit -- they describe what the wired
-    /// shape WILL be once the `Io` plumbing lands.
+    /// Init order is LIFO at scope exit:
+    /// `defer __io_threaded.deinit()` registers at construction
+    /// time and runs AFTER `break :blk` captures the slice into the
+    /// call site, so the Io's thread pool + signal handlers
+    /// (`SIG.IO` / `SIG.PIPE`) outlive the `readFileAlloc` call but
+    /// are torn down before the surrounding block exits. The init
+    /// is infallible (any `CpuCountError` is stored on
+    /// `t.cpu_count_error`, NOT raised) so no `catch` is needed.
+    ///
+    /// Allocator choice (`std.heap.page_allocator`) mirrors the
+    /// existing `.new_expr` codegen path so heap allocation policy
+    /// stays consistent across .zag's surface. Memory ownership
+    /// of the returned `[]u8` is the caller; the user MUST free
+    /// via `std.heap.page_allocator.free(slice)` before discarding
+    /// (a Phase 2.1 widening will add `free <slice>` overload to
+    /// `.free_expr` so the .zag surface gets a cleaner `defer free
+    /// data` syntax). Page-aligned leaks at process exit are
+    /// acceptable for short-lived zag binaries.
+    ///
+    /// Error collapse: `catch &[_]u8{}` silently coalesces every
+    /// path of the triple-union error set
+    /// (`Io.Dir.Reader.Error || std.mem.Allocator.Error ||
+    /// Io.UnexpectedError`) into an empty-slice. The docs/18
+    /// error-propagation contract isn't here yet — Phase 3 may add
+    /// a sibling `read_file_or` builtin that bubbles
+    /// `error.FileNotFound` etc. via zag's `?` operator. v1
+    /// surface keeps `read_file` simple: empty slice on failure,
+    /// heap-allocated bytes on success, no error channel.
+    ///
+    /// Per-call scoping: each fs_read_file invocation steps
+    /// `fs_counter` and emits a fresh `__fs_<N>` scratch — sibling
+    /// `read_file` calls in the same body produce distinct names
+    /// (zig's no-redeclaration rule would reject a clash). The
+    /// counter resets at the top of each function body
+    /// (`genFun` + `genMethod` + `genFreeMethod` in decl.zig).
     fs_read_file,
 };
 
@@ -196,18 +226,17 @@ pub const builtin_table = [_]BuiltinRoute{
     // `std.posix.system.getenv`, which is independent of how the
     // user-facing zag call name is spelled.
     .{ .name = "getEnv", .arity = 1, .receiver = null, .dispatch = .env_var },
-    // Phase 1 third entry: `read_file` (no-receiver free-fn form
-    // after `pub import std.fs.{read_file}` selective import) routes
-    // to the fs_read_file dispatch which is CURRENTLY a `@panic`
-    // runtime stub (deferred to Phase 2 — see the env_var/fs_read_file
-    // variant docblocks above for the deferral rationale). The row
-    // EXISTS so a future release that wires the fs_read_file arm
-    // (Phase 2) has the table entry ready; without this row, a user
-    // calling `read_file(path)` after `pub import std.fs.{read_file}`
-    // would silently fall through to the verbatim emit and zig
-    // would reject with "use of undeclared identifier 'read_file'".
-    // The row + panic guarantees a LOUD-FAIL signal at the host
-    // invocation rather than a confusing compile error.
+    // Phase 2 entry: `read_file` (no-receiver free-fn form after
+    // `pub import std.fs.{read_file}` selective import) routes to
+    // the fs_read_file dispatch which now emits a real zig 0.16
+    // `std.Io.Dir.readFileAlloc` shim — see the `fs_read_file`
+    // variant docblock above for the per-call blk wrapper shape +
+    // the Io lifecycle (`Threaded.init` + `defer deinit`) +
+    // page_allocator ownership contract. arity = 1 is EXACT-match:
+    // only the `read_file("PATH")` one-arg form routes; a future
+    // `read_file(path, limit)` widening would add a SECOND row
+    // with arity=2 rather than overloading this one, so the
+    // exact-arity contract is preserved per Phase 0's note.
     .{ .name = "read_file", .arity = 1, .receiver = null, .dispatch = .fs_read_file },
 };
 

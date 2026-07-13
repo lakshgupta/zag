@@ -79,10 +79,16 @@ pub const Codegen = struct {
     /// `genFreeMethod` so each `pub fn` body has its own `__env_<N>`
     /// sequence. Two getEnv calls in the same body produce
     /// `__env_0` and `__env_1` so zig's no-redeclaration rule is
-    /// satisfied. The counter steps ONLY on the env_var dispatch
-    /// path; the fs_read_file arm keeps its `@panic` runtime stub
-    /// (not wired in Phase 1) so it does not need a counter.
+    /// satisfied. The counter steps ONLY on the env_var dispatch path.
     env_counter: u32,
+    /// Per-function counter for the fs-read scratch variable emitted
+    /// by the `fs_read_file` builtin route (Phase 2 codegen router).
+    /// Reset to 0 by `genFun` / `genMethod` / `genFreeMethod` so
+    /// each `pub fn` body has its own `__fs_<N>` sequence. Two
+    /// read_file calls in the same body produce `__fs_0` and
+    /// `__fs_1` so zig's no-redeclaration rule is satisfied. The
+    /// counter steps ONLY on the fs_read_file dispatch path.
+    fs_counter: u32,
     /// Per-function flag: true when the currently-walked function body
     /// has a non-void return type (only relevant for impl-block methods
     /// because top-level `pub fun` declarations ALWAYS emit
@@ -177,6 +183,11 @@ pub const Codegen = struct {
             // `std.posix.system.getenv`'s `?[*:0]u8` surface to the
             // zag-side `?[]const u8` shape via `std.mem.span`.
             .env_counter = 0,
+            // Phase 2 fs-read counter starts at 0; each `read_file`
+            // builtin emit steps it and emits a fresh `__fs_<N>`
+            // scratch holding the `[]u8` return from
+            // `std.Io.Dir.readFileAlloc`. Mirrors env_counter shape.
+            .fs_counter = 0,
             .fn_returns_value = false,
             // Phase 3 trait-cast: the tracked trait-name set starts
             // empty; generate() populates from prog.traits before any

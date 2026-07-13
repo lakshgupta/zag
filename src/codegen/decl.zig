@@ -158,6 +158,12 @@ const Codegen = core.Codegen;
         // `__env_0` name and zig's no-redeclaration rule would reject
         // a sibling fn body's emit.
         self.env_counter = 0;
+        // Phase 2 codegen-router: fs_counter reset mirrors env_counter
+        // above. Sibling `pub fn` declarations with read_file calls
+        // get their own scoped counter slot to avoid `__fs_<N>`
+        // redeclaration when two fns in the same module both call
+        // read_file.
+        self.fs_counter = 0;
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
         // Trait-bounds guards (docs/16 §3) — mirrors genFun's body
@@ -323,6 +329,13 @@ const Codegen = core.Codegen;
         // counter pattern above so nested methods get a clean
         // `__env_<N>` sequence starting at `_0`.
         self.env_counter = 0;
+        // Phase 2 codegen-router: fs_counter reset mirrors env_counter
+        // above so nested methods get a clean `__fs_<N>` sequence
+        // starting at `_0`. The fs_read_file dispatch emits
+        // `var __io_threaded = std.Io.Threaded.init(...)` per call
+        // so a sibling read_file in the same method body needs its
+        // own scoped counter slot to avoid `__fs_<N>` redeclaration.
+        self.fs_counter = 0;
         // Re-populate the per-function type-info map for any locally-
         // declared typed bindings inside the method body so the
         // div-shim predicate (`needsIntDivShim`) gets correct info
@@ -809,6 +822,11 @@ const Codegen = core.Codegen;
         // body produce distinct `__env_<N>` names. Sibling pub fns
         // start fresh at `_0` thanks to this reset.
         self.env_counter = 0;
+        // Phase 2 codegen-router: fs_counter reset (mirrors env_counter
+        // immediately above) so sibling read_file calls within the
+        // same body produce distinct `__fs_<N>` names. Sibling pub
+        // fns start fresh at `_0` thanks to this reset.
+        self.fs_counter = 0;
         // Top-level `fun` is parsed for return_type in Phase 2, but
         // `fn_returns_value` is only relevant for impl-block methods
         // where the typed-return drives tail-position match emission.

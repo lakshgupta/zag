@@ -1,33 +1,48 @@
 ## std.fs — file system read.
 ##
-## From docs/spec.md §6.4 (System Surfaces): read_file is exposed
-## as a free-fn form after the user writes `pub import std.fs.{read_file}`.
+## From docs/spec.md §6.4 (System Surfaces): read_file is exposed as
+## a free-fn form after the user writes `pub import std.fs.{read_file}`.
 ## The router entry in src/codegen/builtins.zig maps `read_file`
 ## (arity=1) to the `fs_read_file` dispatch.
 ##
-## DEFERRED emit (Phase 2 widening): zig 0.16 retired std.fs.cwd().readFileAlloc
-## and surface the real fs API through std.Io.Dir.readFileAlloc(dir, io, allocator,
-## sub_path, max). The `io: Io` parameter is the new event-loop
-## instance abstraction; emitting a BLOCKING `std.posix.openat +
-## posix.read + read-loop` shim in Phase 1 would silently block the
-## event loop if the user later wraps this in an `async fun` body
-## (no compile-time check forbids the call site from async context).
-## Until the codegen router threads `io` through function-level
-## parameters (Phase 2's "Io as first-class vtable" widening), the
-## fs_read_file arm stays a `@panic` runtime stub so a future release
-## that adds a `read_file` table entry without wiring the arm fails
-## LOUDLY at the user's host invocation.
+## Phase 2 real emit (merged from the prior `@panic` runtime stub):
+## zig 0.16 retired `vendor/zig/lib/std/fs.zig` to a 21-line
+## deprecation-stub file. The canonical read-file entry moved to
+## `std.Io.Dir.readFileAlloc(dir, io, sub_path, gpa, limit)`, which
+## requires a `std.Io` event-loop instance.
 ##
-## Phase 2 reference surface (NOT YET EMITTED, do not invoke yet):
-##   allocator.alloc(std.Io.Dir.cwd(), std.Io.Threaded.init(...).io(),
-##                   path, 65536) catch &[_]u8{}
-## where the `std.Io.Threaded.init(...)` runtime is set up once at
-## zag startup and registered in build_options for codegen reuse.
+## The codegen-router emit (see src/codegen/expr.zig's
+## `.fs_read_file` arm) per-call wraps the readFileAlloc invocation
+## in a blk that owns the Io context:
+##   `var __io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});`
+##   `defer __io_threaded.deinit();`
+## so each `read_file(path)` call gets a fresh Threaded Io on its
+## stack, tearable down via `defer` at the blk scope's exit
+## (post-`break :blk` capture).
+##
+## Memory model (Phase 2 surface, conservative):
+##   - Allocator: `std.heap.page_allocator`. Each successful read
+##     allocates a fresh heap byte-slice for the file contents.
+##   - Ownership: caller OWNS the returned `[]u8`. User MUST free
+##     via `std.heap.page_allocator.free(slice)` before discarding;
+##     page-aligned leaks at process exit are tolerable for short-
+##     lived binaries (a v1 limitation).
+##   - Phase 2.1 widening (deferred) will add a `free <slice>` overload
+##     to `.free_expr` so the .zag surface gets a cleaner
+##     `defer free data` syntax.
+##
+## Error model: `catch &[_]u8{}` silently coalesces every error
+## (the `Io.Dir.Reader.Error || std.mem.Allocator.Error ||
+## Io.UnexpectedError` triple-union) into an empty slice. v1 docs/18
+## error-propagation contract isn't wired here yet — Phase 3 may
+## add a sibling `read_file_or` builtin that bubbles specific errors
+## via zag's `?` operator.
 ##
 ## Stub: throwaway body for the existing .zag parse-stubs-out
-## convention. The (deferred) router arm REWRITES the call site
-## before any reader sees the verbatim form.
+## convention. The (now-real) router arm REWRITES the call site
+## before any reader sees the verbatim form, so the body never
+## executes at runtime.
 
 pub fun read_file(path: str) -> []u8 {
-    return undefined;
+    return &[_]u8{};
 }

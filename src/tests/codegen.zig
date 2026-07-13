@@ -2959,3 +2959,107 @@ test "codegen: getEnv routes through builtin_table (no verbatim fallback)" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(\"HOME\")") == null);
 }
+// ============================================================
+// Phase 2 codegen-router pin tests.
+// ============================================================
+// Phase 2 widens src/codegen/builtins.zig's builtin_table's
+// fs_read_file dispatch from a `@panic` runtime stub to a REAL
+// zig 0.16 emit shape (per-call std.Io.Threaded.init blk
+// wrapper + std.Io.Dir.cwd().readFileAlloc call + catch
+// &[_]u8{} error collapse + page_allocator heap ownership).
+//
+// These three tests pin the Phase 2 fs_read_file surface
+// end-to-end:
+//   1. The __io_threaded = std.Io.Threaded.init(...) /
+//      defer __io_threaded.deinit() Io lifecycle is present
+//      in the emit AND the std.Io.Dir.cwd().readFileAlloc /
+//      .unlimited limit call wraps the user-supplied path
+//      arg via genExpr. Critically: bare read_file( MUST
+//      NOT survive in the emitted zig (the router consumed it).
+//   2. The fs_counter (reset at genFun/genMethod/genFreeMethod
+//      counters all zero their own __fs_<N> counter cleanly)
+//      AND increments per sibling read_file call so zig's
+//      no-redeclaration rule holds across multiple calls in
+//      the same body.
+//   3. The router continues to NOT regress argv_get (Phase 0) or
+//      env_var (Phase 1) - the same body containing a read_file
+//      alongside those surfaces would surface all three emit
+//      shapes (covered indirectly by the OTHER tests).
+
+test "codegen: readFileAlloc emits Threaded.init + readFileAlloc shim" {
+    // The Phase 2 router emit shape: per-call blk wrapper
+    // around std.Io.Dir.cwd().readFileAlloc bridged to
+    // []u8 via std.Io.Threaded.init(...) (per-call Io
+    // lifecycle) plus page_allocator ownership via
+    // defer __io_threaded.deinit(). A
+    // read_file("examples/basics/hello.zag") source site
+    // must surface these substrings so zig sees the Io
+    // event-loop instantiation at the use site, NOT an
+    // undeclared read_file(...) form or a std.fs.cwd()
+    // legacy form (the latter was retired in zig 0.16 -
+    // std.fs.zig is a 21-line deprecation stub now).
+    const src = "fun f() {\n    let d: []u8 = read_file(\"examples/basics/hello.zag\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Per-call Io init + deinit pair
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "defer __io_threaded.deinit()") != null);
+    // The actual readFileAlloc call
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Dir.cwd().readFileAlloc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".unlimited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator") != null);
+    // Result capture via blk
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __fs_0") != null);
+    // Error collapse
+    try std.testing.expect(std.mem.indexOf(u8, zig, "catch &[_]u8{}") != null);
+}
+
+test "codegen: fs_counter increments across multiple read_file calls" {
+    // The per-function fs_counter (reset at genFun /
+    // genMethod / genFreeMethod) must step cleanly across
+    // sibling read_file calls so zig's no-redeclaration
+    // rule is satisfied. The : []u8 annotation is
+    // REQUIRED on both let a and let b: zag's grammar
+    // rejects bare let foo = <expr> for non-tuple rhs
+    // (the parser needs the type slot to dispatch []u8
+    // unchanged). Mirrors the explicit annotations on
+    // let home (Phase 1 test 1) and let a: ?str
+    // (Phase 1 test 2).
+    const src = "fun f() {\n    let a: []u8 = read_file(\"foo\");\n    let b: []u8 = read_file(\"bar\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_1") != null);
+}
+
+test "codegen: read_file routes through builtin_table (no verbatim fallback)" {
+    // The router catches read_file("X") before the verbatim
+    // <name>(<args>) fallback in expr.zig's .call arm. A
+    // let d: []u8 = read_file("examples/basics/hello.zag")
+    // source must surface std.Io.Threaded.init (the shim)
+    // but must NOT leave a bare = read_file( substring in
+    // the emitted zig - the router consumed the call site.
+    // A regression that bypasses builtins.lookup(...) would
+    // leave the verbatim form intact and zig would reject
+    // with "use of undeclared identifier 'read_file'".
+    const src = "fun f() {\n    let d: []u8 = read_file(\"examples/basics/hello.zag\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= read_file(") == null);
+}

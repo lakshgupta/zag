@@ -1,0 +1,23 @@
+## stdlib/fs.zag — Phase 2 read_file smoke-test example.
+##
+## Reads a small known file and prints its byte count. The exact
+## file is `examples/basics/hello.zag` — a tiny source file with
+## predictable content (assert its size are stable across zag
+## revisions so the smoke run's expected-output pin holds).
+##
+## Heap-ownership contract (Phase 2 v1 limitation): the returned
+## `[]u8` is `page_allocator`-owned. We don't `free()` here because
+## the v1 `.free_expr` overload only handles pointer-shaped slots
+## via `std.heap.page_allocator.destroy(ptr)`. A v1 smoke run that
+## exits immediately after printing leaks one page (4 KiB) which
+## the OS reclaims on process exit — acceptable for the
+## smoke-test scope. A future Phase 2.1 widening will add
+## `free <slice-expr>` to `.free_expr` so this example can
+## close over with `defer free data`.
+
+import std.fs.{read_file};
+
+fun main() {
+    let data = read_file("examples/basics/hello.zag");
+    print("read {data.len} bytes\n");
+}
