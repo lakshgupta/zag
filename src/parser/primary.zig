@@ -777,19 +777,17 @@ pub fn parsePrimary(self: *Parser) Expr {
             },
             .string_literal => {
                 self.advance();
-                // Template-literal auto-promotion gate. The pre-fix
-                // check (`indexOf("{") != null`) auto-promoted ANY
-                // string containing a `{` to a template literal, which
-                // silently mis-parsed embedded C-style function bodies
-                // like the cli.zag boilerplate's `"fun main() { ... }"`
-                // as a template with multi-token content (the `\n
-                // print("hello, world\n");\n` between the braces was
-                // captured as a single `.ident` expression). The
-                // `looksLikeTemplateLiteral` helper gates on
-                // identifier-only `{...}` content so plain strings with
-                // `{` chars (function bodies, JSON templates, etc.)
-                // stay `.string_lit`. See `looksLikeTemplateLiteral`'s
-                // docblock for the full rationale and edge cases.
+                // Template-literal auto-promotion gate. The
+                // `looksLikeTemplateLiteral` helper is a matching-brace
+                // gate: it walks each `{...}` and accepts any content
+                // (dots, spaces, operators, parens) so expression-shaped
+                // interpolations like `{pi:.5}`, `{a + b}`, `{obj.f()}`
+                // auto-promote to `.template_lit`. The single content
+                // rejection is a NESTED `{` inside the candidate — that
+                // keeps embedded-code strings (function bodies, JSON
+                // objects, etc.) as `.string_lit`. See
+                // `looksLikeTemplateLiteral`'s docblock for the full
+                // rationale and edge cases.
                 if (looksLikeTemplateLiteral(tok.text)) {
                     return self.buildTemplate(tok.text);
                 }
