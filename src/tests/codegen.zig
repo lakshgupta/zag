@@ -1786,6 +1786,72 @@ test "codegen: `arr[..3]` slice emits verbatim" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "arr[..3]") != null);
 }
 
+test "codegen: `.slice` arm covers all 4 start/end-null combinations" {
+    // Comprehensive regression for the `.slice` codegen arm. After the
+    // arr[..3] bug fix (where the arm always emitted synthetic `0` for
+    // missing start, producing `arr[0..3]` instead of `arr[..3]`), the
+    // arm has four distinct emit shapes:
+    //
+    //   1. start + end  → `arr[10..20]`     (both set, verbatim)
+    //   2. start only   → `arr[5..]`        (start set, no end)
+    //   3. end only     → `arr[..7]`        (no start, end set)
+    //   4. neither      → `arr[0..]`        (both null, synthetic 0)
+    //
+    // All four shapes are exercised in a single body so any future
+    // regression in the start/end null handling (e.g. someone "fixes"
+    // the synthetic-0 path by emitting `0` for `arr[..end]` too, OR
+    // dropping the synthetic 0 for `arr[..]`) would fail exactly one of
+    // these four assertions. Distinct values (10/20/5/7) make the
+    // assertion surface surgical — a regression that swaps the bounds
+    // of two cases (e.g. emits `arr[..20]` for the end-only case) would
+    // still fail the positive substring check.
+    const src =
+        \\fun f() {
+        \\    let a: []i32 = arr[10..20];
+        \\    let b: []i32 = arr[5..];
+        \\    let c: []i32 = arr[..7];
+        \\    let d: []i32 = arr[..];
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Case 1: start + end → verbatim `arr[10..20]`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[10..20]") != null);
+    // Case 2: start only → `arr[5..]`, no end.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[5..]") != null);
+    // Case 3: end only → `arr[..7]`, no start, NO synthetic 0 prefix
+    // (this was the arr[..3] bug — synthetic 0 would emit `arr[0..7]`,
+    // which the positive substring `arr[..7]` would not match because
+    // zig's `..` half-open semantics require the lower-bound to be
+    // either present OR absent, not artificially pre-filled).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[..7]") != null);
+    // Case 4: neither → `arr[0..]` with synthetic 0 prefix (zig rejects
+    // the bare `arr[..]` form, so the synthetic 0 is load-bearing here).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[0..]") != null);
+    // Sanity: two negative assertions guard distinct regressions.
+    //   - `arr[0..7]` (case 3, start MISSING) is the load-bearing pin
+    //     against the actual bug we just fixed: the old "always emit
+    //     `0` for missing start" behavior would produce `arr[0..7]`
+    //     instead of `arr[..7]`.
+    //   - `arr[0..20]` (case 1, start=10 SET) is defensive coverage
+    //     for a different hypothetical regression where the codegen
+    //     unconditionally prepends `0` regardless of whether start is
+    //     missing — that bug would not be caught by the case-3
+    //     negative alone.
+    // Case 2 (`arr[5..]`, start set) and case 4 (`arr[0..]`, both
+    // null) are NOT pinned here: case 2 has start present so the
+    // original bug couldn't affect it, and case 4 is the intended
+    // synthetic-0 case (its presence is asserted positively above).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[0..20]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[0..7]") == null);
+}
+
 test "codegen: bare enum decl emits pub const NAME = enum { ... }" {
     const src = "enum Direction { North, South }";
     var l = lexer_mod.Lexer.init(src);
