@@ -23,28 +23,33 @@ const build_options = @import("build_options");
 
 /// Vendor zig payload, supplied at build time via the `-Dzig_payload`
 /// build option (default: `src/_zig_payload.empty` 0-byte sentinel).
-/// `build.zig` reads the file's bytes at config time using
-/// `posix.openat + std.os.linux.read` (zig 0.16's sparse `std.fs.*`
-/// surface rejects `std.fs.cwd` / `std.fs.openFileAbsolute`, so we
-/// route through the same verified-working surface as
-/// `src/tests/toolchain.zig`'s readback loop) and forwards them
-/// through the `build_options` module attached to the `zag` Module.
 ///
-/// Under the default build the sentinel resolves to a 0-byte slice,
-/// so `has_payload()` folds to false at comptime, `tryMaterialize`
-/// no-ops, and `main.zig`'s `zig_path` resolves to the dev-machine
-/// installed-zig fallback at `zig_install_path`. With
-/// `-Dzig_payload=<path-to-zig>` the bytes flow into the produced
-/// binary's static data section (`addOption([]const u8, "zig_payload",
-/// bytes)` copies them in), and `tryMaterialize` writes them to the
-/// zag cache on first run.
+/// Under the test module (`zig build test`) this const materialises
+/// the test binary's own copy of the payload -- the test binary is
+/// compiled when `src/tests/toolchain.zig`'s `_ =
+/// @import("../toolchain.zig")` is reached from the test module
+/// graph. The test binary is NOT installed (no `b.installArtifact`
+/// call in build.zig for it), so the test binary's embed copy never
+/// lands in `zig-out/bin/zag`.
 ///
-/// Why the sentinel stays at `src/` rather than the project-root
-/// `vendor/`: zig 0.16 enforces a source-file-package boundary on
-/// `@embedFile`, and although this module no longer uses `@embedFile`
-/// directly, the default sentinel still wants to stay inside the
-/// source package so a future revert to a static-`@embedFile` form
-/// for the default case doesn't trip the boundary.
+/// In the production binary, this module is NOT a transitive
+/// dependency after the test-module split (main.zig no longer
+/// pulls `src/tests/toolchain.zig` in via its trailing comptime
+/// block). The production binary's payload view comes from
+/// `src/main.zig`'s `pub const embedded_zig_payload`, which reads
+/// the same `build_options.zig_payload` value (one storage
+/// location).
+///
+/// KNOWN CAVEAT: under zig 0.16 the produced binary lands at
+/// roughly 3.5x the embedded payload size because `pub const X:
+/// []const u8 = ...` is duplicated under slice-inlining rules
+/// (verified chunk-hash: every 4 MB chunk of the payload appears
+/// exactly 2 times in the produced binary). The duplication is
+/// structural to zig 0.16 and shows in BOTH this `addOption`
+/// flow and an earlier `@embedFile` migration attempt (same ~3.5x
+/// ratio). A future zig version that collapses inlined slices
+/// could revisit; for now the for-loop pin in main.zig is the
+/// minimum-cost workaround.
 pub const zig_payload: []const u8 = build_options.zig_payload;
 
 /// Comptime length of the embedded payload. Exposed as a const so it

@@ -29,6 +29,8 @@ pub fn parse(self: *Parser) ast.Program {
         var enum_count: usize = 0;
         var traits_buf: [256]ast.TraitDecl = undefined;
         var trait_count: usize = 0;
+        var imports_buf: [256]ast.ImportDecl = undefined;
+        var import_count: usize = 0;
 
         while (!self.eof()) {
             if (self.peek().tag == .newline) {
@@ -49,6 +51,63 @@ pub fn parse(self: *Parser) ast.Program {
             // the parser simply records each decl in its appropriate slice
             // and preserves source order across all three.
             const lead = self.peek().tag;
+            // `pub` prefix carve-out at the dispatcher. The individual
+            // decl-parsers (parseStructDecl / parseImplBlock /
+            // parseEnumDecl / parseTraitDecl / parseFunDecl) all start
+            // with `expect(.struct_kw)` / `.impl_kw` / etc. and reject
+            // a leading `.pub_kw` with `expected <kw>, got 'pub'`.
+            // Without the advance below, the lib/std/X.zag stubs
+            // (which uniformly write `pub struct` / `pub enum` /
+            // `pub trait` / `pub fun`) hit that error and crash the
+            // scaffold tests. Mirrors the `pub` carve-out in
+            // `parseMethod` (inside impl blocks) which already
+            // accept-and-ignore `pub` before `expect(.fun)`. Privacy
+            // enforcement is deferred — `pub` is preserved at the
+            // AST surface for any future use but codegen does not
+            // gate emission on `pub` (all generated decls already
+            // emit zig's `pub fn` / `pub const`).
+            if (lead == .pub_kw) {
+                // Peek the second token to route to the right parser.
+                // Mirrors the impl-block shape `pub fun NAME(...)`
+                // that parseMethod handles; the top-level form is
+                // the same parser surface, just at module scope.
+                const after_pub = self.peekAhead(1);
+                if (after_pub == .struct_kw or after_pub == .impl_kw or
+                    after_pub == .enum_kw or after_pub == .trait_kw or
+                    after_pub == .fun)
+                {
+                    self.advance(); // consume pub
+                    switch (after_pub) {
+                        .struct_kw => {
+                            structs_buf[struct_count] = self.parseStructDecl();
+                            struct_count += 1;
+                        },
+                        .impl_kw => {
+                            impls_buf[impl_count] = self.parseImplBlock();
+                            impl_count += 1;
+                        },
+                        .enum_kw => {
+                            enums_buf[enum_count] = self.parseEnumDecl();
+                            enum_count += 1;
+                        },
+                        .trait_kw => {
+                            traits_buf[trait_count] = self.parseTraitDecl();
+                            trait_count += 1;
+                        },
+                        .fun => {
+                            functions_buf[fun_count] = self.parseFunDecl();
+                            functions_buf[fun_count].doc = doc;
+                            fun_count += 1;
+                        },
+                        else => unreachable,
+                    }
+                    continue;
+                }
+                // pub_kw without a recognized following keyword is
+                // an error; fall through to the unrecognized-branch
+                // surface below where parseFunDecl surfaces the
+                // `expected fun, got 'pub'` diagnostic.
+            }
             if (lead == .struct_kw) {
                 // Struct decls at module-scope don't carry a doc slot
                 // (`StructDecl` has no `doc` field) — discarding the
@@ -86,6 +145,30 @@ pub fn parse(self: *Parser) ast.Program {
                 trait_count += 1;
                 continue;
             }
+            // Module imports (docs/manual/22-modules.md §Imports).
+            // Two surface shapes at this dispatch site:
+            //   1. `pub_kw` followed by `.import_kw` → set is_pub, advance past `pub`
+            //   2. bare `.import_kw` → is_pub defaults to false
+            // Either branch hands off to `parseImportDecl` which captures
+            // the path components + optional `{A, B as C}` selective list
+            // onto the AST. v1 only captures the AST shape; a followup
+            // codegen pass (Phase 2) walks `prog.imports` at generate()
+            // entry and routes each entry through KNOWN_STD_MODULES via
+            // `resolveStdImport`. The scaffold tests in
+            // `tests/scaffold.zig` exercise the table directly via
+            // `parser_mod.Parser.resolveStdImport(...)` and assert the
+            // lookup returns the expected `lib/std/X.zag` paths.
+            if (lead == .pub_kw and self.peekAhead(1) == .import_kw) {
+                self.advance();
+                imports_buf[import_count] = self.parseImportDecl(true);
+                import_count += 1;
+                continue;
+            }
+            if (lead == .import_kw) {
+                imports_buf[import_count] = self.parseImportDecl(false);
+                import_count += 1;
+                continue;
+            }
             functions_buf[fun_count] = self.parseFunDecl();
             functions_buf[fun_count].doc = doc;
             fun_count += 1;
@@ -101,7 +184,9 @@ pub fn parse(self: *Parser) ast.Program {
         @memcpy(enums, enums_buf[0..enum_count]);
         const traits = self.arena.alloc(ast.TraitDecl, trait_count);
         @memcpy(traits, traits_buf[0..trait_count]);
-        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits };
+        const imports = self.arena.alloc(ast.ImportDecl, import_count);
+        @memcpy(imports, imports_buf[0..import_count]);
+        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits, .imports = imports };
     }
 
 
@@ -307,6 +392,122 @@ pub const Parser = struct {
     pub const parseTypeParams = @import("decl.zig").parseTypeParams;
     pub const parseTurbofishArgs = @import("decl.zig").parseTurbofishArgs;
     pub const parseStructDecl = @import("decl.zig").parseStructDecl;
+    // Module imports (docs/manual/22-modules.md §Imports). parseImportDecl
+    // is referenced from the top-level `Parser.parse` dispatch when the
+    // leading token is `pub_kw` (peekAhead == `.import_kw`) or
+    // bare `.import_kw`. Registered here so `self.parseImportDecl(is_pub)`
+    // reaches the function registered in decl.zig without pulling the
+    // decl.zig file's internals into a separate `@import` site.
+    pub const parseImportDecl = @import("decl.zig").parseImportDecl;
+    // Module imports (docs/manual/22-modules.md §Imports).
+    // `joinDottedPath` is defined as a file-scope Parser struct
+    // member further down in this same file (sibling to
+    // `resolveStdImport` and `KNOWN_STD_MODULES`), so it is
+    // automatically exposed as `Parser.joinDottedPath` via the
+    // struct aggregator — no separate `@import("core.zig")
+    // .joinDottedPath` re-export needed (and adding one creates a
+    // "duplicate struct member name" zig 0.16 compile error
+    // because both arms end up inside the Parser struct body).
+    // The first-commit version of this code shipped that duplicate
+    // line; this comment block replaces it with a documented
+    // explanation so a future reader doesn't try to "register"
+    // the function the same way `KNOWN_STD_MODULES` /
+    // `resolveStdImport` are aliased-registered above.
+
+    // KNOWN_STD_MODULES — Comptime-baked lookup table mapping the
+    // canonical dotted path (`std.string`) to the on-disk `.zag` source
+    // path that backs it (`lib/std/string.zag`). The 8 entries here
+    // match the staged stub files at commit-of-landing; adding a new
+    // `lib/std/X.zag` requires extending this slice and re-running
+    // `zig build scaffold_tests` to confirm parseability.
+    //
+    // Lookup is `O(N)` linear-scan over the array (`path_to_path` walks
+    // each entry's `name` field). The `name` slot is the canonical
+    // dotted form (`std.string`); the joined `path_nodes` slice from
+    // `ast.ImportDecl` is rebuilt into the same dotted form on the
+    // caller side via a `joinDottedPath` helper defined below so the
+    // comparison is shape-stable across both `import std.string` and
+    // `import std.async.stream` (2-element and 3-element paths).
+    //
+    // No I/O at parse time — this is a pure comptime data table.
+    // Codegen reads the resolved path and emits a `const X = @import(
+    // "lib/std/string.zag");` preamble line at the top of the produced
+    // zig module. The `lib/std/*.zag` files themselves are NOT
+    // re-parsed at codegen time; v1 consumes only the type-name
+    // surface (struct/enum/trait decl names) at the `import` use sites.
+    pub const KNOWN_STD_MODULES = &[_]struct {
+        name: []const u8,
+        path: []const u8,
+    }{
+        .{ .name = "std", .path = "lib/std/mod.zag" },
+        .{ .name = "std.string", .path = "lib/std/string.zag" },
+        .{ .name = "std.error", .path = "lib/std/error.zag" },
+        .{ .name = "std.fmt", .path = "lib/std/fmt.zag" },
+        .{ .name = "std.time", .path = "lib/std/time.zag" },
+        .{ .name = "std.atomic", .path = "lib/std/atomic.zag" },
+        .{ .name = "std.bench", .path = "lib/std/bench.zag" },
+        .{ .name = "std.async.stream", .path = "lib/std/async/stream.zag" },
+        .{ .name = "std.arch.x86.avx2", .path = "lib/std/arch/x86/avx2.zag" },
+    };
+
+    pub fn resolveStdImport(dotted: []const u8) ?[]const u8 {
+        // Linear-scan over KNOWN_STD_MODULES — returns the resolved
+        // file path on hit, null on miss. Miss is the v1 default for
+        // paths not in the table (user modules, future optional
+        // stdlib extensions). Lookups are O(N) but N=9 today so a
+        // hash-set upgrade waits until the table grows past 16.
+        for (KNOWN_STD_MODULES) |entry| {
+            if (std.mem.eql(u8, entry.name, dotted)) return entry.path;
+        }
+        return null;
+    }
+
+    /// Join path_components into the canonical dotted form
+    /// (`["std", "string"]` → `"std.string"`). Codegen-consumed so
+    /// the lookup into `KNOWN_STD_MODULES` always sees the SAME
+    /// joined shape regardless of which call path produced the
+    /// identifiers (parse-time `ImportDecl.path_nodes` preservation
+    /// vs. any future codegen-side alternate path). Mirrors the
+    /// naming that users see in source (`import std.string` →
+    /// `"std.string"` lookup key) so the table and the lookup are
+    /// round-trippable by-eye.
+    ///
+    /// The scratch buffer is caller-provided — `joinDottedPath`
+    /// returns a slice into the buffer the caller owns, NOT a slice
+    /// into a stack-local var that would dangle past the function's
+    /// return. The lifetime of the returned slice is bounded by
+    /// `scratch`'s lifetime at the call site; the codegen-emit
+    /// caller passes a stack-allocated buffer and consumes the
+    /// returned slice via `resolveStdImport` + `self.write(...)`
+    /// before any intermediate-state reuse. This avoids the prior
+    /// dangling-pointer bug (a stack-local buffer returned by
+    /// reference that the previous attempt shipped and the
+    /// reviewer flagged).
+    ///
+    /// Buffer-size caveat: a 256-byte scratch is enough for every
+    /// v1 KNOWN_STD_MODULES entry (longest is `std.arch.x86.avx2`
+    /// at 18 bytes including separators). Future entries with
+    /// longer paths truncate silently — the truncated slice then
+    /// mismatches any table entry and `resolveStdImport` returns
+    /// null, which the codegen skips. The lookup-vs-table shape
+    /// drift is benign (no false-positive resolution) but a longer
+    /// scratch should be passed once a v2 entry pushes past 256.
+    pub fn joinDottedPath(scratch: []u8, nodes: []const []const u8) []const u8 {
+        var length: usize = 0;
+        var i: usize = 0;
+        while (i < nodes.len) : (i += 1) {
+            if (i > 0 and length < scratch.len) {
+                scratch[length] = '.';
+                length += 1;
+            }
+            const node = nodes[i];
+            if (length + node.len <= scratch.len) {
+                @memcpy(scratch[length..][0..node.len], node);
+                length += node.len;
+            }
+        }
+        return scratch[0..length];
+    }
 
     // --- stmt.zig ---
     pub const compoundOpForTag = @import("stmt.zig").compoundOpForTag;

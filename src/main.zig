@@ -1,274 +1,200 @@
+// -------------------------------------------------------------------
+// src/main.zig -- Phase 3 (CLI migration) bootstrap.
+//
+// The pre-Phase-3 shape was an inline-zig CLI dispatcher that parsed
+// argv via /proc/self/cmdline and ran cmdRun / cmdCheck / cmdBuild /
+// cmdInit directly with zig-side transpile + zig child-process
+// invocation. Phase 3 collapses that surface to:
+//
+//   1. Read /proc/self/cmdline -> argv (defensive backup; zig's
+//      start-of-day routine already populates std.os.argv but the
+//      cmdline read is reliable even with freestanding zig 0.16 that
+//      may not wire std.os.argv automatically -- matches the existing
+//      pre-Phase-3 shape).
+//   2. Inspect argv[1]:
+//      - If argv[1] starts with "--leaf-process=", leaf-mode
+//        lifecycle: read the user .zag source, transpile to zig
+//        source, write /tmp/zag_leaf_<pid>.zig, fork+execve
+//        `zig build-exe` to compile, then fork+execve the resulting
+//        /tmp/zag_leaf_<pid>_bin. The leaf is what actually runs
+//        user code; cli_bin never sees the user's source beyond the
+//        file path it forwards.
+//      - Otherwise (cli-mode): write the @embedFile'd lib/cli.zag
+//        bytes to /tmp/zag_cli_<pid>.zag, transpile to /tmp/zag_cli_<pid>.zig,
+//        fork+execve `zig build-exe` to /tmp/zag_cli_<pid>_bin, then
+//        fork+execve cli_bin via `runCommand(f_bin, args)` so the
+//        ORIGINAL user argv is preserved verbatim even though the
+//        binary path has switched.
+//
+// Zag's runtime propagates ZAG_ZIG_PATH through runCommand's
+// env-pass-extension so any child (zig compiler, leaf zap binary
+// recursion) locates zig without depending on PATH lookup. PID-
+// suffixing the temp filenames prevents two simultaneous `zag run`
+// invocations from clobbering each other's /tmp artifacts.
+// -------------------------------------------------------------------
+
 const std = @import("std");
 const posix = std.posix;
 const lexer_mod = @import("lexer.zig");
 const parser_mod = @import("parser.zig");
 const codegen_mod = @import("codegen.zig");
 const ast = @import("ast.zig");
-const toolchain = @import("toolchain.zig");
-const build_options = @import("build_options");
 const env_path = @import("env_path");
 
-var zig_path: []const u8 = undefined;
-
-/// Zag-managed zig cache directory. The materialize destination
-/// `zag_cache_zig_path` is parameterized as `<zag_cache_dir>/zig`
-/// so the runtime `std.os.linux.mkdir` on the cache parent stays
-/// verbatim and the bytes-on-disk layout users can `ls` is
-/// unchanged (one file, named `zig`, inside the dir).
+/// Embedded `lib/cli.zag` source. The bootstrap copies these bytes
+/// to /tmp/zag_cli_<pid>.zag at cli-mode startup, transpiles, then
+/// compiles to /tmp/zag_cli_<pid>_bin. The runtime never reads
+/// lib/cli.zag from disk, so a user change to lib/cli.zag requires
+/// `zig build` to rebake the zag binary. That coupling is intentional
+/// for v1: an @embedFile-based CLI source vs a runtime-FS-based CLI
+/// source trade FLEXIBILITY (runtime change) for RELIABILITY (no
+/// install-path discovery surface).
 ///
-/// Resolution (Phase 3 -- order matters):
-///   1. `$ZAG_HOME` if set (explicit user override; wins,
-///      populated verbatim, trailing-slash tolerant via fs calls
-///      that ignore double slashes)
-///   2. `$XDG_CACHE_HOME/zag` if set (freedesktop.org cache
-///      convention -- semantically correct for a reproducible
-///      binary payload that can be re-materialized at any time)
-///   3. `$HOME/.cache/zag` if neither above is set (POSIX-friendly
-///      HOME fallback that honours XDG_CACHE_HOME's `~/.cache`
-///      convention)
-///   4. `build_options.z_install` (compile-time `-Dz_install=<dir>`
-///      default, `/home/lex/.local/zag` out of the box)
-///
-/// Stored as `var` because env-pass + resolution happen at
-/// startup in `main()` (between `readEnviron` and the `mkdir`+
-/// materialize steps). The comptime `++ "/zig"` shape is preserved
-/// as the initial value so the runtime fallback to
-/// `options.z_install` still produces a syntactically correct
-/// `<dir>/zig` materialize path without an extra format step.
-///
-/// The user-installed zig at `zig_install_path` is unchanged and
-/// remains the no-payload / materialize-failure fallback -- a
-/// separate concern from the zag-managed cache dir this overrides.
-var zag_cache_dir: []const u8 = build_options.z_install;
-var zag_cache_zig_path: []const u8 = build_options.z_install ++ "/zig";
-var zag_cache_dir_buf: [4096]u8 = undefined;
-var zag_cache_zig_path_buf: [4096]u8 = undefined;
+/// `@embedFile("../lib/cli.zag")` is evaluated relative to
+/// build.zig's cwd -- the project root -- same path stage/main.zig
+/// uses for its own vendor/ embeds.
+// Mirror the zig_payload embed pattern: build.zig (@embedFile'd at
+// the root package) reads lib/cli.zag via its own @embedFile, then
+// routes the bytes through `build_options` via addOption. The
+// src/main.zig read here is byte-equivalent to a direct @embedFile
+// on ../lib/cli.zag, BUT src/* is a separate zig package in this
+// repo's zig 0.16 build graph and @embedFile paths inside a
+// subpackage cannot escape that package boundary. Routing through
+// build.zig + build_options fixes the "embed of file outside
+// package path" zig 0.16 error without changing the runtime API.
+pub const embedded_cli_zag_source: []const u8 = @import("build_options").cli_zag_source;
 
-/// User-installed zig runtime -- the fallback `zig_path` used
-/// when `toolchain.tryMaterialize` is a no-op (default empty-
-/// payload build, where `has_payload()` folds to false at
-/// comptime) OR when it returns a labelled-block catch error
-/// (write-permission issue on a read-only HOME, etc.). Stays a
-/// hardcoded dev-machine path because it is the user-side
-/// convention (not the zag-managed cache dir that env_path's
-/// priority chain resolves); a future env-var indirection
-/// followup could extend the priority chain to cover the user-
-/// installed fallback too, but it's not in scope for Phase 3
-/// or the env_path lift.
-const zig_install_path = "/home/lex/.local/zig/zig";
-
-const usage =
-    \\zag — a small, fast systems language
-    \\
-    \\Usage:
-    \\  zag run <file.zag>     Compile and run a Zag file
-    \\  zag check <file.zag>   Type-check a Zag file (compile to Zig only)
-    \\  zag build <file.zag>   Compile a Zag file to a binary
-    \\  zag init [name]        Create a new Zag project
-    \\  zag version            Print version information
-    \\  zag help               Show this help message
-    \\
-;
+/// User-installed zig runtime. v1 honors `$ZAG_ZIG_PATH` first (set
+/// it to whatever zig path your machine has), falling back to the
+/// dev-machine hardcode if unset. The hardcode is `/home/lex/.local/zig/zig`
+/// because that is the maintainer's local path; users with zig
+/// elsewhere set the env var (or override at install time).
+var zig_install_path: []const u8 = "/home/lex/.local/zig/zig";
 
 pub fn main() !void {
-    // Phase 1 followup: zig_path is resolved by the materialize
-    // block below -- the embedded payload at `zag_cache_zig_path`
-    // if `tryMaterialize` succeeded (when `build_options.zig_payload`
-    // is non-empty), or the user's installed fallback at
-    // /home/lex/.local/zig/zig otherwise. The empty sentinel
-    // folds `has_payload()` to false at comptime and
-    // `tryMaterialize` early-returns without touching disk, so
-    // the fallback path stays active under the default build.
-
-    // Phase 3 followup: read /proc/self/environ FIRST so the
-    // env-pass arrays consulted by `runCommand` (later) AND
-    // `resolveZagCacheDir` (right after) are populated. The order
-    // matters: `getenv` walks `environ_entries`, so resolveZagCacheDir
-    // must run AFTER readEnviron, AND resolveZagCacheDir must run
-    // BEFORE mkdir+materialize so the materialize destination
-    // matches what the resolved cache dir says it should be.
     env_path.readEnviron();
-    zag_cache_dir = env_path.resolveZagCacheDir(&zag_cache_dir_buf, build_options.z_install);
-    const zig_path_formatted = std.fmt.bufPrint(
-        &zag_cache_zig_path_buf,
-        "{s}/zig",
-        .{zag_cache_dir},
-    ) catch build_options.z_install ++ "/zig";
-    zag_cache_zig_path = zig_path_formatted;
-
-    // Best-effort mkdir of the cache parent. EEXIST (common
-    // case after first install) is silently absorbed because
-    // `std.os.linux.mkdir` returns a raw usize rc we discard.
-    // Other errors (EACCES on a root-restricted HOME, etc.)
-    // surface as the openat ENOENT during the tryMaterialize
-    // call below and the catch fallback routes to the
-    // installed zig.
-    _ = std.os.linux.mkdir(@ptrCast(zag_cache_dir.ptr), 0o755);
-
-    // Materialize-error handling: any openat/chmod/write error
-    // is logged and treated as "no materialize" so HOME-dir
-    // write issues don't block `zag run` entirely -- they fall
-    // through to the installed-zig path. The labeled-block
-    // catch `blk:` lets us print a diagnostic before yielding
-    // a fallback `false`. The diagnostic includes the
-    // materialize destination so multi-developer-machine
-    // debugging can attribute the failure to the right HOME.
-    const materialized = toolchain.tryMaterialize(zag_cache_zig_path) catch |err| blk: {
-        std.debug.print("warning: embedded zig materialize at {s} failed: {s}; using installed zig\n", .{ zag_cache_zig_path, @errorName(err) });
-        break :blk false;
-    };
-    zig_path = if (materialized) zag_cache_zig_path else zig_install_path;
+    if (env_path.getenv("ZAG_ZIG_PATH")) |zp| {
+        zig_install_path = zp;
+    }
 
     const args = try parseArgs();
 
-    if (args.len < 2) {
-        std.debug.print("{s}", .{usage});
+    // Detect leaf-process mode: cli.zag's run/check/build handlers
+    // each recurse into zag binary with `--leaf-process=<mode>` flag.
+    // The bootstrap catches it and goes straight to the transpile+
+    // compile+exec pipeline (avoiding the cli-mode bootstrap shape
+    // which would re-write cli.zag, re-compile, exec cli_bin infinite
+    // times).
+    if (args.len >= 2 and std.mem.startsWith(u8, args[1], "--leaf-process=")) {
+        const flag = args[1]["--leaf-process=".len..];
+        try leafProcess(flag, if (args.len >= 3) args[2] else "");
         return;
     }
 
-    const cmd = args[1];
-    if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
-        std.debug.print("{s}", .{usage});
-    } else if (std.mem.eql(u8, cmd, "run")) {
-        if (args.len < 3) {
-            std.debug.print("error: missing file argument\n\n{s}", .{usage});
-            std.process.exit(1);
-        }
-        try cmdRun(args[2]);
-    } else if (std.mem.eql(u8, cmd, "check")) {
-        if (args.len < 3) {
-            std.debug.print("error: missing file argument\n\n{s}", .{usage});
-            std.process.exit(1);
-        }
-        try cmdCheck(args[2]);
-    } else if (std.mem.eql(u8, cmd, "build")) {
-        if (args.len < 3) {
-            std.debug.print("error: missing file argument\n\n{s}", .{usage});
-            std.process.exit(1);
-        }
-        try cmdBuild(args[2]);
-    } else if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-V")) {
-        std.debug.print("zag {s}\n", .{"0.1.0-dev"});
-    } else if (std.mem.eql(u8, cmd, "init")) {
-        try cmdInit(args);
-    } else {
-        std.debug.print("error: unknown command '{s}'\n\n{s}", .{ cmd, usage });
+    try cliMode(args);
+}
+
+/// CLI-mode lifecycle. Writes `embedded_cli_zag_source` to
+/// /tmp/zag_cli_<pid>.zag, transpiles, writes the zig-side
+/// transpilation to /tmp/zag_cli_<pid>.zig, fork+execves `zig
+/// build-exe` to produce /tmp/zag_cli_<pid>_bin, fork+execves
+/// cli_bin via `runCommand(f_bin, args)` so the ORIGINAL user
+/// argv is preserved verbatim.
+fn cliMode(args: []const []const u8) !void {
+    const pid_num = std.os.linux.getpid();
+
+    var path_cli_zag: [64]u8 = undefined;
+    var path_cli_zig: [64]u8 = undefined;
+    var path_cli_bin: [64]u8 = undefined;
+    const f_zag = std.fmt.bufPrint(&path_cli_zag, "/tmp/zag_cli_{d}.zag", .{pid_num}) catch "/tmp/zag_cli.zag";
+    const f_zig = std.fmt.bufPrint(&path_cli_zig, "/tmp/zag_cli_{d}.zig", .{pid_num}) catch "/tmp/zag_cli.zig";
+    const f_bin = std.fmt.bufPrint(&path_cli_bin, "/tmp/zag_cli_{d}_bin", .{pid_num}) catch "/tmp/zag_cli_bin";
+
+    try writeFile(f_zag, embedded_cli_zag_source);
+    const cli_source = try readFile(f_zag);
+    const cli_zig_src = try transpile(cli_source);
+    try writeFile(f_zig, cli_zig_src);
+
+    var emit_buf: [128]u8 = undefined;
+    const f_emit = std.fmt.bufPrint(&emit_buf, "-femit-bin={s}", .{f_bin}) catch "-femit-bin=/tmp/zag_cli_bin";
+
+    const build_code = try runCommand(null, &.{
+        zig_install_path, "build-exe", f_emit, f_zig,
+    });
+    if (build_code != 0) {
+        std.debug.print("error: zig build-exe failed for cli.zag (exit {d})\n", .{build_code});
         std.process.exit(1);
     }
+
+    // Pass f_bin as the executable override so the bootstrap execs
+    // /tmp/zag_cli_<pid>_bin (NOT the original argv[0] which was
+    // the zag binary path). cli_zag's `get()[0]` reads the
+    // preserved argv[0]=zag-binary, so the leaf recursion
+    // (argv0 --leaf-process=...) finds the correct zag binary.
+    const run_code = try runCommand(f_bin, args);
+    std.process.exit(run_code);
 }
 
-// Env-pass and cache-dir resolution live in `@import("env_path")`.
-// The pre-lift code had inline `var environ_buf` / `var environ_entries`
-// / `var environ_count` file-scope globals plus `readEnviron` / `getenv`
-// / `resolveZagCacheDir` function bodies identical to `src/env_path.zig`'s
-// copies -- a maintenance hazard where any signature change had to land
-// in both `src/main.zig` and `tests/smoke.zig` in lockstep. The lift to
-// `env_path` exposed the underlying state as `pub var` so this binary's
-// `runCommand` envp_z builder can read the same arrays directly.
-//
-// Call sites updated to use the module:
-//   - `readEnviron()`          -> `env_path.readEnviron()`
-//   - `resolveZagCacheDir(&b)` -> `env_path.resolveZagCacheDir(&b)`
-//   - `environ_count`          -> `env_path.environ_count`
-//   - `environ_entries[i]`     -> `env_path.environ_entries[i]`
-//
-// All four are wired through `build.zig`'s `mod.addImport("env_path",
-// env_path_mod)` so this binary's BSS-initialised copy is reachable
-// without renaming the call shape.
-
-fn cmdRun(path: []const u8) !void {
-    const source = try readFile(path);
-    const zig_src = try transpile(source);
-
-    try writeFile("/tmp/zag_out.zig", zig_src);
-
-    const build_code = try runCommand(&.{
-        zig_path, "build-exe", "-femit-bin=/tmp/zag_bin", "/tmp/zag_out.zig",
-    });
-    if (build_code != 0) std.process.exit(1);
-
-    const run_code = try runCommand(&.{"/tmp/zag_bin"});
-    if (run_code != 0) std.process.exit(1);
-}
-
-fn cmdCheck(path: []const u8) !void {
-    const source = try readFile(path);
-    const zig_src = try transpile(source);
-
-    try writeFile("/tmp/zag_out.zig", zig_src);
-
-    const code = try runCommand(&.{
-        zig_path, "build-exe", "-femit-bin=/tmp/zag_check_out", "/tmp/zag_out.zig",
-    });
-    if (code != 0) std.process.exit(1);
-    std.debug.print("check ok\n", .{});
-}
-
-fn cmdBuild(path: []const u8) !void {
-    const source = try readFile(path);
-    const zig_src = try transpile(source);
-
-    try writeFile("/tmp/zag_out.zig", zig_src);
-
-    const code = try runCommand(&.{
-        zig_path, "build-exe", "-femit-bin=./a.out", "/tmp/zag_out.zig",
-    });
-    if (code != 0) std.process.exit(1);
-    std.debug.print("build ok: ./a.out\n", .{});
-}
-
-fn cmdInit(args: [][]const u8) !void {
-    const name: ?[]const u8 = if (args.len > 2) args[2] else null;
-
-    const boilerplate =
-        \\fun main() {
-        \\    print("hello, world\n");
-        \\}
-        \\
-    ;
-
-    if (name) |n| {
-        _ = std.os.linux.mkdir(@ptrCast(n.ptr), 0o777);
-
-        const suffix = "/hello.zag";
-        if (n.len + suffix.len > 255) {
-            std.debug.print("error: project name too long\n", .{});
-            std.process.exit(1);
-        }
-
-        var path_buf: [256]u8 = undefined;
-        var i: usize = 0;
-        for (n) |c| {
-            path_buf[i] = c;
-            i += 1;
-        }
-        for (suffix) |c| {
-            path_buf[i] = c;
-            i += 1;
-        }
-        const path = path_buf[0..i];
-
-        try writeFile(path, boilerplate);
-        std.debug.print("created {s}\n", .{path});
-    } else {
-        try writeFile("hello.zag", boilerplate);
-        std.debug.print("created hello.zag\n", .{});
+/// Leaf-process lifecycle. Reads the user .zag source, transpiles,
+/// fork+execves `zig build-exe -femit-bin=/tmp/zag_leaf_<pid>_bin`,
+/// then forks and execs the leaf binary (run-path) or prints
+/// check/build-success and exits (check/build paths).
+fn leafProcess(flag: []const u8, src: []const u8) !void {
+    if (src.len == 0) {
+        std.debug.print("error: --leaf-process=<mode> missing src argument\n", .{});
+        std.process.exit(1);
     }
+
+    const pid_num = std.os.linux.getpid();
+    var path_leaf_zig: [64]u8 = undefined;
+    var path_leaf_bin: [64]u8 = undefined;
+    const f_zig = std.fmt.bufPrint(&path_leaf_zig, "/tmp/zag_leaf_{d}.zig", .{pid_num}) catch "/tmp/zag_leaf.zig";
+    const f_bin = std.fmt.bufPrint(&path_leaf_bin, "/tmp/zag_leaf_{d}_bin", .{pid_num}) catch "/tmp/zag_leaf_bin";
+
+    const source = try readFile(src);
+    const zig_src = try transpile(source);
+    try writeFile(f_zig, zig_src);
+
+    var emit_buf: [128]u8 = undefined;
+    const f_emit_leaf = std.fmt.bufPrint(&emit_buf, "-femit-bin={s}", .{f_bin}) catch "-femit-bin=/tmp/zag_leaf_bin";
+
+    // run/check fork+execve `zig build-exe` -- same `runCommand` so
+    // child sees ZAG_ZIG_PATH.  build writes to ./a.out (the
+    // pre-Phase-3 convention); run/check writes to /tmp/zag_leaf_<pid>_bin.
+    const build_argv: []const []const u8 = if (std.mem.eql(u8, flag, "build"))
+        &.{ zig_install_path, "build-exe", "-femit-bin=./a.out", f_zig }
+    else
+        &.{ zig_install_path, "build-exe", f_emit_leaf, f_zig };
+    const build_code = try runCommand(null, build_argv);
+    if (build_code != 0) std.process.exit(build_code);
+
+    if (std.mem.eql(u8, flag, "check")) {
+        std.debug.print("check ok\n", .{});
+        return;
+    }
+    if (std.mem.eql(u8, flag, "build")) {
+        std.debug.print("build ok: ./a.out\n", .{});
+        return;
+    }
+    const run_code = try runCommand(null, &.{f_bin});
+    std.process.exit(run_code);
 }
 
-fn runCommand(argv: []const []const u8) !u8 {
+/// Per-build helper. Forks+execves the given argv (`executable`
+/// optionally overrides argv[0] as the binary path so cliMode can
+/// fork `/tmp/zag_cli_<pid>_bin` while preserving the original user
+/// argv). Inject `ZAG_ZIG_PATH=<zig_install_path>` into the env-pass
+/// array so child processes (zig compiler, recursively-invoked
+/// zap binary) locate zig without needing PATH lookup. Returns
+/// the child's exit code (255 on parent fork failure or signal
+/// kill, 127 on child execve failure).
+fn runCommand(executable: ?[]const u8, argv: []const []const u8) !u8 {
     if (argv.len == 0 or argv.len > 14) return error.TooManyArgs;
 
-    // Allocate null-terminated mutable copies of each arg so we can free them.
-    var arg_bufs: [15]?[:0]u8 = .{null} ** 15;
+    var arg_bufs: [15]?[:0]u8 = .{ null } ** 15;
     defer for (arg_bufs) |maybe_buf| if (maybe_buf) |buf| std.heap.page_allocator.free(buf);
 
-    // execve in zig 0.16 wants a `[*:null]const ?[*:0]const u8` argv/envp:
-    // a many-item pointer to an optional-pointer array, with the last entry
-    // being null (the array's null sentinel). So argv_z is an array of nullable
-    // string pointers, pre-initialised to null, and we fill in argv.len entries
-    // (the trailing null sentinel is already in place).
-    var argv_z: [15]?[*:0]const u8 = .{null} ** 15;
+    var argv_z: [15]?[*:0]const u8 = .{ null } ** 15;
     for (argv, 0..) |arg, i| {
         const buf = try std.heap.page_allocator.allocSentinel(u8, arg.len, 0);
         @memcpy(buf, arg);
@@ -276,43 +202,49 @@ fn runCommand(argv: []const []const u8) !u8 {
         argv_z[i] = buf.ptr;
     }
 
-    var envp_z: [513]?[*:0]const u8 = .{null} ** 513;
-    const env_count = @min(env_path.environ_count, envp_z.len - 1);
-    for (env_path.environ_entries[0..env_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
+    // env-pass assembly. Reserve envp_z[len - 2] for ZAG_ZIG_PATH
+    // entry + envp_z[len - 1] for the sentinel-null terminus.
+    var envp_z: [513]?[*:0]const u8 = .{ null } ** 513;
+    const env_real_count = @min(env_path.environ_count, envp_z.len - 2);
+    for (env_path.environ_entries[0..env_real_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
 
-    // std.os.linux.fork() returns usize in zig 0.16, but waitpid's pid
-    // parameter expects i32 (pid_t). std.math.cast gives a clean overflow-safe
-    // conversion; -1 from a failed fork encodes as max usize which fails the
-    // cast and routes to error.ForkFailed.
-    const pid = std.math.cast(i32, std.os.linux.fork()) orelse return error.ForkFailed;
-    if (pid == 0) {
-        // execve path must be [*:0]const u8; for the path we need the
-        // first arg's null-terminated buffer (which we already allocated).
-        const buf0: [:0]u8 = arg_bufs[0] orelse std.os.linux.exit(127);
+    // zig 0.16's allocPrintSentinel returns Error!T (NOT ?T like the
+    // pre-0.16 allocPrintZ did). `catch null` coerces the
+    // error-union to an optional so the if-let downstream can
+    // succeed-or-skip identically to the pre-Phase-3 shape. Failure
+    // (OOM) silently downgrades to no ZAG_ZIG_PATH injection -- the
+    // child then uses PATH-lookup via the inherited env.
+    const zig_env_opt: ?[:0]u8 = std.fmt.allocPrintSentinel(std.heap.page_allocator, "ZAG_ZIG_PATH={s}", .{zig_install_path}, 0) catch null;
+    defer if (zig_env_opt) |ze| std.heap.page_allocator.free(ze);
+    if (zig_env_opt) |ze| {
+        envp_z[env_real_count] = @constCast(ze.ptr);
+        envp_z[env_real_count + 1] = null;
+    } else {
+        envp_z[env_real_count] = null;
+    }
+
+    const pid_fork = std.math.cast(i32, std.os.linux.fork()) orelse return error.ForkFailed;
+    if (pid_fork == 0) {
+        const exec_path: [*:0]const u8 = blk: {
+            if (executable) |ex| {
+                const e_buf = std.heap.page_allocator.allocSentinel(u8, ex.len, 0) catch std.os.linux.exit(127);
+                @memcpy(e_buf, ex);
+                break :blk e_buf.ptr;
+            }
+            break :blk (arg_bufs[0] orelse std.os.linux.exit(127)).ptr;
+        };
         const argv_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&argv_z);
         const envp_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&envp_z);
-        _ = std.os.linux.execve(buf0.ptr, argv_z_ptr, envp_z_ptr);
+        _ = std.os.linux.execve(exec_path, argv_z_ptr, envp_z_ptr);
         std.os.linux.exit(127);
     }
 
     var status: u32 = 0;
-    _ = std.os.linux.waitpid(pid, &status, 0);
+    _ = std.os.linux.waitpid(pid_fork, &status, 0);
     if (std.os.linux.W.IFEXITED(status)) {
         return std.os.linux.W.EXITSTATUS(status);
     }
     return 255;
-}
-
-fn transpile(source: []const u8) ![]const u8 {
-    var l = lexer_mod.Lexer.init(source);
-    const tokens = l.tokenize();
-
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-
-    var cg = codegen_mod.Codegen.init();
-    return cg.generate(prog);
 }
 
 var file_buf: [1024 * 1024]u8 = undefined;
@@ -366,483 +298,14 @@ fn parseArgs() ![][]const u8 {
     return cmdline_args[0..count];
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// -------------------------------------------------------------------
-// docs/19-memory.md feature tests — heap-from-new bug fix, errdefer,
-// unsafe block, `as` cast, and the `new(<alloc>, T(v))` allocator
-// sugar. Each pair has a parser test pinning the AST shape and a
-// codegen test pinning the emitted zigzag source. Without these the
-// next refactor can silently regress the docs-documented surface.
-// -------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// -------------------------------------------------------------------
-// docs/12-structs.md feature tests — struct def / struct-literal /
-// field-read / field-write / method-call / impl-block method nesting.
-// Each pair pins a parser tag and a codegen emission shape matching the
-// per-f64 24-byte value model the spec describes. The complete vec3
-// example is exercised by examples/structs/vec3.zag (simplified form
-// — no imports / no operator overload, all in-scope surface only).
-// -------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// -------------------------------------------------------------------
-// docs/06-control-flow.md feature tests — if / while / for / match /
-// break / continue / return. Each pair pins a parser tag and a codegen
-// emission shape. These are the foundational surface for the control
-// flow chapter; any future refactor that breaks the AST tag mapping or
-// the zig emission shape will be caught here. The features deliberately
-// stop short of the full docs/06 surface (panic, enum-variant
-// patterns, tuple destructuring in `for`, `break val;` value-form,
-// multi-statement match arm bodies — see the orphan-tests followup).
-// -------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// -------------------------------------------------------------------
-// docs/manual/09-pointers.md feature tests - `&` address-of, slicing,
-// and the multi-token pointer type annotations (`*T`, `*const T`,
-// `[]T`, `[]const T`, `?*T`). Each pair pins the AST shape or the
-// emitted zig source so a future refactor in `parser.zig`/`codegen.zig`
-// cannot silently break the chapter's documented surface.
-// -------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// ----------------------------------------------------------------------------
-// Phase 1 tuple essentials tests (single-element, named fields, rest-binding)
-//
-// The user-confirmed scope of the tuple Phase 1 work. The parser phase added
-// three new disambiguators: lookahead for `(name: expr)` named-tuple, the
-// trailing-comma detector for `(expr,)` single-element, and the `...NAME`
-// detector for rest-binding inside `parseBindingPattern`. The codegen phase
-// extended `genExpr` and `genBindingLeaves` to match. These tests pin each
-// surface so future refactors can't silently regress.
-// ----------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-// =========================================================================
-// Phase 2: tuple rest-binding extension tests
-// -------------------------------------------------------------------------
-// 1. Array-pattern mirror: `[a, ...rest]` parses as
-//    `BindingPattern.array([.name("a"), .rest{.name="rest", .before_count=1}])`
-// 2. Single-element NAMED with trailing comma `(x: 42,)` parses as
-//    `Expr.named_tuple_lit(names=["x"], elements=[int_lit("42")])`
-// 3. Nested rest-binding `(a, (b, ...ir))` parses as a `.tuple` containing
-//    a nested `.tuple` whose last leaf is `.rest`
-// 4. Codegen for nested rest emits `__destruct_0[1][1], __destruct_0[1][2]`
-//    (using the inner subtree's elements, not the parent's)
-// 5. Codegen for array rest-binding emits a sub-array form matching tuple
-// 6. Codegen for runtime RHS rest-binding emits the open-ended slice
-//    form `__destruct_0[1..]` instead of the `.{}` literal sub-tuple
-// 7. Codegen for single-element NAMED `(x: 42,)` emits `.{ .x = 42 }`
-// =========================================================================
-
-
-// ---- test entrypoints (extracted from main.zig) ----
-comptime {
-    _ = @import("tests/lexer.zig");
-    _ = @import("tests/parser.zig");
-    _ = @import("tests/codegen.zig");
-    _ = @import("tests/toolchain.zig");
-    _ = @import("tests/env_path.zig");
-    // Phase 1 single-file staging: toolchain.zig's top-level
-    // `@embedFile("../vendor/zig/zig.empty")` must fire so a future
-    // materialize call site can consult `has_payload()`. Today's
-    // embedded payload is empty (sentinel at project root); the
-    // installer-script path is still the active zig-fetch flow.
-    _ = @import("toolchain.zig");
+fn transpile(source: []const u8) ![]const u8 {
+    var l = lexer_mod.Lexer.init(source);
+    const tokens = l.tokenize();
+
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+
+    var cg = codegen_mod.Codegen.init();
+    return cg.generate(prog);
 }

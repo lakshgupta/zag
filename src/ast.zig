@@ -57,6 +57,15 @@ pub const TraitMethodDecl = ast_decl.TraitMethodDecl;
 // preserves the `ast.TypeParam` access path documented for the
 // AST-laundering layer in main.zig.
 pub const TypeParam = ast_decl.TypeParam;
+// Module imports (docs/manual/22-modules.md §Imports).
+// ImportSelector is the AST node for one entry in the optional
+// `{A, B as C}` selective list attached to a `pub import std.X.{...}`
+// decl. ImportDecl is the AST node carrying the dotted path nodes,
+// optional selective-list, and `is_pub` flag. Both are referenced
+// from parser/decl.zig's parseImportDecl and reachable on
+// `Program.imports` via the top.zig aggregator.
+pub const ImportSelector = ast_decl.ImportSelector;
+pub const ImportDecl = ast_decl.ImportDecl;
 
 // Template-literal types (extracted from Expr union body, now top-level).
 pub const TemplateLitExpr = ast_template.TemplateLitExpr;

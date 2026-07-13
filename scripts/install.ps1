@@ -1,11 +1,12 @@
 ##
 ## install.ps1 — Zag Language Installer for Windows (PowerShell)
 ##
-## One-command install:
-##   powershell -c "irm https://zag-lang.org/install.ps1 | iex"
+## One-command install: fetch the installer from this repo on GitHub raw:
+##
+##   powershell -c "irm https://raw.githubusercontent.com/zag-lang/zag/main/scripts/install.ps1 | iex"
 ##
 ## Or download and run:
-##   Invoke-WebRequest -Uri https://zag-lang.org/install.ps1 -OutFile install.ps1
+##   Invoke-WebRequest -Uri https://raw.githubusercontent.com/zag-lang/zag/main/scripts/install.ps1 -OutFile install.ps1
 ##   .\install.ps1
 ##
 ## Environment variables:

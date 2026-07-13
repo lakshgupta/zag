@@ -2,11 +2,15 @@
 ##
 ## install.sh — Zag Language Installer
 ##
-## One-command install:
-##   curl -sS https://zag-lang.org/install.sh | bash
+## One-command install: fetch the canonical user-facing installer from
+## this repo on GitHub raw (this file is the developer-form mirror with
+## source-clone + zig-bundling logic; the user-facing one-liner is
+## `zag-install.sh` at the repo root):
+##
+##   curl -fsSL https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh | bash
 ##
 ## Or with options:
-##   curl -sSO https://zag-lang.org/install.sh && bash install.sh --version 0.1.0
+##   curl -sSO https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh && bash zag-install.sh --version v0.1.0
 ##
 ## Environment variables:
 ##   ZAG_HOME        Install directory (default: ~/.zag)

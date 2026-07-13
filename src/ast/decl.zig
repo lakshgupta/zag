@@ -285,3 +285,38 @@ pub const TraitMethodDecl = struct {
     loc: Loc,
 };
 
+/// One selector inside the optional `{A, B as C}` list on a
+/// `pub import std.X.{A, B as C}` decl. The `name` is the verbatim
+/// source identifier (the canonical name in the source module); the
+/// `alias` is non-null ONLY when the source carries a `as Y` rename
+/// (`use std.error.Error as Error` style), in which case it carries
+/// the new binding name the importing module sees. Caps at
+/// per-decl-prefix flexibility without committing to a `use`/
+/// `pub use` distinction at parser level — codegen reads `alias` as
+/// the binding name verbatim and uses `name` only for the source-side
+/// resolution lookup.
+pub const ImportSelector = struct {
+    name: []const u8,
+    alias: ?[]const u8 = null,
+};
+
+/// One top-level `import …` declaration. Three surface shapes:
+///   1. `import std.string`                  (whole-module, no pub)
+///   2. `pub import std.string`             (whole-module, exported)
+///   3. `pub import std.atomic.{AtomicI32, Ordering as Ord}` (selective + alias)
+/// The `path_nodes` slice holds the verbatim dotted path components
+/// (`["std", "string"]` for `std.string`). The `selectors` slice is
+/// non-empty ONLY when the source uses the `{...}` selective form;
+/// empty slice means "whole-module". Codegen reads is_pub to decide
+/// whether the imported bindings are re-exported (mirrors how `pub fn`
+/// emit works for declarations); selective shape with one or more
+/// entries reads each `name` against the source-side surface (the
+/// resolved std module's struct/enum/trait decls) and binds the
+/// selected names via `alias orelse name` on the importer side.
+pub const ImportDecl = struct {
+    is_pub: bool,
+    path_nodes: []const []const u8,
+    selectors: []const ImportSelector = &[_]ImportSelector{},
+    loc: Loc,
+};
+

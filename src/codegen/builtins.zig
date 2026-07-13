@@ -145,14 +145,43 @@ pub const BuiltinDispatch = enum {
     /// `error.FileNotFound` etc. via zag's `?` operator. v1
     /// surface keeps `read_file` simple: empty slice on failure,
     /// heap-allocated bytes on success, no error channel.
-    ///
-    /// Per-call scoping: each fs_read_file invocation steps
-    /// `fs_counter` and emits a fresh `__fs_<N>` scratch — sibling
-    /// `read_file` calls in the same body produce distinct names
-    /// (zig's no-redeclaration rule would reject a clash). The
-    /// counter resets at the top of each function body
-    /// (`genFun` + `genMethod` + `genFreeMethod` in decl.zig).
-    fs_read_file,
+    ///    /// Per-call scoping: each fs_read_file invocation steps
+        /// `fs_counter` and emits a fresh `__fs_<N>` scratch — sibling
+        /// `read_file` calls in the same body produce distinct names
+        /// (zig's no-redeclaration rule would reject a clash). The
+        /// counter resets at the top of each function body
+        /// (`genFun` + `genMethod` + `genFreeMethod` in decl.zig).
+        fs_read_file,
+
+    /// `fs_write_file` -- Phase 3 real emit (CLI migration). Bridges
+    /// cli.zag's `init` handler to a self-allocating write-loop on the
+    /// posix fd surface (no `Io` event-loop needed for write, only
+    /// for read in zig 0.16's retired `std.fs` layout). Returns i32:
+    /// 0 on success, -1 on any open/write failure. The 2-arity shape
+    /// matches the cli.zag call: `write_file(path_str, content_slice)`.
+    /// docblock mirrored in the table row below.
+    fs_write_file,
+
+    /// `fs_mkdir` -- Phase 3 (CLI migration). Single-arg mkdir patterns
+    /// the cli.zag `init <name>` semantics (mkdir -p: EEXIST silent,
+    /// other errors surface as -1 from the call). docblock mirrored
+    /// in the table row below.
+    fs_mkdir,
+
+    /// `process_exec` -- Phase 3 (CLI migration). The cli.zag-run,
+    /// cli.zag-build, cli.zag-check subcommands use this fork+execve
+    /// to recursively invoke zag in `--leaf-process` mode (which is
+    /// the only mode that touches the lex/parse/codegen surface —
+    /// keeping the bootstrap's zig-side transpile lifecycle in
+    /// place rather than re-implementing it in zag source).
+    /// docblock mirrored in the table row below.
+    process_exec,
+
+    /// `process_exit` -- Phase 3 (CLI migration). Lets cli.zag's
+    /// `cli_main() -> i32` exit code propagate through the zag-side
+    /// `exit(rc)` call instead of zig-side `std.process.exit`.
+    /// docblock mirrored in the table row below.
+    process_exit,
 };
 
 /// One row in the router table. The match shape is name + arity --
@@ -238,6 +267,26 @@ pub const builtin_table = [_]BuiltinRoute{
     // with arity=2 rather than overloading this one, so the
     // exact-arity contract is preserved per Phase 0's note.
     .{ .name = "read_file", .arity = 1, .receiver = null, .dispatch = .fs_read_file },
+    // Phase 3 (CLI migration): four additions that close the loop for
+    // cli.zag as the canonical CLI dispatcher. Each is additive —
+    // prior tests stay byte-identical because the existing argv_get /
+    // env_var / fs_read_file rows are untouched. arity is exact-match
+    // per Phase 0's footgun note: a hypothetical `write_file(p)` (no
+    // content arg) would NOT route here, avoiding the silent-wrong-
+    // emit trap of the prior arity-wildcard design.
+    //
+    //   `write_file`  arity=2  -> fs_write_file (path, content) -> i32
+    //                                          posix.openat + write loop
+    //   `mkdir`       arity=1  -> fs_mkdir      (path)
+    //                                          std.os.linux.mkdir via toPosixPath
+    //   `exec`        arity=1  -> process_exec  (argv []const []const u8)
+    //                                          fork + execve + waitpid
+    //   `exit`        arity=1  -> process_exit  (code: i32, clamped to u8)
+    //                                          std.os.linux.exit
+    .{ .name = "write_file", .arity = 2, .receiver = null, .dispatch = .fs_write_file },
+    .{ .name = "mkdir", .arity = 1, .receiver = null, .dispatch = .fs_mkdir },
+    .{ .name = "exec", .arity = 1, .receiver = null, .dispatch = .process_exec },
+    .{ .name = "exit", .arity = 1, .receiver = null, .dispatch = .process_exit },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that

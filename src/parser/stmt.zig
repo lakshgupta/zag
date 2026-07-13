@@ -326,7 +326,21 @@ pub fn parseBlock(self: *Parser) []const Stmt {
         var stmt_count: usize = 0;
 
         while (self.peek().tag != .rbrace and !self.eof()) {
-            if (self.peek().tag == .newline) {
+            const tag = self.peek().tag;
+            // Skip block-level trivia: newlines (statement separator) and
+            // doc_comment tokens (`##` block at the top of a function,
+            // captured as a single `doc_comment` token by the lexer's
+            // readDocComment). The `##` inside a function body must NOT
+            // become a statement — without this skip, parseStmt's expr_stmt
+            // fallback would wrap the comment text as an `.ident` Expr and
+            // genStmt would emit `    ## Some text.;` to the output zig,
+            // which zig's compiler rejects with `expected statement, found
+            // '##'`. Top-level `##` (preceding a function decl) is consumed
+            // by parseFunDecl's leading-doc-comment capture BEFORE this
+            // loop ever runs, so the only path that reaches here with
+            // `doc_comment` is an interior comment that's already been
+            // detached from any decl — trivia.
+            if (tag == .newline or tag == .doc_comment) {
                 self.advance();
                 continue;
             }
@@ -503,7 +517,14 @@ pub fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
         var arms_buf: [16]ast.MatchArm = undefined;
         var arm_count: usize = 0;
         while (self.peek().tag != .rbrace and !self.eof()) {
-            if (self.peek().tag == .newline) {
+            const tag = self.peek().tag;
+            // Mirror parseBlock/parseStmtList's trivia-skip: a `##`
+            // doc_comment token between match arms is interior trivia,
+            // not an arm pattern. Without this skip, parsePattern would
+            // reject the `##` text with `expected match-arm pattern
+            // (literal, range, ident, or '_'), got '##'` and the user's
+            // match would fail to parse. See parseBlock's doc.
+            if (tag == .newline or tag == .doc_comment) {
                 self.advance();
                 continue;
             }
@@ -805,7 +826,15 @@ pub fn parseStmtList(self: *Parser) []const Stmt {
         var stmts_buf: [256]Stmt = undefined;
         var stmt_count: usize = 0;
         while (self.peek().tag != .rbrace and !self.eof()) {
-            if (self.peek().tag == .newline) {
+            const tag = self.peek().tag;
+            // Mirror parseBlock's trivia-skip: newlines separate stmts,
+            // doc_comment tokens are interior `##` blocks the lexer
+            // captured as a single token. Without this skip, the
+            // `## ...` text becomes a `## ... .ident` expr_stmt and the
+            // codegen emits `    ## ... .;` into the output zig, which
+            // zig rejects with `expected statement, found '##'`. See
+            // parseBlock's doc for the full rationale.
+            if (tag == .newline or tag == .doc_comment) {
                 self.advance();
                 continue;
             }

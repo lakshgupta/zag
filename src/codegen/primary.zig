@@ -5,6 +5,19 @@ const core = @import("core.zig");
 // Cross-bucket file-scope aliases. See CROSS_BUCKET_REEXPORTS in
 // the extraction script for rationale.
 const Codegen = core.Codegen;
+// Cross-bucket alias-resolution import (docs/07 "Type Aliases",
+// docs/11 borrowed-string-view). Same pattern as the imports in
+// src/codegen/expr.zig and src/codegen/stmt.zig: a sibling-bucket
+// helper made available by file-scope re-export rather than
+// re-implementing. Used at the array-literal emit site
+// (`genArrayLit`'s three `a.type_name` write sites — fill,
+// progression, and explicit-list) so that `[3]str { ... }`
+// round-trips to `[3][]const u8 { ... }` (via the
+// `[]str`/`[3]str` mappings in `zagTypeToZig`) without zig ever
+// seeing a bare `str` ident. The same wrap is correct for any
+// other alias-bearing type name (e.g. `[3]?str` would also flow
+// through the alias table, though v1 has no such mapping).
+const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 
     const TemplateCtx = enum { debug_print, buf_print };
 
@@ -122,7 +135,7 @@ const Codegen = core.Codegen;
             // `[1]T{ v } ** N` — Zig's repeat operator. The leading element is
             // present by grammar whenever `fill` is true.
             self.write("[1]");
-            self.write(a.type_name);
+            self.write(zagTypeToZig(a.type_name));
             self.write("{ ");
             if (a.elements.len >= 1) self.genExpr(a.elements[0]);
             self.write(" } ** ");
@@ -135,7 +148,7 @@ const Codegen = core.Codegen;
             self.write("(blk: { var __arr: [");
             self.write(size_str);
             self.write("]");
-            self.write(a.type_name);
+            self.write(zagTypeToZig(a.type_name));
             self.write(" = undefined; ");
             if (k > 0) {
                 self.write("const __pat: [");
@@ -143,7 +156,7 @@ const Codegen = core.Codegen;
                 const k_str = std.fmt.bufPrint(&k_buf, "{d}", .{k}) catch "0";
                 self.write(k_str);
                 self.write("]");
-                self.write(a.type_name);
+                self.write(zagTypeToZig(a.type_name));
                 self.write(" = .{ ");
                 for (a.elements, 0..) |el, i| {
                     if (i > 0) self.write(", ");
@@ -164,7 +177,7 @@ const Codegen = core.Codegen;
         self.write("[");
         self.write(size_str);
         self.write("]");
-        self.write(a.type_name);
+        self.write(zagTypeToZig(a.type_name));
         self.write("{ ");
         for (a.elements, 0..) |el, i| {
             if (i > 0) self.write(", ");

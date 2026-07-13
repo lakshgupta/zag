@@ -446,40 +446,84 @@ pub fn parsePostfix(self: *Parser) Expr {
                     lhs = .{ .method_call = .{ .target = &target_buf[0], .name = name, .args = args } };
                 } else if (self.peek().tag == .lt) {
                     // Method-call turbofish (Phase 3 trait dispatch,
-                    // docs/17 §"Using Traits"). After `.name`, a `.lt`
-                    // token can ONLY be the start of a turbofish call
-                    // site — `obj.draw < a` would have `.draw` fall
-                    // back to member_access (no parens after `.draw`),
-                    // so reaching this arm with `.lt` after `.name` is
-                    // unambiguous. Mirrors the `.call` turbofish
-                    // surface (parsePrimary's ident path) but applied
-                    // to `.method_call` so the dispatch shim's `comptime
-                    // T: type` resolves at the call site to the
-                    // registered source-type — `d.draw<Button>()`
-                    // emits `d.draw(Button)` which binds Button to the
-                    // shim's `T` placeholder, and the shim body
-                    // discards T (the `_ = T;` in `genTraitDecl`) and
-                    // forwards to the vtable slot.
-                    self.advance(); // consume leading `<`
-                    const mc_type_args = self.parseTurbofishArgs();
-                    self.expect(.lparen);
-                    var args_buf: [16]Expr = undefined;
-                    var arg_count: usize = 0;
-                    if (self.peek().tag != .rparen) {
-                        args_buf[arg_count] = self.parseExpr();
-                        arg_count += 1;
-                        while (self.peek().tag == .comma) {
-                            self.advance();
-                            args_buf[arg_count] = self.parseExpr();
-                            arg_count += 1;
+                    // docs/17 §"Using Traits"). The `.lt` token after
+                    // `.name` could be a turbofish start (`obj.draw<T>(a)`)
+                    // OR a comparison (`argv.len < 3`). Disambiguate with
+                    // the same depth+paren lookahead as the `.ident`
+                    // branch's call turbofish gate: walk the remaining
+                    // token stream tracking nested `<...>`, and on
+                    // matching the closing `>` verify that `.lparen`
+                    // follows. If not, fall through unchanged so
+                    // parseComparison picks up the `<`. Mirrors the
+                    // `.call` turbofish surface (parsePrimary's ident
+                    // path) but applied to `.method_call` so the
+                    // dispatch shim's `comptime T: type` resolves at
+                    // the call site to the registered source-type —
+                    // `d.draw<Button>()` emits `d.draw(Button)` which
+                    // binds Button to the shim's `T` placeholder, and
+                    // the shim body discards T (the `_ = T;` in
+                    // `genTraitDecl`) and forwards to the vtable slot.
+                    const tps_start = self.pos;
+                    var depth: u32 = 1;
+                    var idx: u32 = 1;
+                    var is_turbo: bool = false;
+                    while (idx < self.tokens.len - tps_start and depth > 0) : (idx += 1) {
+                        switch (self.tokens[tps_start + idx].tag) {
+                            .lt => depth += 1,
+                            .gt => {
+                                depth -= 1;
+                                if (depth == 0) {
+                                    if (idx + 1 < self.tokens.len - tps_start and self.tokens[tps_start + idx + 1].tag == .lparen) {
+                                        is_turbo = true;
+                                    }
+                                    break;
+                                }
+                            },
+                            else => {},
                         }
                     }
-                    self.expect(.rparen);
-                    const ta_args = self.arena.alloc(Expr, arg_count);
-                    @memcpy(ta_args, args_buf[0..arg_count]);
-                    const ta_target_buf = self.arena.alloc(Expr, 1);
-                    ta_target_buf[0] = lhs;
-                    lhs = .{ .method_call = .{ .target = &ta_target_buf[0], .name = name, .args = ta_args, .type_args = mc_type_args } };
+                    if (is_turbo) {
+                        self.advance(); // consume leading `<`
+                        const mc_type_args = self.parseTurbofishArgs();
+                        self.expect(.lparen);
+                        var args_buf: [16]Expr = undefined;
+                        var arg_count: usize = 0;
+                        if (self.peek().tag != .rparen) {
+                            args_buf[arg_count] = self.parseExpr();
+                            arg_count += 1;
+                            while (self.peek().tag == .comma) {
+                                self.advance();
+                                args_buf[arg_count] = self.parseExpr();
+                                arg_count += 1;
+                            }
+                        }
+                        self.expect(.rparen);
+                        const ta_args = self.arena.alloc(Expr, arg_count);
+                        @memcpy(ta_args, args_buf[0..arg_count]);
+                        const ta_target_buf = self.arena.alloc(Expr, 1);
+                        ta_target_buf[0] = lhs;
+                        lhs = .{ .method_call = .{ .target = &ta_target_buf[0], .name = name, .args = ta_args, .type_args = mc_type_args } };
+                    } else {
+                        // Fall-through: `.name <` is a property access
+                        // followed by a binary operator — NOT a
+                        // turbofish start (the paren-after-gt
+                        // discriminator in the lookahead above
+                        // already rejected it). Construct the
+                        // `.member_access` node so the property name
+                        // is NOT silently dropped on the floor. Pre-fix
+                        // the `if (is_turbo)` block had no `else`,
+                        // so `argv.len < 2` parsed as `argv < 2` and
+                        // zig rejected the generated source with
+                        // `incompatible types: '[]const []const u8'
+                        // and 'comptime_int'` because the slice was
+                        // compared to a literal without `.len` first.
+                        // Same code as the outer `else` arm below; the
+                        // duplication is the cost of the nested-if
+                        // structure that pre-dates this fix.
+                        const target_buf = self.arena.alloc(Expr, 1);
+                        target_buf[0] = lhs;
+                        lhs = .{ .member_access = .{ .target = &target_buf[0], .name = name } };
+                    }
                 } else {
                     // Property-access form: `.name` (no parens). Codegen
                     // emits `<target>.<name>` verbatim — the user-facing
@@ -495,6 +539,63 @@ pub fn parsePostfix(self: *Parser) Expr {
         }
         return lhs;
     }
+
+
+/// Template-literal auto-promotion gate. The `.string_literal` arm
+/// of `parsePrimary` consults this before deciding between `.string_lit`
+/// (plain string) and `.template_lit` (interpolated). Auto-promotion
+/// fires ONLY when every `{...}` in the text contains identifier-like
+/// content (alphanumerics + underscore, optionally followed by `:spec`).
+/// A `\n` or space or paren inside the braces is enough to bail out
+/// to a plain string literal — a critical case for strings that embed
+/// C-style function bodies (e.g. lib/cli.zag's boilerplate:
+/// `"fun main() {\n    print(...);\n}\n"` — the `{ ... }` here is a
+/// function body, NOT a template interpolation). Without this gate,
+/// the auto-promote path runs `buildTemplate`, the `buildTemplate`
+/// walker captures `\n    print(...);\n` as a single `.ident`
+/// expression (treating multi-token C code as a zag identifier), and
+/// the codegen emits `std.fmt.bufPrint(..., "fun main() {any}\n", .{...})`
+/// — a malformed zig call that zig's compiler rejects.
+///
+/// Returns true iff AT LEAST ONE `{...}` exists AND all of them have
+/// identifier-like content. A string with no `{` returns true so the
+/// caller can short-circuit to `.string_lit` (the old behavior
+/// skipped auto-promote when `indexOf("{") == null`).
+fn looksLikeTemplateLiteral(text: []const u8) bool {
+    var any_braces = false;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '{') {
+            any_braces = true;
+            i += 1;
+            var found_close = false;
+            while (i < text.len) {
+                const c = text[i];
+                if (c == '}') {
+                    found_close = true;
+                    i += 1;
+                    break;
+                }
+                // Identifier chars + ':' (for printf-style `:spec`).
+                // Space, paren, semicolon, newline, slash, etc. all
+                // bail out — the `{...}` content is multi-token, not a
+                // template interpolation target.
+                if (!std.ascii.isAlphanumeric(c) and c != '_' and c != ':') {
+                    return false;
+                }
+                i += 1;
+            }
+            if (!found_close) return false; // unmatched '{' — not a template
+        } else {
+            i += 1;
+        }
+    }
+    // Auto-promote only when at least one well-formed `{...}` exists;
+    // a string with no braces stays a string literal. This matches the
+    // pre-fix behavior for the no-braces case (the old `indexOf("{") == null`
+    // branch returned `.string_lit` directly).
+    return any_braces;
+}
 
 
 pub fn parsePrimary(self: *Parser) Expr {
@@ -654,7 +755,20 @@ pub fn parsePrimary(self: *Parser) Expr {
             },
             .string_literal => {
                 self.advance();
-                if (std.mem.indexOf(u8, tok.text, "{") != null) {
+                // Template-literal auto-promotion gate. The pre-fix
+                // check (`indexOf("{") != null`) auto-promoted ANY
+                // string containing a `{` to a template literal, which
+                // silently mis-parsed embedded C-style function bodies
+                // like the cli.zag boilerplate's `"fun main() { ... }"`
+                // as a template with multi-token content (the `\n
+                // print("hello, world\n");\n` between the braces was
+                // captured as a single `.ident` expression). The
+                // `looksLikeTemplateLiteral` helper gates on
+                // identifier-only `{...}` content so plain strings with
+                // `{` chars (function bodies, JSON templates, etc.)
+                // stay `.string_lit`. See `looksLikeTemplateLiteral`'s
+                // docblock for the full rationale and edge cases.
+                if (looksLikeTemplateLiteral(tok.text)) {
                     return self.buildTemplate(tok.text);
                 }
                 return .{ .string_lit = tok.text };

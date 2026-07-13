@@ -13,6 +13,13 @@ const EnumDecl = decl.EnumDecl;
 // decl-side types; the `&[_]TraitDecl{}` empty default preserves the
 // non-trait source-shape compatibility for the 235+ baseline tests.
 const TraitDecl = decl.TraitDecl;
+// Module imports (docs/manual/22-modules.md §Imports): Program.imports
+// carries each top-level `pub import std.X.{A, B as C}` decl so
+// codegen can walk the resolved paths against KNOWN_STD_MODULES (in
+// src/parser/core.zig). Imported via the same `decl.ImportDecl`
+// chain as the other decl-side types; default-empty preserves the
+// non-import source-shape compat (no pre-imports code existed).
+const ImportDecl = decl.ImportDecl;
 
 // ============================================================
 // top.zig — top-level types from src/ast.zig
@@ -59,6 +66,18 @@ pub const Program = struct {
     /// pre-traits-source-shape compatibility (none of the existing
     /// 235+ tests reference trait decls).
     traits: []const TraitDecl = &[_]TraitDecl{},
+    /// Module-level import declarations (`import std.string` and the
+    /// `pub import std.X.{A, B as C}` selective form). Each entry is
+    /// parsed against the KNOWN_STD_MODULES table in
+    /// `src/parser/core.zig` (currently a comptime-baked 8-entry list
+    /// covering `lib/std/{mod,string,error,fmt,time,atomic,bench}.zag`,
+    /// `lib/std/async/stream.zag`, and `lib/std/arch/x86/avx2.zag`);
+    /// a `import std.X` whose path doesn't match a table entry
+    /// currently surfaces a parser-time error (the table is the
+    /// resolution surface for v1 — user-module imports live behind a
+    /// later parser pass). Codegen walks `imports` at generate() entry
+    /// to emit one `@import("...")`-style pre-bind per resolved entry.
+    imports: []const ImportDecl = &[_]ImportDecl{},
 };
 
 pub const Arena = struct {

@@ -535,8 +535,7 @@ pub fn parseMethodParam(self: *Parser) ast.MethodParam {
 
 pub fn parseStructDecl(self: *Parser) ast.StructDecl {
         const start_loc = self.peek().loc;
-        self.expect(.struct_kw);
-        const name = self.expectIdent();
+        self.expect(.struct_kw);        const name = self.expectIdent();
         // Generics (docs/16 §"Generic Types"): if `struct NAME<T> { ... }`,
         // consume the `<...>` BEFORE the opening `{`. Same ler as
         // parseFunDecl.
@@ -590,5 +589,87 @@ pub fn parseStructDecl(self: *Parser) ast.StructDecl {
         const fields_src = fields_buf[0..field_count];
         const fields = self.arena.dupe(ast.StructField, fields_src);
         return .{ .name = name, .fields = fields, .loc = start_loc, .type_params = type_params };
+    }
+
+
+pub fn parseImportDecl(self: *Parser, is_pub: bool) ast.ImportDecl {
+        // Resolves one of three surface shapes:
+        //   1. `import std.string`             (whole-module, no `pub`)
+        //   2. `pub import std.string`         (whole-module, exported)
+        //   3. `pub import std.X.{A, B as C}`  (selective + optional alias)
+        //
+        // The caller (`Parser.parse()` top-level dispatch) has already
+        // consumed the leading `pub` token (when present) and verified
+        // the next token is `.import_kw`. parseImportDecl starts with
+        // an `expect(.import_kw)` so the shape is unambiguous from the
+        // call site. Path components are verbatim idents separated by
+        // `.`; the loop terminates when peek is `.lbrace` (selective
+        // list follows), `.newline` (whole-module, no list), `.eof` /
+        // any other terminator (whole-module).
+        //
+        // Resolution lives in `src/parser/core.zig`'s `KNOWN_STD_MODULES`
+        // lookup table — this function captures only the AST shape; pair
+        // the captured path_nodes with the table at codegen time via
+        // the canonical dotted join (`std.string` from `["std", "string"]`).
+        const start_loc = self.peek().loc;
+        self.expect(.import_kw);
+        var path_buf: [8][]const u8 = undefined;
+        var path_count: usize = 0;
+        path_buf[path_count] = self.expectIdent();
+        path_count += 1;
+        while (self.peek().tag == .dot) {
+            self.advance();
+            // Selective list — terminate the path and let the `{`
+            // branch parse the selector list. Without this guard, an
+            // import like `pub import std.atomic.{AtomicI32}` would
+            // mistakenly re-enter the path loop and consume the `{`
+            // as an ident (no, the lexer already tokenizes `{` as
+            // `.lbrace` — but `expectIdent` would reject it, surface
+            // an `expected identifier, got '{'` error, and break the
+            // whole `pub import std.X.{…}` shape).
+            if (self.peek().tag == .lbrace) break;
+            path_buf[path_count] = self.expectIdent();
+            path_count += 1;
+        }
+        // Selective list — captured ONLY when the source uses `{ … }`.
+        // The list itself is comma-separated `Ident` slots; each
+        // optional `as Ident` tail becomes the binding name on the
+        // importing side (codegen looks the `name` slot up against
+        // the source module's top-level decls, then emits the binding
+        // under `alias orelse name` on the importer side).
+        var selectors_buf: [64]ast.ImportSelector = undefined;
+        var selector_count: usize = 0;
+        if (self.peek().tag == .lbrace) {
+            self.advance();
+            while (self.peek().tag != .rbrace and !self.eof()) {
+                if (self.peek().tag == .newline) {
+                    self.advance();
+                    continue;
+                }
+                if (self.peek().tag == .comma) {
+                    self.advance();
+                    continue;
+                }
+                const name = self.expectIdent();
+                var alias: ?[]const u8 = null;
+                if (self.peek().tag == .as_kw) {
+                    self.advance();
+                    alias = self.expectIdent();
+                }
+                selectors_buf[selector_count] = .{ .name = name, .alias = alias };
+                selector_count += 1;
+            }
+            self.expect(.rbrace);
+        }
+        const path_arena = self.arena.alloc([]const u8, path_count);
+        @memcpy(path_arena, path_buf[0..path_count]);
+        const selectors = self.arena.alloc(ast.ImportSelector, selector_count);
+        if (selector_count > 0) @memcpy(selectors, selectors_buf[0..selector_count]);
+        return .{
+            .is_pub = is_pub,
+            .path_nodes = path_arena,
+            .selectors = selectors,
+            .loc = start_loc,
+        };
     }
 

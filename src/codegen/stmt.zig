@@ -148,13 +148,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // and bare (`none`) all render uniformly via `genElseBranch`.
                 //
                 // IMPORTANT: do NOT emit literal `(` / `)` around the
-                // condition. The `.binary` codegen path already wraps its
-                // emission in `(lhs op rhs)` so adding outer parens would
-                // produce `if ((x > 0)) {` (one extra paren pair) and break
-                // substring assertion tests like the docs/06 pin tests.
-                // For an identifier cond (`if cond { … }`) no outer paren
-                // is needed; the form `if cond {` is exactly what zig
-                // accepts.
+                // condition. The `.binary` codegen path always wraps its
+                // emission in `(...)` (either `(lhs op rhs)` on the
+                // arithmetic surface or `(std.mem.eql(u8, lhs, rhs))` on
+                // the Phase 3 string-comparison shim) so adding outer
+                // parens would produce `if ((x > 0)) {` (one extra paren
+                // pair) and break substring assertion tests like the
+                // docs/06 pin tests. For an identifier cond (`if cond { … }`)
+                // no outer paren is needed; the form `if cond {` is
+                // exactly what zig accepts.
                 self.write("    if ");
                 self.genExpr(ifs.cond);
                 self.write(" {\n");
@@ -168,7 +170,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // and body are both standard zig, so no shim is needed.
                 //
                 // Same outer-paren caveat as `.if_stmt` above: genExpr
-                // already wraps `.binary` in `(lhs op rhs)`, so emitting
+                // always wraps `.binary` in `(...)` (either
+                // `(lhs op rhs)` on arithmetic or `(std.mem.eql(u8, ...))`
+                // on the Phase 3 string-comparison shim), so emitting
                 // literal `(` / `)` around the cond would produce
                 // `while ((i < 10)) {` (double parens) breaking substring
                 // assertions. Drop the wrappers.

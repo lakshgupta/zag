@@ -48,6 +48,17 @@ pub const TokenTag = enum {
     /// in the AST for future use but codegen does not gate emission on
     /// `pub` because all generated decls already use zig's `pub fn`).
     pub_kw,
+    /// `import` keyword — top-level decl that brings another module's
+    /// declarations into scope. Two surface shapes:
+    ///   1. `import std.string`              (whole-module import)
+    ///   2. `pub import std.atomic.{AtomicI32, Ordering.AcqRel}` (selective import with optional alias)
+    /// Resolved against the KNOWN_STD_MODULES lookup table in
+    /// `src/parser/core.zig` (any `import std.X` whose path matches a
+    /// table entry routes to the on-disk `.zag` source at that entry's
+    /// recorded path). User module imports (`import foo` — top-level
+    /// directory name) are a follow-up parser pass; v1 only resolves
+    /// `std.*` paths.
+    import_kw,
     /// Reserved with `_kw` suffix because `if`/`else`/`while`/`for`/`match`/
     /// `break`/`continue` are reserved words in the Zig backend (the lexer
     /// cannot name a TokenTag literal `if`/`else`/etc. without colliding
