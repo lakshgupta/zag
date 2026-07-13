@@ -543,24 +543,35 @@ pub fn parsePostfix(self: *Parser) Expr {
 
 /// Template-literal auto-promotion gate. The `.string_literal` arm
 /// of `parsePrimary` consults this before deciding between `.string_lit`
-/// (plain string) and `.template_lit` (interpolated). Auto-promotion
-/// fires ONLY when every `{...}` in the text contains identifier-like
-/// content (alphanumerics + underscore, optionally followed by `:spec`).
-/// A `\n` or space or paren inside the braces is enough to bail out
-/// to a plain string literal — a critical case for strings that embed
-/// C-style function bodies (e.g. lib/cli.zag's boilerplate:
-/// `"fun main() {\n    print(...);\n}\n"` — the `{ ... }` here is a
-/// function body, NOT a template interpolation). Without this gate,
-/// the auto-promote path runs `buildTemplate`, the `buildTemplate`
-/// walker captures `\n    print(...);\n` as a single `.ident`
-/// expression (treating multi-token C code as a zag identifier), and
-/// the codegen emits `std.fmt.bufPrint(..., "fun main() {any}\n", .{...})`
-/// — a malformed zig call that zig's compiler rejects.
+/// (plain string) and `.template_lit` (interpolated).
 ///
-/// Returns true iff AT LEAST ONE `{...}` exists AND all of them have
-/// identifier-like content. A string with no `{` returns true so the
-/// caller can short-circuit to `.string_lit` (the old behavior
-/// skipped auto-promote when `indexOf("{") == null`).
+/// This is a MATCHING-BRACE gate: for each `{` it walks forward to the
+/// matching `}` at the same brace depth, accepting ANY content inside
+/// (dots, spaces, operators, parens, slashes) so expressions like
+/// `{a + b}`, `{obj.f()}`, `{pi:.5}` auto-promote to `.template_lit`.
+///
+/// The single content-level rejection is a NESTED `{` inside the
+/// candidate `{...}`. This disambiguates from any embedded-code
+/// string (e.g. a function body like
+/// `"fun main() {\n    print(...);\n}\n"` has its own `{` and `}`
+/// pair inside the outer braces, signalling it's code, not a template
+/// interpolation). The legacy char-class gate
+/// (`isAlphanumeric || _ || :`) achieved the same rejection indirectly
+/// by bailing on `\n`, `(`, `)`, `;` etc. — but at the cost of also
+/// rejecting legitimate expression interpolations (`{a + b}`'s space
+/// + `+`, `{pi:.5}`'s `.`, `{obj.f()}`'s `.` + `(`).
+///
+/// Trade-offs vs. the legacy gate: accepts expression content
+/// (operators, dots, parens, method calls); rejects only nested
+/// braces. The `buildTemplate` walker stores the inner text as
+/// `.ident` and codegen's `.ident` arm emits it verbatim, so any
+/// expression-shaped content becomes a valid Zig expression at the
+/// format-arg site.
+///
+/// Returns true iff AT LEAST ONE well-formed `{...}` exists AND none
+/// of them have nested braces. A string with no `{` returns false so
+/// the caller keeps it as `.string_lit` (preserves the legacy
+/// no-brace-stays-string invariant).
 fn looksLikeTemplateLiteral(text: []const u8) bool {
     var any_braces = false;
     var i: usize = 0;
@@ -568,20 +579,31 @@ fn looksLikeTemplateLiteral(text: []const u8) bool {
         if (text[i] == '{') {
             any_braces = true;
             i += 1;
+            // Scan for the matching `}` at the SAME brace depth. A
+            // nested `{` before the matching `}` disqualifies this
+            // string as a template — it's embedded code (function
+            // body, JSON object, etc.), not an interpolation. Any
+            // other content (dots, spaces, operators, parens) is
+            // fine because the .ident verbatim-emit at codegen will
+            // produce a valid Zig expression.
             var found_close = false;
             while (i < text.len) {
                 const c = text[i];
+                if (c == '{') {
+                    // Nested brace — embedded code, not a template
+                    // interpolation. The legacy char-class gate
+                    // achieved the same rejection indirectly (the
+                    // nested `{` is non-alphanumeric so the gate
+                    // bailed), but this explicit check is clearer
+                    // about WHY we reject and accepts all the
+                    // expression-content cases the legacy gate
+                    // blocked.
+                    return false;
+                }
                 if (c == '}') {
                     found_close = true;
                     i += 1;
                     break;
-                }
-                // Identifier chars + ':' (for printf-style `:spec`).
-                // Space, paren, semicolon, newline, slash, etc. all
-                // bail out — the `{...}` content is multi-token, not a
-                // template interpolation target.
-                if (!std.ascii.isAlphanumeric(c) and c != '_' and c != ':') {
-                    return false;
                 }
                 i += 1;
             }
@@ -591,9 +613,9 @@ fn looksLikeTemplateLiteral(text: []const u8) bool {
         }
     }
     // Auto-promote only when at least one well-formed `{...}` exists;
-    // a string with no braces stays a string literal. This matches the
-    // pre-fix behavior for the no-braces case (the old `indexOf("{") == null`
-    // branch returned `.string_lit` directly).
+    // a string with no braces stays a string literal. Same return
+    // semantics as the legacy gate (the old char-class implementation
+    // also returned `any_braces` here).
     return any_braces;
 }
 

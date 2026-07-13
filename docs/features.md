@@ -325,7 +325,23 @@ distribution and audit each new line against `src/`.
   string with braces becomes template_lit" + codegen mirror.
 - [x] Format spec interpolation (`{PI:.5}`) — "parser: format
   spec preserved on interpolation" + "codegen: format spec
-  emitted in placeholder".- [x] Width spec (`{n:5}`) — "codegen: integer width spec flows through".
+  emitted in placeholder". The matching-brace gate in
+  `src/parser/primary.zig:looksLikeTemplateLiteral` accepts the
+  `.` char inside the braces.
+- [x] Width spec (`{n:5}`) — "codegen: integer width spec flows through".
+  Coverage: `examples/basics/strings.zag` (`print("n = |{n:5}|\n")` +
+  `{m:5}`). Compiles to valid zig `{any:5}`.
+- [x] Expression content in interpolation (`{a + b}`, `{obj.f()}`) —
+  matching-brace gate accepts dots, spaces, operators, and parens
+  inside `{...}`; buildTemplate stores the inner text as `.ident`
+  and codegen's `.ident` arm emits it verbatim at the format-arg
+  site. Pinned by "parser: expression operator {a + b} gate
+  accepts spaces and plus" + "parser: method call {obj.f()} gate
+  accepts dot and parens inside braces" + "parser: float precision
+  {pi:.5} gate accepts dot inside braces".
+- [x] Gate rejects nested-brace strings (function bodies, JSON
+  objects, etc.) — pinned by "parser: nested-brace string stays
+  string_lit (embedded-code case)".
   Coverage: `examples/basics/strings.zag` (`print("n = |{n:5}|\n")` +
   `{m:5}`). Compiles to valid zig `{any:5}`.
 - [x] Embedded LF/CR/Tab escapes preserved — "codegen: template

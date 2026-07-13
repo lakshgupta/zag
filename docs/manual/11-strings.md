@@ -85,6 +85,26 @@ print("{42:x}\n");              # "2a"
 print("{42:b}\n");              # "101010"
 ```
 
+**Expression content** — the `{...}` placeholder accepts any
+zig expression, not just a single identifier. Dots, spaces,
+operators, parens, and method calls are all valid inside the
+braces because the gate only rejects a NESTED `{` (an embedded
+code block, not an interpolation):
+
+```
+let a: i32 = 1;
+let b: i32 = 2;
+print("sum = {a + b}\n");                 # "sum = 3"
+print("dot = {obj.f()}\n");               # method-call expression
+print("precise = {pi:.5}\n");            # format spec still works
+```
+
+The placeholder text is emitted verbatim at the format-arg site,
+so any expression that zig accepts as a value-yielding expression
+is a valid interpolation. Format specifiers (`:spec`) are split
+off the first `:` and applied to the placeholder (e.g.
+`{pi:.5}` becomes `{any:.5}` with arg `pi`).
+
 **Memory:** Interpolation allocates a `String` via `Display.write`. Use `with_writer` for zero-alloc formatting in hot paths.
 
 ## String Slicing

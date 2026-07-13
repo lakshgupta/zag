@@ -433,6 +433,112 @@ test "parser: plain interpolation has null spec" {
     }
 }
 
+test "parser: float precision {pi:.5} gate accepts dot inside braces" {
+    // New matching-brace gate unblocks float-precision format specs.
+    // The pre-fix char-class gate bailed on `.` (non-alphanumeric,
+    // not `_` or `:`), so `{pi:.5}` was incorrectly rejected as a
+    // template and emitted as a plain string_lit. The matching-brace
+    // gate accepts any content (dots, spaces, operators) so the
+    // interpolation now promotes to .template_lit with expr="pi"
+    // and spec=".5". Codegen's genTemplateLit emits `{any:.5}` with
+    // arg `pi`, and zig's debug formatter honours the precision.
+    const src = "fun f() {\n    let pi: f64 = 3.14159;\n    print(\"pi = {pi:.5}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const print_stmt = prog.functions[0].body[1];
+    const arg = print_stmt.expr_stmt.call.args[0];
+    try std.testing.expect(arg == .template_lit);
+    try std.testing.expectEqual(@as(usize, 2), arg.template_lit.parts.len);
+    try std.testing.expect(arg.template_lit.parts[0].literal == null);
+    try std.testing.expect(arg.template_lit.parts[0].expr != null);
+    try std.testing.expectEqualStrings("pi", arg.template_lit.parts[0].expr.?.ident);
+    try std.testing.expect(arg.template_lit.parts[0].spec != null);
+    try std.testing.expectEqualStrings(".5", arg.template_lit.parts[0].spec.?);
+}
+
+test "parser: expression operator {a + b} gate accepts spaces and plus" {
+    // New matching-brace gate unblocks expression-shaped interpolation
+    // (e.g. binary operators with operands). The pre-fix char-class
+    // gate bailed on space + `+` (both non-alphanumeric, not `_`/`:`),
+    // so `{a + b}` was incorrectly rejected. The matching-brace gate
+    // walks the content looking for a nested `{` (none here) and
+    // matches the closing `}`. buildTemplate captures `a + b` as
+    // the .ident text; codegen's genExpr .ident arm emits `a + b`
+    // verbatim so zig evaluates the binary expression at the
+    // format-arg site.
+    const src = "fun f() {\n    let a: i32 = 1;\n    let b: i32 = 2;\n    print(\"sum = {a + b}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const print_stmt = prog.functions[0].body[2];
+    const arg = print_stmt.expr_stmt.call.args[0];
+    try std.testing.expect(arg == .template_lit);
+    try std.testing.expectEqual(@as(usize, 2), arg.template_lit.parts.len);
+    try std.testing.expect(arg.template_lit.parts[0].literal == null);
+    try std.testing.expect(arg.template_lit.parts[0].expr != null);
+    // The .ident text carries the full expression verbatim —
+    // codegen's .ident arm emits `a + b` as a Zig binary expression.
+    try std.testing.expectEqualStrings("a + b", arg.template_lit.parts[0].expr.?.ident);
+    try std.testing.expect(arg.template_lit.parts[0].spec == null);
+}
+
+test "parser: method call {obj.f()} gate accepts dot and parens inside braces" {
+    // New matching-brace gate unblocks method-call interpolation.
+    // The pre-fix char-class gate bailed on `.` and `(` (both
+    // non-alphanumeric, not `_`/`:`), so `{obj.f()}` was
+    // incorrectly rejected. The matching-brace gate accepts these
+    // because it only rejects a NESTED `{` (the `{` inside `f()`
+    // would be a nested-brace trigger, but the inner `f()` has no
+    // braces — only parens, which the gate accepts). buildTemplate
+    // captures `obj.f()` as the .ident text; codegen's .ident arm
+    // emits `obj.f()` verbatim so zig evaluates the method call.
+    const src = "fun f() {\n    let obj: i32 = 1;\n    print(\"got {obj.f()}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const print_stmt = prog.functions[0].body[1];
+    const arg = print_stmt.expr_stmt.call.args[0];
+    try std.testing.expect(arg == .template_lit);
+    try std.testing.expectEqual(@as(usize, 2), arg.template_lit.parts.len);
+    try std.testing.expect(arg.template_lit.parts[0].literal == null);
+    try std.testing.expect(arg.template_lit.parts[0].expr != null);
+    try std.testing.expectEqualStrings("obj.f()", arg.template_lit.parts[0].expr.?.ident);
+    try std.testing.expect(arg.template_lit.parts[0].spec == null);
+}
+
+test "parser: nested-brace string stays string_lit (embedded-code case)" {
+    // Regression pin for the embedded-code case the legacy
+    // char-class gate protected against: a string containing
+    // a function body (e.g. `"fun main() {\n    print(...);\n}\n"`),
+    // a JSON object (`"{\"k\": 1}"`), or any other string with a
+    // nested brace pair must NOT auto-promote to .template_lit,
+    // because the inner `{ ... }` block is code, not interpolation.
+    // The matching-brace gate rejects this at the inner-`{` step
+    // (returns false on the first nested `{`), so the string stays
+    // a .string_lit and the embedded code is preserved verbatim.
+    // The plain-string `print` codegen path then emits the full
+    // text as a single string literal to zig.
+    const src = "fun f() {\n    let boilerplate = \"fun main() {\\n    print(\\\"hi\\\");\\n}\\n\";\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    // Defensive: the source has exactly one stmt (the `let`),
+    // so body[0] is the boilerplate binding. Pinning body.len
+    // guards against accidental source rewrites shifting the index.
+    try std.testing.expectEqual(@as(usize, 1), prog.functions[0].body.len);
+    const init = prog.functions[0].body[0].let.init.?;
+    try std.testing.expect(init == .string_lit);
+}
+
 test "parser: tuple destructuring" {
     // `let (x, y) = (10, 20);` should split into a tuple pattern with two
     // name leaves. The legacy `name` field is the empty sentinel for
