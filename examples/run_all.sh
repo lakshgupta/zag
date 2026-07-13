@@ -226,11 +226,27 @@ fi
 cd "$SCRIPT_DIR"
 
 if [[ -n "$FILTER" ]]; then
-    # Normalize: ensure trailing /
-    [[ "$FILTER" != */ ]] && FILTER="${FILTER}/"
+    # Preserve the user's verbatim input for the error message — error
+    # display must reflect what the user typed (so `./run_all.sh
+    # examples/typo/` reports `examples/typo/`, not the normalized
+    # `typo` which would lose the breadcrumb back to their typo).
+    FILTER_DISPLAY="$FILTER"
+    # Normalize: strip a trailing slash (lets users pass either `basics/`
+    # or `basics`; the `[[ -d ]]` test accepts both with or without).
+    [[ "$FILTER" == */ ]] && FILTER="${FILTER%/}"
+    # Normalize: strip a leading `examples/` if present. The script has
+    # `cd $SCRIPT_DIR` already (line above this block), so CWD is the
+    # examples dir and `${SCRIPT_DIR}/${FILTER}` would otherwise
+    # double-prefix to `/path/to/examples/examples/...`. Strip lets
+    # both invocation shapes work:
+    #   ./run_all.sh basics/        (examples-dir-relative; convention)
+    #   ./run_all.sh examples/basics/  (repo-root-relative; user-friendly)
+    if [[ "$FILTER" == examples/* ]]; then
+        FILTER="${FILTER#examples/}"
+    fi
     EXAMPLES_DIR="${SCRIPT_DIR}/${FILTER}"
     if [[ ! -d "$EXAMPLES_DIR" ]]; then
-        echo -e "${RED}Error: directory '$FILTER' not found${NC}"
+        echo -e "${RED}Error: directory '$FILTER_DISPLAY' not found${NC}"
         exit 1
     fi
 else
