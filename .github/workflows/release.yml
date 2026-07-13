@@ -1,0 +1,243 @@
+name: release
+
+# ──────────────────────────────────────────────────────────────────────────
+# Build + publish zag release artifacts on every v* tag push.
+#
+# The 6 (OS, arch) pairs in the build matrix below MUST mirror:
+#   - scripts/package.sh `TARGETS` array (the staging filenames it
+#     archives from)
+#   - scripts/install.sh's detect_platform `PLATFORM_FILE`
+#   - zag-install.sh at the repo root (the user-facing curl-pipe installer)
+#   - docs/manual/31-building.md § Distribution
+# Keep all four lists in lockstep — adding a target here without
+# updating the others would silently "vaporize" that platform's
+# install path on a fresh `bash zag-install.sh --version v0.1.0`.
+#
+# Triggers:
+#   - `v*` tags (e.g. `v0.1.0`)            → build + publish release
+# No `workflow_dispatch` here on purpose: tag-triggered releases give
+# a single canonical point of truth (the tag itself); pre-tag
+# validation happens via `gh workflow run release.yml --ref <branch>`,
+# which uploads artifacts as workflow artifacts (visible for 90 days)
+# without minting a noise release.
+# ──────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# One in-flight release per ref. Cancels any prior in-progress run for
+# the same tag so a force-pushed tag doesn't keep two matrix jobs
+# cooking over the same artifacts.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: '0.16.0'
+
+jobs:
+  # ── Quick smoke gate ─────────────────────────────────────────────────
+  # ~1 minute on ubuntu-latest. Catches obvious build breakage before
+  # burning 6 cross-compile targets (which run sequentially to a single
+  # runner + take ~5-8 minutes total).
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: zig build test
+        run: zig build test
+
+  # ── Cross-compile all 6 (OS, arch) targets ───────────────────────────
+  # Single ubuntu-latest runner + zig 0.16's bundled LLVM / MinGW /
+  # Apple-SDK cross-compile backend → produces darwin + windows
+  # binaries from a linux host, no 3-host runner matrix needed. The
+  # `bare_target` field on each matrix row is the user-facing
+  # `<os>-<arch>` slug (e.g. `darwin-x86_64`) that
+  # scripts/package.sh / `zag-install.sh` / `scripts/install.sh` also
+  # use — keeping a single canonical name across the 4 sites is the
+  # only way a `bash zag-install.sh --version v0.1.0` install on a
+  # fresh machine actually finds the right archive.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            bare: linux-x86_64
+            suffix: ''
+          - target: aarch64-linux-gnu
+            bare: linux-arm64
+            suffix: ''
+          - target: x86_64-macos-none
+            bare: darwin-x86_64
+            suffix: ''
+          - target: aarch64-macos-none
+            bare: darwin-arm64
+            suffix: ''
+          - target: x86_64-windows-gnu
+            bare: windows-x86_64
+            suffix: '.exe'
+          - target: aarch64-windows-gnu
+            bare: windows-arm64
+            suffix: '.exe'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Cross-compile ${{ matrix.target }}
+        run: >
+          zig build install
+          -Dtarget=${{ matrix.target }}
+          -Doptimize=ReleaseFast
+          --prefix ${{ runner.temp }}/stage/${{ matrix.target }}
+      - name: Restage into scripts/package.sh layout
+        shell: bash
+        # Re-emit the staged binary at the path scripts/install.sh's
+        # detect_platform + zag-install.sh's detect_platform build:
+        # `zag-<os>-<arch>{.exe}`. Mirror the filename transform from
+        # scripts/package.sh's TARGETS array so a local
+        # `./scripts/package.sh 0.1.0 --bin-dir zig-out/bin/`
+        # reproduces the exact same on-disk layout as this CI step.
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/bins"
+          src="${{ runner.temp }}/stage/${{ matrix.target }}/bin/zag${{ matrix.suffix }}"
+          dst="${{ runner.temp }}/bins/zag-${{ matrix.bare }}${{ matrix.suffix }}"
+          cp "$src" "$dst"
+          chmod +x "$dst"
+          ls -l "$dst"
+          "$dst" version || true
+      - name: Upload per-binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ runner.temp }}/bins/*
+          if-no-files-found: error
+
+  # ── Aggregate + archive + checksum ───────────────────────────────────
+  # Download all 6 binaries, lay them out under `dist/<version>/` with
+  # the same archive filenames scripts/package.sh writes locally, and
+  # emit SHA256 checksums so users can verify their `zag-install.sh`
+  # download. We do NOT shell out to scripts/package.sh here because
+  # package.sh expects binaries at `<BIN_DIR>/zag-<os>-<arch>{.exe}` —
+  # that directory layout matches `zig-out/bin/`, not the
+  # `$RUNNER_TEMP/bins/` shape we already produced. Mirroring
+  # package.sh's tar/zip/sha256 logic verbatim keeps on-CI + on-dev
+  # release shape identical, which is the audit trail maintainers
+  # need when reproducing a release locally.
+  package:
+    name: Aggregate dist/${{ steps.version.outputs.version }}/
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute version (strip leading 'v')
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Computed version: $version"
+      - name: Download all 6 binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/bins
+          merge-multiple: true
+      - name: Layout dist/<version>/
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          out_dir="dist/$VERSION"
+          mkdir -p "$out_dir"
+          for src in ${{ runner.temp }}/bins/*; do
+            base="$(basename "$src")"
+            is_win=0
+            case "$base" in
+              *.exe) is_win=1; bare="${base%.exe}" ;;
+              *)     bare="$base" ;;
+            esac
+            # tar.gz for linux/darwin; zip for windows. Matches
+            # scripts/package.sh's TARGETS archive-ext column and
+            # zag-install.sh's detect_platform EXT assignment.
+            archive_ext="tar.gz"
+            case "$bare" in
+              zag-windows-*) archive_ext="zip" ;;
+            esac
+            staging="$(mktemp -d)"
+            if [ "$is_win" -eq 1 ]; then
+              cp "$src" "$staging/zag.exe"
+            else
+              cp "$src" "$staging/zag"
+              chmod +x "$staging/zag"
+            fi
+            echo "$VERSION" > "$staging/VERSION"
+            archive="$out_dir/$bare.$archive_ext"
+            if [ "$archive_ext" = "tar.gz" ]; then
+              tar -czf "$archive" -C "$staging" zag VERSION
+            else
+              ( cd "$staging" && zip -q "$OLDPWD/$archive" zag.exe VERSION )
+            fi
+            echo "  packaged: $archive ($(du -h "$archive" | cut -f1))"
+            rm -rf "$staging"
+          done
+      - name: Generate SHA256 checksums
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd "dist/$VERSION" && sha256sum *.{tar.gz,zip} > checksums.txt )
+          echo "---"
+          cat "dist/$VERSION/checksums.txt"
+      - name: Upload release archives as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archives
+          path: dist/**
+          if-no-files-found: error
+
+  # ── Publish GitHub Release ───────────────────────────────────────────
+  # Triggered only on tag push (the workflow `on:` above filters out
+  # everything else). Computes version inline so the GitHub Release
+  # tag name matches the source ref exactly.
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-archives
+          path: dist
+      - name: Compute version (strip leading 'v')
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Zag ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/${{ steps.version.outputs.version }}/*.tar.gz
+            dist/${{ steps.version.outputs.version }}/*.zip
+            dist/${{ steps.version.outputs.version }}/checksums.txt
