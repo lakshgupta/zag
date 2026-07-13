@@ -464,6 +464,117 @@ test "codegen: multi-arg interpolation without specs still works" {
     try std.testing.expect(std.mem.indexOf(u8, zig, ", .{z, flag, ch,})") != null);
 }
 
+test "codegen: float-precision {pi:.5} emit spans format string and args tuple" {
+    // Unblocked-pattern pin for the matching-brace gate (commit f559cf3).
+    // The pre-fix char-class gate bailed on `.` (non-alphanumeric, not
+    // `_` or `:`) so the gate returned false and the string emitted as
+    // a plain `.string_lit` — the print surface stayed a `print("{pi:.5}\n")`
+    // call and zig rejected the call shape because the literal contained
+    // a `{` that the pre-fix codegen wasn't expecting. The new gate
+    // matches `{...}` to its closing `}` at the same brace depth, so
+    // `pi:.5` reaches buildTemplate, which splits on the first `:` to
+    // surface `pi` as the expr and `.5` as the spec; genTemplateLit then
+    // emits the format string `{any:.5}` and the args tuple `.{pi,}`.
+    // This test pins BOTH halves of the surface (format string + args
+    // tuple) so a future regression that breaks either half (e.g. a
+    // `spec` field change that drops the `.5`, OR a `.ident` verbatim-
+    // emit path that wraps the expr in `()`) would fail this test
+    // loudly.
+    const src = "fun f() {\n    let pi: f64 = 3.14159;\n    print(\"pi = {pi:.5}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Format string half: spec is appended after `{any}` so zig's debug
+    // formatter applies the precision at print time.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "{any:.5}") != null);
+    // Args tuple half: the spec lives in the format string, not the args;
+    // the args list carries just `pi` (the verbatim `.ident` text, not
+    // `pi:.5`). Pinned by the negative assertion on `pi:.5,` (which
+    // would surface if the spec leaked into the args tuple).
+    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{pi,})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pi:.5,") == null);
+}
+
+test "codegen: expression {a + b} emits verbatim a + b in args tuple" {
+    // Unblocked-pattern pin for the matching-brace gate. The pre-fix
+    // char-class gate bailed on space + `+` (both non-alphanumeric, not
+    // `_`/`:`) so the gate returned false and the string emitted as a
+    // plain `.string_lit`. The new gate matches `{...}` to its closing
+    // `}` at the same brace depth, so `a + b` reaches buildTemplate
+    // which stores the inner text `a + b` as the `.ident` payload
+    // (buildTemplate was intentionally NOT changed — it was already
+    // working). genTemplateLit's args-tuple emit calls
+    // `args_cg.genExpr(expr)` on the `.ident` payload, and the
+    // genExpr `.ident` arm at src/codegen/expr.zig:147-149 does
+    // `self.write(name)` — emitting the text VERBATIM. So `a + b`
+    // surfaces in the generated zig as a valid binary expression at
+    // the format-arg site. This is the load-bearing assumption the
+    // test pins: if the `.ident` arm ever wraps the text in
+    // `()`/`@as(...)`/etc., `{a + b}` would silently break.
+    const src = "fun f() {\n    let a: i32 = 1;\n    let b: i32 = 2;\n    print(\"sum = {a + b}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Format string half: plain `{any}` (no spec — the spec split on `:`,
+    // there is no `:` inside the `{...}`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "{any}") != null);
+    // Args tuple half: `a + b` appears verbatim in the args list, with
+    // no extra wrapping — the verbatim-emit path is the whole point of
+    // this commit's design. A regression that wrapped it in `()` (e.g.
+    // `.{(@as(i32, a + b),})` for a hypothetical type-coercion path)
+    // would surface as the wrapped form in the negative-substring path
+    // (the positive substring IS `, .{a + b,})` without the wrap).
+    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{a + b,})") != null);
+    // Sanity: the spec-split machinery is not engaged here (no `:` inside
+    // the `{...}`), so the format string stays plain `{any}` and the
+    // args tuple doesn't grow a `.5`/`:5`/etc. spec suffix.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "{any:.5}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "{any:5}") == null);
+}
+
+test "codegen: method-call {obj.f()} emits verbatim obj.f() in args tuple" {
+    // Unblocked-pattern pin for the matching-brace gate. The pre-fix
+    // char-class gate bailed on `.` and `(` (both non-alphanumeric, not
+    // `_`/`:`) so the gate returned false. The new gate accepts these
+    // because it only rejects a NESTED `{` — the inner `f()` has no
+    // braces (only parens, which the gate accepts). buildTemplate
+    // stores the inner text `obj.f()` as the `.ident` payload, and the
+    // genExpr `.ident` arm at src/codegen/expr.zig:147-149 emits it
+    // verbatim. So `obj.f()` surfaces in the generated zig as a valid
+    // method-call expression at the format-arg site. This is the second
+    // load-bearing assumption the test pins (after `{a + b}` above):
+    // if the `.ident` arm ever wraps the text in `(blk: { ... })` /
+    // `try obj.f()` / etc., `{obj.f()}` would silently break.
+    const src = "fun f() {\n    let obj: i32 = 42;\n    print(\"got {obj.f()}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Format string half: plain `{any}` (no spec — the `{...}` has no `:`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "{any}") != null);
+    // Args tuple half: `obj.f()` appears verbatim in the args list.
+    // A regression that wrapped it in a try-block or labeled-blk
+    // (e.g. `, .{try obj.f(),}` or `, .{(blk: { return obj.f(); }),}`)
+    // would surface here — the positive form is the exact substring
+    // `, .{obj.f(),})` with no wrapping.
+    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{obj.f(),})") != null);
+    // Sanity: the inner `f()` parens don't surface as a separate token
+    // group (which would happen if codegen split on `(` first). The full
+    // text `obj.f()` is one contiguous substring in the args list.
+    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{obj., .f(),})") == null);
+}
+
 test "codegen: tuple destructuring emits temp + per-leaf" {
     // `let (x, y) = (10, 20);` must surface as:
     //   const __destruct_0 = .{ 10, 20 };
