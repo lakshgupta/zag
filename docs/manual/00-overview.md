@@ -16,23 +16,25 @@ zig version
 
 ### Install a pre-built binary
 
-Linux or macOS:
+All install URLs below source directly from this GitHub repo (the project domain isn't currently hosted — fetch the canonical installer from GitHub raw). The installer script itself downloads the release archive from `github.com/zag-lang/zag/releases/latest/download/...` at runtime, so a tagged release must exist on the [Releases page](https://github.com/zag-lang/zag/releases) for the install to succeed.
+
+Linux or macOS (defaults to the `main` branch — bleeding edge):
 
 ```
-curl -sS https://zag-lang.org/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```
-powershell -c "irm https://zag-lang.org/install.ps1 | iex"
+powershell -c "irm https://raw.githubusercontent.com/zag-lang/zag/main/scripts/install.ps1 | iex"
 ```
 
 The installer downloads the platform release into `~/.zag/bin/zag`, appends `export PATH="$PATH:$HOME/.zag/bin"` to your shell profile (`.bashrc`, `.zshrc`, `.profile`, or `~/.config/fish/config.fish`), and prints `Zag installed successfully!`. To pin a version, download first and pass `--version`:
 
 ```
-curl -sSO https://zag-lang.org/install.sh
-bash install.sh --version 0.1.0
+curl -sSO https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh
+bash zag-install.sh --version v0.1.0
 ```
 
 Or with a custom install location:

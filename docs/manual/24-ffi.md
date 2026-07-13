@@ -59,6 +59,22 @@ enum CError {
 
 `enum` is the right keyword here because all variants are bare. For tagged unions crossing the FFI boundary, `#[repr(C, T)] union X { VariantA, VariantB(T) }` works the same way: the discriminant type follows `T` (default `u8` if omitted), and only explicitly assigned variants pin a specific tag — bare unassigned variants take the next successive value, payload-bearing unassigned variants still get distinct tag values per the ADT contract. **C ABI detail:** the C consumer of a `union` FFI type sees only the discriminant field; decoding a payload variant on the C side requires the caller to know the variant shape, which is why the explicit `= N` pins matter for any variant whose tag is part of the C-visible contract.
 
+### Backed enums with FFI layout
+
+`#[repr(C, T1)] enum(T2) X { … }` keeps `T2` as the Zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries (read/write of the C-shaped `T1` discriminant against the in-memory `T2` value):
+
+```zag
+# Zag-side value type is str (each variant IS a str);
+# C-ABI representation uses u8 (one-byte tagged discriminant).
+#[repr(C, u8)]
+enum(str) CompactStatus {
+    Ready = "R",
+    Busy  = "B",
+}
+```
+
+`T1` and `T2` need not match: for FFI callers that want byte-sized discriminants but Zig-side ergonomics, this composition lets you have both. See [Enums → Backed Enums](13-enums.md#backed-enums-enumt) for the `enum(T)` form.
+
 ## Importing C Libraries
 
 ```

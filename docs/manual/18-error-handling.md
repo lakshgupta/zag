@@ -99,6 +99,8 @@ fun process() -> Result<i32, Error> {
 
 ## `catch` — Handle Errors
 
+`_` inside `match err { … }` catches both bare variants (`Error.Io`, `Error.Permission`) and payload variants on a custom error union (`MyError.Custom(msg)`). See [Exhaustiveness](#exhaustiveness) below for the paired exhaustive + catch-all shape:
+
 ```
 # Block form — error value bound
 let val = risky() catch |err| {
@@ -184,7 +186,25 @@ let val = risky() catch |err| {
 
 ## Exhaustiveness
 
-`catch |err| { match err { ... } }` must be exhaustive — all variants must be handled.
+`match err { … }` inside a `catch` block must be exhaustive — every variant of the error type must be handled. Omitting a variant is a compile error:
+
+```zag
+match risky() catch |err| {
+    MyError.NotFound         => 0,
+    MyError.Timeout          => -1,
+    MyError.Custom(msg)      => { eprint("{msg}\n"); -2 },
+}
+# omitting any of NotFound / Timeout / Custom is a compile error
+```
+
+Use `_` for a catch-all (covers all unlisted variants):
+
+```zag
+match risky() catch |err| {
+    MyError.NotFound => 0,
+    _                => -99,    # catches Timeout (and any future variants)
+}
+```
 
 ## Memory Summary
 

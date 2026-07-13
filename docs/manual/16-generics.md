@@ -14,6 +14,8 @@ let m = max<i32>(3, 5);    # m = 5
 let m2 = max<f64>(1.0, 2.0);  # m2 = 2.0
 ```
 
+The first `<T>` introduces the type-param into scope; the `T`s in the parameter list and return type reference it. Both are required — there is no `fun max(a: T, b: T) -> T` shorthand, because without the first `<T>` there is no scope in which to introduce `T`. (The turbofish `max<i32>(3, 5)` at the call site is a separate surface — see [Generic Types](#generic-types).)
+
 **Memory:** Generic functions are monomorphized at compile time. Each concrete type gets its own copy. No runtime overhead, no boxing.
 
 ## Generic Types
@@ -90,6 +92,8 @@ impl<T> List<T> {
 }
 ```
 
+The first `<T>` introduces the type-param into scope; the second `<T>` (and any `T` inside `List<T>`) references it. Both are required — there is no `impl List<T>` shorthand, because without the first `<T>` there is no scope in which to introduce `T`. This mirrors the function form `fun max<T: Ordered>(a: T, b: T)` — the `<T>` declares, the `T`s in the signature and body use.
+
 Generic impl blocks emit one orphan free function per method at module scope:
 
 ```
@@ -97,7 +101,7 @@ Generic impl blocks emit one orphan free function per method at module scope:
 pub fn List_T_push(comptime T: type, self: *List(T), value: T) void { ... }
 ```
 
-The compiler rewrites each `<TYPE>` segment in receiver and parameter types to `(TYPE)` when the segment matches one of the impl's declared type-param names (`T`, `U`, `K`, `V`, …). Segments that don't match a type-param name on the enclosing impl (e.g. nested generic-union monomorphizations) pass through verbatim.
+The compiler rewrites each `<TYPE>` segment in receiver and parameter types to `(TYPE)` when the segment matches one of the impl's declared type-param names (`T`, `U`, `K`, `V`, …). Segments that don't match a type-param name on the enclosing impl (e.g. nested generic-enum or generic-union monomorphizations, including `enum(T)` instances like `enum(str) Color` where `T` isn't a type-param of the enclosing impl) pass through verbatim.
 
 ## No Trait Bounds on Associated Types
 

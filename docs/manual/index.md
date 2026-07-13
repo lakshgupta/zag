@@ -67,6 +67,8 @@ A comprehensive guide to the Zag programming language.
 
 - [Testing](25-testing.md) — Tests, benchmarks, safety checks
 - [Building and Releasing](31-building.md) — Build from source, release builds, distribution
+- [Project Layout & Dependencies](34-project-layout.md) — Directory structure, `zag install / add / vendor` workflow, build/test/bench CLI
+- [`zag.toml` Schema](35-zag-toml-schema.md) — Formal reference for the package manifest
 
 ## Memory Allocation Quick Reference
 

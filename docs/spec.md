@@ -391,6 +391,8 @@ let modified = Vec3 { ...base, z: 10.0 };   # { x: 1.0, y: 2.0, z: 10.0 }
 **Field visibility:** Struct fields are **private by default**. Access from outside the module requires getter/setter methods. There is no `pub` on fields — this keeps structs encapsulated and makes OOP boundaries explicit. Because all fields are private, struct literals (`Button { x: 0, y: 0, ... }`) can only be constructed **within the same module**. External construction requires a constructor method (a `pub` function that returns the struct).
 
 **Enums** — bare enumerations; variants are PascalCase. `Color`, `Direction`, and `Error` are typical cases. Variants carry no payload — for any variant that holds data, or for a type with a mix of bare and payload variants, use `union` (§3.3 Unions). The v1 compiler currently accepts the older `enum X { Variant(T) }` syntax as a payload-bearing tagged union; v2 splits this surface so bare enumerations stay under `enum` and the payload-bearing forms migrate to `union`.
+
+**Backed enums (`enum(T)`)** — parens (not angle brackets) signal `T` is a concrete backing type, not a generic parameter (per [Generics](manual/16-generics.md), `<T>` introduces a type variable while `(T)` wraps a concrete type). For v2.1, an `enum` may declare a backing type `T` (currently integer types, `bool`, `char`, or `str`; custom `Copy` types as `T` are deferred). Every variant identifier is bound to a value of type `T` at compile time, and explicit `= v` is mandatory. Variants remain bare — there is no per-variant payload type distinct from `T`. Storage is `sizeof(T)` per value; the variant identifier IS the value, so synthesized `__eq__` compares `T`-values (`Level.High == "high"` is true for `enum(str) Level`). When `T = str`, the compiler synthesizes `from_str(s: str) -> Option<Enum>`. Full surface in [manual/13-enums.md — Backed Enums](manual/13-enums.md#backed-enums-enumt). The keyword remains `enum` for backed enums; `union` is reserved for variants whose payload types may differ.
 ```
 enum Color {
     Red,
@@ -406,7 +408,7 @@ enum Direction {
 }
 ```
 
-**Unions** — tagged unions / sum types. Variants may carry payloads, be bare, or a mix of both. Constructor syntax follows the variant name: `Variant()` for a bare variant, `Variant(arg1, arg2, …)` for a payload variant. Pattern matching destructures the payload per variant. Variants are PascalCase.
+**Unions** — use `union` when variants' **payload types may differ**; for the uniform-payload form (all variants sharing one `T`), use [`enum(T)`](manual/13-enums.md#backed-enums-enumt). Tagged unions / sum types. Variants may carry payloads, be bare, or a mix of both. Constructor syntax follows the variant name: `Variant()` for a bare variant, `Variant(arg1, arg2, …)` for a payload variant. Pattern matching destructures the payload per variant. Variants are PascalCase.
 ```
 union Option<T> {
     Some(T),
@@ -426,6 +428,8 @@ union Shape {
 ```
 
 **Error type** — the canonical error type is an `enum` defined in the stdlib (§11.1). Its variants are all bare, so it is written with `enum`, not `union`. `Error` has variants `NotFound`, `Permission`, `Io`, `Parse`, `InvalidInput`, `Unavailable`, and `Other`. The compiler enforces exhaustiveness in `catch |err|` blocks that match on `err` directly. `Error` is **zero-alloc** — no heap-allocated message field. For custom error types that carry data, use `union MyError { NotFound, Timeout, Custom(str) }` — see below.
+
+**Backed enum vs union**: a type whose variants all share the same value type `T` is `enum(T)`, not `union`. `union` is for variants whose payload types may differ (`Shape { Circle(f64), Rect(f64, f64) }`). The keywords are deliberately separated so the "category of similar values" form (enums) doesn't pay for a per-variant tag when all variants share `T`.
 
 **Error context** — for cases needing context (HTTP handlers, database queries), use `std.error.Context`, a separate type that wraps an `Error` with an optional message. It is only allocated when explicitly created:
 
@@ -1283,7 +1287,7 @@ C variadic `...` in FFI declarations is distinct from Zag's variadic `T...` synt
 | `#[repr(C, packed)]` | C-compatible packed: no padding between fields (like `__attribute__((packed))`) |
 | `#[repr(C, opaque)]` | Opaque FFI type — size/alignment known, layout hidden; only usable via pointers |
 | `#[offset(N)]` | Field attribute: explicit byte offset for the field (must be monotonically increasing) |
-| `#[repr(C, int)]` | On enums: discriminant type (e.g., `i32`, `u8`); enum variants must have explicit values |
+| `#[repr(C, int)]` | On enums: discriminant type (e.g., `i32`, `u8`); enum variants must have explicit values. Composes with `enum(T)` (e.g. `#[repr(C, u8)] enum(str) X`) — the C-ABI uses `u8`; the Zag-side value type is `str` |
 
 ```
 # Force C-compatible layout (no padding reordering)
@@ -2310,7 +2314,7 @@ import math.{Vec3, Mat4}
 
 Third-party packages live in `deps/`. Run `zag install` to fetch them.
 
-Packages are resolved from a central package registry at `zagpm.dev`. Dependencies can also be specified as Git URLs in `zag.toml` for packages not yet published to the registry. The lock file (`zag.lock`) pins exact versions and hashes.
+Packages are resolved from **Git URLs** declared in `zag.toml` — `zag add` / `zag fetch` populate `deps/` from a remote git rev, and local sibling packages use `path = "..."`. Today the protocol is **git-only**: there is no central registry yet. The lock file (`zag.lock`) pins every dependency to an exact git SHA + content hash so the build is auditable end-to-end. A central `zagpm.dev` registry is **deferred to v2+** — once it ships it will be an alias layer over the git protocol, and existing `zag.toml` files will not need to change. See [Project Layout](manual/34-project-layout.md) for the operational guide and [`zag.toml` Schema](manual/35-zag-toml-schema.md) for the manifest format.
 
 ---
 

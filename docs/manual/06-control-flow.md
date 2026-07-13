@@ -88,7 +88,18 @@ for (k, v) in map.iter() {
 
 ## `match`
 
-Pattern matching with exhaustive checks:
+Pattern matching with exhaustive checks.
+
+For partial matches, use `_` as the catch-all pattern. Pair it with the arms you want to handle and let `_` cover the rest (see [Pattern Matching → Exhaustiveness](27-pattern-matching.md#exhaustiveness) for the canonical exhaustive vs. catch-all pairing):
+
+```
+match opt {
+    Option.Some(x) => use(x),
+    _              => default(),    # covers Option.None
+}
+```
+
+For full exhaustiveness — every variant enumerated, no catch-all — the canonical form is:
 
 ```
 match value {

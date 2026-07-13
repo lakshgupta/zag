@@ -107,10 +107,10 @@ Upload these to GitHub Releases for distribution.
 
 ### Installing from release archives
 
-End users install Zag with a single command:
+End users install Zag with a single command. The project domain isn't currently hosted — fetch the installer directly from this repo on GitHub raw:
 
 ```bash
-curl -sS https://zag-lang.org/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh | bash
 ```
 
 Or from a local archive:
