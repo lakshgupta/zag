@@ -3063,3 +3063,96 @@ test "codegen: read_file routes through builtin_table (no verbatim fallback)" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "= read_file(") == null);
 }
+test "codegen: free of []u8 ident emits page_allocator.free (slice overload)" {
+    // Phase 2.1 closure: `let s: []u8 = read_file("path"); defer free s;`
+    // must surface as `defer std.heap.page_allocator.free(s);` instead of
+    // `destroy(s)`. The discriminator consults `type_info_buf` (populated
+    // by collectTypedBindings at fn entry); the leading `[]` in the source
+    // type annotation routes the free site to the slice overload.
+    //
+    // The RHS uses `read_file(...)` because (a) it's the canonical
+    // Phase 2 surface this Phase 2.1 widening was designed for, and
+    // (b) its emit shape (`blk: { ... break :blk __fs_<N>; }`) keeps the
+    // free-discriminator's substring assertions stable.
+    const src =
+        \\fun f() {
+        \\    let s: []u8 = read_file("path");
+        \\    defer free s;
+        \\}
+        \\;
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the slice overload fires.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.free(s)") != null);
+    // Negative: the pointer overload (destroy) must NOT appear for `s`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.destroy(s)") == null);
+}
+
+test "codegen: free of *i32 ident still emits page_allocator.destroy (pointer regression guard)" {
+    // Phase 2.1 regression guard: the existing v1 pointer-typed
+    // `new T(v)` path must keep emitting `destroy`. Without this test,
+    // a future Phase widening that flips the discriminator default
+    // could silently switch pointer-typed frees to the slice overload
+    // (calling `free(*T)` is unsafe — `free` expects a `[]u8` slice,
+    // not a `*T`). Source mirrors the existing allocation.zag pattern;
+    // the prior `new T(v) emits page_allocator.create heap alloc` test
+    // already exercises the create side, this test pins the destroy
+    // side under the Phase 2.1 widening.
+    const src =
+        \\fun f() {
+        \\    let p = new i32(42);
+        \\    defer free(p);
+        \\}
+        \\;
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the pointer overload fires for the unnamed `p` binding
+    // (the bare `let p = new i32(42)` lacks a `: T` annotation, so
+    // type_info_buf has no entry, so the discriminator falls through
+    // to the pointer overload).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.destroy(p)") != null);
+    // Negative: the slice overload must NOT appear for `p`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.free(p)") == null);
+}
+
+test "codegen: free of call expr falls back to page_allocator.destroy (non-ident target)" {
+    // Phase 2.1 fall-back pin: when the free target is a `.call` (NOT a
+    // bare `.ident`), the discriminator's first guard
+    // `const t = f.target.*; if (t != .ident) break :blk false;` short-
+    // circuits the lookup and the pointer overload fires. Without this
+    // test, a future refactor that promotes non-ident operands to a
+    // type-resolver pass could silently route `free read_file("p")` to
+    // `page_allocator.readFileAlloc(...)` (wrong call entirely). The
+    // assertion pins the conservative fall-back for the common
+    // no-binding-discriminator case.
+    // (The generated zig would FAIL to execute — `destroy([]u8)` is a
+    // type error — but codegen tests pin the emit, not the runtime.)
+    const src = "fun f() {\n    defer free 42;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the call-expr gets the page_allocator.destroy(<call>)
+    // fall-back. The call site's outer parens + arg list make the
+    // substring a stable assertion target.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.destroy(42)") != null);
+    // Sanity: the sliced-overload form must NOT appear for the call
+    // target (would route through `page_allocator.free(...)` and miss
+    // the call's argument emission entirely).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator.free(42)") == null);
+}

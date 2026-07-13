@@ -350,7 +350,55 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(")");
             },
             .free_expr => |f| {
-                self.write("std.heap.page_allocator.destroy(");
+                // Phase 2.1: slice-vs-pointer discriminator (closes
+                // examples/stdlib/fs.zag's leak-tolerance caveat from
+                // Phase 2). The cached typed-binding info from
+                // `collectTypedBindings` at fn entry (src/codegen/stmt.zig:27)
+                // gives us the source-side `:T` annotation text per ident
+                // binding. When the free target is a bare `.ident` whose
+                // typed-binding entry starts with `[]` (slice-shaped:
+                // `[]u8`, `[]const u8`, `[]T`, ...) or is exactly `str`
+                // (the docs/07 transparent alias for `[]const u8`), emit
+                // `page_allocator.free(<ident>)` so the heap-owned slice
+                // from `read_file` (Phase 2) gets a matching deallocator.
+                //
+                // Fall-back to `page_allocator.destroy(<expr>)` for:
+                //   - Pointer-typed slots — the existing v1 `new T(v)`
+                //     surface (`let p = new i32(42); defer free p;` from
+                //     allocation.zag).
+                //   - Untyped bindings (no `: T` annotation, so no entry
+                //     lands in `type_info_buf` for the ident). User can
+                //     opt in to the slice overload by adding `: []u8` or
+                //     `: str` to the let.
+                //   - Non-ident operands: `free read_file("p")` (free-of-
+                //     call), `free buf[..5]` (free-of-slice), `free getBox()`
+                //     (free-of-method-call), `free arr[i]` (free-of-index),
+                //     `free (x as *T)` (free-of-cast). Without a type-
+                //     resolver we conservatively route these through the
+                //     pointer overload — users wanting slice-deallocation
+                //     on these forms bind the result to an annotated ident
+                //     first.
+                //
+                // Discriminator cost: O(type_info_count) per `free` site.
+                // Count is bounded by O(small) per fn so per-call cost is
+                // negligible. No helper-factor (a 1-shot block is cheaper
+                // than a named fn + extra stack frame on every free site).
+                const use_slice_free = blk: {
+                    const t = f.target.*;
+                    if (t != .ident) break :blk false;
+                    const tn = self.getSourceTypeName(t.ident) orelse break :blk false;
+                    // Slice-shaped: leading `[]` covers `[]u8`, `[]const
+                    // u8`, `[]T`, and any future `[]<qualifier> T` shape.
+                    if (tn.len >= 2 and tn[0] == '[' and tn[1] == ']') break :blk true;
+                    // Transparent alias `str` → `[]const u8` per docs/07.
+                    if (std.mem.eql(u8, tn, "str")) break :blk true;
+                    break :blk false;
+                };
+                if (use_slice_free) {
+                    self.write("std.heap.page_allocator.free(");
+                } else {
+                    self.write("std.heap.page_allocator.destroy(");
+                }
                 self.genExpr(f.target.*);
                 self.write(")");
             },
