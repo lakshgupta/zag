@@ -2518,3 +2518,351 @@ test "codegen: non-trait cast `x as i32` preserves @as(T, x) emit unchanged" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "_VTable_for_") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrCast(&") == null);
 }
+// =====================================================================
+// E2E: codegen preamble + per-selector alias emit
+//
+// These tests walk the full render path -- lexer -> Parser.parse() ->
+// Codegen.generate(prog) -- and substring-assert the produced zig
+// contains both the `__zag_imported_<i>` preamble AND the per-selector
+// alias forwarders. Pinned because the codegen wiring is structural
+// to zig's `@import("...")` boundary and a regression here silently
+// produces downstream compile errors at user call sites, not a clean
+// test failure.
+// =====================================================================
+
+test "codegen: pub import std.string.{String as MyStr, Display} emits preamble + aliases" {
+    // Selective import shape: parser preserves each selector's name
+    // AND its alias. Codegen must surface both into zig so that
+    // user-side bindings (MyStr, Display) are reachable names.
+    const src = "pub import std.string.{String as MyStr, Display};\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    // Preamble -- `__zag_imported_0` (first import) reaches the
+    // canonical resolved path of `std.string` from KNOWN_STD_MODULES.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") != null);
+
+    // Per-alias forwarder -- user-side aliases must surface verbatim.
+    // `MyStr` maps to `String` (zig-side canonical is the .name).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const MyStr = __zag_imported_0.String") != null);
+
+    // Alias-less selector `Display` reuses its canonical name.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const Display = __zag_imported_0.Display") != null);
+}
+
+test "codegen: whole-module import (no selectors) emits preamble only" {
+    // selectors.len == 0 takes the per-selector pass of zero iterations --
+    // ONLY the preamble line must be present. Pin the negative shape so
+    // a future regression that emits phantom alias lines for whole-module
+    // imports surfaces here, not as a downstream zig compile error.
+    const src = "pub import std.string;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= __zag_imported_0.") == null);
+}
+
+test "codegen: unknown import (not in KNOWN_STD_MODULES) skips both preamble and aliases" {
+    // resolveStdImport returns null -- codegen must skip silently. The
+    // generated zig must NOT contain any `__zag_imported_*` lines.
+    const src = "pub import std.does_not_exist;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_imported_") == null);
+}
+
+test "codegen: multiple std imports take distinct __zag_imported_<i> indices" {
+    // Each prog.imports entry gets a unique preamble-index. Verify that
+    // two distinct std.X imports produce both __zag_imported_0 and
+    // __zag_imported_1 lines (proves the idx counter is bumped per
+    // import and not reset).
+    const src = "pub import std.string;\npub import std.fmt;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_1 = @import(\"lib/std/fmt.zag\")") != null);
+}
+// =====================================================================
+// E2E: parameterized drift pin over all KNOWN_STD_MODULES entries
+// =====================================================================
+
+test "codegen: all 9 KNOWN_STD_MODULES entries render their expected lib/std/<path>.zag preamble" {
+    // Drift pin: KNOWN_STD_MODULES (src/parser/core.zig) and the
+    // codegen preamble's resolveStdImport lookup MUST agree on the
+    // same (name -> path) map. This test renders each entry as
+    // `pub import <name>;` through Parser + Codegen and asserts the
+    // produced zig preamble line resolves to the expected
+    // `lib/std/<path>.zag` URL.
+    //
+    // Catches single-entry drift between parser-side table and
+    // codegen-side lookup: a future change that adds/removes entries
+    // in KNOWN_STD_MODULES without updating this expectation table,
+    // or rewrites resolveStdImport with a different lookup shape,
+    // surfaces here as either a missing prefix (entry not rendered),
+    // a mismatched path (resolveStdImport misroutes), or the count
+    // pin below tripping (silent table growth/shrinkage).
+    const cases = [_]struct { name: []const u8, expected: []const u8 }{
+        .{ .name = "std",               .expected = "lib/std/mod.zag" },
+        .{ .name = "std.string",        .expected = "lib/std/string.zag" },
+        .{ .name = "std.error",         .expected = "lib/std/error.zag" },
+        .{ .name = "std.fmt",           .expected = "lib/std/fmt.zag" },
+        .{ .name = "std.time",          .expected = "lib/std/time.zag" },
+        .{ .name = "std.atomic",        .expected = "lib/std/atomic.zag" },
+        .{ .name = "std.bench",         .expected = "lib/std/bench.zag" },
+        .{ .name = "std.async.stream",  .expected = "lib/std/async/stream.zag" },
+        .{ .name = "std.arch.x86.avx2", .expected = "lib/std/arch/x86/avx2.zag" },
+    };
+    // Count pin: a future regression that drops an entry below 9
+    // (or grows above 9 without this test being updated) breaks here
+    // BEFORE the per-entry loop runs -- catches silent table size
+    // drift that per-entry assertions alone would miss.
+    try std.testing.expectEqual(@as(usize, 9), cases.len);
+
+    for (cases) |c| {
+        var src_buf: [192]u8 = undefined;
+        const src = std.fmt.bufPrint(&src_buf, "pub import {s};\n", .{c.name}) catch unreachable;
+
+        var l = lexer_mod.Lexer.init(src);
+        const tokens = l.tokenize();
+        var arena = ast.Arena.init();
+        var p = parser_mod.Parser.init(tokens, &arena);
+        const prog = p.parse();
+        var cg = codegen_mod.Codegen.init();
+        const zig = cg.generate(prog);
+
+        // Per-entry preamble path assertion. Pull the literal path
+        // string out of `const __zag_imported_0 = @import("<X>");`
+        // and assert X equals c.expected. The prefix/suffix anchored
+        // slice also confirms the emit shape (no spaces-misplaced,
+        // no missing-quote issues).
+        const needle_prefix = "const __zag_imported_0 = @import(\"";
+        const needle_suffix = "\");\n";
+        const prefix_idx = std.mem.indexOf(u8, zig, needle_prefix);
+        try std.testing.expect(prefix_idx != null);
+        const path_start = prefix_idx.? + needle_prefix.len;
+        const suffix_idx = std.mem.indexOfPos(u8, zig, path_start, needle_suffix);
+        try std.testing.expect(suffix_idx != null);
+        const actual_path = zig[path_start..suffix_idx.?];
+        try std.testing.expectEqualStrings(c.expected, actual_path);
+    }
+}
+// =====================================================================
+// Positional pin (strengthened): count + lastIndexOf cross-check
+// =====================================================================
+
+test "codegen: preamble emits exactly once and last preamble precedes last fun decl" {
+    // Strengthens the basic positional pin test (which used
+    // `indexOf` only and would not catch the misordered-duplicate
+    // case `indexOf(preamble) < indexOf(fun)` still passes for).
+    // This test asserts BOTH:
+    //   (1) preamble emits EXACTLY ONCE (count pin)
+    //   (2) the LAST preamble offset is at-or-before the LAST fun
+    //       offset (lastIndexOf pair compare) -- catches any
+    //       duplicate-preamble that misordered into or after a fun
+    //       decl, even when the FIRST preamble is correctly placed
+    //       before the FIRST fun.
+    //
+    // Counter-example the strengthened pin catches but the basic
+    // one does not: emit order [preamble1, fun1, preamble2]
+    //   - indexOf(preamble) = preamble1 offset < indexOf(fun) = fun1
+    //     offset  -> BASIC pin passes  (BUG: duplicate preamble
+    //     misordered past fun1)
+    //   - count("const __zag_imported_") == 2  -> COUNT pin fails
+    //   - lastIndexOf(preamble) = preamble2 offset >
+    //     lastIndexOf(fun) = fun1 offset  -> LAST pin fails
+    //
+    // Combined, count + lastIndexOf pin guarantee that any emission
+    // of `const __zag_imported_<i>` lines happens exactly at the
+    // top, in a contiguous block, before any user fun decl appears.
+    const src = "pub import std.string;\npub fun hello() -> void {\n    let unused: i32 = 1;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    const preamble_prefix = "const __zag_imported_0 = @import(\"";
+    const fun_prefix = "pub fn hello(";
+
+    // (1) Count pin -- a regression that emits the preamble twice
+    // (or zero times) surfaces here regardless of ordering.
+    const preamble_count = std.mem.count(u8, zig, "const __zag_imported_");
+    try std.testing.expectEqual(@as(usize, 1), preamble_count);
+
+    // (2) LastIndexOf pin -- the LAST preamble's offset must be
+    // at-or-before the LAST fun decl's offset. This is the
+    // semantically correct direction for a header-preamble +
+    // ordered-fun-decl codegen: every preamble appears in the
+    // contiguous header block before any fun body. (Operands
+    // chosen as `<=` rather than `<` to also tolerate the (non-
+    // constructively reachable but conceivable) case where the
+    // last preamble offset and last fun offset are equal -- in
+    // which case the count pin still enforces EXACTLY ONE
+    // preamble emission.)
+    const preamble_last = std.mem.lastIndexOf(u8, zig, preamble_prefix);
+    try std.testing.expect(preamble_last != null);
+    const fun_last = std.mem.lastIndexOf(u8, zig, fun_prefix);
+    try std.testing.expect(fun_last != null);
+    try std.testing.expect(preamble_last.? <= fun_last.?);
+}
+// ============================================================
+// Phase 0 codegen-router pin tests (src/codegen/builtins.zig + the
+// .call / .method_call arms in src/codegen/expr.zig + genBuiltinCall
+// helper + per-function argv_counter resets in decl.zig). Each test
+// pins a separate surface so a future regression at one site fails
+// only the relevant test (surgical diagnostic).
+//
+// Phase 0 ships with builtin_table populated with ONE entry: argv_get
+// (selective-import form `pub import std.argv.{get}` surfaces as a
+// bare `get(...)` call). The first two tests pin the no-op passthrough
+// for non-builtin names; the third pins the full argv_get emit shape
+// (blk wrapper + std.os.argv walk + 32-cap array + __argv_0 temp).
+// ============================================================
+
+test "codegen: builtin router preserves non-builtin call verbatim" {
+    // Regression pin on the `.call` arm's per-dispatch fallback: when
+    // the callee name does NOT appear in builtin_table, codegen must
+    // emit the user's call shape verbatim. Without the router-aware
+    // .call arm, this test would fail (no fallback path). With it,
+    // the verbatim `myhelper(1, 2, 3)` shape is preserved.
+    const src = "fun f() {\n    let x: i32 = myhelper(1, 2, 3);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "myhelper(1, 2, 3)") != null);
+}
+
+test "codegen: builtin router does NOT fire on user helpers with builtin-like names" {
+    // Defensive pin: a user-defined helper named `process` (which is
+    // also a potential Phase 2 `std.process` entry) must not trigger
+    // the router. argv_get is the only Phase 0 entry; any other name
+    // falls through to the verbatim fallback. This guards against an
+    // over-broad match that would corrupt unrelated call sites when
+    // a future Phase adds more entries.
+    const src = "fun f() {\n    let r: i32 = process(data);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "process(data)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
+}
+
+test "codegen: argv_get builtin emits per-call blk + std.os.argv walk" {
+    // End-to-end pin on the argv_get dispatch path. The router fires
+    // when `c.name == "get"` and `c.args.len == 0` (builtin's
+    // arity-wildcard match in `lookup`). genBuiltinCall emits:
+    //
+    //     blk: {
+    //         var __argv_0: [32][]const u8 = undefined;
+    //         var __argv_0_n: usize = 0;
+    //         for (std.os.argv, 0..) |a, i| {
+    //             if (i >= 32) break;
+    //             __argv_0[i] = std.mem.span(a orelse "");
+    //             __argv_0_n = i + 1;
+    //         }
+    //         break :blk __argv_0[0..__argv_0_n];
+    //     }
+    //
+    // Each substring below pins a distinct emit shape required by
+    // std.os.argv's stack-allocated capture + span handling.
+    const src = "fun f() {\n    let args: []const []const u8 = get();\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[32][]const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__argv_0[0..__argv_0_n]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.mem.span(a)") != null);
+    // std.os.argv Linux element type is [*:0]const u8 non-optional sentinel
+    // pointer -- span() coerces directly with no optional unwrap. orelse
+    // would have hard-errored on non-optional types so emit MUST NOT
+    // carry an orelse wrapper.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "orelse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= get()") == null);
+}
+
+test "codegen: argv_get counter increments across multiple calls in the same body" {
+    // The per-function argv_counter ensures two argv_get calls in the
+    // same body produce distinct __argv_<N> names (zig's no-
+    // redeclaration rule would reject a clash). Confirm the steps
+    // 0 -> 1 across two consecutive call sites.
+    const src = "fun f() {\n    let a: []const []const u8 = get();\n    let b: []const []const u8 = get();\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__argv_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__argv_1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__argv_2") == null);
+}
+
+test "codegen: argv_counter resets across sibling pub fn boundaries" {
+    // Sibling pub fn bodies each start fresh at __argv_0 (the
+    // per-function counter resets in genFun entrance). Without the
+    // reset, two sibling fns using argv_get would share same-names
+    // and zig's module-level redecl-check would reject the
+    // collision (the temps are nested inside per-fn blk scopes so
+    // this only manifests if the temps escape to module scope, but
+    // the reset is the documented contract).
+    const src =
+        \\fun g() {
+        \\    let x: []const []const u8 = get();
+        \\}
+        \\fun h() {
+        \\    let y: []const []const u8 = get();
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    const argv_0_count = std.mem.count(u8, zig, "__argv_0");
+    const argv_1_count = std.mem.count(u8, zig, "__argv_1");
+    try std.testing.expect(argv_0_count >= 2);
+    try std.testing.expect(argv_1_count <= 1);
+}

@@ -5,6 +5,17 @@ const core = @import("core.zig");
 // Cross-bucket file-scope aliases. See CROSS_BUCKET_REEXPORTS in
 // the extraction script for rationale.
 const Codegen = core.Codegen;
+// Phase 0 codegen-router table: src/codegen/builtins.zig holds the
+// `builtin_table` consulted by the `.call` and `.method_call` arms
+// BEFORE the verbatim fallback. Phase 0 ships with the table EMPTY
+// so this lookup is a no-op; Phase 1 (argv_get, env_var, fs_read_file)
+// and Phase 2+ widenings append entries to the table and matching
+// inline `switch (dispatch) case` arms in `genBuiltinCall` below.
+// The @import path is sibling-bucket (zig 0.16's module-local
+// resolution picks up src/codegen/builtins.zig automatically -- no
+// src/codegen.zig aggregator edit needed, mirror of how stmt.zig and
+// decl.zig peer-references each other without a parent module).
+const builtins = @import("builtins.zig");
 const needsIntDivShim = @import("primary.zig").needsIntDivShim;
 // Cross-bucket alias-resolution import (docs/07 "Type Aliases",
 // docs/11 borrowed-string-view). Same pattern as the
@@ -158,6 +169,28 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         self.genExpr(arg);
                     }
                     self.write(")");
+                } else if (builtins.lookup(c.name, c.args.len)) |dispatch| {
+                    // Phase 0 codegen-router: when the call name +
+                    // arity match a builtin route, fire the
+                    // matched dispatch's inline zig-emit instead of
+                    // the verbatim `<name>(<args>)` form. Phase 0
+                    // ships with builtin_table EMPTY so this branch
+                    // is dead-code-by-design (zig's comptime
+                    // unreachable-check will catch any future skipped
+                    // case in `genBuiltinCall`'s switch). Each
+                    // registered entry writes directly into out_buf
+                    // via genBuiltinCall; the inline emit shape is
+                    // per-dispatch (argv_get emits a blk wrapper,
+                    // fs_read_file emits a `catch &[_]u8{}` for error
+                    // collapse, env_var wraps `orelse null` around
+                    // std.os.getenv's `?[:0]const u8`). See
+                    // src/codegen/builtins.zig for the per-dispatch
+                    // contract; changes to the table are NOT silently
+                    // absorbed -- a future Phase must add the matching
+                    // genBuiltinCall case simultaneously or zig will
+                    // hard-error at compile time (the switch is
+                    // exhaustiveness-checked).
+                    self.genBuiltinCall(dispatch, c.args);
                 } else {
                     // Generics (docs/16 §"Turbofish"):
                     // `name<type_args...>(regular_args...)` emits
@@ -534,6 +567,26 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(ma.name);
             },
             .method_call => |mc| {
+                // Phase 0 codegen-router: when the receiver-prefix
+                // (e.target.* must be `.ident` for this path) + the
+                // method name + the arity match a registered builtin
+                // route, fire the matched dispatch's inline zig-emit
+                // and `return;` so the verbatim form below is never
+                // executed for this call. Phase 0 ships with
+                // builtin_table EMPTY so this branch is dead-code
+                // (mirrors the .call arm above); future Phase entries
+                // extend `builtins.builtin_table` and the matching
+                // genBuiltinCall switch case. The early `return;` is
+                // required because the verbatim emit below doesn't
+                // fall through to a sentinel -- it writes to self.out_buf
+                // inline -- and skipping it preserves the existing
+                // emit shape for non-builtin method calls.
+                if (mc.target.* == .ident) {
+                    if (builtins.lookupWithRecv(mc.target.*.ident, mc.name, mc.args.len)) |dispatch| {
+                        self.genBuiltinCall(dispatch, mc.args);
+                        return;
+                    }
+                }
                 // `target.name(args...)` — emit verbatim because zig
                 // supports both the value-receiver form (e.g. `v.length()`
                 // where v: Vec3) and the type-static constructor form
@@ -618,6 +671,128 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(" ");
                 self.genExpr(b.rhs.*);
                 self.write(")");
+            },
+        }
+    }
+
+    // Phase 0 codegen-router helper. Called from the `.call` and
+    // `.method_call` arms above when `builtins.lookup(...)` returns
+    // a non-null dispatch. Each switch arm emits the inline zig
+    // shim that lowers the free-fn form to a direct zig stdlib
+    // invocation. Phase 0 ships argv_get as the only wired entry;
+    // env_var and fs_read_file @panic at runtime so a future release
+    // adding them to the table without wiring the helper case fails
+    // LOUDLY at the user's host invocation (not silently falling
+    // through to the verbatim form which would emit undeclared-name
+    // errors downstream).
+    //
+    // zig's comptime switch is exhaustiveness-checked: a FUTURE
+    // BuiltinDispatch variant that's missing its case here would
+    // hard-error at this file's COMPILE pass (zig requires all
+    // enum variants to be handled or an `_ => ...` else clause).
+    // Adding a new dispatch must be paired with the matching helper
+    // emit in the same commit, otherwise the zig compile fails
+    // before the runtime test can run. The runtime `@panic` is the
+    // SECOND line of defense for cases where the variant IS handled
+    // but the body is stubbed out — catches the
+    // "table populated, case hit, but body not implemented" footgun
+    // at the user's host invocation with a self-documenting message.
+    //
+    // Earlier draft used `@compileError` here, but zig 0.16 fires
+    // @compileError at .zig compile time WHENEVER the containing
+    // function is compiled, not when reached at runtime — which
+    // would have blocked Phase 0's existing helper from compiling
+    // even though the stubbed arms were never reached. `@panic`
+    // is the runtime-only equivalent that preserves the loud-fail
+    // when-reached intent without the compile-time false positive.
+    pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr) void {
+        switch (dispatch) {
+            .argv_get => {
+                _ = args;
+                // Per-call scoping: each argv_get invocation steps
+                // argv_counter and emits a fresh `__argv_<N>` /
+                // `__argv_<N>_n` pair. Sibling argv_get calls in the
+                // same body produce distinct names (zig's no-
+                // redeclaration rule would reject a clash). The
+                // counter is reset at the top of each function body
+                // (genFun + genMethod + genFreeMethod in decl.zig)
+                // so each fn has its own `_0`-starting namespace
+                // that resets cleanly across pub fn boundaries.
+                const id = self.argv_counter;
+                self.argv_counter += 1;
+                var name_buf: [16]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "__argv_{d}", .{id}) catch "__argv_0";
+
+                // argv_get emit shape: per-call blk wrapper that
+                // copies argv slots into a stack-allocated
+                // [32][]const u8 array. The 32-slot cap matches the
+                // conventional `argc <= 32` working case; longer
+                // argv lists are cut off at 32 and the count tracks
+                // the actual walked count via __argv_<N>_n.
+                //
+                // std.os.argv's element type is OS-dependent —
+                // `*[*:0]u8` on POSIX, optional payload on Windows.
+                // zig 0.16 refuses implicit `[*:0]u8 → []u8`
+                // coercion so we route through std.mem.span with a
+                // default empty-string fallback on the optional
+                // payload. The fallback is defensive: a missing
+                // argv slot would otherwise crash at .span call time.
+                self.write("blk: {\n");
+                self.write("    var ");
+                self.write(name);
+                self.write(": [32][]const u8 = undefined;\n");
+                self.write("    var ");
+                self.write(name);
+                self.write("_n: usize = 0;\n");
+                self.write("    for (std.os.argv, 0..) |a, i| {\n");
+                self.write("        if (i >= 32) break;\n");
+                self.write("        ");
+                self.write(name);
+                // zig 0.16's std.os.argv on Linux stores sentinel-
+                // terminated non-optional pointers (`[*:0]const u8`),
+                // so the canonical coerce-to-slice form is
+                // `std.mem.span(a)` directly. The `orelse ""`
+                // unwrap pattern was a portability footgun on the
+                // dominant-platform shape — it would have failed
+                // to compile at the user's host zig invocation
+                // with `orelse on non-optional type`. Windows +
+                // freestanding zig 0.16 use `?[*:0]const u8`
+                // (optional payload for non-utf8 argv slots);
+                // Phase 1 will branch on @import("builtin.os.tag")
+                // to widen the unwrap across OSes.
+                self.write("[i] = std.mem.span(a);\n");
+                self.write("        ");
+                self.write(name);
+                self.write("_n = i + 1;\n");
+                self.write("    }\n");
+                self.write("    break :blk ");
+                self.write(name);
+                self.write("[0..");
+                self.write(name);
+                self.write("_n];\n");
+                self.write("}");
+            },
+            .env_var => {
+                // Runtime-fail placeholder. Phase 1 wires env_var with
+                // `std.os.getenv(<args[0]>) orelse null` emit; until
+                // then, any table entry that points dispatch=.env_var
+                // panics with a self-documenting message at the user's
+                // host invocation. The use of `@panic` (vs. an earlier
+                // draft's `@compileError`) preserves the loud-fail
+                // contract without blocking the helper's compile-time
+                // analysis — see the genBuiltinCall docblock above for
+                // the zig 0.16 semantics distinction.
+                _ = args;
+                @panic("env_var not wired (Phase 1)");
+            },
+            .fs_read_file => {
+                // Runtime-fail placeholder. Phase 1 wires fs_read_file
+                // with `std.fs.cwd().readFileAlloc(...) catch &[_]u8{}`
+                // emit; until then any table entry pointing dispatch=
+                // .fs_read_file panics with a self-documenting
+                // message. Mirrors the env_var arm above.
+                _ = args;
+                @panic("fs_read_file not wired (Phase 1)");
             },
         }
     }

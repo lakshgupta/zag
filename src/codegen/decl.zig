@@ -146,6 +146,11 @@ const Codegen = core.Codegen;
         self.destructure_counter = 0;
         self.alloc_counter = 0;
         self.match_counter = 0;
+        // Phase 0 codegen-router: reset at each pub fn so sibling
+        // `__argv_<N>` temps (one per argv_get call site) start fresh
+        // at `_0`. Sibling argv_get calls within the same body get
+        // distinct names via the per-call step inside genBuiltinCall.
+        self.argv_counter = 0;
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
         // Trait-bounds guards (docs/16 §3) — mirrors genFun's body
@@ -301,9 +306,12 @@ const Codegen = core.Codegen;
         // `_0`. These counters will be re-zeroed at the next `genFun`
         // entry anyway, but resetting here ensures the method body
         // inside a struct definition has its own local counter space.
+        // Phase 0 codegen-router: argv_counter reset mirrors the
+        // struct's nested method body to its own local counter space.
         self.destructure_counter = 0;
         self.alloc_counter = 0;
         self.match_counter = 0;
+        self.argv_counter = 0;
         // Re-populate the per-function type-info map for any locally-
         // declared typed bindings inside the method body so the
         // div-shim predicate (`needsIntDivShim`) gets correct info
@@ -778,6 +786,13 @@ const Codegen = core.Codegen;
         // no-redeclaration rule is satisfied; sibling `pub fn`s reset
         // their own counters to start fresh at `_0`.
         self.match_counter = 0;
+        // Phase 0 codegen-router: argv_counter reset so sibling argv_get
+        // calls within the same body produce distinct `__argv_<N>`
+        // names without a redeclaration clash. Mirrors the pattern of
+        // the existing per-function counters above (destructure, alloc,
+        // match) so the router surface stays consistent with the
+        // traditional counter-set.
+        self.argv_counter = 0;
         // Top-level `fun` is parsed for return_type in Phase 2, but
         // `fn_returns_value` is only relevant for impl-block methods
         // where the typed-return drives tail-position match emission.

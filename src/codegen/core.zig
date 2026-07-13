@@ -64,6 +64,17 @@ pub const Codegen = struct {
     /// existing counters here would create collisions with destructuring
     /// temps (`__destruct_<N>`) and `new` heap locals (`__p_<N>`).
     match_counter: u32,
+    /// Per-function counter for argv-slice temps emitted by the
+    /// `argv_get` builtin route (Phase 0 codegen router). Reset to 0
+    /// by `genFun` so each `pub fn` body has its own `__argv_<N>` /
+    /// `__argv_<N>_n` sequence. Mirrors the existing per-function
+    /// counters (destruct, alloc, match) so multiple argv_get
+    /// calls in the same body produce distinct brick-temp names
+    /// without zig's no-redeclaration rule. The counter steps ONLY
+    /// on the argv_get dispatch path; other builtin emits use
+    /// existing per-call state (env_var / fs_read_file don't need
+    /// per-call temps because their args emit inline).
+    argv_counter: u32,
     /// Per-function flag: true when the currently-walked function body
     /// has a non-void return type (only relevant for impl-block methods
     /// because top-level `pub fun` declarations ALWAYS emit
@@ -105,6 +116,12 @@ pub const Codegen = struct {
     pub const genElseBranch = @import("stmt.zig").genElseBranch;
     pub const genEnumDecl = @import("decl.zig").genEnumDecl;
     pub const genExpr = @import("expr.zig").genExpr;
+    // Phase 0 codegen-router helper. Called from the `.call` and
+    // `.method_call` arms in expr.zig when builtin_table matches.
+    // Without this registration the arms compile-error with
+    // `no field named 'genBuiltinCall' in 'Codegen'`, so the build
+    // wouldn't reach the inline switch dispatch downstream.
+    pub const genBuiltinCall = @import("expr.zig").genBuiltinCall;
     pub const genFreeMethod = @import("decl.zig").genFreeMethod;
     pub const genFun = @import("decl.zig").genFun;
     pub const genMatchExpr = @import("stmt.zig").genMatchExpr;
@@ -142,6 +159,10 @@ pub const Codegen = struct {
             .type_info_count = 0,
             .alloc_counter = 0,
             .match_counter = 0,
+            // Phase 0 argv-slice counter starts at 0; each
+            // `argv_get` builtin emit steps it and emits a fresh
+            // `__argv_<N>` / `__argv_<N>_n` pair.
+            .argv_counter = 0,
             .fn_returns_value = false,
             // Phase 3 trait-cast: the tracked trait-name set starts
             // empty; generate() populates from prog.traits before any
