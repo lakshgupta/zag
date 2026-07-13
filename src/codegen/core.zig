@@ -194,22 +194,17 @@ pub const Codegen = struct {
             // `__env_<N>` scratch used to bridge
             // `std.posix.system.getenv`'s `?[*:0]u8` surface to the
             // zag-side `?[]const u8` shape via `std.mem.span`.
-            // Phase 2 fs-read counter starts at 0; each `read_file`
-            // builtin emit steps it and emits a fresh `__fs_<N>`
-            // scratch holding the `[]u8` return from
-            // `std.Io.Dir.readFileAlloc`. Mirrors env_counter shape.
+            // Phase 2 fs-read scratch: each `read_file` builtin emit
+            // reuses the same `__fs_0` temp scoped to its blk: { ... }
+            // block. Multiple read_file calls in the same body
+            // produce distinct scoped names so zig's no-redeclaration
+            // rule is satisfied.
             .fs_counter = 0,
-            // Phase 3 (CLI migration): write_file / mkdir / exec
-            // counters start at 0; each fs_write_file emit steps
-            // write_file_counter and emits a fresh `__wf_<N>_*`
-            // namespace (fd + byte-count); each fs_mkdir emit steps
-            // mkdir_counter and emits a fresh `__mk_<N>_z` scratch;
-            // each process_exec emit steps exec_counter and emits a
-            // fresh `__exec_<N>_*` namespace. Mirrors the existing
-            // per-fn-counter shape so multiple sibling calls in the
-            // same body produce distinct brick-temp names without
-            // zig's no-redeclaration rule. process_exit doesn't
-            // need a counter — its emit is a single inline
+            // Phase 3 (CLI migration): fs_write_file, fs_mkdir, and
+            // process_exec dispatches each emit a hardcoded scratch
+            // name (`__wf_file`, `__mk_buf`, `__exec_res`) scoped
+            // to the per-call blk: { ... } block. process_exit
+            // doesn't need a scratch — its emit is a single inline
             // `(std.os.linux.exit(...))` statement with no temp names.
             .fn_returns_value = false,
             // Phase 3 trait-cast: the tracked trait-name set starts
