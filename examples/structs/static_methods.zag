@@ -1,0 +1,41 @@
+## Type-static methods (`pub fun` no `self`) + instance method (`pub fun` with
+## `self`) co-located in one `impl Point { ... }` block. Doctest in `main`
+## asserts both call shapes compile and `zig run` exits 0.
+## Run: zag run examples/structs/static_methods.zag
+
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    # Type-static: called as `Point.new(3.0, 4.0)`.
+    pub fun new(x: f64, y: f64) -> Point {
+        return Point { x: x, y: y };
+    }
+
+    # Type-static: called as `Point.default()`.
+    pub fun default() -> Point {
+        return Point { x: 0.0, y: 0.0 };
+    }
+
+    # Instance method: called as `p.distance_squared(&q)` — desugars to
+    # `Point.distance_squared(&p, &q)` at the call site.
+    pub fun distance_squared(self: *const Point, other: *const Point) -> f64 {
+        let dx: f64 = self.x - other.x;
+        let dy: f64 = self.y - other.y;
+        return dx * dx + dy * dy;
+    }
+}
+
+fun main() {
+    let p: Point = Point.new(3.0, 4.0);
+    let q: Point = Point.default();
+
+    print("p = ({p.x}, {p.y})\n");
+    print("q = ({q.x}, {q.y})\n");
+
+    let d: f64 = p.distance_squared(&q);
+    print("p.distance_squared(&q) = {d}\n");
+    print("expected d = 25.0\n");
+}

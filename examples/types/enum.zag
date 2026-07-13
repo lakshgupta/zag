@@ -15,6 +15,13 @@
 # This file is kept in the v1 form so it continues to compile against the
 # current compiler. The taxonomy is documented in docs/manual/13-enums.md
 # (bare enumerations) and docs/manual/14-unions.md (tagged unions).
+#
+# v2.1 extension — backed enums (`enum(T)`): the v2 docs introduce
+# `enum(str)`, `enum(u8)`, etc., where every variant carries an explicit
+# value of type T (`enum Level { Low = "low", High = "high" }`). The v1
+# compiler does not yet parse the `enum(T)` surface — it lives in the
+# docs only and the example form here stays v1 until the v2.1 parser
+# lands. Reference: docs/manual/13-enums.md ("Backed Enums").
 
 enum Direction {
     North,
