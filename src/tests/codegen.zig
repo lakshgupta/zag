@@ -25,6 +25,15 @@ const codegen_mod = @import("../codegen.zig");
 const ast = @import("../ast.zig");
 
 test "codegen: hello world" {
+    // zig 0.16 main-signature migration: the generated zig for a
+    // source-side `fun main()` is `pub fn main(init: std.process.Init) !void`
+    // (NOT the legacy `pub fn main() void`). The new signature is
+    // required because `std.os.argv` / `std.posix.argv` were both
+    // removed in zig 0.16 — the ONLY way to access argv at runtime
+    // is via `init.minimal.args.toSlice(allocator)` at main entry.
+    // The assertion matches the new signature's start (`pub fn main(`)
+    // without being too tight on the parameter shape — any future
+    // zig signature tweak wouldn't break this pin-test.
     const src = "fun main() {\n    print(\"hello, world\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -36,7 +45,8 @@ test "codegen: hello world" {
     var cg = codegen_mod.Codegen.init();
     const zig_src = cg.generate(prog);
 
-    try std.testing.expect(std.mem.indexOf(u8, zig_src, "pub fn main()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "pub fn main(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "std.process.Init") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "std.debug.print") != null);
 }
 
@@ -2893,24 +2903,12 @@ test "codegen: builtin router does NOT fire on user helpers with builtin-like na
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
 }
 
-test "codegen: argv_get builtin emits per-call blk + std.os.argv walk" {
-    // End-to-end pin on the argv_get dispatch path. The router fires
-    // when `c.name == "get"` and `c.args.len == 0` (builtin's
-    // arity-wildcard match in `lookup`). genBuiltinCall emits:
-    //
-    //     blk: {
-    //         var __argv_0: [32][]const u8 = undefined;
-    //         var __argv_0_n: usize = 0;
-    //         for (std.os.argv, 0..) |a, i| {
-    //             if (i >= 32) break;
-    //             __argv_0[i] = std.mem.span(a orelse "");
-    //             __argv_0_n = i + 1;
-    //         }
-    //         break :blk __argv_0[0..__argv_0_n];
-    //     }
-    //
-    // Each substring below pins a distinct emit shape required by
-    // std.os.argv's stack-allocated capture + span handling.
+test "codegen: argv_get builtin routes through __zag_argv module-level global" {
+    // zig 0.16 retired `std.os.argv` / `std.posix.argv`. The new
+    // architecture: genFun's `is_main` special case captures
+    // `init.minimal.args.toSlice(...)` into the module-level
+    // `__zag_argv` global at main entry, and the `.argv_get` dispatch
+    // is now a single reference to that global.
     const src = "fun f() {\n    let args: []const []const u8 = get();\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -2919,17 +2917,14 @@ test "codegen: argv_get builtin emits per-call blk + std.os.argv walk" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: {\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "[32][]const u8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__argv_0[0..__argv_0_n]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.mem.span(a)") != null);
-    // std.os.argv Linux element type is [*:0]const u8 non-optional sentinel
-    // pointer -- span() coerces directly with no optional unwrap. orelse
-    // would have hard-errored on non-optional types so emit MUST NOT
-    // carry an orelse wrapper.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "orelse") == null);
+    // Positive: the router routes to the module-level __zag_argv global.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_argv") != null);
+    // Negative: the verbatim `get()` form must NOT appear (proves the
+    // builtin_table router fired rather than falling through).
     try std.testing.expect(std.mem.indexOf(u8, zig, "= get()") == null);
+    // Negative: the legacy per-call blk walker surface is retired.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[32][]const u8") == null);
 }
 
 // ============================================================
@@ -2961,12 +2956,11 @@ test "codegen: argv_get builtin emits per-call blk + std.os.argv walk" {
 // doesn't depend on Phase 2's deferred fs work.
 // ============================================================
 
-test "codegen: getEnv emits std.posix.system.getenv shim" {
-    // The Phase 1 router emit shape: per-call blk wrapper around
-    // std.posix.system.getenv bridged to ?[]const u8 via std.mem.span.
-    // A `getEnv("HOME")` source site must surface these substrings so
-    // zig sees the libc-or-syscall-form getenv call at the use site,
-    // NOT an undeclared `getEnv(...)` form.
+test "codegen: getEnv emits std.posix.getenv shim with @as(?[]const u8, ...) coercion" {
+    // zig 0.16: std.posix.system.getenv was retired in favour of
+    // std.posix.getenv (which takes []const u8 and returns ?[:0]const u8).
+    // The new minimal shape wraps it in @as(?[]const u8, ...) to bridge
+    // the sentinel-terminated return to zag's `?[]const u8` shape.
     const src = "fun f() {\n    let home: ?str = getEnv(\"HOME\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -2975,23 +2969,26 @@ test "codegen: getEnv emits std.posix.system.getenv shim" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: { var __env_0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.mem.span") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __env_0") != null);
+    // Positive (substring): the router fired with the new stdlib + coercion.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(?[]const u8") != null);
+    // Negative: the legacy per-call temp + std.posix.system surface is retired.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.mem.span") == null);
+    // Negative: the verbatim `getEnv(...)` form must NOT appear
+    // (proves the builtin_table router fired).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(\"HOME\")") == null);
 }
 
-test "codegen: env_counter increments across multiple getEnv calls" {
-    // The per-function env_counter (reset at genFun / genMethod /
-    // genFreeMethod) must step cleanly across sibling getEnv calls
-    // so zig's no-redeclaration rule is satisfied. Mirrors the
-    // argv_get counter pin test above.
-    // The `: ?str` annotation is REQUIRED on both `let a` and
-    // `let b`: zag's grammar rejects bare `let foo = <expr>` for
-    // non-tuple rhs (the parser needs the type slot to dispatch
-    // the zag-side `?str` -> zig-side `?[]const u8` coercion).
-    // Mirrors the explicit annotations on `let home` (test 1
-    // above) and `let x` (test 3 below).
+test "codegen: multiple getEnv calls each route through std.posix.getenv" {
+    // The env_counter pattern (per-call `__env_<N>` temps) was retired
+    // alongside the env_var emit-shape simplification: the new
+    // minimal `blk: { break :blk @as(?[]const u8, std.posix.getenv(...)) }`
+    // shape has no temp var to name. Sibling getEnv calls in the same
+    // body now produce identical emit shapes — this test pins that
+    // BOTH calls route through the builtin_table (not the verbatim
+    // fallback) and each gets its own std.posix.getenv invocation.
     const src = "fun f() {\n    let a: ?str = getEnv(\"HOME\");\n    let b: ?str = getEnv(\"PATH\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -3000,19 +2997,22 @@ test "codegen: env_counter increments across multiple getEnv calls" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_1") != null);
+    // Positive: both getEnv calls route through std.posix.getenv with
+    // their respective name arguments preserved verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv(\"HOME\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv(\"PATH\")") != null);
+    // Negative: the retired per-call temp pattern is gone.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_") == null);
+    // Negative: the verbatim `getEnv(...)` form must NOT appear for
+    // either call (proves the router fired for both).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(") == null);
 }
 
-test "codegen: getEnv routes through builtin_table (no verbatim fallback)" {
-    // The router catches `getEnv("X")` before the verbatim
-    // `<name>(<args>)` fallback in expr.zig's `.call` arm. A
-    // `let x: ?str = getEnv("HOME")` source must surface
-    // `std.posix.system.getenv` (the shim) but must NOT leave a bare
-    // `= getEnv(` substring in the emitted zig — the router consumed
-    // the call site. A regression that bypasses `builtins.lookup(...)`
-    // would leave the verbatim form intact and zig would reject with
-    // "use of undeclared identifier 'getEnv'".
+test "codegen: getEnv routes through builtin_table to std.posix.getenv (no verbatim fallback)" {
+    // zig 0.16: std.posix.system.getenv was retired in favour of
+    // std.posix.getenv (takes []const u8, returns ?[:0]const u8). The
+    // builtin_table router fires for the `getEnv` free-fn call,
+    // producing the inline shim that uses the new stdlib surface.
     const src = "fun f() {\n    let x: ?str = getEnv(\"HOME\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -3021,7 +3021,9 @@ test "codegen: getEnv routes through builtin_table (no verbatim fallback)" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv") != null);
+    // Negative: the legacy std.posix.system.getenv path is retired.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(\"HOME\")") == null);
 }
 // ============================================================

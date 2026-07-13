@@ -455,16 +455,27 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // synthetic `len` Expr.
                 self.genExpr(s.target.*);
                 self.write("[");
-                // zig 0.16 REJECTS the no-start form `arr[..]` with
-                // `expected expression, found '..'` — the AST walk
-                // distinguishes "no start" (null `s.start`) from
-                // "start is 0" (an int_lit Expr for the literal 0),
-                // so the no-start form is always a deliberate
-                // whole-slice view; emit `0` as the synthetic start
-                // to bridge the gap. The presence-end (`..end`)
-                // form on the next line still works because we only
-                // touch the no-start branch.
-                if (s.start) |st| self.genExpr(st.*) else self.write("0");
+                // zig 0.16 REJECTS only the no-start-AND-no-end form
+                // `arr[..]` with `expected expression, found '..'`. The
+                // half-start forms `arr[..end]` and `arr[start..]` both
+                // parse cleanly. The AST walk distinguishes "no start"
+                // (null `s.start`) from "start is 0" (an int_lit Expr
+                // for the literal 0), so the no-start form is always a
+                // deliberate user intent — emit `0` as a synthetic
+                // start ONLY when both start AND end are null (the
+                // `arr[..]` case that zig rejects). The `arr[..end]`
+                // case falls through to `..end` directly, preserving
+                // the user's source intent (fixes the
+                // `codegen: arr[..3] slice emits verbatim` test that
+                // was previously broken by an over-eager synthetic-0
+                // injection).
+                if (s.start) |st| {
+                    self.genExpr(st.*);
+                } else if (s.end == null) {
+                    self.write("0");
+                }
+                // else: start is null but end is set — emit `..end`
+                // directly (zig accepts this verbatim).
                 self.write("..");
                 if (s.end) |en| {
                     self.genExpr(en.*);
