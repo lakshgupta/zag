@@ -155,6 +155,51 @@ fn leafProcess(flag: []const u8, src: []const u8) !void {
     const zig_src = try transpile(source);
     try writeFile(f_zig, zig_src);
 
+    // `zig test` does compile+run in one step — no separate build-exe.
+    // The user-facing `zag test <file.zag>` subcommand routes here
+    // (cli.zag's cmd_test recurses with --leaf-process=test). The
+    // exit code from the chosen zig subcommand (0 = all pass /
+    // successful run, non-zero = some failed / runtime error)
+    // propagates verbatim so the user's shell sees the correct
+    // status. zig's test/program output goes to stderr via the
+    // inherited fd (runCommand's fork+execve preserves the child's
+    // stderr), so failures are visible to the user.
+    //
+    // Dispatch: `zig test` only runs `test "..." {}` blocks; it
+    // does NOT invoke `pub fn main()`. The canonical zag
+    // `fun main() { ... }` form transpiles to a `pub fn main()
+    // !void { ... }` that `zig test` would silently skip (or error
+    // with "no tests found" depending on zig version). Detect
+    // which shape the generated source has and route to the right
+    // zig subcommand:
+    //
+    //   - has `test "` blocks → `zig test` (run the test blocks)
+    //   - has `pub fn main(` only → `zig run` (run the program)
+    //   - neither → error with a helpful message
+    //
+    // The detection is a substring check on the generated zig
+    // source (`zig_src` is already in memory from the transpile
+    // call above). A substring false-positive on a print statement
+    // that prints the literal text `test "` is acceptable for v1 —
+    // the user can use a different test-block shape, and the
+    // heuristic is forward-compatible with zig's own test-block
+    // detection (zig accepts any `test "<name>" { ... }` block
+    // shape at any indentation level).
+    if (std.mem.eql(u8, flag, "test")) {
+        const has_test_block = std.mem.indexOf(u8, zig_src, "test \"") != null;
+        const has_main = std.mem.indexOf(u8, zig_src, "pub fn main(") != null;
+        if (has_test_block) {
+            const test_code = try runCommand(null, &.{ zig_install_path, "test", f_zig });
+            std.process.exit(test_code);
+        } else if (has_main) {
+            const run_code = try runCommand(null, &.{ zig_install_path, "run", f_zig });
+            std.process.exit(run_code);
+        } else {
+            std.debug.print("error: {s} has no test blocks or main function — `zag test` requires test \"...\" {{}} blocks; use `zag run` for main() programs\n", .{src});
+            std.process.exit(1);
+        }
+    }
+
     var emit_buf: [128]u8 = undefined;
     const f_emit_leaf = std.fmt.bufPrint(&emit_buf, "-femit-bin={s}", .{f_bin}) catch "-femit-bin=/tmp/zag_leaf_bin";
 

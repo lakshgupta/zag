@@ -46,6 +46,7 @@ pub fun usage() {
     print("  zag run <file.zag>     Compile and run a Zag file\n");
     print("  zag check <file.zag>   Type-check a Zag file (compile to Zig only)\n");
     print("  zag build <file.zag>   Compile a Zag file to a binary\n");
+    print("  zag test <file.zag>    Compile and run tests in a Zag file\n");
     print("  zag init [name]        Create a new Zag project\n");
     print("  zag version            Print version information\n");
     print("  zag help               Show this help message\n");
@@ -136,6 +137,13 @@ pub fun cmd_build(src: []const u8) -> i32 {
     return spawn_leaf("build", src);
 }
 
+pub fun cmd_test(src: []const u8) -> i32 {
+    if get().len < 3 {
+        return 1;
+    }
+    return spawn_leaf("test", src);
+}
+
 pub fun cli_main() -> i32 {
     let argv: []const []const u8 = get();
     if argv.len < 2 {
@@ -195,6 +203,14 @@ pub fun cli_main() -> i32 {
             return 1;
         }
         return cmd_build(argv[2]);
+    }
+    if cmd == "test" {
+        if argv.len < 3 {
+            print("error: missing file argument\n\n");
+            usage();
+            return 1;
+        }
+        return cmd_test(argv[2]);
     }
 
     print("error: unknown command '{cmd}'\n\n");

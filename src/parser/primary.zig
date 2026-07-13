@@ -550,16 +550,27 @@ pub fn parsePostfix(self: *Parser) Expr {
 /// (dots, spaces, operators, parens, slashes) so expressions like
 /// `{a + b}`, `{obj.f()}`, `{pi:.5}` auto-promote to `.template_lit`.
 ///
-/// The single content-level rejection is a NESTED `{` inside the
-/// candidate `{...}`. This disambiguates from any embedded-code
-/// string (e.g. a function body like
-/// `"fun main() {\n    print(...);\n}\n"` has its own `{` and `}`
-/// pair inside the outer braces, signalling it's code, not a template
-/// interpolation). The legacy char-class gate
-/// (`isAlphanumeric || _ || :`) achieved the same rejection indirectly
-/// by bailing on `\n`, `(`, `)`, `;` etc. — but at the cost of also
-/// rejecting legitimate expression interpolations (`{a + b}`'s space
-/// + `+`, `{pi:.5}`'s `.`, `{obj.f()}`'s `.` + `(`).
+/// The content-level rejections are:
+///   1. NESTED `{` inside the candidate `{...}` — embedded code with
+///      its own brace pair (e.g. a JSON object).
+///   2. `;` (semicolon) inside the candidate — statement separator;
+///      template interpolations are EXPRESSIONS, not statements. This
+///      catches the cli.zag boilerplate
+///      `"fun main() {\n    print(...);\n}\n"` which has
+///      `{ print(...); }` (a statement, not an expression) and was
+///      wrongly auto-promoted by the f559cf3 matching-brace gate.
+///      The legacy char-class gate achieved the same rejection
+///      indirectly by bailing on `;` (non-alphanumeric); the
+///      matching-brace gate needs an explicit `;` check because the
+///      inner `print(...)` parens are not braces, so the nested-`{`
+///      path doesn't fire.
+/// The legacy char-class gate (`isAlphanumeric || _ || :`) caught
+/// BOTH rejections (nested-`{` indirectly via non-alphanumeric
+/// characters; `;` directly) but at the cost of also rejecting
+/// legitimate expression interpolations (`{a + b}`'s space + `+`,
+/// `{pi:.5}`'s `.`, `{obj.f()}`'s `.` + `(`). The matching-brace
+/// gate unblocks those 3 patterns while the `;` check keeps the
+/// embedded-code strings as `.string_lit`.
 ///
 /// Trade-offs vs. the legacy gate: accepts expression content
 /// (operators, dots, parens, method calls); rejects only nested
@@ -582,10 +593,13 @@ fn looksLikeTemplateLiteral(text: []const u8) bool {
             // Scan for the matching `}` at the SAME brace depth. A
             // nested `{` before the matching `}` disqualifies this
             // string as a template — it's embedded code (function
-            // body, JSON object, etc.), not an interpolation. Any
-            // other content (dots, spaces, operators, parens) is
-            // fine because the .ident verbatim-emit at codegen will
-            // produce a valid Zig expression.
+            // body, JSON object, etc.), not an interpolation. A
+            // `;` (semicolon) before the matching `}` also
+            // disqualifies — template interpolations are
+            // EXPRESSIONS, not statements. Any other content
+            // (dots, spaces, operators, parens) is fine because
+            // the .ident verbatim-emit at codegen will produce a
+            // valid Zig expression.
             var found_close = false;
             while (i < text.len) {
                 const c = text[i];
@@ -598,6 +612,23 @@ fn looksLikeTemplateLiteral(text: []const u8) bool {
                     // about WHY we reject and accepts all the
                     // expression-content cases the legacy gate
                     // blocked.
+                    return false;
+                }
+                if (c == ';') {
+                    // Statement separator — template interpolations
+                    // are expressions, so a `;` inside `{...}` is
+                    // a strong signal of embedded code. The
+                    // canonical case is the cli.zag boilerplate
+                    // `"fun main() {\n    print(\"hello, world\\n\");\n}\n"`
+                    // whose `{ print(...); }` is a statement (not
+                    // an expression) and was wrongly auto-promoted
+                    // by the f559cf3 matching-brace gate. The
+                    // legacy char-class gate caught this
+                    // indirectly (`;` is non-alphanumeric); the
+                    // matching-brace gate needs this explicit check
+                    // because the inner `print(...)` parens are
+                    // NOT braces, so the nested-`{` path above
+                    // doesn't fire for the boilerplate.
                     return false;
                 }
                 if (c == '}') {

@@ -442,7 +442,15 @@ test "parser: float precision {pi:.5} gate accepts dot inside braces" {
     // interpolation now promotes to .template_lit with expr="pi"
     // and spec=".5". Codegen's genTemplateLit emits `{any:.5}` with
     // arg `pi`, and zig's debug formatter honours the precision.
-    const src = "fun f() {\n    let pi: f64 = 3.14159;\n    print(\"pi = {pi:.5}\\n\");\n}\n";
+    //
+    // Source uses NO leading text (just `"{pi:.5}\n"`) so buildTemplate
+    // produces exactly 2 parts: [expr+spec, trailing literal "\n"].
+    // The pre-fix test source had `"pi = {pi:.5}\n"` which produces
+    // 3 parts (leading "pi = ", expr+spec, trailing "\n") and the
+    // `parts.len == 2` assertion failed. Fixed by removing the
+    // incidental leading text so the assertion surface matches the
+    // gate-pinning intent.
+    const src = "fun f() {\n    let pi: f64 = 3.14159;\n    print(\"{pi:.5}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -469,7 +477,13 @@ test "parser: expression operator {a + b} gate accepts spaces and plus" {
     // the .ident text; codegen's genExpr .ident arm emits `a + b`
     // verbatim so zig evaluates the binary expression at the
     // format-arg site.
-    const src = "fun f() {\n    let a: i32 = 1;\n    let b: i32 = 2;\n    print(\"sum = {a + b}\\n\");\n}\n";
+    //
+    // Source uses NO leading text (just `"{a + b}\n"`) so buildTemplate
+    // produces exactly 2 parts: [expr, trailing literal "\n"]. The
+    // pre-fix test source had `"sum = {a + b}\n"` which produces 3
+    // parts and the `parts.len == 2` assertion failed. Fixed by
+    // removing the incidental leading text.
+    const src = "fun f() {\n    let a: i32 = 1;\n    let b: i32 = 2;\n    print(\"{a + b}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -497,7 +511,13 @@ test "parser: method call {obj.f()} gate accepts dot and parens inside braces" {
     // braces — only parens, which the gate accepts). buildTemplate
     // captures `obj.f()` as the .ident text; codegen's .ident arm
     // emits `obj.f()` verbatim so zig evaluates the method call.
-    const src = "fun f() {\n    let obj: i32 = 1;\n    print(\"got {obj.f()}\\n\");\n}\n";
+    //
+    // Source uses NO leading text (just `"{obj.f()}\n"`) so buildTemplate
+    // produces exactly 2 parts: [expr, trailing literal "\n"]. The
+    // pre-fix test source had `"got {obj.f()}\n"` which produces 3
+    // parts and the `parts.len == 2` assertion failed. Fixed by
+    // removing the incidental leading text.
+    const src = "fun f() {\n    let obj: i32 = 1;\n    print(\"{obj.f()}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -537,6 +557,47 @@ test "parser: nested-brace string stays string_lit (embedded-code case)" {
     try std.testing.expectEqual(@as(usize, 1), prog.functions[0].body.len);
     const init = prog.functions[0].body[0].let.init.?;
     try std.testing.expect(init == .string_lit);
+}
+
+test "parser: statement-like content in braces stays string_lit (; rejected)" {
+    // The f559cf3 matching-brace gate was too permissive: it
+    // accepted `{...}` content with `;` (semicolons) as a
+    // template interpolation. But template interpolations are
+    // EXPRESSIONS, not statements — a `;` inside `{...}` is a
+    // strong signal of embedded code. The canonical case is the
+    // cli.zag boilerplate
+    //   "fun main() {\n    print(\"hello, world\\n\");\n}\n"
+    // whose `{ print(...); }` is a statement (has `;`), not an
+    // expression, and was wrongly auto-promoted by the f559cf3
+    // gate — the transpiled zig had a `;` inside the args tuple
+    // `.{}` which zig rejected as a syntax error.
+    //
+    // The refined gate (this commit) explicitly rejects `;`
+    // inside `{...}` content. This test pins the `;` rejection
+    // with a minimal source that has `;` but NO nested braces
+    // (so the nested-brace check above doesn't fire — this test
+    // is the `;`-rejection pin specifically). The 3 unblocked
+    // patterns from f559cf3 (`{pi:.5}`, `{a + b}`, `{obj.f()}`)
+    // are all single-line expressions WITHOUT `;`, so they still
+    // pass the refined gate.
+    const src = "fun f() {\n    let s = \"x { a; b } y\";\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init.?;
+    try std.testing.expect(init == .string_lit);
+    // Strengthened pin on the "gate didn't eat chars" property: the
+    // matching-brace gate walks the content to find the matching `}`
+    // and rejects on `;`. The bytes between (including the `;`) MUST
+    // be preserved verbatim — a gate that half-consumed the content
+    // before rejecting (the legacy char-class gate bailed on the
+    // first non-alphanumeric char, so a string with `;` would stay
+    // as `.string_lit` but the content was already truncated) would
+    // fail this assertion. The substring check confirms the full
+    // string including the `;` and the trailing `y` is intact.
+    try std.testing.expectEqualStrings("x { a; b } y", init.string_lit);
 }
 
 test "parser: tuple destructuring" {
