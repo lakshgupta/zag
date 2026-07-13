@@ -1,0 +1,32 @@
+## std.error — the canonical Error type + Context wrapper + ErrorExt trait.
+##
+## From docs/spec.md §3.3 "Error type":
+##   enum Error { NotFound, Permission, Io, Parse, InvalidInput,
+##                Unavailable, Other }
+##
+## Context wraps an Error with a heap-allocated message. ErrorExt is
+## the trait that produces a Context via `? err.context("…")?`.
+##
+## Stub: this file is the canonical surface. Real Error/CANONICAL is
+## declared here once and is the value zig compiler-level error
+## handlers hand back via the global Error state.
+
+pub enum Error {
+    NotFound,
+    Permission,
+    Io,
+    Parse,
+    InvalidInput,
+    Unavailable,
+    Other,
+}
+
+pub struct Context {
+    msg: []const u8,
+    source: *Error,
+}
+
+pub trait ErrorExt {
+    fun context(self: *Error, msg: []const u8) -> Context;
+    fun context_str(self: *Error, msg: str) -> Context;
+}

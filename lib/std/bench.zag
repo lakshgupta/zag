@@ -1,0 +1,19 @@
+## std.bench — runtime allocation counters + benchmark harness.
+##
+## Stub: real impl lands via the runtime counters in src/codegen/
+## that emit `std.heap` allocation hooks at every `new` and `alloc`
+## call site, plus per-line benchmark scaffolding. Until then, the
+## Counters struct exposes the surface shape (bytes_live, bytes_total,
+## allocations) and a sync snapshot that returns zeros.
+
+pub struct Counters {
+    bytes_live: usize,
+    bytes_total: usize,
+    allocations: usize,
+}
+
+impl Counters {
+    pub fun snapshot(self: *Counters) -> Counters {
+        return Counters { bytes_live: 0, bytes_total: 0, allocations: 0 };
+    }
+}

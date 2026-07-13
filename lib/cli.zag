@@ -1,0 +1,210 @@
+## lib/cli.zag — zag CLI dispatcher.
+##
+## This file's bootstrap story is unusual: it embeds inside the
+## zag binary via `@embedFile("../lib/cli.zag")` in
+## src/main.zig (the bootstrap path is relative to build.zig's
+## cwd). When zag runs (e.g. `zag run hello.zag`), the bootstrap
+## copies these bytes to /tmp/zag_cli.zag, transpiles them, runs
+## the zig compiler to produce /tmp/zag_cli_bin, fork+execs
+## cli_bin with the ORIGINAL user argv. The cli_bin's main() then
+## runs THIS file's main() (which in turn calls cli_main()).
+##
+## cli_main dispatches via get() — the same argv_get builtin used
+## everywhere else. run / check / build each recurse by invoking
+## the zag binary in --leaf-process mode (the bootstrap's leaf
+## branch does the transpile+compile step; cli.zag doesn't need
+## that surface because the lex/parse/codegen functions live
+## zig-side in src/).
+##
+## The recurse-into-zag pattern is safe: cli_bin fork+execs the
+## same zag binary with a different argv (--leaf-process=...). The
+## bootstrap recognises --leaf-process and goes straight to the
+## transpile+compile+exec pipeline without re-entering cli_main.
+## No infinite recursion: the leaf NEVER calls cli.zag
+## (cli.zag is only ever compiled-and-run when the bootstrap sees
+## a user-facing subcommand like run/check/build/init).
+##
+## Errors: cli_main returns an i32 exit code; main() forwards
+## it through process.exit() (the codegen-router exit builtin)
+## so the failure mode is equivalent to the previous zig-side
+## main.zig's std.process.exit(N).
+##
+## String concat caveat: zag source has no string-concat operator.
+## we use byte-by-byte copy into a stack array for the init
+## `<name>/hello.zag` path (matches today's zig-side main.zig;
+## the v1 init name is bounded to 256 chars so the stack buf is
+## sufficient).
+
+pub import std.argv.{get};
+pub import std.fs.{write_file};
+pub import std.fs.{mkdir};
+pub import std.process.{exec};
+pub import std.process.{exit};
+
+pub fun usage() {
+    print("Usage:\n");
+    print("  zag run <file.zag>     Compile and run a Zag file\n");
+    print("  zag check <file.zag>   Type-check a Zag file (compile to Zig only)\n");
+    print("  zag build <file.zag>   Compile a Zag file to a binary\n");
+    print("  zag init [name]        Create a new Zag project\n");
+    print("  zag version            Print version information\n");
+    print("  zag help               Show this help message\n");
+}
+
+pub fun cmd_help() -> i32 {
+    usage();
+    return 0;
+}
+
+pub fun cmd_version() -> i32 {
+    print("zag 0.1.0-dev\n");
+    return 0;
+}
+
+pub fun cmd_init_anon() -> i32 {
+    let boilerplate: str = "fun main() {\n    print(\"hello, world\\n\");\n}\n";
+    let rc: i32 = write_file("hello.zag", boilerplate);
+    if rc != 0 {
+        print("error: failed to write 'hello.zag'\n");
+        return 1;
+    }
+    print("created hello.zag\n");
+    return 0;
+}
+
+pub fun cmd_init_named(n: []const u8) -> i32 {
+    let boilerplate: str = "fun main() {\n    print(\"hello, world\\n\");\n}\n";
+    let rc1: i32 = mkdir(n);
+    if rc1 != 0 {
+        print("error: failed to create directory '{n}'\n");
+        return 1;
+    }
+    ## Byte-by-byte path concat: "<n>/hello.zag".
+    ## 256-byte stack buffer (matches today's zig-side main.zig).
+    var path_buf: [256]u8 = undefined;
+    var i: usize = 0;
+    while i < n.len {
+        path_buf[i] = n[i];
+        i = i + 1;
+    }
+    let suffix: str = "/hello.zag";
+    let sl: usize = suffix.len;
+    while i < n.len + sl {
+        path_buf[i] = suffix[i - n.len];
+        i = i + 1;
+    }
+    let path: []u8 = path_buf[0 .. i];
+    let rc2: i32 = write_file(path, boilerplate);
+    if rc2 != 0 {
+        print("error: failed to write '{path}'\n");
+        return 1;
+    }
+    print("created {path}\n");
+    return 0;
+}
+
+## Spawn a leaf-process goto of zag. The first argv slot is
+## always the binary path (cli_bin inherited it from the
+## bootstrap's execve), so the recursion is self-contained.
+pub fun spawn_leaf(leaf_flag: []const u8, src: []const u8) -> i32 {
+    let argv0: []const u8 = get()[0];
+    let leafflag: str = "--leaf-process={leaf_flag}";
+    ## Zag-native array literal + whole-slice view: `[3]str { ... }`
+    ## then `args[..]` yields `[]str` (= `[][]const u8`) for exec.
+    let args: [3]str = [3]str { argv0, leafflag, src };
+    return exec(args[..]);
+}
+
+pub fun cmd_run(src: []const u8) -> i32 {
+    if get().len < 3 {
+        return 1;
+    }
+    return spawn_leaf("run", src);
+}
+
+pub fun cmd_check(src: []const u8) -> i32 {
+    if get().len < 3 {
+        return 1;
+    }
+    return spawn_leaf("check", src);
+}
+
+pub fun cmd_build(src: []const u8) -> i32 {
+    if get().len < 3 {
+        return 1;
+    }
+    return spawn_leaf("build", src);
+}
+
+pub fun cli_main() -> i32 {
+    let argv: []const []const u8 = get();
+    if argv.len < 2 {
+        usage();
+        return 1;
+    }
+    let cmd: []const u8 = argv[1];
+
+    ## /help/\u00b6/--help/\u00b6-h/
+    if cmd == "help" {
+        return cmd_help();
+    }
+    if cmd == "--help" {
+        return cmd_help();
+    }
+    if cmd == "-h" {
+        return cmd_help();
+    }
+    ## /version/\u00b6/--version/\u00b6-V/
+    if cmd == "version" {
+        return cmd_version();
+    }
+    if cmd == "--version" {
+        return cmd_version();
+    }
+    if cmd == "-V" {
+        return cmd_version();
+    }
+    ## /init [name]/
+    if cmd == "init" {
+        if argv.len > 2 {
+            return cmd_init_named(argv[2]);
+        }
+        return cmd_init_anon();
+    }
+    ## /run/ /check/ /build/ \u2014 each recurses into zag --leaf-process.
+    if cmd == "run" {
+        if argv.len < 3 {
+            print("error: missing file argument\n\n");
+            usage();
+            return 1;
+        }
+        return cmd_run(argv[2]);
+    }
+    if cmd == "check" {
+        if argv.len < 3 {
+            print("error: missing file argument\n\n");
+            usage();
+            return 1;
+        }
+        return cmd_check(argv[2]);
+    }
+    if cmd == "build" {
+        if argv.len < 3 {
+            print("error: missing file argument\n\n");
+            usage();
+            return 1;
+        }
+        return cmd_build(argv[2]);
+    }
+
+    print("error: unknown command '{cmd}'\n\n");
+    usage();
+    return 1;
+}
+
+pub fun main() {
+    let rc: i32 = cli_main();
+    if rc != 0 {
+        exit(rc);
+    }
+}

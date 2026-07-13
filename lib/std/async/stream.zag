@@ -1,0 +1,16 @@
+## std.async.stream — AsyncStream trait + combinator stubs.
+##
+## From docs/spec.md §6.4.3: the `AsyncStream<T>` trait is the async
+## analogue of `Iterator<T>`. Combinators (`map`, `filter`, `take`,
+## `skip`, `chain`, `zip`, `buffered`, `timeout`, `collect`) are
+## monomorphized at compile time and chain off the polling model.
+##
+## Stub: drops the `<T>` type parameter on the trait and uses a sync
+## `poll_next` returning bool (Some/None flag) because the parser
+## doesn't yet accept generic trait declarations with poll-style
+## async return types. Once `async fun` lands, the trait gets a real
+## `poll_next(self: *Self) -> Option<T>` shape.
+
+pub trait AsyncStream {
+    fun poll_next(self: *Self) -> bool;
+}

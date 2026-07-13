@@ -46,3 +46,20 @@
 pub fun read_file(path: str) -> []u8 {
     return &[_]u8{};
 }
+
+## Phase 3 (CLI migration) additions: `write_file` + `mkdir`.
+##
+## Both are wired as codegen-router builtins in
+## src/codegen/builtins.zig's builtin_table (arity=2 and arity=1
+## respectively) — the function declarations below are the
+## router's lookup target; the throwaway bodies are never
+## executed because the router rewrites the call site before
+## the produced zig source reaches zig's compile phase.
+
+pub fun write_file(path: str, content: []const u8) -> i32 {
+    return -1;
+}
+
+pub fun mkdir(path: str) -> i32 {
+    return -1;
+}

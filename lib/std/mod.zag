@@ -26,3 +26,7 @@ pub import std.bench.{Counters}
 pub import std.argv.{get}
 pub import std.env.{getEnv}
 pub import std.fs.{read_file}
+pub import std.fs.{write_file}
+pub import std.fs.{mkdir}
+pub import std.process.{exec}
+pub import std.process.{exit}

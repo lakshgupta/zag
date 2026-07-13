@@ -1,0 +1,27 @@
+## std.atomic — atomic types + memory ordering.
+##
+## Pass-through: real impl is zig's std.atomic. This file declares
+## the zag-side type surface; the codegen router emits zig
+## `std.atomic.*` calls for the actual load/store/cas operations,
+## leaving the type names (`AtomicI32`, `Ordering.AcqRel`, …) as
+## the user-facing API.
+##
+## AtomicPtr drops its type parameter for now — the parser doesn't
+## yet support the `AtomicPtr<T>` declaration shape; the real
+## codegen routes `std.atomic.AtomicPtr(*T)` via the concrete
+## pointer type at the call site, which works without a generic
+## declaration on the zag side.
+
+pub struct AtomicI32  { _opaque: i32 }
+pub struct AtomicI64  { _opaque: i64 }
+pub struct AtomicUsize { _opaque: usize }
+pub struct AtomicBool { _opaque: bool }
+pub struct AtomicPtr  { _opaque: usize }
+
+pub enum Ordering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}

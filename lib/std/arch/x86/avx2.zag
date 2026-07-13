@@ -1,0 +1,15 @@
+## std.arch.x86.avx2 — AVX2 intrinsics for x86_64.
+##
+## Pass-through entry point. Real impl lives in zig's std.arch.x86.avx2
+## (`_mm256_fmadd_ps`, `_mm256_load_ps`, `_mm256_store_ps`, …) and is
+## surface-stable on every supported target. When a user writes
+## `import std.arch.x86.avx2`, the resolver emits a one-line zig alias
+## block (`const __zag_std_arch_x86_avx2 = struct { const avx2 = @import("std").arch.x86.avx2; };`)
+## and call sites (`std.arch.x86.avx2._mm256_fmadd_ps(a, b, c)`) resolve
+## through that alias.
+##
+## Stub: this file exists so module discovery has a target. Once
+## KNOWN_STD_MODULES lands, this entry point is wired to the
+## pass-through path. Until then, calling `_mm256_*` from zag source
+## requires the compiler-emit primitive path (canonical keyword
+## routing in src/codegen/), not import resolution.
