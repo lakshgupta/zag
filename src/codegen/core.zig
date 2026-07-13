@@ -71,10 +71,18 @@ pub const Codegen = struct {
     /// counters (destruct, alloc, match) so multiple argv_get
     /// calls in the same body produce distinct brick-temp names
     /// without zig's no-redeclaration rule. The counter steps ONLY
-    /// on the argv_get dispatch path; other builtin emits use
-    /// existing per-call state (env_var / fs_read_file don't need
-    /// per-call temps because their args emit inline).
+    /// on the argv_get dispatch path.
     argv_counter: u32,
+    /// Per-function counter for the env-result scratch variable
+    /// emitted by the `env_var` builtin route (Phase 1 codegen
+    /// router). Reset to 0 by `genFun` / `genMethod` /
+    /// `genFreeMethod` so each `pub fn` body has its own `__env_<N>`
+    /// sequence. Two getEnv calls in the same body produce
+    /// `__env_0` and `__env_1` so zig's no-redeclaration rule is
+    /// satisfied. The counter steps ONLY on the env_var dispatch
+    /// path; the fs_read_file arm keeps its `@panic` runtime stub
+    /// (not wired in Phase 1) so it does not need a counter.
+    env_counter: u32,
     /// Per-function flag: true when the currently-walked function body
     /// has a non-void return type (only relevant for impl-block methods
     /// because top-level `pub fun` declarations ALWAYS emit
@@ -163,6 +171,12 @@ pub const Codegen = struct {
             // `argv_get` builtin emit steps it and emits a fresh
             // `__argv_<N>` / `__argv_<N>_n` pair.
             .argv_counter = 0,
+            // Phase 1 env-result counter starts at 0; each
+            // `getEnv` builtin emit steps it and emits a fresh
+            // `__env_<N>` scratch used to bridge
+            // `std.posix.system.getenv`'s `?[*:0]u8` surface to the
+            // zag-side `?[]const u8` shape via `std.mem.span`.
+            .env_counter = 0,
             .fn_returns_value = false,
             // Phase 3 trait-cast: the tracked trait-name set starts
             // empty; generate() populates from prog.traits before any

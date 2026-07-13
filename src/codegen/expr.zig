@@ -708,7 +708,17 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr) void {
         switch (dispatch) {
             .argv_get => {
-                _ = args;
+                // argv_get does not consume user-supplied args (it
+                // iterates `std.os.argv` directly), so no `_ = args`
+                // suppression is needed here either -- zig 0.16 does
+                // not warn on unused function parameters by default
+                // and an explicit `_ = args` discard would now
+                // compile-error as "pointless discard" once the
+                // sibling `.env_var` arm started consuming args[0]
+                // (Phase 1): zig treats the param as used by the
+                // function-as-a-whole, so `_ = args` in any single
+                // arm is meaningless.
+                //
                 // Per-call scoping: each argv_get invocation steps
                 // argv_counter and emits a fresh `__argv_<N>` /
                 // `__argv_<N>_n` pair. Sibling argv_get calls in the
@@ -773,25 +783,103 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("}");
             },
             .env_var => {
-                // Runtime-fail placeholder. Phase 1 wires env_var with
-                // `std.os.getenv(<args[0]>) orelse null` emit; until
-                // then, any table entry that points dispatch=.env_var
-                // panics with a self-documenting message at the user's
-                // host invocation. The use of `@panic` (vs. an earlier
-                // draft's `@compileError`) preserves the loud-fail
-                // contract without blocking the helper's compile-time
-                // analysis — see the genBuiltinCall docblock above for
-                // the zig 0.16 semantics distinction.
-                _ = args;
-                @panic("env_var not wired (Phase 1)");
+                // Phase 1 router: real emit shape for the env_var
+                // dispatch. The bridge is intentionally minimal: copy
+                // the user-side name arg into a sentinel-terminated
+                // stack buffer via `std.posix.toPosixPath`, pass that
+                // buffer's pointer to `std.posix.system.getenv`, and
+                // convert the non-null arm's `[*:0]u8` pointer to a
+                // `[]const u8` slice via `std.mem.span`. The end
+                // result is the zag-side `?[]const u8` shape (the
+                // docs/11 borrowed-string-view contract: non-null is a
+                // sentinel-terminated slice to a process-owned buffer
+                // — users wanting heap ownership must copy or convert).
+                //
+                // Per-call scoping: each env_var invocation steps
+                // env_counter and emits a fresh `__env_<N>` result
+                // variable + per-call `__env_<N>_z` sentinel buffer
+                // ref. Sibling getEnv calls in the same body produce
+                // distinct names (zig's no-redeclaration rule would
+                // reject a clash). The counter resets at the top of
+                // each function body (genFun + genMethod +
+                // genFreeMethod in decl.zig).
+                const id = self.env_counter;
+                self.env_counter += 1;
+                var name_buf: [16]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "__env_{d}", .{id}) catch "__env_0";
+
+                // Emit a (blk: { ... }) wrapper that
+                //   1. allocates a fresh `var __env_<N>: ?[]const u8 = null;`
+                //   2. tries to copy the user-side name arg into a
+                //      sentinel-terminated buffer via toPosixPath (the
+                //      if-let [|__env_<N>_z|] silently degrades to
+                //      `null` on PATH-too-long without bubbling);
+                //   3. passes `&__env_<N>_z` (the inner-`[]:0`u8` array
+                //      pointer) to `std.posix.system.getenv` — the `&`
+                //      coerces `*[PATH_MAX-1:0]u8` to `[*:0]const u8`
+                //      for the libc-or-syscall layer's argument shape;
+                //   4. on non-null inner if-let, sets `__env_<N> =
+                //      std.mem.span(__s)` which widens the
+                //      sentinel-terminated pointer to the zag-side
+                //      `[]const u8` slice shape.
+                //   5. `break :blk __env_<N>` yields the nullable slice
+                //      out of the blk to the zag call site.
+                //
+                // The double-`if-let` (vs a single `if-let {|n|
+                // try...else null`) preserves the docs/11 borrow
+                // contract — neither arm produces a heap allocation,
+                // both arms stay on the borrowed env-block storage
+                // managed by the OS, and the user's copy/convert
+                // decision is left at the call site.
+                // Const-cast rationale (the v1 caveat). Two cast
+                // points: (a) `&__env_<N>_z` is `*[4095:0]u8`
+                // (mutable) but `std.posix.system.getenv` expects
+                // `[*:0]const u8` — zig 0.16 will not implicitly
+                // coerce `*[N:0]u8` → `[*:0]const u8`, hence
+                // `@constCast(&__env_<N>_z)`. (b) `std.mem.span(__s)`
+                // where `__s: [*:0]u8` resolves to the mutable slice
+                // overload that returns `[]u8`; assigning into the
+                // outer `?[]const u8` slot requires `@constCast` for
+                // the same reason. The const-cast is sound on both
+                // sides — the underlying storage is the OS-managed
+                // env-block which is logically read-only for the
+                // lifetime of the process, so we are just restoring
+                // the const-ness the OS ABI would have offered if
+                // zig exposed a const-native getenv return type
+                // (it doesn't, by design — libc's `getenv` returns
+                // the mutable pointer for in-place modification).
+                self.write("blk: { var ");
+                self.write(name);
+                self.write(": ?[]const u8 = null; if (std.posix.toPosixPath(");
+                self.genExpr(args[0]);
+                self.write(")) |");
+                self.write(name);
+                self.write("_z| { if (std.posix.system.getenv(@constCast(&");
+                self.write(name);
+                self.write("_z))) |__s| { ");
+                self.write(name);
+                self.write(" = @constCast(std.mem.span(__s)); } } break :blk ");
+                self.write(name);
+                self.write("; }");
             },
             .fs_read_file => {
-                // Runtime-fail placeholder. Phase 1 wires fs_read_file
-                // with `std.fs.cwd().readFileAlloc(...) catch &[_]u8{}`
-                // emit; until then any table entry pointing dispatch=
-                // .fs_read_file panics with a self-documenting
-                // message. Mirrors the env_var arm above.
-                _ = args;
+                // Runtime-fail placeholder (Phase 1 defer). The
+                // builtins.zig table already has `read_file` routing
+                // to `.fs_read_file` so the codegen-router surface
+                // is wired end-to-end; the emit itself stays
+                // @panic'd until Phase 2 lands the real emit. Phase 2
+                // will route through zig 0.16's `std.Io.Dir.readFileAlloc`
+                // (note: NOT `std.fs.cwd().readFileAlloc`, which the
+                // vendored 0.16 stdlib no longer exposes -- the 21-line
+                // `vendor/zig/lib/std/fs.zig` is a deprecation stub).
+                // The `std.Io.Dir.readFileAlloc` signature requires an
+                // `Io` event-loop instance, which the codegen-router
+                // cannot safely emit as a blocking call today -- the
+                // Phase 2 work introduces the codegen-router-aware
+                // `Io` context first, then this arm's emit swap.
+                //
+                // NOTE: no `_ = args` suppression is needed --
+                // mirror the rationale on `.argv_get` above.
                 @panic("fs_read_file not wired (Phase 1)");
             },
         }

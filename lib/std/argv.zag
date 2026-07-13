@@ -1,0 +1,20 @@
+## std.argv — command-line argument access.
+##
+## From docs/spec.md §6.4 (System Surfaces): argv is exposed as a
+## free-fn form after the user writes `pub import std.argv.{get}`.
+## The router in src/codegen/builtins.zig fires on a `get()` call and
+## emits a per-call `(blk: { var __argv_<N>: [32][]const u8 = undefined;
+## ...; break :blk __argv_<N>[0..__argv_<N>_n]; })` wrapper that captures
+## `std.os.argv` into a stack-allocated 32-slot slice bounded by the
+## walk count `__argv_<N>_n`. The emit uses `std.mem.span(a)` directly
+## (no `orelse ""` wrapper) because `std.os.argv` on Linux stores
+## non-optional sentinel-terminated pointers — `orelse` would have
+## hard-errored at compile time per Phase 0's Linux-correctness work.
+##
+## Stub: throwaway body so the .zag file parses through the existing
+## stub convention; the genBuiltinCall arm REWRITES the call site
+## before any reader sees the verbatim form.
+
+pub fun get() -> []const []const u8 {
+    return &[_][]const u8{};
+}

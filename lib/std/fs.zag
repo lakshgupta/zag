@@ -1,0 +1,33 @@
+## std.fs — file system read.
+##
+## From docs/spec.md §6.4 (System Surfaces): read_file is exposed
+## as a free-fn form after the user writes `pub import std.fs.{read_file}`.
+## The router entry in src/codegen/builtins.zig maps `read_file`
+## (arity=1) to the `fs_read_file` dispatch.
+##
+## DEFERRED emit (Phase 2 widening): zig 0.16 retired std.fs.cwd().readFileAlloc
+## and surface the real fs API through std.Io.Dir.readFileAlloc(dir, io, allocator,
+## sub_path, max). The `io: Io` parameter is the new event-loop
+## instance abstraction; emitting a BLOCKING `std.posix.openat +
+## posix.read + read-loop` shim in Phase 1 would silently block the
+## event loop if the user later wraps this in an `async fun` body
+## (no compile-time check forbids the call site from async context).
+## Until the codegen router threads `io` through function-level
+## parameters (Phase 2's "Io as first-class vtable" widening), the
+## fs_read_file arm stays a `@panic` runtime stub so a future release
+## that adds a `read_file` table entry without wiring the arm fails
+## LOUDLY at the user's host invocation.
+##
+## Phase 2 reference surface (NOT YET EMITTED, do not invoke yet):
+##   allocator.alloc(std.Io.Dir.cwd(), std.Io.Threaded.init(...).io(),
+##                   path, 65536) catch &[_]u8{}
+## where the `std.Io.Threaded.init(...)` runtime is set up once at
+## zag startup and registered in build_options for codegen reuse.
+##
+## Stub: throwaway body for the existing .zag parse-stubs-out
+## convention. The (deferred) router arm REWRITES the call site
+## before any reader sees the verbatim form.
+
+pub fun read_file(path: str) -> []u8 {
+    return undefined;
+}

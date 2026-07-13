@@ -2866,3 +2866,96 @@ test "codegen: argv_counter resets across sibling pub fn boundaries" {
     try std.testing.expect(argv_0_count >= 2);
     try std.testing.expect(argv_1_count <= 1);
 }
+
+// ============================================================
+// Phase 1 codegen-router pin tests.
+// ============================================================
+// Phase 1 widens src/codegen/builtins.zig's builtin_table with
+// `getEnv` (env_var dispatch, real zig 0.16 emit shim) and
+// `read_file` (fs_read_file dispatch, DEFERRED — keeps the @panic
+// runtime stub because zig 0.16 retired std.fs.cwd().readFileAlloc
+// in favour of std.Io.Dir.readFileAlloc which requires an Io
+// event-loop instance that the codegen router can't safely emit yet).
+//
+// These tests pin the Phase 1 router surface end-to-end:
+//   1. The env_var shim compiles through (std.posix.system.getenv +
+//      std.mem.span + per-call blk wrapper).
+//   2. The env_counter resets + increments sanely across multiple
+//      getEnv calls in the same body (mirrors the argv_get counter
+//      pin test one block above).
+//   3. The router fires on getEnv — a verbatim `getEnv(...)` call
+//      must NOT survive in the emitted zig output because the router
+//      consumed it before the verbatim fallback in expr.zig's `.call`
+//      arm. A regression that bypasses the lookup() route would
+//      surface here because the bare call site would appear verbatim.
+//
+// fs_read_file (read_file route) is deliberately UNTESTED at this
+// level because its arm is still the @panic stub — the table row
+// exists for forward-compatibility but the dispatch isn't wired yet.
+// The tests focus on the live `getEnv` surface so Phase 1 landing
+// doesn't depend on Phase 2's deferred fs work.
+// ============================================================
+
+test "codegen: getEnv emits std.posix.system.getenv shim" {
+    // The Phase 1 router emit shape: per-call blk wrapper around
+    // std.posix.system.getenv bridged to ?[]const u8 via std.mem.span.
+    // A `getEnv("HOME")` source site must surface these substrings so
+    // zig sees the libc-or-syscall-form getenv call at the use site,
+    // NOT an undeclared `getEnv(...)` form.
+    const src = "fun f() {\n    let home: ?str = getEnv(\"HOME\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: { var __env_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.mem.span") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __env_0") != null);
+}
+
+test "codegen: env_counter increments across multiple getEnv calls" {
+    // The per-function env_counter (reset at genFun / genMethod /
+    // genFreeMethod) must step cleanly across sibling getEnv calls
+    // so zig's no-redeclaration rule is satisfied. Mirrors the
+    // argv_get counter pin test above.
+    // The `: ?str` annotation is REQUIRED on both `let a` and
+    // `let b`: zag's grammar rejects bare `let foo = <expr>` for
+    // non-tuple rhs (the parser needs the type slot to dispatch
+    // the zag-side `?str` -> zig-side `?[]const u8` coercion).
+    // Mirrors the explicit annotations on `let home` (test 1
+    // above) and `let x` (test 3 below).
+    const src = "fun f() {\n    let a: ?str = getEnv(\"HOME\");\n    let b: ?str = getEnv(\"PATH\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_1") != null);
+}
+
+test "codegen: getEnv routes through builtin_table (no verbatim fallback)" {
+    // The router catches `getEnv("X")` before the verbatim
+    // `<name>(<args>)` fallback in expr.zig's `.call` arm. A
+    // `let x: ?str = getEnv("HOME")` source must surface
+    // `std.posix.system.getenv` (the shim) but must NOT leave a bare
+    // `= getEnv(` substring in the emitted zig — the router consumed
+    // the call site. A regression that bypasses `builtins.lookup(...)`
+    // would leave the verbatim form intact and zig would reject with
+    // "use of undeclared identifier 'getEnv'".
+    const src = "fun f() {\n    let x: ?str = getEnv(\"HOME\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(\"HOME\")") == null);
+}

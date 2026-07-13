@@ -1,0 +1,28 @@
+## Top-level re-export barrel — `import std` brings the whole surface in.
+##
+## This is a stub: the selective-import form on each line is the
+## canonical zag pattern (see docs/manual/22-modules.md §Imports and
+## §Re-exports). Bare re-exports (`pub use X as Y`) are deferred to a
+## later parser pass — when landed, this file collapses to a one-line
+## `pub use std.string as string` style surface.
+
+pub import std.error.{Error, Context, ErrorExt}
+pub import std.string.{String, Display as StringDisplay}
+pub import std.fmt.{Display, Writer, FmtError}
+pub import std.time.{Duration, Timer}
+pub import std.atomic.{AtomicI32, AtomicI64, AtomicUsize, AtomicBool, Ordering}
+pub import std.bench.{Counters}
+# Phase 1: codegen-router-wired entries. Each selective import here
+# installs one row in src/codegen/builtins.zig's `builtin_table` so the
+# matching bare-name call site (`get()`, `getEnv(...)`, `read_file(...)`)
+# fires the corresponding genBuiltinCall arm. argv/env/fs are split into
+# separate modules so the codegen-router path can be selectively widened
+# without dragging unrelated surface into the gzip-installed executable.
+#
+# Phase 0 entry: `pub import std.argv.{get}` → builtin argv_get (Phase 0 wired).
+# Phase 1 entries:
+#   `pub import std.env.{getEnv}`         → builtin env_var   (Phase 1 wired; emits std.posix.system.getenv).
+#   `pub import std.fs.{read_file}`      → builtin fs_read_file (Phase 1 DEFERRED — emits @panic; see lib/std/fs.zag docblock for why).
+pub import std.argv.{get}
+pub import std.env.{getEnv}
+pub import std.fs.{read_file}

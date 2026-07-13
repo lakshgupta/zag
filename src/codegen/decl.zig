@@ -151,6 +151,13 @@ const Codegen = core.Codegen;
         // at `_0`. Sibling argv_get calls within the same body get
         // distinct names via the per-call step inside genBuiltinCall.
         self.argv_counter = 0;
+        // Phase 1 codegen-router: env_counter reset mirrors the argv
+        // counter pattern so sibling `__env_<N>` temps (one per
+        // env_var / getEnv call site) start fresh at `_0` per fn.
+        // Without this reset, sibling pub fns would reuse the same
+        // `__env_0` name and zig's no-redeclaration rule would reject
+        // a sibling fn body's emit.
+        self.env_counter = 0;
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
         // Trait-bounds guards (docs/16 §3) — mirrors genFun's body
@@ -312,6 +319,10 @@ const Codegen = core.Codegen;
         self.alloc_counter = 0;
         self.match_counter = 0;
         self.argv_counter = 0;
+        // Phase 1 codegen-router: env_counter reset mirrors the argv
+        // counter pattern above so nested methods get a clean
+        // `__env_<N>` sequence starting at `_0`.
+        self.env_counter = 0;
         // Re-populate the per-function type-info map for any locally-
         // declared typed bindings inside the method body so the
         // div-shim predicate (`needsIntDivShim`) gets correct info
@@ -793,6 +804,11 @@ const Codegen = core.Codegen;
         // match) so the router surface stays consistent with the
         // traditional counter-set.
         self.argv_counter = 0;
+        // Phase 1 codegen-router: env_counter reset (mirrors argv_counter
+        // immediately above) so sibling getEnv calls within the same
+        // body produce distinct `__env_<N>` names. Sibling pub fns
+        // start fresh at `_0` thanks to this reset.
+        self.env_counter = 0;
         // Top-level `fun` is parsed for return_type in Phase 2, but
         // `fn_returns_value` is only relevant for impl-block methods
         // where the typed-return drives tail-position match emission.
