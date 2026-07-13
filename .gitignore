@@ -1,0 +1,66 @@
+# ─── Build artifacts (zig 0.16) ──────────────────────────────────────────
+# zig-out/ holds all binaries; zig-cache/ + .zig-cache/ are the stdlib +
+# project build caches. All three are per-machine; never commit.
+zig-out/
+zig-cache/
+.zig-cache/
+
+# ─── Distribution packaging ───────────────────────────────────────────────
+# scripts/package.sh writes dist/<version>/{archives,checksums.txt}.
+# The leading `dist/` excludes the entire subtree (recursive directory
+# pattern), covering both version-named subdirs and any loose file
+# dropped at the dist/ root.
+dist/
+
+# ─── Vendored zig ─────────────────────────────────────────────────────────
+# scripts/install.sh mirrors a resolved zig install into vendor/zig/ on
+# this machine. Per-developer; never commit. If a real zig binary is to
+# be shipped in-tree, add a narrow whitelisting pattern (e.g.
+# !vendor/zig/zig) and override this block per-release.
+vendor/
+
+# ─── Python helpers ──────────────────────────────────────────────────────
+# scripts/ carries helper .py files (codegen_split.py, lexer_split.py,
+# ast_split.py, …) that produce __pycache__/ on first import. Patterns
+# scope globally so .pyc files anywhere in the tree are caught.
+__pycache__/
+*.pyc
+*.pyo
+
+# ─── AI editor / agent state ──────────────────────────────────────────────
+# Local caches from AI assistants living next to the source tree, where
+# the maintainer actually uses one — speculative tool families are not
+# listed. Add a new pattern here only when the corresponding tooling is
+# being adopted by a Zag maintainer.
+.codebuff/
+.claude/
+
+# ─── Editor / IDE ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.fuse_hidden*
+.wakeup
+
+# ─── OS ────────────────────────────────────────────────────────────────────
+# Both case variants for cross-filesystem robustness — Windows NTFS and
+# default macOS APFS/HFS+ are case-insensitive (so `Desktop.ini` and
+# `desktop.ini` resolve the same), but a case-sensitive Linux checkout
+# would treat them as distinct.
+.DS_Store
+Thumbs.db
+thumbs.db
+Desktop.ini
+desktop.ini
+
+# ─── Local env / secrets ─────────────────────────────────────────────────
+# .env / .envrc are imported by some shells (direnv etc.); *.local is the
+# conventional override suffix for "do not commit this variant".
+.env
+.envrc
+*.local
+
+# ─── Loose build outputs ──────────────────────────────────────────────────
+*.out
