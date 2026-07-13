@@ -1,0 +1,37 @@
+## Comments — line, doc, and multi-line doc continuation
+##
+## Run: zag run comments.zag
+##
+## Three comment forms:
+##   #   line comment — ignored by the lexer, runs to end of line
+##   ##  doc comment — captured as Token.doc_comment, emitted as zig `///`
+##
+## A `#` line that follows a `##` line is a doc-comment continuation
+## (it folds into the same doc block). This is how the multi-line
+## doc-comment above (which spans 3 source lines) becomes ONE doc
+## entry on the next zig `pub fn`.
+
+## A doc comment can be attached to any top-level decl. Codegen
+## emits the doc block as zig `///` lines above the matching
+## `pub fn` / `pub const` declaration.
+fun greet() -> []const u8 {
+    # Inline line comment inside a function body — not part of the
+    # doc surface, so codegen does NOT emit it as zig `///`.
+    return "hello";
+}
+
+## A doc block with a `#` (line-comment) continuation line. The
+#  second line is a regular line comment that the parser folds
+#  into the same doc entry. This is how multi-line docs work
+#  when you want to mix `##` and `#` freely.
+fun farewell() -> []const u8 {
+    return "goodbye";
+}
+
+fun main() {
+    # Line comment in main body — purely for the human reader.
+    print(greet());
+    print("\n");
+    print(farewell());
+    print("\n");
+}

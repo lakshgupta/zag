@@ -2733,7 +2733,7 @@ test "codegen: preamble emits exactly once and last preamble precedes last fun d
 // ============================================================
 // Phase 0 codegen-router pin tests (src/codegen/builtins.zig + the
 // .call / .method_call arms in src/codegen/expr.zig + genBuiltinCall
-// helper + per-function argv_counter resets in decl.zig). Each test
+// helper). Each test
 // pins a separate surface so a future regression at one site fails
 // only the relevant test (surgical diagnostic).
 //
@@ -2741,7 +2741,9 @@ test "codegen: preamble emits exactly once and last preamble precedes last fun d
 // (selective-import form `pub import std.argv.{get}` surfaces as a
 // bare `get(...)` call). The first two tests pin the no-op passthrough
 // for non-builtin names; the third pins the full argv_get emit shape
-// (blk wrapper + std.os.argv walk + 32-cap array + __argv_0 temp).
+// (a single reference to the module-level `__zag_argv` global — the
+// per-call blk wrapper + std.os.argv walk + 32-cap array + __argv_<N>
+// temp have been retired alongside the argv_counter field).
 // ============================================================
 
 test "codegen: builtin router preserves non-builtin call verbatim" {
@@ -2817,54 +2819,6 @@ test "codegen: argv_get builtin emits per-call blk + std.os.argv walk" {
     // carry an orelse wrapper.
     try std.testing.expect(std.mem.indexOf(u8, zig, "orelse") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "= get()") == null);
-}
-
-test "codegen: argv_get counter increments across multiple calls in the same body" {
-    // The per-function argv_counter ensures two argv_get calls in the
-    // same body produce distinct __argv_<N> names (zig's no-
-    // redeclaration rule would reject a clash). Confirm the steps
-    // 0 -> 1 across two consecutive call sites.
-    const src = "fun f() {\n    let a: []const []const u8 = get();\n    let b: []const []const u8 = get();\n}\n";
-    var l = lexer_mod.Lexer.init(src);
-    const tokens = l.tokenize();
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-    var cg = codegen_mod.Codegen.init();
-    const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__argv_0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__argv_1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__argv_2") == null);
-}
-
-test "codegen: argv_counter resets across sibling pub fn boundaries" {
-    // Sibling pub fn bodies each start fresh at __argv_0 (the
-    // per-function counter resets in genFun entrance). Without the
-    // reset, two sibling fns using argv_get would share same-names
-    // and zig's module-level redecl-check would reject the
-    // collision (the temps are nested inside per-fn blk scopes so
-    // this only manifests if the temps escape to module scope, but
-    // the reset is the documented contract).
-    const src =
-        \\fun g() {
-        \\    let x: []const []const u8 = get();
-        \\}
-        \\fun h() {
-        \\    let y: []const []const u8 = get();
-        \\}
-        \\
-    ;
-    var l = lexer_mod.Lexer.init(src);
-    const tokens = l.tokenize();
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-    var cg = codegen_mod.Codegen.init();
-    const zig = cg.generate(prog);
-    const argv_0_count = std.mem.count(u8, zig, "__argv_0");
-    const argv_1_count = std.mem.count(u8, zig, "__argv_1");
-    try std.testing.expect(argv_0_count >= 2);
-    try std.testing.expect(argv_1_count <= 1);
 }
 
 // ============================================================

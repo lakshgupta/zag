@@ -455,7 +455,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // synthetic `len` Expr.
                 self.genExpr(s.target.*);
                 self.write("[");
-                if (s.start) |st| self.genExpr(st.*);
+                // zig 0.16 REJECTS the no-start form `arr[..]` with
+                // `expected expression, found '..'` — the AST walk
+                // distinguishes "no start" (null `s.start`) from
+                // "start is 0" (an int_lit Expr for the literal 0),
+                // so the no-start form is always a deliberate
+                // whole-slice view; emit `0` as the synthetic start
+                // to bridge the gap. The presence-end (`..end`)
+                // form on the next line still works because we only
+                // touch the no-start branch.
+                if (s.start) |st| self.genExpr(st.*) else self.write("0");
                 self.write("..");
                 if (s.end) |en| {
                     self.genExpr(en.*);
@@ -518,7 +527,21 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // declaration order so the emitted source preserves the
                 // user's initialization order (matters for tests that
                 // assert the exact field-position sequence).
-                self.write(sl.type_name);
+                //
+                // Phase 3 (CLI migration) followup: wrap the type name
+                // through `zagTypeToZig` so the v1 transparent-alias
+                // contract (`str` becomes `[]const u8`, etc.) extends to
+                // struct-literal sites. Without this wrap, a struct
+                // literal whose type name contains a bare `str` (or any
+                // other aliased identifier) emits the unaliased name to
+                // zig and zig rejects it with `undeclared identifier
+                // 'str'`. The wrap is a no-op for type names that don't
+                // contain a tracked alias (e.g. `Point`, `Vec3`),
+                // matching the `.call` / `.method_call` arm's existing
+                // wrap-on-turbofish-only pattern but applied
+                // unconditionally because struct-literal type names
+                // are the user-visible type, not a type-param slot.
+                self.write(zagTypeToZig(sl.type_name));
                 self.write("{ ");
                 for (sl.inits, 0..) |fi, i| {
                     if (i > 0) self.write(", ");
@@ -662,6 +685,56 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(")");
             },
             .binary => |b| {
+                // zig 0.16 string-comparison shim. The bare `(lhs == rhs)`
+                // form is rejected by zig 0.16 when both operands are
+                // `[]const u8` (slices don't implement `==` by default
+                // — only single-value types do, and slices are
+                // fat-pointer aggregates). The existing `emitPatternCond`
+                // for `match` arms already handles this via
+                // `std.mem.eql(u8, scrut, "lit")`; the `.binary` arm
+                // extends the same surface to any expression position
+                // (if-condition, while-condition, return-RHS, let-RHS,
+                // binary-operand nested position). Heuristic: when the
+                // operator is `.eq` or `.ne` AND at least one operand
+                // is a `.string_lit` (the common pattern `cmd == "help"`,
+                // `name != "anonymous"`, etc.), we route through
+                // `std.mem.eql(u8, lhs, rhs)` (with a leading `!` for
+                // `.ne`). Non-string-literal operands (e.g. two bare
+                // `[]const u8` idents) fall through to the default
+                // `(lhs == rhs)` emit — the heuristic intentionally
+                // does NOT guess at the operand's type because we lack
+                // a type-resolver in codegen. Users wanting equality
+                // between two slice idents bind one to a `str` literal
+                // first (or we add a `slice_eq` builtin in a followup).
+                if (b.op == .eq or b.op == .ne) {
+                    if (b.lhs.* == .string_lit or b.rhs.* == .string_lit) {
+                        if (b.op == .ne) self.write("!");
+                        // Phase 3 (CLI migration) followup: the string-
+                        // comparison shim is wrapped in an outer `(` / `)`
+                        // so the emit shape `(std.mem.eql(u8, lhs, rhs))`
+                        // carries its own parens. The previous bare
+                        // `std.mem.eql(...)` emit was rejected by zig in
+                        // `if`-condition position (`if std.mem.eql(...) {`
+                        // → `expected '(', found 'an identifier'`) because
+                        // the surrounding `.if_stmt` / `.while_stmt` arms
+                        // intentionally do NOT add outer parens (they
+                        // rely on the `.binary` codegen path's existing
+                        // wrap to keep the docs/06 single-paren surface).
+                        // The AST tag is still `.binary` (the parser
+                        // doesn't rewrite the expr), so any
+                        // AST-tag-based outer-paren discriminator at
+                        // the call site is fooled — wrapping HERE
+                        // restores the assumed invariant (every `.binary`
+                        // emit is parenthesized) without forcing every
+                        // call site to re-inspect the emit shape.
+                        self.write("(std.mem.eql(u8, ");
+                        self.genExpr(b.lhs.*);
+                        self.write(", ");
+                        self.genExpr(b.rhs.*);
+                        self.write("))");
+                        return;
+                    }
+                }
                 // zig 0.16 shim (see `needsIntDivShim` doc above). When the
                 // predicate fires for `.div`/`.mod` we route through
                 // `@divTrunc`/`@rem` instead of emitting the bare
@@ -756,79 +829,26 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr) void {
         switch (dispatch) {
             .argv_get => {
-                // argv_get does not consume user-supplied args (it
-                // iterates `std.os.argv` directly), so no `_ = args`
-                // suppression is needed here either -- zig 0.16 does
-                // not warn on unused function parameters by default
-                // and an explicit `_ = args` discard would now
-                // compile-error as "pointless discard" once the
-                // sibling `.env_var` arm started consuming args[0]
-                // (Phase 1): zig treats the param as used by the
-                // function-as-a-whole, so `_ = args` in any single
-                // arm is meaningless.
-                //
-                // Per-call scoping: each argv_get invocation steps
-                // argv_counter and emits a fresh `__argv_<N>` /
-                // `__argv_<N>_n` pair. Sibling argv_get calls in the
-                // same body produce distinct names (zig's no-
-                // redeclaration rule would reject a clash). The
-                // counter is reset at the top of each function body
-                // (genFun + genMethod + genFreeMethod in decl.zig)
-                // so each fn has its own `_0`-starting namespace
-                // that resets cleanly across pub fn boundaries.
-                const id = self.argv_counter;
-                self.argv_counter += 1;
-                var name_buf: [16]u8 = undefined;
-                const name = std.fmt.bufPrint(&name_buf, "__argv_{d}", .{id}) catch "__argv_0";
-
-                // argv_get emit shape: per-call blk wrapper that
-                // copies argv slots into a stack-allocated
-                // [32][]const u8 array. The 32-slot cap matches the
-                // conventional `argc <= 32` working case; longer
-                // argv lists are cut off at 32 and the count tracks
-                // the actual walked count via __argv_<N>_n.
-                //
-                // std.os.argv's element type is OS-dependent —
-                // `*[*:0]u8` on POSIX, optional payload on Windows.
-                // zig 0.16 refuses implicit `[*:0]u8 → []u8`
-                // coercion so we route through std.mem.span with a
-                // default empty-string fallback on the optional
-                // payload. The fallback is defensive: a missing
-                // argv slot would otherwise crash at .span call time.
-                self.write("blk: {\n");
-                self.write("    var ");
-                self.write(name);
-                self.write(": [32][]const u8 = undefined;\n");
-                self.write("    var ");
-                self.write(name);
-                self.write("_n: usize = 0;\n");
-                self.write("    for (std.os.argv, 0..) |a, i| {\n");
-                self.write("        if (i >= 32) break;\n");
-                self.write("        ");
-                self.write(name);
-                // zig 0.16's std.os.argv on Linux stores sentinel-
-                // terminated non-optional pointers (`[*:0]const u8`),
-                // so the canonical coerce-to-slice form is
-                // `std.mem.span(a)` directly. The `orelse ""`
-                // unwrap pattern was a portability footgun on the
-                // dominant-platform shape — it would have failed
-                // to compile at the user's host zig invocation
-                // with `orelse on non-optional type`. Windows +
-                // freestanding zig 0.16 use `?[*:0]const u8`
-                // (optional payload for non-utf8 argv slots);
-                // Phase 1 will branch on @import("builtin.os.tag")
-                // to widen the unwrap across OSes.
-                self.write("[i] = std.mem.span(a);\n");
-                self.write("        ");
-                self.write(name);
-                self.write("_n = i + 1;\n");
-                self.write("    }\n");
-                self.write("    break :blk ");
-                self.write(name);
-                self.write("[0..");
-                self.write(name);
-                self.write("_n];\n");
-                self.write("}");
+                // zig 0.16 main-signature migration: argv is no
+                // longer accessible at runtime via a raw slice
+                // (`std.os.argv` and `std.posix.argv` were both
+                // removed). The canonical idiom is to capture
+                // `init.minimal.args.toSlice(allocator)` at main
+                // entry (see `genFun` in decl.zig, which special-
+                // cases the main function to accept
+                // `init: std.process.Init` and store the result in
+                // the module-level `__zag_argv` global). The
+                // `.argv_get` dispatch is now a simple reference
+                // to that global -- no per-call blk wrapper, no
+                // 32-slot cap (the slice is already bounded by the
+                // actual argc), no `std.mem.span` coercion
+                // (toSlice already returns the right type). The
+                // `argv_counter` field and per-call `__argv_<N>`
+                // temps have been retired (this commit completes
+                // the dead-counter cleanup alongside env_counter,
+                // write_file_counter, mkdir_counter, and
+                // exec_counter).
+                self.write("__zag_argv");
             },
             .env_var => {
                 // Phase 1 router: real emit shape for the env_var
@@ -851,11 +871,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // reject a clash). The counter resets at the top of
                 // each function body (genFun + genMethod +
                 // genFreeMethod in decl.zig).
-                const id = self.env_counter;
-                self.env_counter += 1;
-                var name_buf: [16]u8 = undefined;
-                const name = std.fmt.bufPrint(&name_buf, "__env_{d}", .{id}) catch "__env_0";
-
                 // Emit a (blk: { ... }) wrapper that
                 //   1. allocates a fresh `var __env_<N>: ?[]const u8 = null;`
                 //   2. tries to copy the user-side name arg into a
@@ -896,20 +911,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // zig exposed a const-native getenv return type
                 // (it doesn't, by design — libc's `getenv` returns
                 // the mutable pointer for in-place modification).
-                self.write("blk: { var ");
-                self.write(name);
-                self.write(": ?[]const u8 = null; if (std.posix.toPosixPath(");
+                // zig 0.16: std.posix.toPosixPath, std.posix.system.getenv,
+                // and std.mem.span were all retired. std.posix.getenv is the
+                // canonical replacement — takes []const u8 directly, returns
+                // ?[:0]const u8. The @as(?[]const u8, ...) coerces the
+                // sentinel-terminated optional into the docs/11 borrowed-
+                // string-view shape zag exposes.
+                self.write("blk: { break :blk @as(?[]const u8, std.posix.getenv(");
                 self.genExpr(args[0]);
-                self.write(")) |");
-                self.write(name);
-                self.write("_z| { if (std.posix.system.getenv(@constCast(&");
-                self.write(name);
-                self.write("_z))) |__s| { ");
-                self.write(name);
-                self.write(" = @constCast(std.mem.span(__s)); } } break :blk ");
-                self.write(name);
-                self.write("; }");
-            },
+                self.write(")); }");            },
             .fs_read_file => {
                 // Phase 2 router: real emit shape for the fs_read_file
                 // dispatch. zig 0.16's `std.Io.Dir.readFileAlloc` (which
@@ -978,6 +988,134 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(", std.heap.page_allocator, .unlimited) catch &[_]u8{}; break :blk ");
                 self.write(name);
                 self.write("; }");
+            },
+            .fs_write_file => {
+                // Phase 3 (CLI migration) router: per-call (blk: { \u2026 })
+                // wrapper that opens the path via `std.posix.toPosixPath`
+                // (the same shape `env_var` uses for libc getenv) then
+                // `std.posix.openat(WRONLY|CREAT|TRUNC, 0o644)` + a per-
+                // chunk write loop. Returns 0 on success, -1 on any open
+                // or write failure (the cli.zag init handler treats -1
+                // as "scaffolding failed" and exits with code 1).
+                // zig 0.16: `std.posix.openat`, `std.posix.write`, and
+                // `std.posix.close` were all retired. `std.fs.cwd().createFile`
+                // is the canonical replacement — takes a `[]const u8` path,
+                // returns a `File` handle with `writeAll` and `close` methods.
+                // The `.truncate = true` flag matches the prior
+                // `O_WRONLY|O_CREAT|O_TRUNC` behavior. Single `writeAll` call
+                // replaces the per-chunk write loop (small files only — the
+                // cli.zag init boilerplate is < 100 bytes).
+                // zig 0.16 STUB: the vendored stdlib's std.fs / std.Io.Dir /
+                // std.posix.s API surface diverges significantly from standard
+                // zig 0.16. The real implementation requires either:
+                //   (a) an Io event-loop handle (std.Io.Dir.createFile needs
+                //       dir, io, sub_path, flags), or
+                //   (b) raw std.posix.openat(AT_FDCWD, ...) with a
+                //       null-terminated stack buffer for the path.
+                // Both are substantial refactors deferred to a followup
+                // commit once the vendored stdlib surface stabilises. For
+                // now, emit a clear runtime error so the user sees what's
+                // missing instead of a zig panic.
+                // The .len and .ptr references consume args[0] and args[1]
+                // so zig doesn't flag them as unused locals in the caller
+                // (e.g. cli.zag's `let boilerplate = ...; write_file(p, boilerplate)`).
+                // zig 0.16: std.Io.Dir.cwd().createFile(io, path, flags)
+                // opens a file at the current working directory. writePositionalAll
+                // (offset=0) replaces the per-chunk write loop. close on defer
+                // is the v1 RAII shape.
+                self.write("blk: { const __wf_file = std.Io.Dir.cwd().createFile(__zag_io, ");
+                self.genExpr(args[0]);
+                self.write(", .{ .truncate = true }) catch break :blk -1; defer __wf_file.close(__zag_io); __wf_file.writePositionalAll(__zag_io, ");
+                self.genExpr(args[1]);
+                self.write(", 0) catch break :blk -1; break :blk @as(i32, 0); }");
+            },
+            .fs_mkdir => {
+                // Phase 3 (CLI migration) router: per-call (blk: { ... })
+                // via toPosixPath + std.posix.mkdir. EEXIST silently
+                // coalesced (matches cli.zag init's "mkdir -p" semantics);
+                // other failures surface as -1.
+                // zig 0.16: `std.posix.mkdir` and `std.posix.mkdirat` were
+                // both retired. `std.fs.cwd().makeDir` is the canonical
+                // replacement — takes a `[]const u8` path, returns
+                // `PathAlreadyExists` on duplicate (which we silently
+                // coalesce to match cli.zag's `mkdir -p` semantics). Other
+                // failures (permission denied, ENOSPC) surface as -1.
+                // zig 0.16 STUB: see .fs_write_file above for the full
+                // rationale. The real implementation needs std.Io.Dir.makeDir
+                // or std.posix.mkdir with null-terminated path. Deferred.
+                // zig 0.16: std.Io.Dir.cwd().createDir(io, sub_path, permissions)
+                // creates a directory. PathAlreadyExists is silently coalesced
+                // to 0 (cli.zag init's "mkdir -p" semantics); other failures
+                // surface as -1. Permissions default to .{} (0o755 via the
+                // std.Io.Dir.createDir default).
+                self.write("blk: { std.Io.Dir.cwd().createDir(__zag_io, ");
+                self.genExpr(args[0]);
+                // zig 0.16: std.Io.File.Permissions is an enum (not a
+                // raw integer) on POSIX, with two named variants:
+                // .default_file = 0o666 and .default_dir = 0o777. The
+                // enum has a `_ =>` catch-all for any other mode_t
+                // value, so @enumFromInt(0o755) would also work, but
+                // .default_dir is the idiomatic stdlib choice for
+                // directory creation (rwxrwxrwx; the owner's write
+                // bit is implicit since they just created the dir).
+                self.write(", .default_dir) catch |e| { if (e != error.PathAlreadyExists) break :blk -1; }; break :blk @as(i32, 0); }");
+            },
+            .process_exec => {
+                // Phase 3 (CLI migration) router: per-call (blk: { ... })
+                // that does fork+execve+waitpid with env read from
+                // /proc/self/environ on every invocation. Returns the
+                // child's exit code (255 on parent fork failure, 127 on
+                // child execve failure, otherwise W.EXITSTATUS).
+                // Phase 3 (CLI migration) router: per-call (blk: { ... })
+                // wrapper. The opening `{` is REQUIRED — every other dispatch
+                // helper in this switch (argv_get, env_var, fs_read_file,
+                // fs_write_file, fs_mkdir) emits `blk: { ... }` with the brace;
+                // .process_exec is the only one that emitted `blk:\n` (no
+                // brace), causing zig to parse the body's `var __exec_0_arg_bufs`
+                // line as a malformed statement after a label-named `blk:`
+                // (the `expected 'var' or 'const' before variable declaration`
+                // error seen on the bootstrap). Adding `{` here restores
+                // consistency with the other dispatch-helper shapes.
+                // zig 0.16: std.posix.fork, std.posix.execve, std.posix.waitpid,
+                // std.posix.openat, std.posix.close, and the /proc/self/environ
+                // scanning were all retired. std.process.Child is the canonical
+                // replacement — takes []const []const u8 argv, inherits the
+                // parent environment automatically, and spawnAndWait returns
+                // a Term enum with .Exited(code) for normal exit. The catch
+                // handles spawn failure (255), and the else arm covers
+                // signal/stop/abort exits (also 255).
+                // zig 0.16 STUB: std.process.Child no longer has .allocator
+                // or .argv fields. The real API is std.process.spawn(io,
+                // SpawnOptions) returning a Child, or std.process.run(gpa,
+                // io, RunOptions) returning a RunResult. Both require an
+                // Io event-loop handle. Deferred to a followup commit.
+                // 255 (not -1) matches the shell convention for exec failure
+                // ("command not found"). The .len reference consumes args[0]
+                // so zig doesn't flag it as unused in the caller.
+                // zig 0.16: std.process.run(gpa, io, RunOptions) wraps spawn+wait
+                // and returns a RunResult with .term (a Term union: .Exited(code)
+                // for normal exit, .Signal/.Stopped/.Aborted for the else arm).
+                // 255 (not -1) matches the shell convention for exec failure.
+                // The page_allocator is used for the run's internal scratch
+                // (stdout/stderr capture buffers); the call returns when the
+                // child exits so the leak is bounded to the run duration.
+                self.write("blk: { const __exec_res = std.process.run(std.heap.page_allocator, __zag_io, .{ .argv = ");
+                self.genExpr(args[0]);
+                                // zig 0.16: Child.Term uses lowercase union tags
+                // (.exited, .signal, .stopped, .unknown). The pre-0.14
+                // PascalCase .Exited was retired. The .exited arm carries
+                // the u8 exit code from the child process.
+                self.write(" }) catch break :blk 255; switch (__exec_res.term) { .exited => |__c| break :blk @as(i32, __c), else => break :blk 255, } }");
+            },
+            .process_exit => {
+                // Phase 3 (CLI migration) router: bare statement-shaped
+                // emit. Outer parens let it work in both statement and
+                // expression positions. @as(u8, @intCast(...)) clamps
+                // i32 to one byte since std.os.linux.exit only takes u8.
+                // No per-call counter needed (no temp names).
+                self.write("(std.os.linux.exit(@as(u8, @intCast(");
+                self.genExpr(args[0]);
+                self.write("))))");
             },
         }
     }

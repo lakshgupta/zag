@@ -67,12 +67,6 @@ pub const Codegen = struct {
     /// Per-function counter for argv-slice temps emitted by the
     /// `argv_get` builtin route (Phase 0 codegen router). Reset to 0
     /// by `genFun` so each `pub fn` body has its own `__argv_<N>` /
-    /// `__argv_<N>_n` sequence. Mirrors the existing per-function
-    /// counters (destruct, alloc, match) so multiple argv_get
-    /// calls in the same body produce distinct brick-temp names
-    /// without zig's no-redeclaration rule. The counter steps ONLY
-    /// on the argv_get dispatch path.
-    argv_counter: u32,
     /// Per-function counter for the env-result scratch variable
     /// emitted by the `env_var` builtin route (Phase 1 codegen
     /// router). Reset to 0 by `genFun` / `genMethod` /
@@ -80,7 +74,6 @@ pub const Codegen = struct {
     /// sequence. Two getEnv calls in the same body produce
     /// `__env_0` and `__env_1` so zig's no-redeclaration rule is
     /// satisfied. The counter steps ONLY on the env_var dispatch path.
-    env_counter: u32,
     /// Per-function counter for the fs-read scratch variable emitted
     /// by the `fs_read_file` builtin route (Phase 2 codegen router).
     /// Reset to 0 by `genFun` / `genMethod` / `genFreeMethod` so
@@ -89,6 +82,29 @@ pub const Codegen = struct {
     /// `__fs_1` so zig's no-redeclaration rule is satisfied. The
     /// counter steps ONLY on the fs_read_file dispatch path.
     fs_counter: u32,
+    /// Per-function counter for the fs-write scratch namespace
+    /// emitted by the `fs_write_file` builtin route (Phase 3 CLI
+    /// migration). Reset to 0 by `genFun` / `genMethod` /
+    /// `genFreeMethod` so each `pub fn` body has its own `__wf_<N>_*`
+    /// sequence. Two write_file calls in the same body produce
+    /// `__wf_0_*` and `__wf_1_*` so zig's no-redeclaration rule is
+    /// satisfied across the per-call (fd, byte-count, ...) namespace.
+    /// The counter steps ONLY on the fs_write_file dispatch path.
+    /// Per-function counter for the mkdir scratch emitted by the
+    /// `fs_mkdir` builtin route (Phase 3 CLI migration). Reset to 0
+    /// by `genFun` / `genMethod` / `genFreeMethod` so each fn body
+    /// has its own `__mk_<N>_z` slot. Two mkdir calls in the same
+    /// body produce `__mk_0_z` and `__mk_1_z` so zig's
+    /// no-redeclaration rule is satisfied across the toPosixPath
+    /// scratch variable.
+    /// Per-function counter for the exec scratch namespace emitted
+    /// by the `process_exec` builtin route (Phase 3 CLI migration).
+    /// Reset to 0 by `genFun` / `genMethod` / `genFreeMethod` so
+    /// each fn body has its own `__exec_<N>_*` sequence. The
+    /// execution shape stacks several local vars per call
+    /// (arg_bufs, argv_z, env_buf, envp_z, pid, status) so a
+    /// fresh namespace per call avoids zig's no-redeclaration
+    /// rejection on sibling `exec` calls.
     /// Per-function flag: true when the currently-walked function body
     /// has a non-void return type (only relevant for impl-block methods
     /// because top-level `pub fun` declarations ALWAYS emit
@@ -173,21 +189,28 @@ pub const Codegen = struct {
             .type_info_count = 0,
             .alloc_counter = 0,
             .match_counter = 0,
-            // Phase 0 argv-slice counter starts at 0; each
-            // `argv_get` builtin emit steps it and emits a fresh
-            // `__argv_<N>` / `__argv_<N>_n` pair.
-            .argv_counter = 0,
             // Phase 1 env-result counter starts at 0; each
             // `getEnv` builtin emit steps it and emits a fresh
             // `__env_<N>` scratch used to bridge
             // `std.posix.system.getenv`'s `?[*:0]u8` surface to the
             // zag-side `?[]const u8` shape via `std.mem.span`.
-            .env_counter = 0,
             // Phase 2 fs-read counter starts at 0; each `read_file`
             // builtin emit steps it and emits a fresh `__fs_<N>`
             // scratch holding the `[]u8` return from
             // `std.Io.Dir.readFileAlloc`. Mirrors env_counter shape.
             .fs_counter = 0,
+            // Phase 3 (CLI migration): write_file / mkdir / exec
+            // counters start at 0; each fs_write_file emit steps
+            // write_file_counter and emits a fresh `__wf_<N>_*`
+            // namespace (fd + byte-count); each fs_mkdir emit steps
+            // mkdir_counter and emits a fresh `__mk_<N>_z` scratch;
+            // each process_exec emit steps exec_counter and emits a
+            // fresh `__exec_<N>_*` namespace. Mirrors the existing
+            // per-fn-counter shape so multiple sibling calls in the
+            // same body produce distinct brick-temp names without
+            // zig's no-redeclaration rule. process_exit doesn't
+            // need a counter — its emit is a single inline
+            // `(std.os.linux.exit(...))` statement with no temp names.
             .fn_returns_value = false,
             // Phase 3 trait-cast: the tracked trait-name set starts
             // empty; generate() populates from prog.traits before any
@@ -221,6 +244,35 @@ pub const Codegen = struct {
             \\// `print` interpolation which uses the per-call `.debug_print` ctx).
             \\// The `__zag_` prefix reserves the name against user identifiers.
             \\var __zag_interp_buf: [4096]u8 = undefined;
+            \\
+            // Module-level argv snapshot (zig 0.16 migration). The
+            // new zig 0.16 main signature is `pub fn main(init:
+            // std.process.Init) !void`; argv is only available via
+            // `init.minimal.args.toSlice(allocator)` at main entry.
+            // Since zag's codegen doesn't thread `init` through every
+            // function that might call `get()` (the argv accessor
+            // builtin), we capture the args into this module-level
+            // global at main entry and have `.argv_get` dispatch
+            // return it directly. The arena-allocator-backed slice
+            // lives for the process lifetime, so no manual cleanup
+            // is needed. Type is `[]const []const u8` (slice of
+            // string slices) matching the `.argv_get` codegen's
+            // per-call array element type; `toSlice` returns
+            // `[]const [:0]const u8` (sentinel-terminated) which
+            // implicitly coerces to `[]const []const u8` on store.
+            // Declared as `var` (not `const`) because it's
+            // reassigned at main entry; the `__zag_` prefix reserves
+            // the name against user identifiers.
+            \\var __zag_argv: []const []const u8 = &[_][]const u8{};
+            \\
+            // zig 0.16: the std.Io event-loop handle is now the canonical
+            // way to do file/process operations. Store it at main entry
+            // (see genFun's is_main special-case in decl.zig) so the
+            // .fs_write_file / .fs_mkdir / .process_exec dispatches can
+            // pass it to std.Io.Dir.cwd().createFile(io, ...) etc.
+            // without a per-call io parameter. The `var` is needed
+            // because it's assigned at runtime from init.io.
+            \\var __zag_io: std.Io = undefined;
             \\
         );
 

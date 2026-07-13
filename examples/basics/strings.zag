@@ -1,0 +1,46 @@
+## Strings — interpolation, width spec, and byte strings
+##
+## Run: zag run strings.zag
+##
+## Covers docs/manual/11-strings.md:
+##   "hello, {name}!\n"          plain interpolation
+##   "n = |{n:5}|\n"             width spec (right-aligned, width 5)
+##   b"raw bytes"                byte string (u8 slice, not UTF-8)
+##
+## NOTE: the `looksLikeTemplateLiteral` gate (src/parser/primary.zig)
+## currently accepts only alphanumerics, `_`, and `:` inside `{...}`.
+## Patterns that REJECT and fall through to a plain string literal
+## (which zig then rejects at format-string-parse time):
+##   - float precision dots:      {pi:.5}    — the `.` fails the gate
+##   - expression operators:       {a + b}    — spaces and `+` fail
+##   - expression method calls:    {obj.f()}  — `.` and `(` fail
+## These compile to invalid zig (e.g. `std.debug.print("{pi:.5}\n", .{})`
+## where zig sees an unrecognised named placeholder). A lexer widening
+## to accept matching-brace contents is the fix; for now the patterns
+## above are the working subset. Plain `{ident}` and `{ident:N}` width
+## both compile cleanly to zig `{any}` and `{any:N}` respectively.
+
+fun main() {
+    # Plain interpolation: `{expr}` placeholders are evaluated and
+    # spliced into the output. The placeholder accepts a single
+    # identifier (multi-token expressions with operators/dots are
+    # pending the lexer widening — see the NOTE above).
+    let name: []const u8 = "Zag";
+    print("hello, {name}!\n");
+
+    # Width spec: `{ident:N}` right-aligns the expression in a field
+    # of width N. Useful for tabular output where columns line up.
+    # Codegen emits zig `{any:N}` which std.debug.print accepts (the
+    # width form is valid; only the precision-with-dot form fails).
+    let n: i32 = 42;
+    print("n = |{n:5}|\n");
+    let m: i32 = 7;
+    print("m = |{m:5}|\n");
+
+    # Byte string: a `b"..."` literal is a `[]const u8` (raw bytes),
+    # not a heap-allocated String. Useful for binary protocols,
+    # syscall argv, and zero-overhead byte slices.
+    print("byte string: ");
+    print(b"hello");
+    print("\n");
+}

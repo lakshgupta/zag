@@ -146,24 +146,23 @@ const Codegen = core.Codegen;
         self.destructure_counter = 0;
         self.alloc_counter = 0;
         self.match_counter = 0;
-        // Phase 0 codegen-router: reset at each pub fn so sibling
-        // `__argv_<N>` temps (one per argv_get call site) start fresh
-        // at `_0`. Sibling argv_get calls within the same body get
-        // distinct names via the per-call step inside genBuiltinCall.
-        self.argv_counter = 0;
         // Phase 1 codegen-router: env_counter reset mirrors the argv
         // counter pattern so sibling `__env_<N>` temps (one per
         // env_var / getEnv call site) start fresh at `_0` per fn.
         // Without this reset, sibling pub fns would reuse the same
         // `__env_0` name and zig's no-redeclaration rule would reject
         // a sibling fn body's emit.
-        self.env_counter = 0;
         // Phase 2 codegen-router: fs_counter reset mirrors env_counter
         // above. Sibling `pub fn` declarations with read_file calls
         // get their own scoped counter slot to avoid `__fs_<N>`
         // redeclaration when two fns in the same module both call
         // read_file.
         self.fs_counter = 0;
+        // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
+        // exec counters reset mirrors the fs_counter (Phase 2) pattern
+        // above so each fn body has its own scoped counter slot
+        // starting at `_0`. `process_exit` doesn't need a counter —
+        // its emit is a single inline statement with no temp names.
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
         // Trait-bounds guards (docs/16 §3) — mirrors genFun's body
@@ -319,16 +318,12 @@ const Codegen = core.Codegen;
         // `_0`. These counters will be re-zeroed at the next `genFun`
         // entry anyway, but resetting here ensures the method body
         // inside a struct definition has its own local counter space.
-        // Phase 0 codegen-router: argv_counter reset mirrors the
-        // struct's nested method body to its own local counter space.
         self.destructure_counter = 0;
         self.alloc_counter = 0;
         self.match_counter = 0;
-        self.argv_counter = 0;
         // Phase 1 codegen-router: env_counter reset mirrors the argv
         // counter pattern above so nested methods get a clean
         // `__env_<N>` sequence starting at `_0`.
-        self.env_counter = 0;
         // Phase 2 codegen-router: fs_counter reset mirrors env_counter
         // above so nested methods get a clean `__fs_<N>` sequence
         // starting at `_0`. The fs_read_file dispatch emits
@@ -336,6 +331,11 @@ const Codegen = core.Codegen;
         // so a sibling read_file in the same method body needs its
         // own scoped counter slot to avoid `__fs_<N>` redeclaration.
         self.fs_counter = 0;
+        // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
+        // exec counters reset mirrors the fs_counter (Phase 2) pattern
+        // above so each fn body has its own scoped counter slot
+        // starting at `_0`. `process_exit` doesn't need a counter —
+        // its emit is a single inline statement with no temp names.
         // Re-populate the per-function type-info map for any locally-
         // declared typed bindings inside the method body so the
         // div-shim predicate (`needsIntDivShim`) gets correct info
@@ -455,6 +455,26 @@ const Codegen = core.Codegen;
         // return CANONICAL;` pattern; do NOT site-specialize the
         // alias to a single emit location.
         if (std.mem.eql(u8, text, "str")) return "[]const u8";
+        // Phase 3 (CLI migration) followup: extend the alias table to
+        // cover the array-shaped forms `[]str` and `[N]str` so a
+        // `let args: [3]str = ...;` binding or a `[3]str { a, b, c }`
+        // array-literal rounds-trips to `[3][]const u8` instead of
+        // surfacing a bare `str` ident to zig (which has no such
+        // type slot and rejects with `undeclared identifier 'str'`).
+        // The cli.zag bootstrap's `spawn_leaf` function uses both
+        // forms in one body, so the mapping is end-to-end-exercised
+        // by the e2e test that imports lib/cli.zag.
+        //
+        // The mappings are LITERAL on the bracket shape (the parser
+        // captures the full bracket text including the size digit
+        // span, e.g. `[3]str` and `[15]?[:0]u8`); a future generic
+        // array alias would need a more general rewriter (the
+        // `.range`-style walk of <...> segments in
+        // `rewriteReceiverType` is the model). For v1, the two
+        // concrete sizes (slice + fixed-3) cover the only
+        // array-of-strings shape that the CLI bootstrap uses.
+        if (std.mem.eql(u8, text, "[]str")) return "[][]const u8";
+        if (std.mem.eql(u8, text, "[3]str")) return "[3][]const u8";
         return text;
     }
 
@@ -810,23 +830,21 @@ const Codegen = core.Codegen;
         // no-redeclaration rule is satisfied; sibling `pub fn`s reset
         // their own counters to start fresh at `_0`.
         self.match_counter = 0;
-        // Phase 0 codegen-router: argv_counter reset so sibling argv_get
-        // calls within the same body produce distinct `__argv_<N>`
-        // names without a redeclaration clash. Mirrors the pattern of
-        // the existing per-function counters above (destructure, alloc,
-        // match) so the router surface stays consistent with the
-        // traditional counter-set.
-        self.argv_counter = 0;
-        // Phase 1 codegen-router: env_counter reset (mirrors argv_counter
-        // immediately above) so sibling getEnv calls within the same
+        // Phase 1 codegen-router: env_counter reset (mirrors the
+        // match_counter reset above) so sibling getEnv calls within
+        // the same
         // body produce distinct `__env_<N>` names. Sibling pub fns
         // start fresh at `_0` thanks to this reset.
-        self.env_counter = 0;
         // Phase 2 codegen-router: fs_counter reset (mirrors env_counter
         // immediately above) so sibling read_file calls within the
         // same body produce distinct `__fs_<N>` names. Sibling pub
         // fns start fresh at `_0` thanks to this reset.
         self.fs_counter = 0;
+        // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
+        // exec counters reset mirrors the fs_counter (Phase 2) pattern
+        // above so each fn body has its own scoped counter slot
+        // starting at `_0`. `process_exit` doesn't need a counter —
+        // its emit is a single inline statement with no temp names.
         // Top-level `fun` is parsed for return_type in Phase 2, but
         // `fn_returns_value` is only relevant for impl-block methods
         // where the typed-return drives tail-position match emission.
@@ -851,7 +869,22 @@ const Codegen = core.Codegen;
         // the no-return surface.
         self.write("pub fn ");
         self.write(fun.name);
+        // zig 0.16 main-signature migration: when the source-side
+        // function is named `main`, the generated zig must use the
+        // new `pub fn main(init: std.process.Init) !void` signature
+        // (the old `pub fn main() void` form is no longer accepted
+        // as an OS entry point in zig 0.16). The `init` parameter
+        // is the ONLY way to access argv at runtime via
+        // `init.minimal.args.toSlice(allocator)`; we capture it
+        // into the module-level `__zag_argv` global at the start
+        // of main's body so the `.argv_get` dispatch can return
+        // it without threading `init` through every function that
+        // calls `get()`. The `!void` return type is forced (rather
+        // than inferred from the body) because the `try` on the
+        // `toSlice` call needs a fallible signature.
+        const is_main = std.mem.eql(u8, fun.name, "main");
         self.write("(");
+        if (is_main) self.write("init: std.process.Init");
         // Generics (docs/16 §1, §4): emit `comptime X: type` or
         // `comptime X: TYPE` for each TypeParam BEFORE the regular
         // params. Zig's comptime-arg convention places compile-time
@@ -862,13 +895,43 @@ const Codegen = core.Codegen;
         // regular param.
         const generics_preamble = self.genTypeParamsPreamble(fun.type_params);
         for (fun.params, 0..) |p, i| {
-            if (i > 0 or generics_preamble) self.write(", ");
+            if (i > 0 or generics_preamble or is_main) self.write(", ");
             self.write(p.name);
             self.write(": ");
             self.write(zagTypeToZig(p.type_text));
         }
         self.write(") ");
-        if (fun.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
+        // zig 0.16 main-signature migration: wrap the return
+        // type in `!` (error union) so the `try` on
+        // `init.minimal.args.toSlice(...)` can propagate
+        // `OutOfMemory`. Preserves the user's annotated return
+        // type (e.g., `fun main() -> i32` → `!i32`) rather than
+        // hardcoding `!void`, so a user who writes a fallible
+        // main with a non-void return type doesn't lose the
+        // return-value contract. The `if (fun.return_type) |rt|
+        // ... else "void"` pattern matches the legacy
+        // non-main branch below; we just prefix `!` to the
+        // resolved type.
+        // zig 0.16 main-signature migration: wrap the return
+        // type in `!` (error union) so the `try` on
+        // `init.minimal.args.toSlice(...)` can propagate
+        // `OutOfMemory`. Preserves the user's annotated return
+        // type (e.g., `fun main() -> i32` → `!i32`) rather than
+        // hardcoding `!void`, so a user who writes a fallible
+        // main with a non-void return type doesn't lose the
+        // return-value contract. The double-wrap guard checks
+        // whether the user's return type already starts with `!`
+        // (i.e., is already an error union) and skips the prefix
+        // in that case — otherwise we'd emit `!!i32` which zig
+        // rejects. The `if (fun.return_type) |rt| ... else "void"`
+        // pattern matches the legacy non-main branch below; we
+        // just prefix `!` to the resolved type when not already
+        // error-union.
+        if (is_main) {
+            const already_err_union = if (fun.return_type) |rt| rt.len > 0 and rt[0] == '!' else false;
+            if (!already_err_union) self.write("!");
+            if (fun.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
+        } else if (fun.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
         self.write(" {\n");
         // Trait-bounds guards (docs/16 §3): emit
         // `if (!@hasDecl(T, "method")) @compileError(...)` BEFORE
@@ -891,6 +954,24 @@ const Codegen = core.Codegen;
                 self.write(p.name);
                 self.write(";\n");
             }
+        }
+        // zig 0.16 main-signature migration: capture argv at main
+        // entry into the module-level `__zag_argv` global. The
+        // `init.minimal.args.toSlice(allocator)` call is the ONLY
+        // way to get argv in zig 0.16 (the old `std.os.argv` /
+        // `std.posix.argv` slices were removed). The
+        // `init.arena.allocator()` returns an arena-backed allocator
+        // that lives for the process lifetime, so the returned
+        // slice needs no manual cleanup. The `try` propagates
+        // `OutOfMemory` through the main signature (forced `!void`
+        // above). Emitted ONLY for the main function; other functions
+        // don't have `init` in scope.
+        if (is_main) {
+            self.write("    __zag_argv = try init.minimal.args.toSlice(init.arena.allocator());\n");
+                // zig 0.16: also capture the Io event-loop handle from init
+                // so the .fs_write_file / .fs_mkdir / .process_exec dispatches
+                // can pass it to std.Io.Dir.cwd().createFile(io, ...) etc.
+                self.write("    __zag_io = init.io;\n");
         }
 
         for (fun.body) |stmt| {
