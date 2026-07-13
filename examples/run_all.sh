@@ -176,7 +176,21 @@ find_zag_binary() {
         echo -e "  ${YELLOW}⚠${NC} ZAG_BIN='${ZAG_BIN}' is not executable — auto-detecting instead" >&2
     fi
 
-    # 2. Auto-detect from zig-out/bin/ (built binary for this platform)
+    # 2. Auto-detect the canonical local build: `zig build` produces
+    #    `${PROJECT_ROOT}/zig-out/bin/zag` directly. Check this BEFORE
+    #    the platform-renamed copy (next step) and the PATH fallback
+    #    (last step) so a fresh `zig build` (without run_all.sh's
+    #    `--build` flag, which only places the platform-renamed copy)
+    #    still resolves to the canonical local artifact — this fixes
+    #    the stale-PATH-install blind spot where `which zag` returned
+    #    an old binary ahead of an up-to-date local build.
+    local local_build="${PROJECT_ROOT}/zig-out/bin/zag"
+    if [ -x "$local_build" ]; then
+        echo "$local_build"
+        return 0
+    fi
+
+    # 3. Auto-detect from zig-out/bin/ (built binary for this platform)
     read -r OS ARCH SUFFIX <<< "$(detect_platform)"
     local packaged="${PROJECT_ROOT}/zig-out/bin/zag-${OS}-${ARCH}${SUFFIX}"
     if [ -x "$packaged" ]; then
