@@ -45,9 +45,20 @@ test "codegen: hello world" {
     var cg = codegen_mod.Codegen.init();
     const zig_src = cg.generate(prog);
 
+    // Structural pins (existing): main emitted with zig 0.16's
+    // `init: std.process.Init` signature, and the print call routed
+    // through zig's `std.debug.print`.
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "pub fn main(") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "std.process.Init") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "std.debug.print") != null);
+    // Content pin (tightening): the LITERAL `"hello, world\n"` substring
+    // (with `\`+`n` as two chars, NOT a LF byte) reaches codegen verbatim.
+    // Catches a future regression that mangles string-literal contents
+    // even though the print call SETUP would still satisfy the
+    // structural pins above. Mirrors the established
+    // `template preserves LF byte in literal via \n escape` test
+    // (same substring-escape discipline) one section below.
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "\"hello, world\\n\"") != null);
 }
 
 test "codegen: doc comment emitted as zig ///" {
@@ -63,6 +74,89 @@ test "codegen: doc comment emitted as zig ///" {
     const zig_src = cg.generate(prog);
 
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "/// adds a and b") != null);
+}
+
+test "codegen: doc comment emitted as zig /// on struct" {
+    // Pin the parser-threaded StructDecl.doc → codegen genDocComment
+    // path. The manual's example (## A 3D vector. struct Vec3 {...})
+    // requires this round-trip; pre-fix the parser explicitly discarded
+    // the doc accumulator at src/parser/core.zig:113.
+    const src =
+        \\## A 3D vector.
+        \\struct Vec3 {
+        \\    x: f64,
+        \\    y: f64,
+        \\    z: f64,
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+
+    var cg = codegen_mod.Codegen.init();
+    const zig_src = cg.generate(prog);
+
+    // Emit pin: the literal `/// A 3D vector.` line must surface in
+    // the zig output. Matches the existing fun test's positive
+    // substring pin discipline.
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "/// A 3D vector.") != null);
+    // AST pin: confirms the parser threaded the captured doc into
+    // StructDecl.doc (caught-future regression: parser drops it again).
+    try std.testing.expect(prog.structs.len == 1);
+    try std.testing.expect(prog.structs[0].doc != null);
+    try std.testing.expect(std.mem.indexOf(u8, prog.structs[0].doc.?, "A 3D vector.") != null);
+}
+
+test "codegen: doc comment emitted as zig /// on enum" {
+    // Pin the parser-threaded EnumDecl.doc → codegen genDocComment
+    // path. Mirrors the struct test on the sibling enum branch.
+    const src = "## Cardinal directions.\nenum Dir { North, South }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+
+    var cg = codegen_mod.Codegen.init();
+    const zig_src = cg.generate(prog);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "/// Cardinal directions.") != null);
+    try std.testing.expect(prog.enums.len == 1);
+    try std.testing.expect(prog.enums[0].doc != null);
+    try std.testing.expect(std.mem.indexOf(u8, prog.enums[0].doc.?, "Cardinal directions.") != null);
+}
+
+test "codegen: doc comment emitted as zig /// on trait" {
+    // Pin the parser-threaded TraitDecl.doc → codegen genDocComment
+    // path. Mirrors the struct/enum tests on the trait branch. Uses
+    // `*Self` as a type text — the existing codegen rewrite
+    // (`rewriteSelfToT`) substitutes `Self`→`T` for trait dispatch,
+    // and parseMethodParam's collectCastType captures `*Self`
+    // verbatim in the `type_text` slice.
+    const src =
+        \\## Something drawable.
+        \\trait Drawable { fun draw(self: *Self); }
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+
+    var cg = codegen_mod.Codegen.init();
+    const zig_src = cg.generate(prog);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "/// Something drawable.") != null);
+    try std.testing.expect(prog.traits.len == 1);
+    try std.testing.expect(prog.traits[0].doc != null);
+    try std.testing.expect(std.mem.indexOf(u8, prog.traits[0].doc.?, "Something drawable.") != null);
 }
 
 test "codegen: multi-line doc emitted as multiple ///" {

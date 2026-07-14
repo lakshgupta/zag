@@ -72,6 +72,20 @@ distribution and audit each new line against `src/`.
 - [x] Doc comment emitted as zig `/// ` — codegen via
   `src/codegen/stmt.zig:genDocComment`. Pinned by
   "codegen: doc comment emitted as zig ///".
+- [x] Doc comment attached to non-fun decls (struct/enum/trait) —
+  `StructDecl.doc` / `EnumDecl.doc` / `TraitDecl.doc` threaded
+  by `src/parser/core.zig`'s top-level accumulator + emitted
+  via `genDocComment` in `src/codegen/decl.zig`'s `genStructDecl`
+  / `genEnumDecl` / `genTraitDecl` immediately before each
+  container's `pub const NAME = ...` emit. Pinned by
+  `"codegen: doc comment emitted as zig /// on struct"`,
+  `"codegen: doc comment emitted as zig /// on enum"`, and
+  `"codegen: doc comment emitted as zig /// on trait"`.
+  *impl-block doc deferred*: an `impl NAME { ... }` desugars to
+  either nested-in-struct methods (so the doc would attach above
+  the struct, NOT above the impl body) or module-level free fns
+  via `genFreeMethod` (no single zig container to anchor `///`
+  onto). Designing the right ritual here is a followup.
 
 ## 03. Literals ([manual/03-literals.md](../manual/03-literals.md))
 

@@ -185,6 +185,14 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genStructDecl(self: *Codegen, sd: ast.StructDecl, all_impls: []const ast.ImplBlock) void {
+        // Doc (docs/02 §"Doc Comments"): emit `/// ` lines immediately
+        // BEFORE the `pub const NAME = ...` emit so the doc survives
+        // through to the zig container site. Mirrors genFun's
+        // `if (fun.doc) |d| self.genDocComment(d)` call. The parser
+        // has already attached `sd.doc` via StructDecl.doc — null
+        // means no doc, render the bare `pub const NAME = struct {...}`
+        // shape (existing tests pin this path).
+        if (sd.doc) |d| self.genDocComment(d);
         // Generics (§2 Generic Types): when `sd.type_params.len > 0`,
         // emit the thunk form `pub fn NAME(comptime T0: type, ...) type
         // { return struct { … }; }` so call sites `List(i32, ...)`
@@ -558,6 +566,11 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genTraitDecl(self: *Codegen, td: ast.TraitDecl) void {
+        // Doc (docs/02 §"Doc Comments"): emit `/// ` lines BEFORE the
+        // `pub const NAME = struct { ... }` emit (mirrors genStructDecl
+        // and genFun; struct vs trait both surface as named zig
+        // containers).
+        if (td.doc) |d| self.genDocComment(d);
         // Docs/17 §"Definition": `trait NAME { fun draw(self: *Self); ... }`
         // compiles to a zig fat-pointer container holding (data ptr,
         // vtable ptr), an inner VTable struct of function pointers keyed
@@ -714,6 +727,9 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genEnumDecl(self: *Codegen, ed: ast.EnumDecl, all_impls: []const ast.ImplBlock) void {
+        // Doc (docs/02 §"Doc Comments"): emit `/// ` lines BEFORE the
+        // `pub const NAME = ...` emit (mirrors genStructDecl/genFun).
+        if (ed.doc) |d| self.genDocComment(d);
         self.write("pub const ");
         self.write(ed.name);
         self.write(" = ");

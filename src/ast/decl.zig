@@ -127,6 +127,14 @@ pub const StructDecl = struct {
     name: []const u8,
     fields: []const StructField,
     loc: Loc,
+    /// Optional doc comment `## ...` attached BEFORE the decl. Set by
+    /// the parser's top-level accumulator (src/parser/core.zig) when a
+    /// `doc_comment` token precedes the struct keyword; null when the
+    /// source omits a doc. Codegen emits the doc as zig `///` lines via
+    /// `genDocComment` immediately before the `pub const NAME = ...`
+    /// emit. Default-null preserves backward-compat for callers that
+    /// construct StructDecl literals without specifying doc.
+    doc: ?[]const u8 = null,
     /// Generics (docs/16 §"Generic Types"): `<...>` type-parameter
     /// list parsed immediately after the struct name and BEFORE the
     /// opening `{`. Same shape as `FunDecl.type_params`, default-empty
@@ -233,6 +241,10 @@ pub const EnumDecl = struct {
     name: []const u8,
     variants: []const EnumVariant,
     loc: Loc,
+    /// Optional doc comment `## ...` attached BEFORE the decl. See
+    /// `StructDecl.doc` for the parser-threaded semantics. Codegen
+    /// emits `///` lines immediately before `pub const NAME = ...`.
+    doc: ?[]const u8 = null,
 };
 
 /// One variant inside an `enum NAME { ... }`. `payload_type` is `null`
@@ -262,6 +274,10 @@ pub const TraitDecl = struct {
     name: []const u8,
     methods: []const TraitMethodDecl,
     loc: Loc,
+    /// Optional doc comment `## ...` attached BEFORE the decl. See
+    /// `StructDecl.doc` for the parser-threaded semantics. Codegen
+    /// emits `///` lines immediately before `pub const NAME = ...`.
+    doc: ?[]const u8 = null,
 };
 
 /// One method inside a `trait NAME { ... }` block. Phase 1 minimum

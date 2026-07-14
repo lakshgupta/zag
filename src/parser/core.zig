@@ -80,6 +80,7 @@ pub fn parse(self: *Parser) ast.Program {
                     switch (after_pub) {
                         .struct_kw => {
                             structs_buf[struct_count] = self.parseStructDecl();
+                            structs_buf[struct_count].doc = doc;
                             struct_count += 1;
                         },
                         .impl_kw => {
@@ -88,10 +89,12 @@ pub fn parse(self: *Parser) ast.Program {
                         },
                         .enum_kw => {
                             enums_buf[enum_count] = self.parseEnumDecl();
+                            enums_buf[enum_count].doc = doc;
                             enum_count += 1;
                         },
                         .trait_kw => {
                             traits_buf[trait_count] = self.parseTraitDecl();
+                            traits_buf[trait_count].doc = doc;
                             trait_count += 1;
                         },
                         .fun => {
@@ -109,13 +112,14 @@ pub fn parse(self: *Parser) ast.Program {
                 // `expected fun, got 'pub'` diagnostic.
             }
             if (lead == .struct_kw) {
-                // Struct decls at module-scope don't carry a doc slot
-                // (`StructDecl` has no `doc` field) — discarding the
-                // captured doc keeps the top-of-loop accumulator clean
-                // without forcing every decl-kind to accept it.
-                structs_buf[struct_count] = self.parseStructDecl();
-                struct_count += 1;
-                continue;
+            // Struct decls: the captured doc reaches codegen via
+            // `StructDecl.doc`; every decl-kind that emits a single
+            // zig container (`struct`, `enum`, `trait`) carries doc,
+            // matching the FunDecl wiring above.
+            structs_buf[struct_count] = self.parseStructDecl();
+            structs_buf[struct_count].doc = doc;
+            struct_count += 1;
+            continue;
             }
             if (lead == .impl_kw) {
                 // Same rationale as the struct-decl branch — impl blocks
@@ -126,24 +130,27 @@ pub fn parse(self: *Parser) ast.Program {
             }
             if (lead == .enum_kw) {
                 // Top-level enum decl — recorded into `enums` so codegen
-                // emits `pub const NAME = enum { ... };` and consumers
-                // (functions, impls, other top-level decls) reference
-                // the name naturally.
-                enums_buf[enum_count] = self.parseEnumDecl();
-                enum_count += 1;
-                continue;
+            // emits `pub const NAME = enum { ... };` and consumers
+            // (functions, impls, other top-level decls) reference
+            // the name naturally. doc slots through to codegen.
+            enums_buf[enum_count] = self.parseEnumDecl();
+            enums_buf[enum_count].doc = doc;
+            enum_count += 1;
+            continue;
             }
             if (lead == .trait_kw) {
                 // Top-level trait decl (docs/17 §"Definition"). Phase 1
                 // scaffolds the AST/parser surface only; Phase 2 wires
                 // the codegen (vtable struct + dispatch shims). Trait
                 // decls at module scope don't carry a doc slot — same
-                // rationale as the `struct` branch above. Recorded in
-                // source-order alongside structs/enums/impls so codegen
-                // can walk the slice in declaration order at emit time.
-                traits_buf[trait_count] = self.parseTraitDecl();
-                trait_count += 1;
-                continue;
+            // rationale as the `struct` branch above. Recorded in
+            // source-order alongside structs/enums/impls so codegen
+            // can walk the slice in declaration order at emit time.
+            // doc slots through `TraitDecl.doc` to codegen.
+            traits_buf[trait_count] = self.parseTraitDecl();
+            traits_buf[trait_count].doc = doc;
+            trait_count += 1;
+            continue;
             }
             // Module imports (docs/manual/22-modules.md §Imports).
             // Two surface shapes at this dispatch site:
