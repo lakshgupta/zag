@@ -343,8 +343,61 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // and unary LHSes (e.g. `(a + b) as f32`) surface as
                 // `@as(f32, (a + b))` with their internal precedence
                 // bindings intact.
+                //
+                // Float-family carve-out (the bug fix exposed by
+                // examples/types/primitives.zag `pi as f32`): when the
+                // cast target is a float type (`f16`/`f32`/`f64`) AND
+                // the operand is a float-typed `.ident` (verified via
+                // the per-function `type_info_buf` populated by
+                // `collectTypedBindings`), emit zig 0.16's single-arg
+                // `@floatCast(<value>)` form. The target type is
+                // inferred from the enclosing binding's `: T`
+                // annotation (e.g. `let half: f32 = pi as f32;` →
+                // `const half: f32 = @floatCast(pi);`); the literal
+                // f64 rounds to f32 per IEEE 754 with no overflow
+                // error. For ALL other float-target operands (int-lit,
+                // binary/call/member-access RHS, untyped idents, ...)
+                // the legacy `@as(target, value)` form is the safe
+                // default — zig 0.16's `@as` accepts widening cleanly
+                // (`@as(f64, i32_var)` works) and accepts comptime
+                // coercion of `.int_lit` and `.float_lit` operands via
+                // implicit type-resolution. The previous `@as(f32,
+                // f64_var)` rejection only fires for lossy narrowing
+                // from a runtime-float source, which is the precise
+                // case the typed-binding lookup catches. Non-float
+                // targets (`i32`, `*T`, `str`→`[]const u8`, trait
+                // names, ...) keep the legacy `@as(target, value)` path
+                // untouched so the existing `codegen: as cast emits
+                // @as builtin` and trait-cast tests stay byte-stable.
+                //
+                // Known limitation (deferred): narrowing casts whose
+                // RHS is a non-`.ident` expression (e.g.
+                // `(a + b) as f32` where `a + b` is evaluated at
+                // runtime) fall through to `@as(target, value)` and
+                // zig will reject the same way it rejected
+                // `@as(f32, f64_var)`. A fix would require a
+                // recursive operand-type walker; the v1 surface
+                // passes the common ident-RHS shape (which the
+                // user-reported bug exposes) and a followup can
+                // widen to `.binary` / `.call` operands once the
+                // expression-type-resolution infrastructure lands.
+                const target_zig = zagTypeToZig(c.type_text);
+                if (core.isFloatTypeName(target_zig) and c.expr.* == .ident) {
+                    const op_ident = c.expr.*.ident;
+                    if (self.getSourceTypeName(op_ident)) |source_type| {
+                        if (core.isFloatTypeName(source_type)) {
+                            // Single-arg form: zig infers target from
+                            // the enclosing binding's `: T` annotation
+                            // OR the rhs-coercion position.
+                            self.write("@floatCast(");
+                            self.genExpr(c.expr.*);
+                            self.write(")");
+                            return;
+                        }
+                    }
+                }
                 self.write("@as(");
-                self.write(zagTypeToZig(c.type_text));
+                self.write(target_zig);
                 self.write(", ");
                 self.genExpr(c.expr.*);
                 self.write(")");
@@ -1110,13 +1163,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // The page_allocator is used for the run's internal scratch
                 // (stdout/stderr capture buffers); the call returns when the
                 // child exits so the leak is bounded to the run duration.
-                self.write("blk: { const __exec_res = std.process.run(std.heap.page_allocator, __zag_io, .{ .argv = ");
+                self.write("blk: { var __child = std.process.spawn(__zag_io, .{ .argv = ");
                 self.genExpr(args[0]);
-                                // zig 0.16: Child.Term uses lowercase union tags
-                // (.exited, .signal, .stopped, .unknown). The pre-0.14
-                // PascalCase .Exited was retired. The .exited arm carries
-                // the u8 exit code from the child process.
-                self.write(" }) catch break :blk 255; switch (__exec_res.term) { .exited => |__c| break :blk @as(i32, __c), else => break :blk 255, } }");
+                self.write(" }) catch break :blk 255; defer __child.kill(__zag_io); const __term = __child.wait(__zag_io) catch break :blk 255; switch (__term) { .exited => |__c| break :blk @as(i32, __c), else => break :blk 255, } }");
             },
             .process_exit => {
                 // Phase 3 (CLI migration) router: bare statement-shaped

@@ -26,6 +26,18 @@ pub const Lexer = struct {
     col: u32,
     tokens_buf: [4096]Token,
     tokens_len: u32,
+    // v2 char fix path (docs/features.md §08 v2 4-byte Unicode char
+    // row, gap (b)): each bare `\uNNNN` escape is normalized to the
+    // brace form `\u{NNNN}` and the rewritten text stored in a slot
+    // of `char_norm_bufs` rather than slicing into immutable `src`.
+    // Slot indexing is monotonic: token N's text references
+    // `char_norm_bufs[N]`; once that token is added to `tokens_buf`
+    // the slice is stable for the lexer's lifetime. 256 slots cover
+    // any realistic zag source. Bounds: each slot handles up to 16-byte
+    // char literals (the largest form `'\u{FFFFFF}'` is 12 chars; 16 is
+    // double-margin + safety for future-extended escape sequences).
+    char_norm_bufs: [256][16]u8 = undefined,
+    char_norm_count: u32 = 0,
 
     pub fn init(src: []const u8) Lexer {
         return .{

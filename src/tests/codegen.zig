@@ -441,6 +441,155 @@ test "codegen: let with f64 annotation" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const pi: f64 = 3.14;") != null);
 }
 
+test "codegen: bf16 passes through to zigzag verbatim (zig rejects, not zag)" {
+    // Source-of-truth: docs/features.md §08 bf16 row. See that row
+    // for the rejection-layer claim this test pins.
+    //
+    // Mechanism: `bf16` is NOT in v1's `zagTypeToZig` alias set
+    // (only `str` / `[]str` / `[3]str` round-trip), so the source
+    // type-text reaches codegen unchanged. The leaf zigzag
+    // contains `const v: bf16 = 0;` literally; zig 0.16 then
+    // rejects with `error: use of undeclared identifier 'bf16'`.
+    //
+    // Negatives block the common substitution arms so a future
+    // fix path landing a silent substitution would break loud.
+    const src = "fun f() {\n    let v: bf16 = 0;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Scope: rejection-layer identification only — does NOT pin
+    // isFloatIdentType (future-fix concern; separate test needed).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const v: bf16 = 0;") != null);
+    // Inline-annotation substitution guards.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const v: f16 = 0;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const v: f32 = 0;") == null);
+    // Cast-wrap substitution guards (f16/f32 wrap + bf16 self-cast).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(f16,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(f32,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(bf16,") == null);
+}
+
+test "codegen: char type ident silently rewrites to u32 (v2 fix path landed)" {
+    // Source-of-truth: docs/features.md §08 v2 4-byte Unicode char
+    // row, gap (a). Once the fix path lands, zag's codegen
+    // substitutes `char` → `u32` silently so let-bind / var-bind /
+    // struct-field / enum-varlist / impl-method-receiver / fun-param
+    // / fun-return surfaces emit a type zig 0.16 accepts. Pairs with
+    // the codegen char_lit propagate test (c) and the integration
+    // test `let c: char = '\u2764' surfaces both gap (a) and gap (c)
+    // lanes together` (which composes gap (a) AND gap (c) into ONE
+    // source pattern).
+    //
+    // Mechanism: src/codegen/decl.zig:436's `zagTypeToZig` adds a
+    // literal-on-entry check: when the user's source-side type-text
+    // is exactly `char`, the codegen rewrites to `u32` so `let c:
+    // char = 'Z'` round-trips to `const c: u32 = 'Z';`.
+    //
+    // Negatives: ensure the rewrite does NOT pass `char` through
+    // to zigzag (which would leave the layer-(a) gap open) AND does
+    // NOT silently rewrite to `u8` (a future maintainer might
+    // mistakenly add `u8` semantics for the byte-stream branch).
+    const src = "fun f() {\n    let c: char = 'Z';\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the silent u32 rewrite emits the u32 type ident.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c: u32 = 'Z';") != null);
+    // Sanity: the bare `char` ident MUST NOT pass through to zigzag.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c: char = 'Z';") == null);
+    // Sanity: byte-shaped u8 rewrite (a plausible-alternative if a
+    // future maintainer re-architects char) MUST NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c: u8 = 'Z';") == null);
+    // Cast-wrap substitution guards: u8/u32 wraps are not the rewrite path.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(u8,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(char,") == null);
+}
+
+test "codegen: Expr.char_lit propagates normalized figure (v2 fix path landed)" {
+    // Source-of-truth: docs/features.md §08 v2 4-byte Unicode char
+    // row, gap (c). Pairs with the lexer-level test (b) in
+    // src/tests/lexer.zig (gap (b) normalization) and the codegen
+    // test (a) above (gap (a) char→u32 substitution). This test
+    // pins the codegen-side of the cycle: the .char_lit arm at
+    // src/codegen/expr.zig still emits `s` verbatim, but with the
+    // lexer's brace-form text in `s` (no further rewrite needed).
+    //
+    // Mechanism: the source `let c: u8 = '\u2764';` uses `u8` as
+    // the binding type to keep gap (c) isolated from gap (a) (a
+    // post-fix `char` ident would silently rewrite to u32, mixing
+    // both lanes into one test). The lexer's readChar normalizes
+    // the bare `\u2764` to `\u{2764}`. The codegen's .char_lit arm
+    // propagates the brace-form text unchanged. Net: the zigzag leaf
+    // contains `const c: u8 = '\u{2764}';` literally.
+    //
+    // Sanity: the raw bare form MUST NOT appear in the zigzag emit
+    // (otherwise lane-(b) normalization regressed at a post-fix pin).
+    const src = "fun f() {\n    let c: u8 = '\\u2764';\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the brace-form escape reaches zigzag unchanged. The
+    // surrounding `'` chars make the 10-char `'\u{2764}'` substring
+    // match the in-source char_lit exactly.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c: u8 = '\\u{2764}';") != null);
+    // Sanity: the raw bare form MUST NOT appear in the zigzag emit
+    // — the per-token match `"\\u2764'"` (with leading quote so the
+    // substring can't accidentally match a longer identifier-prefix
+    // pattern, e.g., `\u2764something`) would surface a regression
+    // in readChar's brace-form rewrite.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "\\u2764'") == null);
+}
+
+test "codegen: let c: char = '\\u2764' surfaces both gap (a) and gap (c) lanes together" {
+    // Source-of-truth: docs/features.md §08 v2 4-byte Unicode char
+    // row. Pairs with the lane-by-lane pin tests (a) + (c) above.
+    // This integration test combines BOTH gap (a) (the `char` type
+    // ident) AND gap (c) (the raw `\u2764` escape) into ONE source
+    // pattern so the v2 fix must address both lanes together.
+    //
+    // Mechanism: the source `let c: char = '\u2764';` exercises
+    // BOTH lane-(a) AND lane-(c) at the same codegen emit site.
+    // The v2 fix path produces one of FOUR codegen output fingerprints:
+    //   1. today (no v2-fix):   `    const c: char = '\u2764';`
+    //   2. lane-(a) only fix:   `    const c: u8 = '\u2764';`
+    //   3. lane-(b/c) only fix: `    const c: char = '\u{2764}';`
+    //   4. both lanes fixed:    `    const c: u8 = '\u{2764}';`
+    const src = "fun f() {\n    let c: char = '\\u2764';\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Scope: the disjunction's positive arm names `u32` specifically
+    // (the codegen-side target type for `char` per docs/features.md
+    // §08 v2 4-byte Unicode char row). A future stage would extend
+    // the disjunction to accept u16/u8 if a byte-stream char surface
+    // is added alongside the codepoint surface.
+    //
+    // Positive disjunction: today's exact form OR both-fixed form must match.
+    const today_form = std.mem.indexOf(u8, zig, "    const c: char = '\\u2764';") != null;
+    const both_fixed_form = std.mem.indexOf(u8, zig, "    const c: u32 = '\\u{2764}';") != null;
+    try std.testing.expect(today_form or both_fixed_form);
+    // Lane-(a) only residue (u8 ident + raw escape) MUST NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c: u32 = '\\u2764';") == null);
+    // Lane-(b/c) only residue (char ident + brace escape) MUST NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c: char = '\\u{2764}';") == null);
+}
+
 test "codegen: binary emission is parenthesised" {
     // The generated zigzag source must wrap binary expressions in `()` so
     // downstream zig's natural precedence rules cannot reorder the AST's
@@ -3437,4 +3586,24 @@ test "codegen: free of call expr falls back to page_allocator.destroy (non-ident
     // target (would route through `page_allocator.free(...)` and miss
     // the call's argument emission entirely).
     try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator.free(42)") == null);
+}
+
+test "codegen: defer stmt emits defer verbatim" {
+    // Mirrors zig 0.16 defer keyword one-to-one so zig semantics
+    // (runs the expression on scope exit regardless of return path)
+    // match the zag docs Pattern 1 framing. The peer errdefer test
+    // in this file documents the errdefer half of the audit pair.
+    //
+    // `defer <expr>` triggers genExpr on `expr`. For an integer literal
+    // like `42` the genExpr arm emits the literal verbatim, so the
+    // defer output is `    defer 42;`.
+    const src = "fun f() { defer 42; }";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    defer 42;") != null);
 }

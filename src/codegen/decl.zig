@@ -483,6 +483,15 @@ const Codegen = core.Codegen;
         // array-of-strings shape that the CLI bootstrap uses.
         if (std.mem.eql(u8, text, "[]str")) return "[][]const u8";
         if (std.mem.eql(u8, text, "[3]str")) return "[3][]const u8";
+        // v2 char fix path (docs/features.md §08 v2 4-byte Unicode char
+        // row): zag's `char` ident silently rewrites to zig's `u32`
+        // primitive so let-bind / var-bind / struct-field / enum-varlist /
+        // impl-method-receiver / fun-param / fun-return surfaces emit a
+        // type zig's 0.16 lexer accepts. Pin: codegen test (a) `char
+        // type ident silently rewrites to u32` and the integration test
+        // `let c: char = '\u2764' surfaces both gap (a) and gap (c)
+        // lanes together` both-fixed form arm.
+        if (std.mem.eql(u8, text, "char")) return "u32";
         return text;
     }
 

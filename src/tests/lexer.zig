@@ -166,6 +166,37 @@ test "lexer: char literal escape" {
     try std.testing.expectEqualStrings("'\\n'", tokens[0].text);
 }
 
+test "lexer: '\\u2764' char literal normalized to brace form (v2 fix path landed)" {
+    // Source-of-truth: docs/features.md §08 v2 4-byte Unicode char
+    // row, gap (b). Pairs with the codegen-level tests for gaps
+    // (a) + (c) in src/tests/codegen.zig.
+    //
+    // Mechanism: src/lexer/string.zig:64's `readChar` detects the
+    // bare `'\uHHHH'` (8-char slice) escape and rewrites it to the
+    // brace form `'\u{HHHH}'` (10-char slice), writing the rewritten
+    // text into a per-Lexer `char_norm_bufs[slot]` instead of the
+    // immutable source slice. The bracing is purely lexical — no
+    // codepoint decode happens (the bytes `\` `u` `{` `2` `7` `6` `4`
+    // `}` `'` are written verbatim, just with the braces inserted).
+    //
+    // Sanity: BOTH source forms (already-braced and bare) converge
+    // on the same token-text length (10 chars) after normalization,
+    // pins the lexer converging on a canonical brace form rather
+    // than preserving the source shape.
+    const src_bare = "'\\u2764'";                 // source: `'\u2764'` (8-char slice)
+    var l_bare = lexer_mod.Lexer.init(src_bare);
+    const bare_tokens = l_bare.tokenize();
+    try std.testing.expectEqual(lexer_mod.TokenTag.char_literal, bare_tokens[0].tag);
+    try std.testing.expectEqualStrings("'\\u{2764}'", bare_tokens[0].text);
+
+    const src_braced = "'\\u{2764}'";             // source: `'\u{2764}'` (10-char slice)
+    var l_braced = lexer_mod.Lexer.init(src_braced);
+    const braced_tokens = l_braced.tokenize();
+    try std.testing.expectEqual(lexer_mod.TokenTag.char_literal, braced_tokens[0].tag);
+    try std.testing.expectEqualStrings("'\\u{2764}'", braced_tokens[0].text);
+    try std.testing.expectEqual(bare_tokens[0].text.len, braced_tokens[0].text.len);
+}
+
 test "lexer: byte string literal" {
     const src = "b\"hello\"";
     var l = lexer_mod.Lexer.init(src);
