@@ -702,6 +702,66 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(ma.name);
             },
             .method_call => |mc| {
+                // Raw-pointer arithmetic methods (p.add(N) / q.offset(p))
+                // — zig-fallback emit because zig has no .add /
+                // .offset method on `*raw T`. Both forms re-emit the
+                // target expression three times (zig's `@TypeOf` is
+                // compile-time so the re-emission is cached at
+                // comptime). Arity-checked to exactly 1 arg; wrong-
+                // arity call sites fall through to the verbatim emit
+                // so zig reports "no method named 'add'" with high-
+                // quality diagnostics rather than zig's panic-on-
+                // arity in codegen. Codegen doesn't have a type-
+                // resolver so the bytecode is emitted regardless of
+                // whether the target's binding annotation is `*raw T`
+                // — the user's "fall back to Zig" brief is honoured
+                // by letting zigzag's type checker catch non-`*raw T`
+                // accidental uses (zig 0.16 will reject a numeric
+                // stride offset on an owning pointer at type-check).
+                if (mc.args.len == 1) {
+                    if (std.mem.eql(u8, mc.name, "add")) {
+                        // p.add(N) -> @as(@TypeOf(p), @ptrFromInt(@intFromPtr(p) + N * @sizeOf(@typeInfo(@TypeOf(p)).pointer.child)))
+                        // The `@typeInfo(@TypeOf(p)).pointer.child` strip
+                        // is critical: `@sizeOf(@TypeOf(p))` returns the
+                        // POINTER size (8 on 64-bit for `*raw u8`), not
+                        // the POINTE size (1 for u8). Without the strip,
+                        // `p.add(2)` on `p: *raw u8` advances by 16 bytes
+                        // instead of 2. The strip is symmetric on the
+                        // offset branch (the divisor should also be the
+                        // pointee stride).
+                        self.write("@as(@TypeOf(");
+                        self.genExpr(mc.target.*);
+                        self.write("), @ptrFromInt(@intFromPtr(");
+                        self.genExpr(mc.target.*);
+                        self.write(") + ");
+                        self.genExpr(mc.args[0]);
+                        self.write(" * @sizeOf(@typeInfo(@TypeOf(");
+                        self.genExpr(mc.target.*);
+                        self.write(")).pointer.child)))");
+                        return;
+                    }
+                    if (std.mem.eql(u8, mc.name, "offset")) {
+                        // q.offset(p) -> (@intFromPtr(q) - @intFromPtr(p)) / @sizeOf(@typeInfo(@TypeOf(q)).pointer.child)
+                        // Pointee-stride divisor (see `.add` comment for
+                        // the `@typeInfo` strip rationale).
+                        // Paren balance: 6 opens (outer `(`, two
+                        // `@intFromPtr(`, `@sizeOf(`, `@typeInfo(`,
+                        // `@TypeOf(`) and 6 closes — the final
+                        // `))).pointer.child))` sequence closes
+                        // @TypeOf, @typeInfo (via `.pointer.child)`),
+                        // and @sizeOf. A previous draft dropped the
+                        // final `)` and produced 6 opens + 5 closes,
+                        // leaving `@sizeOf(` open.
+                        self.write("(@intFromPtr(");
+                        self.genExpr(mc.target.*);
+                        self.write(") - @intFromPtr(");
+                        self.genExpr(mc.args[0]);
+                        self.write(")) / @sizeOf(@typeInfo(@TypeOf(");
+                        self.genExpr(mc.target.*);
+                        self.write(")).pointer.child))");
+                        return;
+                    }
+                }
                 // Phase 0 codegen-router: when the receiver-prefix
                 // (e.target.* must be `.ident` for this path) + the
                 // method name + the arity match a registered builtin

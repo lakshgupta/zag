@@ -118,6 +118,32 @@ unsafe {
 
 Use `*raw T` only for FFI interop, lock-free algorithms, or other low-level code that has no safe alternative.
 
+> **Implementation note** (zig-fallback): the `.add` / `.offset` method
+> calls on `*raw T` are recognised by zag's parser as ordinary
+> `.method_call` nodes; the codegen layer (`src/codegen/expr.zig`'s
+> `.method_call` arm) rewrites them into the equivalent zig intrinsics
+> at compile time:
+>
+> ```
+> p.add(N)     -> @as(@TypeOf(p), @ptrFromInt(@intFromPtr(p) + N * @sizeOf(@typeInfo(@TypeOf(p)).pointer.child)))
+> q.offset(p)  -> (@intFromPtr(q) - @intFromPtr(p)) / @sizeOf(@typeInfo(@TypeOf(q)).pointer.child)
+> ```
+>
+> The `@typeInfo(@TypeOf(p)).pointer.child` strip is critical — it
+> extracts the **pointee type** (`u8` for `p: *raw u8`) instead of the
+> pointer type (`*raw u8` itself, which has `@sizeOf` = 8 on 64-bit).
+> Without the strip, `p.add(2)` on `p: *raw u8` would advance by 16
+> bytes instead of 2, and `q.offset(p)` would divide by 8 instead of
+> 1 — producing element-stride counts that are wrong by a factor of
+> `sizeof(pointer)`.
+>
+> Wrong-arity calls (anything other than exactly 1 argument) and
+> method names other than `add` / `offset` fall through to the
+> verbatim `p.foo(args)` emission so zig can report
+> `no method named 'foo'` with high-quality diagnostics. The
+> `unsafe` wrapper is purely a user-side convention — zag does not
+> enforce any special semantics on its contents.
+
 ## What zag does NOT catch
 
 The "no hidden control flow" principle means zag is explicitly permissive at the type level and pushes safety to optional, opt-in tools. The classes of bug below are common but require explicit tooling to surface:

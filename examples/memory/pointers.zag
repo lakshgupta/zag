@@ -49,11 +49,63 @@ fun main() {
     # prefixing `?`. Initialise to `null` when no value is ready; bind
     # a real pointer otherwise. Nullable pointer forms are `Copy` — the
     # assignment below duplicates the (possibly null) pointer value.
+    # (codegen-decl.zig: `?*T annotation round-trips in let binding`)
     let maybe_ptr: ?*i32 = null;
     var owned_counter: i32 = 7;
     let also_maybe: ?*i32 = &owned_counter;
     print("maybe = {maybe_ptr}\n");
     print("also_maybe = {also_maybe}\n");
+
+    # Nullable immutable pointer (`?*const T`): the same null-or-pointer
+    # surface as `?*T`, but the pointee it carries is immutable. The
+    # `&counter_r` initializer borrows the value as `*const i32` so
+    # the emitted zig matches the user-annotated type without coercion.
+    # (codegen-decl.zig: `?*const T annotation round-trips in let binding`)
+    var counter_r: i32 = 50;
+    let maybe_ro: ?*const i32 = null;
+    let also_ro: ?*const i32 = &counter_r;
+    print("also_ro = {also_ro}\n");
+
+    # Nullable raw pointer (`?*raw T`): same null-or-pointer surface
+    # applied to a raw C-style pointer. Useful for FFI shims where a
+    # callback may return null on error. The `null` initialiser is
+    # the natural starting state for a typed raw bind until the FFI
+    # call completes. (codegen-decl.zig: `?*raw T annotation round-trips`)
+    let maybe_raw: ?*raw u8 = null;
+    print("maybe_raw = {maybe_raw}\n");
+
+    # Nullable slice (`?[]const u8`): the same null-or-value surface
+    # applied to a slice type. Binds a slice OR null. Used in
+    # lib/std/env.zag where `?[]const u8` is the canonical return
+    # type for environment lookups that may fail. (codegen-decl.zig:
+    # `?[]const u8 annotation round-trips in let binding`)
+    let maybe_slice: ?[]const u8 = null;
+    let hello_const: []const u8 = "hello";
+    let also_slice: ?[]const u8 = hello_const;
+    print("also_slice = {also_slice}\n");
+
+    # Non-nullable immutable annotation (`*const T`): the same
+    # surface as `let read_only: i32 = ...` + `&read_only` does
+    # automatically, but spelled out as an explicit annotation. Useful
+    # when the binding kind is `var` but the pointer is borrowed
+    # immutably — e.g. when a function parameter wants the caller's
+    # data without copying.
+    # (codegen-decl.zig: `*const T annotation round-trips in let binding`)
+    var fresh: i32 = 70;
+    let fresh_ro: *const i32 = &fresh;
+    print("fresh_ro = {fresh_ro}\n");
+
+    # Slice iteration: `for v in slice { ... }` walks the slice in
+    # source order, yielding each element as a Copy. Codegen emits
+    # `for (slice) |v| { ... }` verbatim so zig's iteration semantics
+    # carry through directly. The slice's `len` drives the iteration
+    # count; the slice's `ptr` field advances `T`-sized steps.
+    # (codegen-decl.zig: `for v in slice { ... }` iter emits verbatim`)
+    print("iter middle = ");
+    for v in middle {
+        print("{v} ");
+    }
+    print("\n");
 
     # Indexed assignment to a slice element.
     var scratch: [3]i32 = [3]i32 { 0 ... };
@@ -61,4 +113,22 @@ fun main() {
     scratch[1] = 22;
     scratch[2] = 33;
     print("scratch = {scratch[0]} {scratch[1]} {scratch[2]}\n");
+
+    # Raw-pointer arithmetic: `p.add(N)` and `q.offset(p)` are
+    # zig-fallback'd by the codegen (see docs/manual/09-pointers.md
+    # §"Raw pointers" implementation note) so the parser's regular
+    # `.method_call` shape round-trips to zig's @ptrFromInt /
+    # @intFromPtr / @sizeOf(@typeInfo(@TypeOf(p)).pointer.child)
+    # intrinsics at compile time. The `@typeInfo...pointer.child`
+    # strip extracts the POINTE type so `@sizeOf(*raw u8)` becomes
+    # `@sizeOf(u8)` = 1 (byte stride) instead of 8 (pointer stride).
+    # `unsafe` is a user-side convention only — zag does not enforce
+    # any special semantics on its contents.
+    var raw_buf: [4]u8 = undefined;
+    unsafe {
+        let p: *raw u8 = &raw_buf;
+        let q: *raw u8 = p.add(2);     # p + 2 * sizeof(u8) = p + 2 bytes
+        let n: i64 = q.offset(p);      # (q - p) / sizeof(u8) = 2
+        print("q.offset(p) = {n}\n");
+    }
 }

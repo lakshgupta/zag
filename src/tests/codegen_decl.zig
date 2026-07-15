@@ -926,6 +926,219 @@ test "codegen: `?*T` annotation round-trips in let binding" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const p: ?*T = null;") != null);
 }
 
+test "codegen: `?*const T` annotation round-trips in let binding" {
+    // Three-shape pointer type (`?`, `*`, then `const T`) — collects via
+    // `collectCastType`'s three-capture path (the `?` arm sets
+    // `prev_was_ptr = true` so `*` glues on without space; the `*` arm
+    // sets `prev_was_ptr = true` so `const` glues without space; the
+    // `const_kw` token is treated as identifier-equivalent; the trailing
+    // `T` identifier is space-separated as the elem-name). Pins the
+    // nullable-immutable-pointee annotation form documented in
+    // docs/manual/09-pointers.md §"Nullable pointers".
+    const src = "fun f() {\n    let x: i32 = 5;\n    let p: ?*const i32 = &x;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": ?*const i32") != null);
+    // Scope: only the annotation form is positively pinned here — the
+    // rhs initializer `&x` may surface as bare `&x` or paren-wrapped
+    // `(&x)` depending on codegen precedence context, so we don't pin
+    // the rhs shape (kept loose to avoid a false-positive regression
+    // when the codegen boundary in `genExpr` `.addr` tweaks).
+    // Sanity: spaced forms must NOT appear — the prev_was_ptr flag must
+    // carry across the `?` → `*` → `const` → `T` capture sequence with
+    // each pointer-class token resetting it to true so the next ident
+    // is glued. A regression that left a previous-token space after
+    // `?` or `*` would surface as "? *const" or "?* const" below.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "? *const") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "?* const") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "?*const  i32") == null);
+}
+
+test "codegen: `?*raw T` annotation round-trips in let binding" {
+    // The `*raw` shape uses the same prev_was_ptr-gating path as the
+    // bare `*` test, but the `raw` keyword is emitted via the
+    // ident-equivalent arm (collectCastType treats raw as a regular
+    // identifier text since the lexer doesn't surface it as a special
+    // token). The emission must produce `?*raw u8` verbatim — a future
+    // regression that did NOT set `prev_was_ptr = true` after the `*`
+    // capture would surface as "?* raw u8" below.
+    const src = "fun f() {\n    let p: ?*raw u8 = null;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": ?*raw u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const p: ?*raw u8 = null;") != null);
+    // Sanity: the pre-space-form failures (would indicate the
+    // prev_was_ptr flag was reset between `*` and `raw`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "?* raw") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "? *raw") == null);
+}
+
+test "codegen: `?[]const u8` annotation round-trips in let binding" {
+    // The nullable slice form uses the `?` prefix capture AFTER the
+    // user writes `?` then the `[]` arm sets prev_was_ptr=true so
+    // `const` glues without a space when the next token is the
+    // `const` keyword, then `u8` is space-separated as the elem-name.
+    // Without this pin, a future regression in collectCastType's
+    // dispatch order would surface as "?[]const u8" → "?[] const u8"
+    // or "?[] const u8" (both inserted-space forms) and break the
+    // nullable-slice bindings used in docs/09 + lib/std/env.zag.
+    const src = "fun f() {\n    let s: ?[]const u8 = null;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": ?[]const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const s: ?[]const u8 = null;") != null);
+    // Sanity: space-injected forms must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "?[] const") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "? []const") == null);
+}
+
+test "codegen: `*const T` annotation round-trips in let binding" {
+    // The non-nullable immutable pointer annotation (no `?` prefix).
+    // The collectCastType path collects `*`, then `const` (which keeps
+    // prev_was_ptr=true so the glue is unbroken), then `T` as the
+    // elem-name. Verifies the same shape the `let p_const: *const
+    // i32` binding in examples/memory/pointers.zag exercises — the
+    // codegen-output tail-substring check below pins the zigzag
+    // emission shape.
+    const src = "fun f() {\n    let x: i32 = 5;\n    let p: *const i32 = &x;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": *const i32") != null);
+    // Sanity: the `?`-prefixed (nullable) form is NOT the same shape —
+    // a regression that ALWAYS emits `?*` would still surface in the
+    // examples/memory/pointers.zag runnable path, so the negative
+    // assertion is just a fast feedback loop.
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": ?*const i32") == null);
+}
+
+test "codegen: `*raw T` annotation round-trips in let binding" {
+    // The non-nullable raw pointer annotation (no `?` prefix). Used in
+    // examples/memory/unsafe.zag (`let p: *raw u8 = buf;` inside an
+    // unsafe block). The collectCastType path emits `*raw` verbatim
+    // via the prev_was_ptr glue across the `*` → `raw` capture pair.
+    // Scope: only the type-text annotation is pinned here — the rhs
+    // initializer is codegen-shape-dependent (paren-form `(&x)` vs
+    // bare `&x`; `null` may emit as `@ptrFromInt(0)` depending on
+    // zag's null-init rewrite, so we don't pin it).
+    const src = "fun f() {\n    let p: *raw u8 = null;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": *raw u8") != null);
+}
+
+test "codegen: `for v in slice { ... }` iter emits `for (slice) |v|` verbatim" {
+    // The slice-iteration form (zig's native for-loop over a slice)
+    // round-trips through codegen's `.slice` arm + the for-stmt arm.
+    // The iter source is a slice, NOT a range — so the for-stmt arm
+    // routes via the iter-non-range path which emits the user
+    // expression verbatim inside `for (...) |x|`. Pinned by the
+    // positive substring `for (...) |v|` (matching the user-pattern
+    // verified by the existing `for x in iter()` non-range test).
+    const src =
+        \\fun f() {
+        \\    let s: []i32 = data[1..3];
+        \\    for v in s {
+        \\        print("{v}\n");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The slice is bound to `let s: []i32 = data[1..3];` (the half-open
+    // form surfaces in the source-side binding emission, already covered
+    // by the slice-arm pin above). The for-loop iter's source IS the
+    // ident `s`, so the for-iter non-range codegen arm passes `s`
+    // verbatim inside `for (...) |v|`. Iter-source inlining (e.g.
+    // `for (data[1..3]) |v|`) is NOT a zag surface — the iterator MUST
+    // be bound to a name first, mirroring zig's own pre-condition.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "for (s) |v|") != null);
+    // Sanity: the body print call must surface across the iteration
+    // boundary (verifies the for-body statement-emit link, not just
+    // the iter header).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print") != null);
+}
+
+test "codegen: fun with `[]T` parameter emits the slice signature verbatim" {
+    // Slice-as-parameter codegen pins the function-signature emitter's
+    // pointer-type capture for `[]T`. Manual section 09 §"Slicing"
+    // states `fun sum(s: []i32) -> i32` is a valid function shape;
+    // this test pins the round-trip so a future regression in
+    // parser/decl.zig's parseMethodParam/parseFunDecl signature
+    // emitter that breaks `[]T` would surface here.
+    const src = "fun sum(s: []i32) -> i32 {\n    return s[0];\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the slice param annotation round-trips.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn sum(s: []i32)") != null);
+    // Sanity: the spaced form `[] i32` MUST NOT appear (collectCastType
+    // sets prev_was_ptr after the `[]` capture so the elem-name glues).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[] i32") == null);
+}
+
+test "codegen: raw-ptr `p.add` with wrong arity falls through verbatim" {
+    // Arity-check guards: `p.add(1, 2)` (2 args) and `p.add()` (0
+    // args) fall through to the verbatim `target.name(args)` emit
+    // shape so zig reports "no method named 'add'" with high-quality
+    // diagnostics rather than zig's panic-on-arity in codegen.
+    //
+    // Negative pin: a future regression that dropped the arity gate
+    // would surface here because the codegen would try to emit
+    // `mc.args[0]` (index out of bounds on 0-arg) or `mc.args[1]`
+    // (out-of-bounds on 2-arg from a 2-arg call). We pin the
+    // verbatim fall-through is reached by asserting the literal
+    // `p.add(` substring is present.
+    const src = "fun f() {\n    let p: *raw u8 = 0;\n    let q: *raw u8 = p.add(1, 2);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: literal `p.add(1, 2)` (with both args) reaches
+    // zigzag verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "p.add(1, 2)") != null);
+    // Sanity: the @TypeOf re-emit prefix MUST NOT appear (which
+    // would indicate the arity gate was dropped).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@TypeOf") == null);
+}
+
 test "codegen: `arr[2..]` slice emits verbatim" {
     // The `.slice` arm emits target + `[` + start + `..` + `]` when
     // end is null (no ` + 1` adjustment fires because there's no end
@@ -2097,4 +2310,126 @@ test "codegen: read_file routes through builtin_table (no verbatim fallback)" {
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "= read_file(") == null);
+}
+
+test "codegen: raw pointer .add(N) emits zig-fallback @ptrFromInt + @sizeOf(@typeInfo(@TypeOf(...)).pointer.child)" {
+    // Closes the BLOCKER finding from the §09 Pointers audit review:
+    // docs/manual/09-pointers.md §"Raw pointers" documents
+    // `p.add(N)` as `p + N * sizeof(T)` but zag's parser routes the
+    // call through `.method_call` and emits `p.add(N)` verbatim to
+    // zigzag — zig 0.16 has no `.add` method on `*raw T` and rejects
+    // the generated source. The codegen-side fix (zig-fallback) is
+    // implemented in src/codegen/expr.zig's `.method_call` arm: when
+    // `mc.name == "add"` and `mc.args.len == 1`, emit the
+    // `@ptrFromInt(@intFromPtr(p) + N * @sizeOf(@typeInfo(@TypeOf(p)).pointer.child))`
+    // expansion directly so zigzag never sees the `.add` syntax.
+    //
+    // The `@typeInfo(@TypeOf(p)).pointer.child` strip is critical —
+    // `@sizeOf(@TypeOf(p))` returns the POINTER size (8 on 64-bit
+    // for `*raw u8`), not the POINTE size (1 for u8). Without the
+    // strip, `p.add(2)` on `p: *raw u8` advances by 16 bytes instead
+    // of 2. The positive pin asserts the FULL closed-form substring
+    // `@sizeOf(@typeInfo(@TypeOf(p)).pointer.child)` — including
+    // all closing parens — so the next regression that drops a `)`
+    // or skips the `@typeInfo` strip fails immediately.
+    const src = "fun f() {\n    var buf: [4]u8 = undefined;\n    let p: *raw u8 = &buf;\n    let q: *raw u8 = p.add(2);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the closed-form `@sizeOf(@typeInfo(@TypeOf(p)).pointer.child)`
+    // substring appears (the `.child` field-access closes the @typeInfo strip).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@sizeOf(@typeInfo(@TypeOf(p)).pointer.child)") != null);
+    // Positive: the @ptrFromInt / @intFromPtr pair both appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrFromInt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr(p)") != null);
+    // Sanity: the verbatim `.add(` form MUST NOT appear (else the
+    // zig-fallback didn't fire and zigzag got `p.add(2)` to reject).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "p.add(") == null);
+    // Sanity: the buggy `@sizeOf(@TypeOf(p))` substring (without the
+    // `@typeInfo` strip) MUST NOT appear — this is the semantic bug
+    // the test pins against regression.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@sizeOf(@TypeOf(p))") == null);
+}
+
+test "codegen: raw pointer .offset(p) emits (@intFromPtr - @intFromPtr) / @sizeOf(@typeInfo(@TypeOf(...)).pointer.child)" {
+    // Same zig-fallback shape as `.add` but produces a numeric
+    // difference (integer / usize = integer) instead of a pointer.
+    // The positive pin asserts the FULL closed-form substring
+    // `@sizeOf(@typeInfo(@TypeOf(q)).pointer.child)` so the
+    // paren-balance bug AND the missing `@typeInfo` strip both fail
+    // loudly. The strip is critical for heterogeneous-type offset
+    // (e.g. `q: *raw u8`, `p: *raw u8` after `p.add(N)`) because
+    // without it `@sizeOf(@TypeOf(q))` would return pointer stride
+    // instead of pointee stride.
+    const src = "fun f() {\n    var buf: [4]u8 = undefined;\n    let p: *raw u8 = &buf;\n    let q: *raw u8 = p.add(2);\n    let n: i64 = q.offset(p);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: closed-form `@sizeOf(@typeInfo(@TypeOf(q)).pointer.child)`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@sizeOf(@typeInfo(@TypeOf(q)).pointer.child)") != null);
+    // Positive: both `q` and `p` show up inside the offset formula
+    // (the `(@intFromPtr(q) - @intFromPtr(p))` half).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr(q)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr(p)") != null);
+    // Sanity: the verbatim `.offset(` form MUST NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "q.offset(") == null);
+    // Sanity: the buggy `@sizeOf(@TypeOf(q))` substring (without the
+    // `@typeInfo` strip) MUST NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@sizeOf(@TypeOf(q))") == null);
+}
+
+test "codegen: raw pointer .add on wrong arity falls through to verbatim" {
+    // Negative pin: when `mc.args.len != 1`, the zig-fallback
+    // branch in src/codegen/expr.zig's `.method_call` arm must
+    // SKIP — the user gets the verbatim `p.add(1, 2)` emission so
+    // zig reports `no method named 'add'` with high-quality
+    // diagnostics rather than zig panicking inside codegen.
+    // Without this fall-through, an over-eager rewrite would
+    // crash on `args[0]` (out-of-bounds) at codegen time.
+    const src = "fun f() {\n    var buf: [4]u8 = undefined;\n    let p: *raw u8 = &buf;\n    p.add(1, 2);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Sanity: the @ptrFromInt rewrite MUST NOT fire on wrong-arity
+    // sites (the fall-through preserves the verbatim form so zig
+    // can reject with a clean error message).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrFromInt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr") == null);
+    // Positive: the verbatim `p.add(1, 2)` form MUST appear so zig
+    // gets a chance to report `no method named 'add'` to the user.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "p.add(1, 2)") != null);
+}
+
+test "codegen: raw pointer method other than add/offset falls through to verbatim" {
+    // Negative pin: even on the correct 1-arg shape, a method
+    // name other than `add` / `offset` must NOT trigger the
+    // zig-fallback — it would silently rewrite arbitrary user
+    // method calls (e.g. `p.someMethod()`) into @intFromPtr
+    // arithmetic and break legitimate receiver-method calls on
+    // raw pointers.
+    const src = "fun f() {\n    var buf: [4]u8 = undefined;\n    let p: *raw u8 = &buf;\n    p.someMethod(2);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Sanity: the fallback rewrite MUST NOT fire.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrFromInt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr") == null);
+    // Positive: verbatim form preserved.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "p.someMethod(2)") != null);
 }
