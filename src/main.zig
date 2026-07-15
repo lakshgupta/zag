@@ -211,7 +211,20 @@ fn leafProcess(flag: []const u8, src: []const u8) !void {
     else
         &.{ zig_install_path, "build-exe", f_emit_leaf, f_zig };
     const build_code = try runCommand(null, build_argv);
-    if (build_code != 0) std.process.exit(build_code);
+    if (build_code != 0) {
+        // Diagnostic mirror of cliMode's "error: zig build-exe
+        // failed for cli.zag" print (src/main.zig:88-92): the leaf
+        // path was previously silent because std.process.exit just
+        // propagates build_code without surfacing zig's diagnostic
+        // (the leaf's capture path doesn't re-print zig's stderr
+        // when it gets disconnected). Mirrors the CLI path so user
+        // failures point at the sourceline + exit status; zig's own
+        // diagnostics live on stderr via fork+execve inheritance
+        // (see `fork+execve preserves the child's stderr` comment
+        // on the test-flag branch above).
+        std.debug.print("error: zig build-exe failed for {s} (exit {d})\n", .{ src, build_code });
+        std.process.exit(build_code);
+    }
 
     if (std.mem.eql(u8, flag, "check")) {
         std.debug.print("check ok\n", .{});

@@ -70,39 +70,140 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     }
 
     pub     fn genPrintCall(self: *Codegen, c: ast.Expr.CallExpr) void {
-        if (c.args.len != 1) {
-            // Multi-arg print: fall back to the generic debug-print
-            // form with the args list. Mirrors the codegen already
-            // used for templates where the trailing comma is appended
-            // unconditionally when args are non-empty.
-            self.write("std.debug.print(\"{any}\", .{");
-            for (c.args, 0..) |arg, i| {
-                if (i > 0) self.write(", ");
-                self.genExpr(arg);
+        // Route every call variant through the `__zag_print`
+        // preamble helper (declared in src/codegen/core.zig's
+        // generate() preamble) instead of `std.debug.print`
+        // directly. The shim writes to STDOUT via zig 0.16's
+        // buffered-writer File.stdout() API; the original
+        // `std.debug.print` route wrote to STDERR which made
+        // `zag run foo.zag` produce empty stdout AND empty stderr
+        // when invoked via the leaf-process fork+execve path
+        // (tests/e2e.zig's stderr-capture caveat is moot now —
+        // the destination is canonical stdout).
+        if (c.args.len == 0) {
+            // No-arg print. parseCallExpr accepts `print()` as a
+            // zero-element call (no min-arity guard), and the
+            // previous generic-{any}-with-empty-args shape
+            // (`__zag_print("{any}", .{})`) is rejected by zig
+            // because `{any}` reads 1 arg from `.{}` (arity
+            // mismatch). Emit the empty-string form so `print()`
+            // is at worst a no-op rather than a zig compile
+            // error.
+            self.write("__zag_print(\"\", .{})");
+            return;
+        }
+        if (c.args.len >= 2) {
+            // Multi-arg print: first arg is the FORMAT string,
+            // remaining args are the format-arg tuple. This
+            // extends the single-arg `.string_lit` /
+            // `.byte_string_lit` arm's existing
+            // format-string-first convention
+            // (`__zag_print("<str>", .{})`) and matches the
+            // user's mental model from C `printf("fmt\n", ...)`
+            // and Rust `println!("fmt {}", arg)` where the
+            // string-literal slot is the printf-style format
+            // spec and the trailing args are the values
+            // pulled into the placeholders.
+            //
+            // The previous generic-{any} fallback was wrong
+            // on two counts: (a) it overwrote the user's
+            // format string with a hardcoded `"{any}"` so
+            // any embedded `{d}`, `{x}`, etc. placeholders
+            // were lost; (b) it spliced the N args under a
+            // single `{any}` slot, and zig's
+            // std.fmt.format arity check rejected the
+            // generated call with an opaque
+            // `expected expression, found '.'` parse error
+            // that pointed at the args tuple rather than
+            // naming the multi-arg surface as the cause.
+            // operators.zag's range section's docblock
+            // flagged this as the upstream bug.
+            //
+            // Only literal string/byte_string first args are
+            // supported today. The `.template_lit` first-arg
+            // case (`print("hello {name}", extra)`) is
+            // deferred: genTemplateLit's `.debug_print`
+            // emit already produces a complete
+            // `__zag_print(...)` statement (own format
+            // string + own args tuple) rather than a bare
+            // format-string token, so naively splicing
+            // `c.args[0]` into the outer args tuple would
+            // nest a `__zag_print` call inside another
+            // `__zag_print`'s args. Refactoring
+            // genTemplateLit to return a separate
+            // format-string + args slice so this codepath
+            // can merge them is the proper fix; deferred
+            // to a followup commit. Users hitting this
+            // today can route through two consecutive
+            // `print` calls (`print(extra); print("hello
+            // {name}");`) without losing readability.
+            //
+            // Other first-arg shapes (tuple_lit, ident,
+            // call, method_call, ...) also reject at
+            // codegen time with a clear diagnostic naming
+            // the cause, following the destructuring-
+            // invariant pattern in src/codegen/stmt.zig's
+            // genBindingLeaves path (`std.debug.print` +
+            // `std.process.exit(1)`). The user sees
+            // `error:codegen: ...` at compile time rather
+            // than zig's downstream parse rejection.
+            switch (c.args[0]) {
+                .string_lit, .byte_string_lit => |str| {
+                    self.write("__zag_print(\"");
+                    self.write(str);
+                    self.write("\", .{");
+                    for (c.args[1..], 0..) |arg, i| {
+                        if (i > 0) self.write(", ");
+                        self.genExpr(arg);
+                    }
+                    // zig 0.16 requires a trailing comma
+                    // inside even the single-field args
+                    // tuple (see genTemplateLit's
+                    // `.debug_print` docblock for the
+                    // `.{x}` vs `.{x,}` rationale).
+                    self.write(",})");
+                },
+                else => {
+                    // The canonical workaround is single-arg template
+                    // interpolation (the .template_lit arm above is
+                    // fully wired) — and pre-existing zag code uses
+                    // this everywhere, so it should lead the error
+                    // message. Rephrase
+                    //   `print("range: {x}", extra)`
+                    // as
+                    //   `print("range: {x}, extra={extra} ")`
+                    // and the single-arg template arm handles format
+                    // string + args uniformly. The split-into-separate-
+                    // print-calls fallback is for cases where the
+                    // extra args are logically distinct streams.
+                    std.debug.print(
+                        "error:codegen: multi-arg print first arg must be a literal format string without `{{...}}` placeholders (got '{s}' with {d} extra arg(s)); rephrase as single-arg template interpolation — e.g., `print(\"range: {{x}}, extra={{extra}}\")` combines format + extras into one template, or split into separate print calls if the extras are logically distinct\n",
+                        .{ @tagName(c.args[0]), c.args.len - 1 },
+                    );
+                    std.process.exit(1);
+                },
             }
-            if (c.args.len > 0) self.write(",");
-            self.write("})");
             return;
         }
         const arg = c.args[0];
         switch (arg) {
             .string_lit, .byte_string_lit => |str| {
-                self.write("std.debug.print(\"");
+                self.write("__zag_print(\"");
                 self.write(str);
                 self.write("\", .{})");
             },
             .char_lit => {
-                self.write("std.debug.print(\"{c}\", .{");
+                self.write("__zag_print(\"{c}\", .{");
                 self.genExpr(arg);
                 self.write(",})");
             },
             .array_lit => {
-                self.write("std.debug.print(\"{any}\", .{");
+                self.write("__zag_print(\"{any}\", .{");
                 self.genExpr(arg);
                 self.write(",})");
             },
             .tuple_lit => {
-                self.write("std.debug.print(\"{any}\", .{");
+                self.write("__zag_print(\"{any}\", .{");
                 self.genExpr(arg);
                 self.write(",})");
             },
@@ -110,7 +211,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.genTemplateLit(t, .debug_print);
             },
             else => {
-                self.write("std.debug.print(\"{any}\", .{");
+                self.write("__zag_print(\"{any}\", .{");
                 self.genExpr(arg);
                 self.write(",})");
             },
@@ -194,44 +295,126 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 
         for (t.parts) |part| {
             if (part.literal) |lit| {
-                for (lit) |c| {
-                    switch (c) {
+            // Phase: zag-source escape-sequence detection. The LEXER in
+            // `src/lexer/string.zig:readString` PRESERVES escape sequences
+            // raw (`\"` stays as 2 bytes `\`, `"` rather than decoded to a
+            // single `"` char), so codegen sees the `\` byte and must
+            // convert it to the equivalent zigzag escape form here.
+            // Without this conversion, a zag source `\"` becomes `\\"`
+            // in zigzag source (escape-for-backslash + closing-quote),
+            // which truncates the format string at the first `\"` and
+            // zig 0.16 surfaces the resulting malformed args tuple as
+            // `expected ',' after argument`. Same for `\n`, `\t`, `\r`,
+            // `\\` — handle each pair explicitly so the emitted zigzag
+            // string is parseable. The un-escaped `"`, LF, CR, TAB
+            // cases below keep their original role (covering raw
+            // decoded characters that arrive via the lexer when a
+            // multi-line string source puts the literal LF inside the
+            // text directly rather than via `\n`).
+            var lit_idx: usize = 0;
+            while (lit_idx < lit.len) {
+                const c = lit[lit_idx];
+                if (c == '\\' and lit_idx + 1 < lit.len) {
+                    const nxt = lit[lit_idx + 1];
+                    switch (nxt) {
                         '"' => {
                             if (fmt_len + 2 <= fmt_buf.len) {
                                 fmt_buf[fmt_len] = '\\';
                                 fmt_buf[fmt_len + 1] = '"';
                                 fmt_len += 2;
                             }
+                            lit_idx += 2;
+                            continue;
                         },
-                        0x0A => {
+                        'n' => {
                             if (fmt_len + 2 <= fmt_buf.len) {
                                 fmt_buf[fmt_len] = '\\';
                                 fmt_buf[fmt_len + 1] = 'n';
                                 fmt_len += 2;
                             }
+                            lit_idx += 2;
+                            continue;
                         },
-                        0x0D => {
-                            if (fmt_len + 2 <= fmt_buf.len) {
-                                fmt_buf[fmt_len] = '\\';
-                                fmt_buf[fmt_len + 1] = 'r';
-                                fmt_len += 2;
-                            }
-                        },
-                        0x09 => {
+                        't' => {
                             if (fmt_len + 2 <= fmt_buf.len) {
                                 fmt_buf[fmt_len] = '\\';
                                 fmt_buf[fmt_len + 1] = 't';
                                 fmt_len += 2;
                             }
+                            lit_idx += 2;
+                            continue;
+                        },
+                        'r' => {
+                            if (fmt_len + 2 <= fmt_buf.len) {
+                                fmt_buf[fmt_len] = '\\';
+                                fmt_buf[fmt_len + 1] = 'r';
+                                fmt_len += 2;
+                            }
+                            lit_idx += 2;
+                            continue;
+                        },
+                        '\\' => {
+                            if (fmt_len + 2 <= fmt_buf.len) {
+                                fmt_buf[fmt_len] = '\\';
+                                fmt_buf[fmt_len + 1] = '\\';
+                                fmt_len += 2;
+                            }
+                            lit_idx += 2;
+                            continue;
                         },
                         else => {
-                            if (fmt_len < fmt_buf.len) {
-                                fmt_buf[fmt_len] = c;
-                                fmt_len += 1;
+                            // Unrecognized escape sequence — emit `\\` to
+                            // escape the backslash and let the next
+                            // iteration handle the second byte through
+                            // the regular single-byte switch below.
+                            if (fmt_len + 2 <= fmt_buf.len) {
+                                fmt_buf[fmt_len] = '\\';
+                                fmt_buf[fmt_len + 1] = '\\';
+                                fmt_len += 2;
                             }
+                            lit_idx += 1;
+                            continue;
                         },
                     }
                 }
+                switch (c) {
+                    '"' => {
+                        if (fmt_len + 2 <= fmt_buf.len) {
+                            fmt_buf[fmt_len] = '\\';
+                            fmt_buf[fmt_len + 1] = '"';
+                            fmt_len += 2;
+                        }
+                    },
+                    0x0A => {
+                        if (fmt_len + 2 <= fmt_buf.len) {
+                            fmt_buf[fmt_len] = '\\';
+                            fmt_buf[fmt_len + 1] = 'n';
+                            fmt_len += 2;
+                        }
+                    },
+                    0x0D => {
+                        if (fmt_len + 2 <= fmt_buf.len) {
+                            fmt_buf[fmt_len] = '\\';
+                            fmt_buf[fmt_len + 1] = 'r';
+                            fmt_len += 2;
+                        }
+                    },
+                    0x09 => {
+                        if (fmt_len + 2 <= fmt_buf.len) {
+                            fmt_buf[fmt_len] = '\\';
+                            fmt_buf[fmt_len + 1] = 't';
+                            fmt_len += 2;
+                        }
+                    },
+                    else => {
+                        if (fmt_len < fmt_buf.len) {
+                            fmt_buf[fmt_len] = c;
+                            fmt_len += 1;
+                        }
+                    },
+                }
+                lit_idx += 1;
+            }
             } else if (part.expr) |expr| {
                 // `{any}` accepts any Zig type at the format-arg site. If the
                 // user wrote a printf-style format spec (e.g. `:.5`, `:5`,
@@ -272,7 +455,17 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 
         switch (ctx) {
             .debug_print => {
-                self.write("std.debug.print(\"");
+                // Route template-literal interpolation through the
+                // `__zag_print` preamble helper (defined in
+                // src/codegen/core.zig's generate() preamble) so
+                // interpolated `print("hello, {name}\n", ...)`
+                // writes to STDOUT, matching the multi-arg /
+                // single-arg paths in genPrintCall above. The
+                // context name `.debug_print` is historical —
+                // the destination is now stdout; the rename is
+                // deferred to avoid touching the call sites in
+                // genPrintCall's template_lit branch.
+                self.write("__zag_print(\"");
                 self.write(fmt_buf[0..fmt_len]);
                 self.write("\", .{");
                 self.write(args_cg.out_buf[0..args_cg.out_len]);

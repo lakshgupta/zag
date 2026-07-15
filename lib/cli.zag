@@ -107,9 +107,29 @@ pub fun cmd_init_named(n: []const u8) -> i32 {
 ## Spawn a leaf-process goto of zag. The first argv slot is
 ## always the binary path (cli_bin inherited it from the
 ## bootstrap's execve), so the recursion is self-contained.
+##
+## Flag concat caveat: zag source has no string-concat operator, and
+## the router's template-literal `{any}` formatter renders `[]const u8`
+## as a zig debug-array `{ byte, byte, byte }` which would emit
+## `--leaf-process={ 114, 117, 110 }` instead of `--leaf-process=run`.
+## We byte-copy the prefix + tail into a 64-byte stack buffer (matching
+## the cmd_init_named pattern below; the combined arg is bounded to
+## 64 chars for v1 — a real path would use the `concat` builtin once
+## the codegen router's `{s}`-for-string-arg surface lands).
 pub fun spawn_leaf(leaf_flag: []const u8, src: []const u8) -> i32 {
     let argv0: []const u8 = get()[0];
-    let leafflag: str = "--leaf-process={leaf_flag}";
+    var fl: [64]u8 = undefined;
+    let prefix: []const u8 = "--leaf-process=";
+    var i: usize = 0;
+    while i < prefix.len {
+        fl[i] = prefix[i];
+        i = i + 1;
+    }
+    while i < prefix.len + leaf_flag.len {
+        fl[i] = leaf_flag[i - prefix.len];
+        i = i + 1;
+    }
+    let leafflag: str = fl[0 .. i];
     ## Zag-native array literal + whole-slice view: `[3]str { ... }`
     ## then `args[..]` yields `[]str` (= `[][]const u8`) for exec.
     let args: [3]str = [3]str { argv0, leafflag, src };

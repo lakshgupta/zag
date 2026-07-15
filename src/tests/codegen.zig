@@ -47,10 +47,10 @@ test "codegen: hello world" {
 
     // Structural pins (existing): main emitted with zig 0.16's
     // `init: std.process.Init` signature, and the print call routed
-    // through zig's `std.debug.print`.
+    // through zig's `__zag_print`.
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "pub fn main(") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "std.process.Init") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig_src, "std.debug.print") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "__zag_print(\"hello, world\\n\", .{})") != null);
     // Content pin (tightening): the LITERAL `"hello, world\n"` substring
     // (with `\`+`n` as two chars, NOT a LF byte) reaches codegen verbatim.
     // Catches a future regression that mangles string-literal contents
@@ -304,7 +304,7 @@ test "codegen: array progression emits blk+__pat pattern" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __arr") != null);
 }
 
-test "codegen: template literal in print emits std.debug.print" {
+test "codegen: template literal in print emits __zag_print" {
     const src = "fun f() {\n    let name = \"zag\";\n    print(\"hello, {name}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -315,7 +315,7 @@ test "codegen: template literal in print emits std.debug.print" {
     const zig = cg.generate(prog);
     // zig 0.16 requires a trailing comma inside `.{...}` even when only one
     // field is present; we always emit `.{name,}` for single-arg interpolation.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.debug.print(\"hello, {any}\\n\", .{name,})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"hello, {any}\\n\", .{name,})") != null);
 }
 
 test "codegen: template preserves LF byte in literal via \\n escape" {
@@ -331,9 +331,64 @@ test "codegen: template preserves LF byte in literal via \\n escape" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "\"a{any}a\\n\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.debug.print") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"a{any}a\\n\", .{x,})") != null);
 }
 
+test "codegen: print(<str>, val1, val2) emits multi-arg __zag_print" {
+    // Multi-arg print shape: codegen routes print(<str>, val1, val2, ...) through
+    // genPrintCall's multi-arg arm (c.args.len >= 2). The zig emit is:
+    //   __zag_print("<str>", .{val1, val2, ...,})
+    // - first-arg-as-format-string, remaining args as the args tuple, with a
+    // trailing comma inside the anonymous-struct literal (zig 0.16 single-field
+    // `.{x}` requirement, mirroring the .template_lit single-arg arm).
+    //
+    // Pre-fix this multi-arg surface was only documented in the codegen docblock;
+    // no positive-substring pin test existed. A future regression on the trailing
+    // comma placement, the first-arg-as-format-string contract, or the N-args tuple
+    // shape would fail this pin test loudly.
+    //
+    // The zag source `print("a", x, y)` round-trips to the canonical zig
+    // `__zag_print("a", .{x, y,})` (verbatim first-arg, comma-separated remaining
+    // args, trailing comma inside .{x, y,}).
+    const src = "fun f() {\n    let x: i32 = 0;\n    let y: i32 = 0;\n    print(\"a\", x, y);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"a\", .{x, y,})") != null);
+}
+
+test "codegen: print() zero-args emits __zag_print with empty format string" {
+    // Per `genPrintCall`'s `if (c.args.len == 0)` arm: bare `print()` codegens
+    // to `__zag_print("", .{})` (empty format string + empty args tuple).
+    // The no-args case does NOT emit a trailing comma inside `.{}` (zig 0.16
+    // is happy with no-comma for zero-field args tuples), so the precise
+    // `.{})` (no comma) shape is the unique fingerprint of this arm. The
+    // codegen deliberately maps the zero-arity `print()` to the args-less
+    // __zag_print shape rather than a special-case zig builtin — closes
+    // the §3.1 Phase-3 audit gap on trivial formatting.
+    const src = "fun main() {\n    print();\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+
+    var cg = codegen_mod.Codegen.init();
+    const zig_src = cg.generate(prog);
+
+    // Tight pin: the literal `__zag_print("", .{})` substring (note the
+    // TWO ADJACENT quote bytes — empty string — and the LACK of trailing
+    // comma inside `.{})`) uniquely identifies the `c.args.len == 0` arm.
+    // The `c.args.len >= 1` arms either include a string body (single-arg)
+    // or a trailing comma when args present (multi-arg); only this arm
+    // emits both markers together.
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "__zag_print(\"\", .{})") != null);
+}
 test "codegen: module-level interp_buf emitted" {
     const src = "fun f() {\n    print(\"{x}\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
@@ -1145,9 +1200,9 @@ test "codegen: errdefer stmt emits errdefer verbatim" {
     // match the zag docs' Pattern 2 framing.
     //
     // `errdefer <expr>` triggers genExpr on `expr`. For `print(string_lit)`
-    // the call-emit is `std.debug.print("...", .{})` (the literal-string
+    // the call-emit is `__zag_print("...", .{})` (the literal-string
     // specialization). So the errdefer output is
-    // `    errdefer std.debug.print("cleanup\n", .{});`.
+    // `    errdefer __zag_print("cleanup\n", .{});`.
     // Pre-existing test was written when codegen emitted the user's
     // `print(...)` verbatim (a simpler print codegen). Updated to the
     // current stamp-shape substring.
@@ -1159,7 +1214,7 @@ test "codegen: errdefer stmt emits errdefer verbatim" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    errdefer std.debug.print(\"cleanup\\n\", .{})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    errdefer __zag_print(\"cleanup\\n\", .{})") != null);
 }
 
 test "codegen: unsafe block emits body in plain block with comment markers" {
@@ -1169,7 +1224,7 @@ test "codegen: unsafe block emits body in plain block with comment markers" {
     // visible to `-Dunsafe-block-check` tooling without affecting the
     // emitted zig semantics (raw pointer ops are already unconditional).
     //
-    // The body's `print(string_lit)` codegen emits `std.debug.print(...)`,
+    // The body's `print(string_lit)` codegen emits `__zag_print(...)`,
     // NOT the user's `print(...)` verbatim. Pre-existing test was written
     // when codegen was simpler — updated to the current emission shape.
     const src = "fun f() {\n    unsafe {\n        print(\"inside\\n\");\n    }\n}\n";
@@ -1181,7 +1236,7 @@ test "codegen: unsafe block emits body in plain block with comment markers" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    // unsafe {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.debug.print(\"inside\\n\", .{})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"inside\\n\", .{})") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    // }") != null);
 }
 
@@ -1404,7 +1459,7 @@ test "codegen: if-stmt with else emits zig if/else" {
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    if (x > 0) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    } else {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    std.debug.print(\"neg\\n\", .{});") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    __zag_print(\"neg\\n\", .{});") != null);
 }
 
 test "codegen: if-stmt with else-if chain emits chained zig emission" {
@@ -1433,7 +1488,7 @@ test "codegen: if-stmt with else-if chain emits chained zig emission" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "    if a {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    } else if b {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    } else {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    std.debug.print(\"other\\n\", .{});") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    __zag_print(\"other\\n\", .{});") != null);
 }
 
 test "codegen: if-expression emits labeled blk + break :blk" {

@@ -228,8 +228,32 @@ pub const Codegen = struct {
         self.write(
             \\const std = @import("std");
             \\
-            \\pub fn print_fn(msg: []const u8) void {
-            \\    std.debug.print("{s}", .{msg});
+            \\// Module-level `__zag_print` shim — replaces the prior
+            \\// `pub fn print_fn` helper that routed `print(...)` calls
+            \\// through zig's `prior primitive` (STDERR-bound). The new
+            \\// helper writes to STDOUT via zig 0.16's buffered-writer
+            \\// File.stdout() API; emit sites in
+            \\// `src/codegen/primary.zig::genPrintCall` and
+            \\// `genTemplateLit`'s `.debug_print` ctx call this
+            \\// helper instead of `prior primitive(...)`. The
+            \\// `comptime fmt` + `anytype args` signature mirrors
+            \\// `prior primitive`'s own surface so the format-string
+            \\// interpolation rules (`{any}`, `:.N`, `:x`, etc.) are
+            \\// preserved byte-identical — only the destination
+            \\// fd changes. `catch return` is intentional: v1's
+            \\// `print(...)` is documented to silently drop I/O
+            \\// errors (no exception/panic propagation expected
+            \\// from a print statement). The `__zag_` prefix
+            \\// reserves the name against user identifiers.
+            \\fn __zag_print(comptime fmt: []const u8, args: anytype) void {
+            \\    var buf: [65536]u8 = undefined;
+            \\    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+            \\    var written: usize = 0;
+            \\    while (written < slice.len) {
+            \\        const rc = std.os.linux.write(std.posix.STDOUT_FILENO, slice.ptr + written, slice.len - written);
+            \\        if (rc == 0) return;
+            \\        written += @intCast(rc);
+            \\    }
             \\}
             \\
             \\// Module-level scratch buffer for standalone template-literal evaluation.
