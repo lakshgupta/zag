@@ -44,8 +44,17 @@ comptime {
     // package-root-relative, not file-relative, so the names below
     // match the actual src/tests/X.zig paths.
     _ = @import("tests/lexer.zig");
-    _ = @import("tests/parser.zig");
-    _ = @import("tests/codegen.zig");
     _ = @import("tests/toolchain.zig");
     _ = @import("tests/env_path.zig");
+    _ = @import("tests/parser_core.zig");
+    _ = @import("tests/parser_primary.zig");
+    _ = @import("tests/parser_expr.zig");
+    _ = @import("tests/parser_decl.zig");
+    _ = @import("tests/parser_stmt.zig");
+    _ = @import("tests/codegen_core.zig");
+    _ = @import("tests/codegen_primary.zig");
+    _ = @import("tests/codegen_expr.zig");
+    _ = @import("tests/codegen_decl.zig");
+    _ = @import("tests/codegen_stmt.zig");
+    _ = @import("tests/codegen_builtins.zig");
 }
