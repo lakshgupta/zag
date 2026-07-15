@@ -1,4 +1,6 @@
-## Structs with methods, struct-literal construction, and field access.
+## Structs with methods, struct-literal construction, field access (read +
+## write), and a mutable receiver method (`self: *Vec3` lets the body write
+## through the pointer; the immutable form is `self: *const Vec3`).
 ## Run: zag run examples/structs/vec3.zag
 
 struct Vec3 {
@@ -15,13 +17,48 @@ impl Vec3 {
     pub fun sumsq(self: *const Vec3) -> f64 {
         return self.x * self.x + self.y * self.y + self.z * self.z;
     }
+
+    # Mutable receiver: `self: *Vec3` (no `const`) lets the body write
+    # through the pointer. The codegen emits `self.x = ...` directly
+    # because `self` is `*Vec3` (mutable), not `*const Vec3`. Compare
+    # with `sumsq` above which uses `*const Vec3` and can only read.
+    pub fun scale(self: *Vec3, factor: f64) {
+        self.x = self.x * factor;
+        self.y = self.y * factor;
+        self.z = self.z * factor;
+    }
 }
 
 fun main() {
     let v: Vec3 = Vec3.new(1.0, 2.0, 3.0);
-    let v2: Vec3 = Vec3 { x: 4.0, y: 5.0, z: 6.0 };
+
+    # v2 is `var` (not `let`) so it can be field-assigned AND
+    # method-called with mutable receivers below. Using a single
+    # binding for both the read-only prints and the field-write
+    # avoids the duplicate `Vec3 { x: 4.0, y: 5.0, z: 6.0 }` literal
+    # a previous revision had (one `let v2` for reads + one `var w`
+    # for writes).
+    var v2: Vec3 = Vec3 { x: 4.0, y: 5.0, z: 6.0 };
 
     print("v = ({v.x}, {v.y}, {v.z})\n");
     print("v2 = ({v2.x}, {v2.y}, {v2.z})\n");
     print("v.sumsq = {v.sumsq()}\n");
+
+    # Field write through an identifier binding: `v2.x = 99.0;` is the
+    # canonical field-mutation shape — the parser routes this through
+    # `.field_assign` (target: `.member_access(v2, x)`, value: float_lit),
+    # and codegen emits `v2.x = 99.0;` verbatim. Combined with the
+    # mutable method call below, this exercises both write-through-pointer
+    # and write-through-ident surfaces in one main.
+    v2.x = 99.0;
+    print("after v2.x = 99.0: v2 = ({v2.x}, {v2.y}, {v2.z})\n");
+
+    # Mutable method call: `v2.scale(2.0)` — desugars to
+    # `Vec3.scale(&v2, 2.0)` at the call site. The receiver passes by
+    # pointer so the body can write to `self.x` / `self.y` / `self.z`.
+    # Even though v2 is `var`, the receiver-mutability distinction
+    # (`self: *Vec3` not `self: *const Vec3`) is what lets the body
+    # write through self.
+    v2.scale(2.0);
+    print("after v2.scale(2.0): v2 = ({v2.x}, {v2.y}, {v2.z})\n");
 }

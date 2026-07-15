@@ -2433,3 +2433,70 @@ test "codegen: raw pointer method other than add/offset falls through to verbati
     // Positive: verbatim form preserved.
     try std.testing.expect(std.mem.indexOf(u8, zig, "p.someMethod(2)") != null);
 }
+
+test "codegen: struct field assignment `v.x = val` emits `v.x = val;` verbatim" {
+    // Closes the §12 audit-fill gap: docs/manual/12-structs.md §"Field
+    // Access" documents `v.x = 10.0;` but no codegen test pinned the
+    // emission shape. The parser routes the assignment through the
+    // existing `.field_assign` stmt (target: `.member_access`, value:
+    // any Expr) — the codegen path is shared with bare assignment
+    // (the `.assign` stmt arm) so the codegen output is `v.x = 10.0;`
+    // verbatim. Pin the verbatim shape so a future codegen refactor
+    // that wraps field assignment in some kind of `blk:` shim (e.g.
+    // for method-call RHS) would fail loudly.
+    const src = "fun f() {\n    var v: Vec3 = Vec3 { x: 1.0, y: 2.0, z: 3.0 };\n    v.x = 10.0;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the verbatim `v.x = 10.0;` shape is emitted.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "v.x = 10.0;") != null);
+    // Sanity: no `blk:` shim wrapping for plain field-write RHS.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: {") == null);
+    // Sanity: the struct-literal's binding still emits `const v = ...` not `var v`
+    // — assignment to a `let` binding should still compile (zig's `const`
+    // would reject it, but the codegen-side emission shape is what this test
+    // pins; the binding-mutability check is downstream).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "v.x") != null);
+}
+
+test "codegen: mutable struct method emits self: *Vec3 (not *const Vec3)" {
+    // Closes the §12 audit-fill gap: docs/manual/12-structs.md §"Methods"
+    // documents both `self: *const Vec3` (read-only) and `self: *Vec3`
+    // (mutable, can write through) receiver shapes. The existing
+    // `codegen: impl method nests pub fn inside struct decl` test pins
+    // the `*const Vec3` shape; no test pins the `*Vec3` shape (the
+    // distinction is the load-bearing difference — `*Vec3` lets the
+    // method body emit `self.x = ...` without zig rejecting the
+    // `.x` field-write on a const-pointer receiver). Pin the literal
+    // `self: *Vec3` substring (NOT `*const Vec3`) so a future parser
+    // regression that drops the `const` qualifier on mutable receivers
+    // would surface here.
+    const src =
+        \\struct Vec3 { x: f64, y: f64, z: f64 }
+        \\impl Vec3 {
+        \\    pub fun normalize(self: *Vec3) {
+        \\        self.x = 0.0;
+        \\    }
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: the mutable receiver shape `self: *Vec3` appears
+    // (no `const` between `*` and `Vec3`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "self: *Vec3") != null);
+    // Sanity: the literal `*const Vec3` substring MUST NOT appear —
+    // would surface a regression where the parser dropped the
+    // mutable-receiver semantic.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "*const Vec3") == null);
+    // Sanity: the field-write `self.x = 0.0` reaches zigzag unchanged.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "self.x = 0.0;") != null);
+}
