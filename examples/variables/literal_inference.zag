@@ -1,0 +1,81 @@
+## Variables — literal-init inference carve-out
+##
+## Per docs/04 §"Carve-Out: Literal Initializers", the parser accepts
+## bindings WITHOUT `: T` when the initializer is one of 11 literal
+## Expr kinds. Each kind carries its type from the source form alone
+## so the compiler assigns the type without assistance. This example
+## exercises each kind so future regressions in the literal-init
+## surface are caught by `examples/run_all.sh`.
+##
+## Run: zag run literal_inference.zag
+
+fun main() {
+    # int_lit (decimal, hex, binary, with underscores) -> i32.
+    let n_dec = 42;
+    let n_hex = 0xFF;
+    let n_bin = 0b1010;
+    let n_under = 1_000_000;
+    print("int: dec={n_dec} hex={n_hex} bin={n_bin} under={n_under}\n");
+
+    # float_lit (decimal + exponent) -> f64.
+    let pi = 3.141592653589793;
+    let big = 1.0e10;
+    print("float: pi={pi:.5} big={big}\n");
+
+    # bool_lit -> bool.
+    let on = true;
+    let off = false;
+    print("bool: on={on} off={off}\n");
+
+    # char_lit -> u8 (single-byte ASCII).
+    let ch = 'A';
+    print("char: ch={ch}\n");
+
+    # string_lit -> []const u8 (escapes preserved verbatim).
+    let greeting = "hello, world\n";
+    print("str: {greeting}");
+
+    # byte_string_lit -> []const u8 (raw bytes).
+    let bytes = b"raw-bytes";
+    print("byte-str: {bytes}\n");
+
+    # tuple_lit -> anonymous struct of element types (mixed-type OK).
+    let triple = (1, 2.5, true);
+    let (i, f, b) = triple;
+    print("tuple: i={i} f={f:.2} b={b}\n");
+
+    # array_lit -> [N]T inferred from element shape and size text. Indexing
+    # into the binding uses `.index` (NOT a literal-init Expr kind) so the
+    # secondary bindings carry `: i32` annotation per docs/04 §"Carve-Out"
+    # (only the 11 literal Expr kinds omit the annotation; identifier / index
+    # accesses do not).
+    let nums = [3]i32 { 1, 2, 3 };
+    let first: i32 = nums[0];
+    let last: i32 = nums[2];
+    print("array: first={first} last={last}\n");
+
+    # template_lit -> []const u8 (runtime-formatted). The parser
+    # classifies any string containing a `{...}` placeholder as
+    # `template_lit` (see the parser-docstring on the matching-brace
+    # gate); the binding's literal-init carve-out applies.
+    let formatted = "value: {n_dec}";
+    print("template: {formatted}\n");
+
+    # var with literal-int init. The docs/04 §"Carve-Out" table lists
+    # `int_lit` as one of the 11 literal-init kinds that omit `: T` —
+    # the parser accepts `var counter = 0` (no annotation). BUT
+    # zig 0.16 rejects mutable bindings whose initialiser infers
+    # `comptime_int` (compile-time integer singleton has no address,
+    # so a runtime `var` cannot hold it). The compiler-side workaround
+    # for this is captured in `examples/basics/variables.zag` — bind
+    # the `var` with an explicit `: i32` here so the example actually
+    # runs end-to-end.
+    var counter: i32 = 0;
+    counter = counter + 1;
+    counter = counter * 10;
+    print("var (literal-init): counter={counter}\n");
+
+    # const (without annotation) via literal-init. Compile-time-foldable.
+    const LIMIT = 256;
+    print("const (literal-init): LIMIT={LIMIT}\n");
+}

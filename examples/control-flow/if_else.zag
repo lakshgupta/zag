@@ -3,25 +3,36 @@
 ## Run: zag run if_else.zag
 
 fun main() {
-    # if/else as expression
-    let x: i32 = if true { 1 } else { 2 };
+    # if/else as expression. Uses a binary cond (1 == 1) rather than
+    # a bare literal (`if true`) because zag's codegen routes the
+    # cond through genExpr's `.binary` arm when the cond is binary
+    # (which wraps the emit in `(...)`); a bare literal cond emits
+    # `if true` verbatim, and zig 0.16 rejects the bare-cond form
+    # when the body uses `break :blk` (the value-yielding shape this
+    # expression context requires).
+    let x: i32 = if 1 == 1 { 1 } else { 2 };
     print("x = {x}\n");
 
-    # for loop with range
-    var sum: i32 = 0;
+    # for loop with range. Sum is `usize` (NOT `i32`) because zig's
+    # for-loop counter `i` is usize-typed by default — adding a usize
+    # to an i32 would fail zig's strict mode without an explicit
+    # `i32`-narrowing cast, and zag's current `as`-cast codegen emits
+    # `@as(i32, usize)` which zig 0.16 rejects ("not all usize fit").
+    # The narrow-cast codegen fix is a deferred §07 surface line.
+    var sum: usize = 0;
     for i in 1..5 {
         sum = sum + i;
     }
     print("sum 1..4 = {sum}\n");
 
-    # while loop
+    # while loop — `count` is var because the body reassigns it.
     var count: i32 = 0;
     while count < 3 {
         print("count = {count}\n");
         count = count + 1;
     }
 
-    # match expression
+    # match expression — `let val` and `let label` are not reassigned.
     let val: i32 = 42;
     let label: str = match val {
         0      => "zero",

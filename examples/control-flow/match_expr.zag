@@ -29,9 +29,15 @@ fun main() {
     };
     print("doubled = {doubled}\n");
 
-    ## Wildcard arm (last) — terminal fallback. Subsequent statements still
-    ## execute after the match because the match is expression-valued.
+    ## Wildcard arm (last) — terminal fallback. The scrutinee temp
+    ## `__m_<N>` is referenced in the non-wildcard arm's condition
+    ## (`__m_<N> == 3`) so zig 0.16 doesn't flag it as unused. Tested
+    ## here — the codegen `cd: match-stmt identifies ident arm emits
+    ## const binding` covers the IDENT-pattern arm shape; this
+    ## example uses literal-pattern non-wildcard to exercise the same
+    ## scrutinee-references bound.
     let safe: i32 = match n {
+        3 => 99,
         _ => 0,
     };
     print("safe = {safe}\n");

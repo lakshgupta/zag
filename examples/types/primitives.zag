@@ -1,26 +1,79 @@
-## Primitive types and type conversions
+## Primitive types and type conversions (docs/manual/08-primitives.md).
 ##
 ## Run: zag run primitives.zag
+##
+## Covers every primitive type listed in
+## docs/manual/08-primitives.md EXCEPT the two v2-deferred
+## bullets pinned at the bottom of §08 (bf16, char ≠ u8).
+## Each `let v: T = N` line binds one primitive; each `print`
+## line proves the runtime round-trip by emitting the value
+## through zag's `__zag_print("{any}", .{arg,})` builtin.
+## Variable names are kept short (`i8v`, `u16v`, `f32v`, ...)
+## so the full set fits comfortably on one screen. The c-compat
+## ABI types (`c_short`, `c_int`, `c_long`, `c_ulong`) are NOT
+## listed in the manual's primitive table so no row covers
+## them — see §08 Note 2 in docs/features.md.
 
 fun main() {
-    # Integer types
-    let a: i32 = 42;
-    let b: i64 = a;           # implicit widening
-    let c: u32 = 0xFF;
-    print("a = {a}, b = {b}, c = {c}\n");
+    # ── §08 Signed integers ─────────────────────────────────────
+    # Every signed int size: i8 / i16 / i32 / i64 / i128 / isize.
+    # `let i64v: i64 = i32v` exercises implicit widening — zig
+    # also allows implicit i32 → i64 because both sides are
+    # the smaller-to-larger rule, BUT FORBIDS implicit
+    # narrowing (i64 → i32 requires an `as` cast).
+    let i8v:   i8    = 1;
+    let i16v:  i16   = 2;
+    let i32v:  i32   = 3;
+    let i64v:  i64   = i32v;       # implicit widening (i32 → i64)
+    let i128v: i128  = 4;
+    let isz:   isize = 5;          # pointer-width signed
+    print("signed    i8={i8v}, i16={i16v}, i32={i32v}, i64={i64v}, i128={i128v}, isize={isz}\n");
 
-    # Float types
-    let pi: f64 = 3.141592653589793;
-    let half: f32 = pi as f32;  # explicit narrowing
-    print("pi = {pi:.5}, half = {half:.5}\n");
+    # ── §08 Unsigned integers ───────────────────────────────────
+    # Every unsigned int size: u8 / u16 / u32 / u64 / u128 /
+    # usize. The u8 line doubles as the §08 Char row below —
+    # v1 char IS u8 single-byte ASCII, so 'Z' renders as the
+    # integer 90 at runtime (not the character 'Z'). The
+    # 4-byte Unicode char (`'\u2764'` per manual) is deferred
+    # to v2 — see §08's deferred bullets.
+    let u8v:   u8    = 'Z';        # char_lit → ASCII 90 (v1 char == u8)
+    let u16v:  u16   = 6;
+    let u32v:  u32   = 0xFF;
+    let u64v:  u64   = 7;
+    let u128v: u128  = 8;
+    let usz:   usize = 9;          # pointer-width unsigned
+    print("unsigned  u8={u8v}, u16={u16v}, u32={u32v}, u64={u64v}, u128={u128v}, usize={usz}\n");
 
-    # Bool and char
-    let t: bool = true;
-    let ch: char = '∑';
-    print("t = {t}, ch = {ch}\n");
+    # ── §08 Floats ──────────────────────────────────────────────
+    # Every float size: f16 / f32 / f64. `f16` is described as
+    # "library-only in v1" by docs/08 — the gap is the zig-side
+    # SCALAR ARITHMETIC hooks, NOT the bind / print round-trip.
+    # The let-binding compiles + the value prints + the value
+    # can be assigned / compared inside the binding's scope.
+    # bf16 also in the manual's table but REJECTED by zag's
+    # parser — see §08 deferred bullet.
+    let f16v: f16 = 1.5;           # IEEE 754 half
+    let f32v: f32 = 2.5;           # IEEE 754 single
+    let f64v: f64 = 3.141592653589793;   # IEEE 754 double
+    print("floats    f16={f16v}, f32={f32v:.5}, f64={f64v:.5}\n");
 
-    # Type conversions
-    let int_val: i32 = 65;
-    let float_val: f64 = int_val as f64;
-    print("{int_val} as f64 = {float_val}\n");
+    # ── §08 Boolean ─────────────────────────────────────────────
+    # `bool` is a 1-byte stack primitive. Both `true` and
+    # `false` literals bound below exercise the keyword
+    # recogniser (`Expr.bool_lit`).
+    let b_t: bool = true;
+    let b_f: bool = false;
+    print("bool      on={b_t}, off={b_f}\n");
+
+    # ── §08 `as` type conversion ────────────────────────────────
+    # Two `as` cast profiles, replayed here so the canonical
+    # primitives tour is self-contained. Full coverage of all
+    # three profiles (int→float widening, float→float narrowing,
+    # float→int truncating) lives on §07.
+    let f64_pi:   f64 = 3.141592653589793;
+    let f32_half: f32 = f64_pi as f32;       # f64 → f32 narrowing
+    print("as-cast   f64={f64_pi:.5} -> f32={f32_half:.5}\n");
+    let i32_int: i32  = 65;
+    let f64_wider: f64 = i32_int as f64;     # i32 → f64 widening
+    print("as-cast   i32={i32_int} -> f64={f64_wider}\n");
 }

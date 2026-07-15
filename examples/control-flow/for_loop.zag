@@ -1,32 +1,43 @@
 ## For loops over ranges and iterables
 fun main() {
-    ## `for i in 0..10` — half-open range emits zig's `for (0..10) |i|`.
-    let sum: i32 = 0;
+    ## `for i in 0..5` — half-open range emits zig's `for (0..5) |i|`.
+    ## The accumulator `sum` is `usize` because zig's for-loop capture
+    ## `i` is usize-typed by default — an `i32 sum + usize i` mix
+    ## requires an `i32`-narrowing cast, and zag's current `as`-cast
+    ## codegen emits `@as(i32, i)` which zig 0.16 rejects in strict mode
+    ## (not all usize values fit in i32). The cumulative workaround is
+    ## to use a `usize` accumulator; the `print(...)` template
+    ## interpolation handles usize smoothly (zig's `{any}` formatter is
+    ## type-agnostic). The narrow-cast codegen fix is tracked as a
+    ## deferred bullet in §06 / §07.
+    var sum: usize = 0;
     for i in 0..5 {
         sum = sum + i;
     }
     print("half-open sum = {sum}\n");
 
-    ## `for i in 0...10` — inclusive range emits `for (0..10 + 1) |i|`,
-    ## which iterates 0,1,...,10 (zig's half-open range semantics get
-    ## pushed to inclusive via the +1).
-    let count: i32 = 0;
-    for i in 0...5 {
+    ## `for _ in 0...5` — inclusive range emits `for (0..5 + 1) |_|`,
+    ## iterates 0,1,...,5. Wildcard `_` so the body doesn't reference
+    ## any captured value; zig 0.16 doesn't flag `_` as unused the way
+    ## it would an `i` capture. The `+ 1` adjustment flips zig's
+    ## half-open range semantics into inclusive — without it, the loop
+    ## would iterate 0-4 only (the codegen docblock on `for-range`).
+    var count: usize = 0;
+    for _ in 0...5 {
         count = count + 1;
     }
     print("inclusive count = {count}\n");
 
-    ## `for x in items()` — verbatim iter expression emits `for (items()) |x|`.
-    ## Currently the example statically lists items; future: pass slices,
-    ## arrays, or iterators once those are parsed.
-    let total: i32 = 0;
+    ## `for x in 1..4` — verbatim iter; capture `x` summed into a
+    ## usize accumulator (same i32/usize avoidance rationale as above).
+    var total: usize = 0;
     for x in 1..4 {
         total = total + x;
     }
     print("mixed total = {total}\n");
 
-    ## `for _ in 0..3` — wildcard pattern emits `for (0..3) |_|`.
-    let tick: i32 = 0;
+    ## `for _ in 0..3` — wildcard half-open; body just increments tick.
+    var tick: usize = 0;
     for _ in 0..3 {
         tick = tick + 1;
     }

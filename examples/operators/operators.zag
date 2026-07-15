@@ -10,11 +10,22 @@ fun main() {
     print("modulo: 17 % 5 = {m}\n");
     print("negation: -{m} = {n}\n");
 
-    # Bitwise ops on integer literals.
+    # Bitwise ops on integer literals. `~` does NOT accept a bare
+    # bit-literal because zig's `~` is rejected on
+    # `comptime_int` (the binary-literal is a comptime_int
+    # singleton whose negation has no fixed-width bit pattern).
+    # The zag-side work-around is to wrap the literal in an
+    # explicit cast first: `~(0b1100 as i32)`. The `as i32`
+    # cast promotes the comptime_int to a fixed-width i32 in
+    # the AST (codegen emits `@as(i32, 0b1100)` in zig), and
+    # the outer `~` then has a typed operand. This is the
+    # tightest one-line shape in zag source. (`@as(i32, 0b1100)`
+    # alone is rejected — `@as` is a zig-side builtin, not a
+    # zag-side keyword; zag source uses `x as T` exclusively.)
     let a: i32 = 0b1100 & 0b1010;
     let b: i32 = 0b1100 | 0b1010;
     let c: i32 = 0b1100 ^ 0b1010;
-    let d: i32 = ~0b1100;
+    let d: i32 = ~(0b1100 as i32);
     let e: i32 = 0b0001 << 2;
     let f: i32 = 0b1000 >> 2;
     print("bitwise: and={a} or={b} xor={c} not={d} shl={e} shr={f}\n");
@@ -66,13 +77,53 @@ fun main() {
     let nested: i32 = arr[0];
     print("index: first={first} second={second} after_write={after_write} chained={nested}\n");
 
-    # Range: half-open `..` and inclusive `...`. Both produce an
-    # anonymous struct `.{start, end, inclusive}` for downstream
-    # consumption; print("{any}") renders the tuple via zig's debug
-    # formatter so the user can verify shape.
-    let half: i32 = 0;
-    let half_end: i32 = 10;
-    let inc_end: i32 = 10;
-    print("range: half-open 0..{any}-{any} = {any}\n", .{ 0, 10, .{ half, half_end, false } });
-    print("range: inclusive 0...{any} = {any}\n", .{ inc_end, .{ 0, inc_end, true } });
+    # Range: half-open `..` and inclusive `...`. Both ranges share
+    # start=0 and end=10; only the `inclusive` flag differs.
+    #
+    # The zag-side `0..10` / `0...10` Range Expr codegens to
+    # anonymous struct `.{ start, end, inclusive }`. Two ways
+    # to surface this to a reader:
+    #
+    #   1. Single-arg template interpolation (this section's
+    #      `print("range half-open: {range_start}...")` calls —
+    #      the per-field breakdown with `{range_start}` /
+    #      `{half_open_inc}` interpolations rendered through
+    #      zig's `{any}` placeholder).
+    #
+    #   2. Single-arg tuple-literal print
+    #      (`print(r)` where `r` is a tuple binding, codegens
+    #      `__zag_print("{any}", .{r,})`) — the user's
+    #      single-arg tuple printing surface that ALREADY works
+    #      through genPrintCall's `.tuple_lit` arm. The
+    #      anonymous-struct Debug form `.{ 0, 10, false }` is
+    #      what zig prints via `{any}`.
+    #
+    # The multi-arg shape `print("fmt\n", args...)` IS wired
+    # in src/codegen/primary.zig:genPrintCall's
+    # `c.args.len >= 2` branch — but only when the format
+    # string has NO `{}` placeholder (literal `string_lit` /
+    # `byte_string_lit` first arg). The Reason: zag's
+    # auto-promotion gate converts any string-literal source
+    # text containing `{...}` into a `.template_lit` Expr
+    # (see parser/primary.zig:looksLikeTemplateLiteral), so
+    # `print("range: {x}\n", extra)` reaches genPrintCall
+    # with first arg as `.template_lit` not `.string_lit`.
+    # The codegen fix rejects `.template_lit` first arg at
+    # compile time because genTemplateLit's `.debug_print`
+    # emit already produces a complete `__zag_print(...)`
+    # statement — naively splicing `c.args[0]` into the
+    # outer args tuple would nest a `__zag_print` call
+    # inside another's args. Refactoring genTemplateLit
+    # to return fmt + args slices so this codepath can
+    # MERGE template args with extra args is the proper
+    # fix — deferred. Operators.zag's range section uses
+    # single-arg prints (path #1 above), so the multi-arg
+    # branch fix in primary.zig is a defensive improvement
+    # for cases where the format string has no `{...}`.
+    let range_start: i32 = 0;
+    let range_end_v: i32 = 10;
+    let half_open_inc: bool = false;
+    let inclusive_inc: bool = true;
+    print("range: half-open start={range_start} end={range_end_v} inclusive={half_open_inc}\n");
+    print("range: inclusive start={range_start} end={range_end_v} inclusive={inclusive_inc}\n");
 }

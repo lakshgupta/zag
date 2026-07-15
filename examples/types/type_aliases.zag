@@ -1,0 +1,132 @@
+## Type aliases and the v1 type surface (docs/manual/07-types.md).
+##
+## Run: zag run type_aliases.zag
+##
+## Closes the docs/07 row gaps. Every bullet below is exercised on
+## a single `main` so a future regression surfaces here before it
+## reaches production. Citations in docs/features.md §07 cite this
+## file by file-name only — line numbers go stale on every edit.
+##
+## Surfaces exercised:
+##   1. Literal-init type inference (the parser-side `isLiteralInit`
+##      carve-out: int → i32, float → f64, str literal → []const u8,
+##      bool → bool).
+##   2. Explicit `: T` annotation override (forces a wider / narrower
+##      primitive than the inferred literal-init default).
+##   3. `str` → `[]const u8` transparent alias at three AST sites:
+##      let-binding (`name_v`), fn-param (`print_echo`'s `name: str`),
+##      and fn-return (`get_greeting`'s `-> str`).
+##   4. `as` type conversion — three real casts:
+##        int → float widening     (`int_v as f64`)
+##        float → float narrowing  (`widen_f64 as f32`)
+##        float → int truncating   (`widen_f64 as i32`)
+##   5. `void` zero-byte-unit return — both EXPLICIT (`log` uses
+##      `-> void`) and INFERRED (`do_nothing` omits the arrow).
+##   6. Zag-source escape sequences inside template-literal format
+##      strings (`\"`, `\n`, `\t`, `\r`, `\\`) — pins the docs/11
+##      escape-pair codegen path that
+##      `src/codegen/primary.zig:genTemplateLite` now emits as
+##      zigzag escapes (without the fix, `\"` produced `\\"` which
+##      zig 0.16 rejects with `expected ',' after argument`).
+
+fun main() {
+    # ── 1. Literal-init type inference ──────────────────────────
+    # Each `let` below has NO `: T` annotation. The parser's
+    # `isLiteralInit` carve-out assigns the canonical primitive
+    # default; codegen then emits the inferred type via the
+    # `ImpliedType` resolver at the let-bind site. This is the
+    # ONLY surface on which zag permits type inference — every
+    # non-literal initializer (binary op, fn call, deref, …)
+    # REQUIRES an explicit annotation.
+    let auto_i = 42;       # inferred i32
+    let auto_f = 3.14;     # inferred f64
+    let auto_s = "hello";  # inferred []const u8
+    let auto_b = true;     # inferred bool
+
+    # ── 2. Explicit type annotation override ───────────────────
+    # The annotation wins over the inferred literal-init default.
+    # i64 ↔ i32 and f64 ↔ f32 are the canonical override pairs.
+    let wide_i64: i64 = 42;        # i64 (not inferred i32)
+    let narrow_f32: f32 = 3.14;    # f32 (not inferred f64)
+
+    print("inferred     i={auto_i} f={auto_f:.5} b={auto_b} s={auto_s}\n");
+    print("override     i64={wide_i64} f32={narrow_f32:.5}\n");
+
+    # ── 4. `as` type conversion ────────────────────────────────
+    # All `as` casts are compile-time; no runtime cost. The
+    # codegen arm emits `@as(T, expr)` from `Expr.cast`. Three
+    # distinct cast profiles exercised end-to-end:
+    let int_v: i32 = 65;
+    let widen_f64: f64 = int_v as f64;      # int → float widening (no precision loss)
+    let trunc_f32: f32 = widen_f64 as f32;  # float → float narrowing (precision loss)
+    let trunc_i32: i32 = widen_f64 as i32;  # float → int truncating (65.0 → 65)
+    print("as-cast      {int_v} -> f64={widen_f64} -> f32={trunc_f32} -> i32={trunc_i32}\n");
+
+    # ── 3. `str` transparent alias (let-bind site) ─────────────
+    # The zag-side `: str` annotation routes through
+    # `src/codegen/decl.zig:zagTypeToZig` and emits `[]const u8`
+    # at the codegen site.
+    let name_v: str = "zag";
+
+    # ── 3. `str` transparent alias (fn-param site) ─────────────
+    print_echo(name_v);
+
+    # ── 3. `str` transparent alias (fn-return site) ────────────
+    let greeting_v: str = get_greeting();
+
+    # ── 6. Zag-source escape sequences inside template-literal ──
+    # The format string `\"{name_v}\"` and the `\n` at the end
+    # exercise the docs/11 escape-pair codegen path. Pre-fix,
+    # zag emitted `\\"` (escape-for-backslash + closing quote)
+    # instead of `\"` (escape-for-quote), which zig 0.16 rejects
+    # with `expected ',' after argument` on the args tuple.
+    # Post-fix, `\"` and `\n` emit as `\"` and `\n` in zigzag source,
+    # so the generated string parses cleanly and prints
+    # `str-quote-name="zag"\n` at runtime.
+    # The simpler `\"{name_v}\"` form — zigzag runtime output:
+    # `str-quote="zag"` (with the literal quotes rendering as content).
+    print("str-quote=\\\"{name_v}\\\"\n");
+    print("str-alias     name={name_v} greeting={greeting_v}\n");
+
+    # ── 5. `void` zero-byte-unit return ────────────────────────
+    # `log(...)` uses the EXPLICIT `-> void` form; `do_nothing`
+    # omits the arrow. Both compile to the same zig emit
+    # (`pub fn NAME(...) void { ... }`) per the codegen fallback
+    # `if (m.return_type) |rt| self.write(zagTypeToZig(rt)) else
+    # self.write("void");` in src/codegen/decl.zig.
+    log(name_v);
+    do_nothing();
+    print("void return   explicit-arrow + inferred-arrow both accepted\n");
+}
+
+## Takes a `str` (transparent alias for `[]const u8`) and prints
+## it with the docs/11 escape-pair codegen path exercised inside
+## the format string (`\"{name}\"` produces `echo: "zag"` at
+## runtime — same as the main block's `str-quote-name="..."` line
+## but inside an fn body so the codegen arm runs against a
+## `name: str` parameter rather than a let-bound `name_v: str`.
+fun print_echo(name: str) -> void {
+    print("echo: \\\"{name}\\\"\n");
+}
+
+## Returns a `str` backed by a string literal. Exercises the
+## docs/07 alias resolution at the fn-RETURN emit site — the
+## zag-side `-> str` becomes `[]const u8` as the trailing
+## return-type text in the generated zig fn signature.
+fun get_greeting() -> str {
+    return "hello";
+}
+
+## Logs a message via the EXPLICIT `-> void` return-type form.
+## Documents the zero-byte-unit codegen shape: when the source
+## writes `-> void` explicitly, codegen emits the same `void`
+## form as the inferred (no-arrow) path below.
+fun log(msg: str) -> void {
+    print("[log] {msg}\n");
+}
+
+## No-arg function with INFERRED void return type (the arrow is
+## omitted entirely). Codegen falls through to the `void` emit
+## path because the parser set `m.return_type = null`.
+fun do_nothing() {
+}
