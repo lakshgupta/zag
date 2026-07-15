@@ -1901,6 +1901,61 @@ test "codegen: match-counter increments per match" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "const __m_1 = b") != null);
 }
 
+test "codegen: match { 3 => 99, _ => 0 } yields 99 for scrutinee 3 and 0 otherwise" {
+    // Pairs with examples/control-flow/match_expr.zag's `safe` block:
+    //   let safe: i32 = match val { 3 => 99, _ => 0 };
+    // Pins the non-wildcard literal arm BEFORE the wildcard — codegens
+    // to `if (__m_0 == 3) { break :blk 99; }` (literal arm) followed by
+    // `break :blk 0;` (wildcard fallback). Mirrors the established
+    // match-stmt codegen test convention but specifically targets the
+    // new non-wildcard-literal-arm shape that was added to the example
+    // to exercise scrutinee capture (and to confirm the `3` arm doesn't
+    // get conflated with the wildcard by the codegen).
+    //
+    // Load-bearing pin: the literal `3` from the AST's literal-arm
+    // payload must reach codegen unchanged (as `__m_0 == 3`). A
+    // regression that stored the pattern as the scrutinee identifier
+    // would surface as `__m_0 == __m_0`.
+    const src =
+        \\fun f() {
+        \\    let x: i32 = 3;
+        \\    let result: i32 = match x { 3 => 99, _ => 0 };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Scrutinee bind: captures x to a temp at the start of the match.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __m_0 = x") != null);
+    // The non-wildcard literal arm emits an equality check against the
+    // literal `3` — the load-bearing pin (see docstring above).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__m_0 == 3") != null);
+    // Literal arm body emits `break :blk 99` so the match expression
+    // yields 99 when x == 3.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk 99") != null);
+    // Wildcard fallback emits `break :blk 0` — no equality test (the
+    // wildcard matches any value, no condition needed). The presence
+    // of `break :blk 0` distinguishes this arm from the literal arm above.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk 0") != null);
+    // Negative pins (closes reviewer finding's rigor gap):
+    // - "literal 3 actually reached codegen" — a regression that
+    //   substituted the scrutinee identifier `__m_0` for the
+    //   literal-arm payload would emit `__m_0 == __m_0` somewhere.
+    //   Forbid that shape so a future degenerate codegen path is loud.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__m_0 == __m_0") == null);
+    // - "match counter is fresh per Codegen.init()" — this test has
+    //   only ONE match-stmt, so the per-match counter must stay at
+    //   `__m_0`. A regression that prematurely increments the counter
+    //   within a single init() would surface as `__m_1` (or higher)
+    //   appearing in the output despite only one match being present.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__m_1") == null);
+}
+
 test "codegen: break-stmt emits zig break;" {
     // Codegen emits zig's bare `break;` (no label, no value).
     const src =
