@@ -14,6 +14,28 @@ pub fn init(tokens: []const Token, arena: *ast.Arena) Parser {
             .pos = 0,
             .arena = arena,
             .allow_struct_lit = true,
+            // Gap #2 closure (docs/manual/14-unions §Mixed Bare + Payload):
+            // known_variant_names tracks every variant ident declared at
+            // module scope (push sites: parseEnumDecl/parseUnionDecl). The
+            // table powers parsePrimary's `.identifier` arm disambiguation
+            // so `Pair { x: 2.0, y: 3.0 }` (unqualified brace) routes to
+            // `enum_variant_ctor { enum_name = null, ... }` when `Pair` is
+            // in the table, falling through to `.struct_lit` otherwise.
+            // Reset to zero on init() so a Parser reused across multiple
+            // codegen-pass calls (e.g. smoke+scaffold tests in one process)
+            // doesn't carry stale variant names between files.
+            .known_variant_names = undefined,
+            .known_variant_count = 0,
+            // BLOCKING #2 fix: known_struct_names tracking parallel to
+            // known_variant_names. Populated by parseStructDecl on the
+            // top-level decl-completion hook so parsePrimary can
+            // prefer struct-literal when an ident matches BOTH a struct
+            // decl AND a brace-named-field variant name. Reset to empty
+            // on init() so a Parser reused across multiple codegen-pass
+            // calls (smoke + scaffold + e2e in one process) starts
+            // fresh — same pattern as the variant table reset above.
+            .known_struct_names = undefined,
+            .known_struct_count = 0,
         };
     }
 
@@ -73,8 +95,8 @@ pub fn parse(self: *Parser) ast.Program {
                 // the same parser surface, just at module scope.
                 const after_pub = self.peekAhead(1);
                 if (after_pub == .struct_kw or after_pub == .impl_kw or
-                    after_pub == .enum_kw or after_pub == .trait_kw or
-                    after_pub == .fun)
+                    after_pub == .enum_kw or after_pub == .union_kw or
+                    after_pub == .trait_kw or after_pub == .fun)
                 {
                     self.advance(); // consume pub
                     switch (after_pub) {
@@ -89,6 +111,19 @@ pub fn parse(self: *Parser) ast.Program {
                         },
                         .enum_kw => {
                             enums_buf[enum_count] = self.parseEnumDecl();
+                            enums_buf[enum_count].doc = doc;
+                            enum_count += 1;
+                        },
+                        .union_kw => {
+                            // v2 split (docs/14 §\"Definition\"): `pub union`
+                            // is the payload-bearing sibling of `pub enum`.
+                            // Same enum-record slot in `enums_buf` (both
+                            // keywords produce an EnumDecl-shaped AST
+                            // because codegen reuses the union(enum) / enum(T)
+                            // emit logic). Doc threading mirrors the enum
+                            // path (`pub union { ... }` → doc attaches via
+                            // `enums_buf[i].doc = doc`).
+                            enums_buf[enum_count] = self.parseUnionDecl();
                             enums_buf[enum_count].doc = doc;
                             enum_count += 1;
                         },
@@ -137,6 +172,19 @@ pub fn parse(self: *Parser) ast.Program {
             enums_buf[enum_count].doc = doc;
             enum_count += 1;
             continue;
+            }
+            if (lead == .union_kw) {
+                // v2 split (docs/14 §\"Definition\"): bare `union X { ... }`
+                // is the payload-bearing counterpart to bare `enum`. The
+                // recorded slot is `enums_buf` (the shared EnumDecl AST
+                // shape carries both surfaces; codegen branches on the
+                // backing-type + payload presence to pick the emit form).
+                // doc threads through to codegen the same way as the
+                // `enum` arm above.
+                enums_buf[enum_count] = self.parseUnionDecl();
+                enums_buf[enum_count].doc = doc;
+                enum_count += 1;
+                continue;
             }
             if (lead == .trait_kw) {
                 // Top-level trait decl (docs/17 §"Definition"). Phase 1
@@ -293,6 +341,58 @@ pub fn isClosureBound(self: *Parser, name: []const u8) bool {
     }
 
 
+pub fn isKnownVariant(self: *Parser, name: []const u8) bool {
+        // Gap #2 closure (docs/manual/14-unions §Mixed Bare + Payload):
+        // linear scan over `known_variant_names` populated at module
+        // scope by parseEnumDecl / parseUnionDecl. The lookup is O(N)
+        // (matching the codegen-side lookupVariantFieldsByName helper
+        // in src/codegen/core.zig) with N bounded by 256, so for a
+        // typical v1 program (a handful of unions/enums) the cost is
+        // trivial. Returns true when `name` matches any registered
+        // variant ident — callers (parsePrimary's `.identifier` arm in
+        // src/parser/primary.zig) use this to decide whether an
+        // unqualified brace ctor `T { ... }` should route to
+        // `.enum_variant_ctor { enum_name = null, ... }` (when matched)
+        // or fall through to `.struct_lit` (when not matched). The
+        // hit-rate is high for source files that declare and use
+        // variants in source order (the typical case); the miss-rate
+        // costs a struct_lit instead of a variant ctor (false-positive
+        // on struct-literal direction is acceptable because it
+        // preserves legacy behavior). Mirror of the codegen-side
+        // lookupVariantFieldsByName call so the parser and codegen
+        // agree on the same name-table content.
+        var i: u32 = 0;
+        while (i < self.known_variant_count) : (i += 1) {
+            if (std.mem.eql(u8, self.known_variant_names[i], name)) return true;
+        }
+        return false;
+    }
+
+
+pub fn isKnownStruct(self: *Parser, name: []const u8) bool {
+        // BLOCKING #2 fix (docs/manual/14-unions §Mixed Bare + Payload):
+        // linear scan over `known_struct_names` populated at module
+        // scope by parseStructDecl. The lookup is O(N) with N bounded by
+        // 256 (the same defensive bound used by `known_variant_names`),
+        // so for typical v1 programs (typically < 16 structs per file)
+        // the cost is trivial. Returns true when `name` matches any
+        // registered struct decl — callers (parsePrimary's
+        // `.identifier` arm in src/parser/primary.zig) use this for the
+        // STRUCT-WINS-FIRST tie-breaker when an ident could be either a
+        // struct type OR a brace-named-field variant. The hit-rate is
+        // high for source files that declare and use structs in source
+        // order (the typical case); the miss-rate falls through to the
+        // existing variant-lookup branch preserving legacy behavior.
+        // Companion to `isKnownVariant` (same O(N) shape; both tables
+        // are independent and bounded by the same 256-slot cap).
+        var i: u32 = 0;
+        while (i < self.known_struct_count) : (i += 1) {
+            if (std.mem.eql(u8, self.known_struct_names[i], name)) return true;
+        }
+        return false;
+    }
+
+
 pub fn expectIdent(self: *Parser) []const u8 {
         const tok = self.peek();
         // Method/struct names can be any user-facing identifier PLUS
@@ -365,6 +465,34 @@ pub const Parser = struct {
     /// collectTypedBindings in src/codegen/stmt.zig).
     closure_bindings: [256][]const u8 = undefined,
     closure_binding_count: u32 = 0,
+    /// Gap #2 closure (docs/manual/14-unions §Mixed Bare + Payload):
+    /// variant-name table populated by parseEnumDecl / parseUnionDecl.
+    /// Powers the parsePrimary `.identifier` arm disambiguation so
+    /// `Pair { x: 2.0, y: 3.0 }` (unqualified brace ctor) routes to a
+    /// `.enum_variant_ctor { enum_name = null, variant_name = \"Pair\", ... }`
+    /// AST node when `Pair` is in the table, falling through to the
+    /// existing `.struct_lit` arm otherwise. Tracks ONLY the variant
+    /// names — not the union or struct names — so a struct type named
+    /// `Pair` and a variant named `Pair` can coexist (struct-literal
+    /// wins because the registration path requires a brace form, which
+    /// struct-literal also consumes if the variant check fails). For
+    /// one-program, single-Parser runs, the table size matches the
+    /// 256-bound on `prog.enums` declared at module scope; the bound
+    /// is a defensive ceiling against pathological large files.
+    known_variant_names: [256][]const u8 = undefined,
+    known_variant_count: u32 = 0,
+    /// BLOCKING #2 fix (docs/manual/14-unions §Mixed Bare + Payload):
+    /// struct-name table populated by parseStructDecl. Powers the
+    /// struct-wins-first tie-breaker in parsePrimary's `.identifier`
+    /// arm — when the leading ident is BOTH a registered struct decl
+    /// AND matches a brace-named-field variant name, `parseStructLit`
+    /// wins (a struct literal can be type-checked against ANY matching
+    /// struct shape, while a brace-ctor only fits a specific variant
+    /// payload). The same per-Parser reset applies (init() zero-entries
+    /// it) so a Parser reused across multiple codegen-pass calls
+    /// starts fresh.
+    known_struct_names: [256][]const u8 = undefined,
+    known_struct_count: u32 = 0,
 
 
     // ----- Method aliases -----
@@ -378,10 +506,39 @@ pub const Parser = struct {
     pub const isLiteralInit = @import("core.zig").isLiteralInit;
     pub const eof = @import("core.zig").eof;
     pub const parse = @import("core.zig").parse;
-
+    // Gap #2 closure re-exports (docs/manual/14-unions §Mixed Bare +
+    // Payload): parsePrimary's `.identifier` arm (src/parser/primary
+    // .zig) calls `self.isKnownVariant(name)` to decide whether
+    // `T { ... }` should route to a brace-named-field variant ctor AST
+    // node or fall through to the legacy `.struct_lit` arm; and
+    // `self.parseEnumVariantCtorBrace(name)` to actually build the
+    // `.enum_variant_ctor { enum_name = null, variant_name, args }`
+    // node once the brace-form gate fires. Both helpers live in
+    // their respective files (src/parser/core.zig::isKnownVariant and
+    // src/parser/primary.zig::parseEnumVariantCtorBrace) and are
+    // surfaced here as `Parser.isKnownVariant` / `Parser
+    // .parseEnumVariantCtorBrace` via the same `@import`-based
+    // re-export pattern used by `parsePrimary` / `parseStructLit`
+    // above. Without these bindings, zig surfaces a `no field or
+    // member function named 'isKnownVariant' / 'parseEnumVariantCtorBrace'
+    // in 'parser.core.Parser'` compile error at the call site.    pub const isKnownVariant = @import("core.zig").isKnownVariant;
+    // Gap #2 closure helper re-export: parsePrimary's `.identifier` arm
+    // (src/parser/primary.zig) calls `self.isKnownStruct(name)` (added by the
+    // BLOCKING #2 fix) to decide whether to route to `parseStructLit` (when
+    // the leading ident matches a registered struct decl) BEFORE
+    // consulting the variant-lookup. Same re-export pattern as
+    // `isKnownVariant` / `isClosureBound` — file-scope helper in
+    // core.zig::isKnownStruct surfaced as `Parser.isKnownStruct` via this
+    // const. Without this binding zig surfaces a `no field or member
+    // function named 'isKnownStruct' in 'parser.core.Parser'` compile
+    // error at the parsePrimary call site.
+    pub const isKnownVariant = @import("core.zig").isKnownVariant;
+    pub const isKnownStruct = @import("core.zig").isKnownStruct;
     // --- decl.zig ---
     pub const parseClosureExpr = @import("decl.zig").parseClosureExpr;
     pub const parseEnumDecl = @import("decl.zig").parseEnumDecl;
+    pub const parseUnionDecl = @import("decl.zig").parseUnionDecl;
+    pub const parseBackedEnumValue = @import("decl.zig").parseBackedEnumValue;
     pub const parseEnumVariantPayload = @import("decl.zig").parseEnumVariantPayload;
     pub const parseTraitDecl = @import("decl.zig").parseTraitDecl;
     pub const parseTraitMethodDecl = @import("decl.zig").parseTraitMethodDecl;
@@ -532,6 +689,20 @@ pub const Parser = struct {
     pub const parseMatchExpr = @import("stmt.zig").parseMatchExpr;
     pub const parsePattern = @import("stmt.zig").parsePattern;
     pub const parsePatternBinding = @import("stmt.zig").parsePatternBinding;
+    // gap #6 brace-named-field walker registration (docs/manual/14-unions
+    // §\"Definition\" + docs/manual/13-enums §\"Choosing Between enum and
+    // union\"): `parsePatternField` parses one
+    // `Variant { name: bind, ... }` slot (consumes IDENT + `:` +
+    // `parsePatternBinding` for the capture). Without this re-export,
+    // the brace-form parser walker in `src/parser/stmt.zig` calls
+    // `self.parsePatternField()` and zig reports
+    // `no field or member function named 'parsePatternField' in
+    // 'parser.core.Parser'` (the same diagnostic as the equivalent
+    // codegen-side gap #2 `lookupVariantFields` re-export fix; the
+    // parser-side mirror is needed because brace-named-field is a
+    // parser-generated AST shape that an unqualified brace ctor would
+    // also call into).
+    pub const parsePatternField = @import("stmt.zig").parsePatternField;
     pub const parseReturnStmt = @import("stmt.zig").parseReturnStmt;
     pub const parseStmt = @import("stmt.zig").parseStmt;
     pub const parseStmtList = @import("stmt.zig").parseStmtList;
@@ -568,5 +739,13 @@ pub const Parser = struct {
     pub const parsePostfix = @import("primary.zig").parsePostfix;
     pub const parsePrimary = @import("primary.zig").parsePrimary;
     pub const parseStructLit = @import("primary.zig").parseStructLit;
+    // Gap #2 closure (docs/manual/14-unions §Mixed Bare + Payload) ctor
+    // parser re-export: parsePrimary's `.identifier` arm routes brace-
+    // form ctors `Variant { f1: v1, f2: v2 }` to
+    // `self.parseEnumVariantCtorBrace(name)` so the unqualified variant
+    // ctor surface round-trips through the same AST shape as the
+    // qualified form `Enum.Variant(args)`. Mirrors the existing
+    // `parsePrimary`/`parseStructLit` re-exports via `@import` indirection.
+    pub const parseEnumVariantCtorBrace = @import("primary.zig").parseEnumVariantCtorBrace;
 
 };

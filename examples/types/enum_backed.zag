@@ -1,0 +1,59 @@
+# examples/types/enum_backed.zag
+#
+# End-to-end demonstration of `enum(T)` backed enums (docs/manual/
+# 13-enums.md §"Backed Enums enum(T)"). Covers:
+#   - `enum(u8)` integer-backed form with explicit `= value` per variant
+#   - `enum(str)` string-backed form (round-trips via the str→[]const u8
+#     type alias)
+#   - `enum(char)` char-backed form (round-trips via the char→u32 alias)
+#   - `enum(u8)` with auto-inferred values (zig picks the next byte when
+#     the user omits `= expr`)
+#
+# Backing-enum semantics: every variant is a value of type T at compile
+# time. The tag type is `T` (vs. the bare-enum `u8` byte tag) so
+# comparisons like `Status.Ok == 0` are value-equality, not byte-tag
+# equality. This is the bridge that turns zag enums into a "category of
+# similar values" surface — the docs/13 design rationale.
+#
+# v1 status: this surface was docs-only until the v2 split landed.
+# The `enum(T)` keyword shape is now parsed end-to-end.
+
+enum(u8) Status {
+    Ok = 0,
+    Warn = 1,
+    Err = 2,
+}
+
+enum(str) Level {
+    Low = "low",
+    Medium = "medium",
+    High = "high",
+}
+
+enum(char) Vowel {
+    A = 'a',
+    E = 'e',
+    I = 'i',
+    O = 'o',
+    U = 'u',
+}
+
+enum(u8) AutoInfer {
+    First,
+    Second,
+    Third,
+}
+
+fun main() {
+    let s: u8 = Status.Ok;
+    print(s);
+
+    let lvl: str = Level.High;
+    print(lvl);
+
+    let a: char = Vowel.A;
+    print(a);
+
+    let third: u8 = AutoInfer.Third;
+    print(third);
+}

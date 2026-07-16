@@ -237,6 +237,14 @@ pub const ImplBlock = struct {
 /// emitting the enum's tag variants verbatim and zig's own exhaustive-
 /// match checker enforces the docs/13 contract that every match must
 /// handle every variant (or fall through to `_`).
+///
+/// `backing_type` is the verbatim source-text slot for the
+/// `enum(T) { ... }` backed-enum form (docs/manual/13-enums
+/// §"Backed Enums"): set to the canonical type name (`"str"`,
+/// `"u8"`, `"i32"`) when the source carries `enum(T) NAME { ... }`,
+/// null otherwise. When set, codegen emits `enum(T) { Variant = value, ... }`
+/// instead of the bare `enum { ... }` form. Default-null preserves the
+/// legacy bare-enum surface.
 pub const EnumDecl = struct {
     name: []const u8,
     variants: []const EnumVariant,
@@ -245,18 +253,78 @@ pub const EnumDecl = struct {
     /// `StructDecl.doc` for the parser-threaded semantics. Codegen
     /// emits `///` lines immediately before `pub const NAME = ...`.
     doc: ?[]const u8 = null,
+    /// Backing-type from `enum(T) NAME { ... }` (the backed-enum form
+    /// per docs/manual/13-enums). Captured verbatim from between the
+    /// `(` and `)` after `enum_kw`; codegen routes through
+    /// `zagTypeToZig` so `str` rewrites to `[]const u8` while
+    /// primitives (`u8`, `i32`) round-trip verbatim. Mutually
+    /// exclusive with payload-bearing variants — codegen rejects the
+    /// combination at emit time because zig's `enum(T) { V = t, ... }`
+    /// cannot host a tagged-union shape.
+    backing_type: ?[]const u8 = null,
 };
 
-/// One variant inside an `enum NAME { ... }`. `payload_type` is `null`
-/// for bare tag-only variants (`Direction.North`); non-null for variants
-/// carrying a single value whose type is the captured verbatim text
-/// (`Shape.Circle` carries `payload_type = "f64"`). Multi-type payloads
-/// (`Rect(f64, f64)`) round-trip through `payload_type` verbatim as
-/// well — codegen emits the raw text inside the variant's parens.
+/// One variant inside an `enum NAME { ... }` declaration. Three payload
+/// shapes are accepted across the v2 split (docs/manual/13-enums
+/// §"Choosing Between enum and union" + docs/manual/14-unions
+/// §"Definition"):
+///
+///   - Bare: `Variant` (no payload; `payload_type` = null, `fields` =
+///     empty, `value_text` = null)
+///   - Paren-positional: `Variant(T1, T2, ...)` (multi-arg payload;
+///     `payload_type` carries the joined verbatim text `T1, T2, ...`,
+///     `fields` empty, `value_text` null). Codegen emits
+///     `struct { a: T1, b: T2, ... }` with sequential single-letter
+///     field names so the existing positional ctor `Variant(arg1,
+///     arg2)` round-trips as `.{ .0 = arg1, .1 = arg2, ... }`.
+///   - Brace-named-field: `Variant { name1: T1, name2: T2 }`
+///     (named-field payload; `payload_type` null, `fields` carries
+///     the structured list, `value_text` null). Codegen emits
+///     `struct { name1: T1, name2: T2 }` preserving the source names
+///     so user code can address `.name1` / `.name2` on the union
+///     payload without resorting to positional `.0` / `.1` syntax.
+///
+/// `value_text` is non-null ONLY for variants in an `enum(T)` backed-enum:
+/// `Low = "low"` carries `value_text = "\"low\""`. Codegen emits
+/// `= value_text` after the variant ident when non-null. The `enum(T)`
+/// form is mutually exclusive with the union/payload forms (codegen
+/// branches on `EnumDecl.backing_type` before deciding the emit
+/// shape).
 pub const EnumVariant = struct {
     name: []const u8,
+    /// Joined verbatim type-text payload for the paren-positional form
+    /// (`Rect(f64, f64)` carries `payload_type = "f64, f64"`). Null for
+    /// bare variants AND for brace-named-field variants (the structured
+    /// `fields` slot carries the brace-form payload instead so codegen
+    /// can preserve user-written field names).
     payload_type: ?[]const u8,
     loc: Loc,
+    /// Structured payload list for the brace-named-field form
+    /// (`Drag { x: f64, y: f64 }` carries `fields = [{x, "f64"},
+    /// {y, "f64"}]`). Empty for bare AND paren-positional variants.
+    /// Codegen uses this slot when emitting `union(enum) { Drag:
+    /// struct { x: f64, y: f64 } }` so the user's named-field names
+    /// round-trip into the union payload type, restoring the source-
+    /// faithful `.x` / `.y` access surface that the docs/14 named-field
+    /// example promises.
+    fields: []const VariantField = &[_]VariantField{},
+    /// Backing-enum value for `enum(T) { Variant = value }`. Captured
+    /// verbatim from after the `=` sign so codegen emits the raw text.
+    /// Null for all variants in a non-backed enum. Default-null
+    /// preserves backward-compat with the existing bare-enum +
+    /// tagged-union surfaces where `value_text` is never set.
+    value_text: ?[]const u8 = null,
+};
+
+/// One named-field slot inside a brace-named-field variant
+/// (`Variant { name: T }`). Mirrors `StructField.NamedField` for the
+/// variant-payload context so codegen can reuse the existing
+/// `.named { name, type_text }` shape when emitting the
+/// `struct { name: T }` payload type. Distinct from `StructField`
+/// because variants own a tighter slot (no `idx`, no embed-form arm).
+pub const VariantField = struct {
+    name: []const u8,
+    type_text: []const u8,
 };
 
 /// One trait declaration of the form

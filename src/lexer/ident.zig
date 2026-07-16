@@ -44,6 +44,8 @@ pub     fn readIdent(self: *Lexer, start_loc: ast.Loc) void {
         .impl_kw
     else if (std.mem.eql(u8, text, "enum"))
         .enum_kw
+    else if (std.mem.eql(u8, text, "union"))
+        .union_kw
     else if (std.mem.eql(u8, text, "trait"))
         .trait_kw
     else if (std.mem.eql(u8, text, "pub"))

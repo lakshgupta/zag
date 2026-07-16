@@ -1,0 +1,32 @@
+# examples/types/named_field_match.zag
+#
+# End-to-end demonstration of brace-named-field MATCH-ARM destructuring
+# (docs/manual/14-unions §"Definition"). The match pattern `Pair { x: w,
+# y: h }` parses as `Pattern.EnumVariantNamedPattern` (parser: src/parser/
+# stmt.zig; codegen: src/codegen/stmt.zig .enum_variant_named arm).
+#
+# Codegen emits (per src/tests/codegen_decl.zig:2504 pin):
+#   cond:    __m_0 == .Pair
+#   preamble: const w = __m_0.x; _ = w; const h = __m_0.y; _ = h;
+#   body:    break :blk (w + h);
+# Source-side field names (`x`, `y`) round-trip because the union
+# payload's anonymous-struct preserves the source field names from the
+# variant's brace-fields declaration.
+#
+# v1→v2 migration note: v2 separates `union` (payload-bearing or mixed)
+# from `enum` (bare labels without payload). Update types with
+# payload-bearing variants to use the `union` keyword.
+#
+# Pinned by `src/tests/codegen_decl.zig:2504`.
+
+union Pos {
+    Pair { x: f64, y: f64 },
+}
+
+fun main() {
+    let p: Pos = Pair { x: 1.5, y: 2.5 };
+    let total: f64 = match p {
+        Pair { x: w, y: h } => w + h,
+    };
+    print("{total}\n");
+}

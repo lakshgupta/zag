@@ -691,6 +691,58 @@ pub fn parsePattern(self: *Parser) ast.Pattern {
                             .bindings = bindings_arena,
                         } };
                     }
+                    // Unqualified brace-named-field shape: peek 0 =
+                    // .lbrace -- `Variant { name1: b1, name2: b2, ... }`
+                    // (gap #6, docs/manual/14-unions §"Definition"). The
+                    // field-name walker mirrors `parseStructDecl`'s named-
+                    // field shape (declared on `src/parser/primary.zig`)
+                    // but routes binds through `parsePatternField` instead
+                    // of `parseFieldAssign` because pattern-side bindings
+                    // accept `_` discards via `parsePatternBinding`
+                    // returning `null`. `bindings` carried by the AST
+                    // shape `EnumVariantNamedPattern.fields` (sibling to
+                    // the legacy `EnumVariantPattern.bindings`) — codegen
+                    // consumes this slot to emit the binding preamble
+                    // inside the arm block (`const w = __m.x; ...`). The
+                    // `token.tag` lookahead is captured BEFORE the
+                    // consume so `(.dot .identifier .identifier)` style
+                    // scoped paths (`Shape.Drag { x: w }` qualified) are
+                    // distinguishable from the bare
+                    // `Drag { x: w }` unqualified form — covered by the
+                    // outer `peek[1]==.dot && peek[2]==identifier` arm
+                    // above. This arm fires ONLY when the immediately-
+                    // following token is `.lbrace` so the order in which
+                    // the three shape-detect arms run (qualified-dot,
+                    // unqualified-paren, unqualified-brace) is critical —
+                    // putting the brace arm AFTER the paren arm ensures a
+                    // source written as `Foo(x)` still matches the paren
+                    // shape and isn't misparsed as a single-field brace
+                    // form `Foo { x: ... }`.
+                    if (self.pos + 1 < self.tokens.len and
+                        self.tokens[self.pos + 1].tag == .lbrace)
+                    {
+                        const variant_name = self.expectIdent();
+                        self.expect(.lbrace);
+                        var field_buf: [16]ast.VariantFieldPattern = undefined;
+                        var field_count: usize = 0;
+                        if (self.peek().tag != .rbrace) {
+                            field_buf[field_count] = self.parsePatternField();
+                            field_count += 1;
+                            while (self.peek().tag == .comma) {
+                                self.advance();
+                                field_buf[field_count] = self.parsePatternField();
+                                field_count += 1;
+                            }
+                        }
+                        self.expect(.rbrace);
+                        const fields_arena = self.arena.alloc(ast.VariantFieldPattern, field_count);
+                        @memcpy(fields_arena, field_buf[0..field_count]);
+                        return .{ .enum_variant_named = .{
+                            .enum_name = "",
+                            .variant_name = variant_name,
+                            .fields = fields_arena,
+                        } };
+                    }
                     // Bare-variant shape: peek 0 is arm-terminator
                     // (`=>`, `if`, `,`, `}`, newline, or eof). The
                     // PascalCase gate plus the terminator check ensure we
@@ -733,6 +785,28 @@ pub fn parsePatternBinding(self: *Parser) ?[]const u8 {
             return null;
         }
         return self.expectIdent();
+    }
+
+
+pub fn parsePatternField(self: *Parser) ast.VariantFieldPattern {
+        // Brace-named-field match pattern walker (gap #6,
+        // docs/manual/14-unions §"Definition" + docs/manual/13-enums
+        // §"Choosing Between enum and union"). Mirrors the per-field
+        // walker inside `parseStructDecl` (src/parser/primary.zig) but
+        // routes through `parsePatternBinding` (returns `null` for `_`
+        // discard, otherwise ident) so the captured bindings may skip
+        // any single slot via wildcard. The `name` prefix MUST be an
+        // identifier (no `_` — the field name is sourced from the
+        // variant-decl side, not the binding side); rejects any other
+        // leading token with a parse error so the user gets a clear
+        // diagnostic instead of a silent mismatch with zig's
+        // (later) anonymous-struct field-name resolver. Returns
+        // `null` capture when the binding is a wildcard (so codegen
+        // can avoid emitting a useless `const _ = __m.x` preamble).
+        const name = self.expectIdent();
+        self.expect(.colon);
+        const capture = self.parsePatternBinding();
+        return .{ .name = name, .capture = capture };
     }
 
 

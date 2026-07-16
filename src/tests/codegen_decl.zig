@@ -2500,3 +2500,103 @@ test "codegen: mutable struct method emits self: *Vec3 (not *const Vec3)" {
     // Sanity: the field-write `self.x = 0.0` reaches zigzag unchanged.
     try std.testing.expect(std.mem.indexOf(u8, zig, "self.x = 0.0;") != null);
 }
+
+test "codegen: brace-named-field match-arm destructuring emits __m == .Variant + const-name = __m.field preamble" {
+    // gap #6 round-trip (`docs/manual/14-unions §"Definition"` +
+    // `src/codegen/stmt.zig`'s `emitPatternBindings` helper).
+    // `match p { Pos { x: w, y: h } => w + h }` emits zig — inside the
+    // labelled `blk` block — three pieces:
+    //   1. cond: `if (__m_0 == .Pos)`
+    //   2. preamble (inside the `if`-block, before `break :blk`):
+    //      `const w = __m_0.Pos.x; const h = __m_0.Pos.y;`
+    //      — zig 0.16's union(enum) requires explicit variant dispatch
+    //      (`__m_0.<variant_name>.<field>` — Bug #2 fix); the `_ = NAME;`
+    //      throwaway was removed (Bug #1 fix) because zig 0.16 also
+    //      rejects pointless-discard of locally-used consts.
+    //   3. arm body: `break :blk (w + h);`
+    // All three pieces must round-trip from source → zag emit.
+    const src =
+        \\union Pos {
+        \\    Pos { x: f64, y: f64 },
+        \\}
+        \\
+        \\fun main() {
+        \\    let p: Pos = Pos.Pos(2.0, 3.0);
+        \\    let sum: f64 = match p {
+        \\        Pos { x: w, y: h } => w + h,
+        \\    };
+        \\    print(sum);
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    // Cond: `__m_0 == .Pos` (the `__m_0` counter-name comes from
+    // `genMatchExpr`'s `std.fmt.bufPrint(&name_buf, "__m_{d}", .{id})`
+    // — the first match expr in the source gets id=0).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__m_0 == .Pos") != null);
+    // Binding preamble shape: `const <capture> = __m_0.<variant_name>.<source-field>` (zig 0.16 union(enum) dispatch — Bug #2 fix).
+    // The source field name MUST round-trip (gap #2 brace-ctor emit
+    // preserves user-written field names on the anonymous-struct
+    // payload; gap #6 picks them up via `Pattern.VariantFieldPattern
+    // .name`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const w = __m_0.Pos.x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const h = __m_0.Pos.y") != null);
+    // zig 0.16 unused-const throwaway: each capture is followed by
+    // `_ = NAME;` to silence the "unused local" diagnostic regardless
+    // of whether the arm body's EXPR references the capture.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "_ = w;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "_ = h;") == null);
+}
+
+test "codegen: unqualified brace ctor routes through brace-named-field emit via lookupVariantFieldsByName" {
+    // Pins the FULL gap #2 surface end-to-end. The unqualified brace ctor
+    // `Pair { x: 2.0, y: 3.0 }` parses to `enum_variant_ctor { enum_name=null, Pair, [2.0, 3.0] }`;
+    // codegen consults `lookupVariantFieldsByName("Pair")` to resolve the
+    // source-named `x`, `y` fields and emit `.{ .Pair = .{ .x = 2.0, .y = 3.0 } }`
+    // (not the legacy `.{ .a = 2.0, .b = 3.0 }`). Single-line src literal
+    // uses real braces (zig non-raw strings have no brace semantics).
+    const src = "union Pos { Pair { x: f64, y: f64 } }\n\nfun main() { let p: Pos = Pair { x: 2.0, y: 3.0 }; print(p.x); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    // AST pin (gap #2 closure, BLOCKING #2 fix): the parser must route
+    // `Pair { x: 2.0, y: 3.0 }` to `enum_variant_ctor { enum_name = null }`
+    // (NOT `enum_name = "Pos"` from the legacy qualified path). The codegen
+    // emit-shape pin above would still pass if gap #2 reverted to dead code
+    // and the legacy `Pos.Pair(...)` qualified route happened to emit the
+    // same shape — this pin catches that false-positive. Distinguished from
+    // struct_lit by the `.enum_variant_ctor` tag (struct_lit would imply
+    // `Pos { x: 2.0 }` was a struct-literal, the path that pre-fix fell
+    // through to when isKnownVariant lookup missed).
+    try std.testing.expect(prog.functions.len == 1);
+    try std.testing.expect(prog.functions[0].body.len == 2);
+    try std.testing.expect(prog.functions[0].body[0] == .let);
+    try std.testing.expect(prog.functions[0].body[0].let.init != null);
+    const init_expr = prog.functions[0].body[0].let.init.?;
+    try std.testing.expect(init_expr == .enum_variant_ctor);
+    // LOAD-BEARING: enum_name MUST be null (gap #2 unqualified path).
+    try std.testing.expect(init_expr.enum_variant_ctor.enum_name == null);
+    try std.testing.expect(std.mem.eql(u8, init_expr.enum_variant_ctor.variant_name, "Pair"));
+    try std.testing.expect(init_expr.enum_variant_ctor.args.len == 2);
+
+
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    // Positive: source-named field init surfaces in zigzag.
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".Pair = .{ .x = 2.0, .y = 3.0 } }") != null);
+    // Sanity: legacy single-letter positional init (.a, .b) MUST NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".a = 2.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".b = 3.0") == null);
+}

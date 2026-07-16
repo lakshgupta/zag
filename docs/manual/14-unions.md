@@ -1,9 +1,5 @@
 # Unions
 
-> **v1→v2 migration note.** The `union` keyword represents tagged unions / sum types — variants may carry a payload, be bare, or mix both. The v1 compiler does not yet recognize `union` as a keyword; instead it parses the v2 `union` surface as `enum`. Once `union` is wired in, payload-bearing declarations that today read `enum X { Variant(T) }` will be rewritten to `union X { Variant(T) }`. Example `.zag` files in this repository continue to use the legacy `enum` form so they remain runnable against the v1 compiler.
-
-## Definition
-
 Use `union` when variants' **payload types may differ**; the uniform-payload case (all variants sharing one `T`) is [`enum(T)`](13-enums.md#backed-enums-enumt) per §13. The `<T>` angle brackets in `Option<T>`, `Result<T, E>`, etc. follow the [Generics](16-generics.md) convention — they declare a type parameter, not a backing type.
 
 A `union` is a tagged union (algebraic data type). Variants can:
@@ -23,8 +19,6 @@ union Shape {
 **Memory:** A `union` is a tag plus the largest variant. For `Shape`: `max(sizeof(f64), sizeof([3]f64), 0) + tag = 24 + 1 = 25 bytes` (with platform alignment). Bare variants cost zero bytes beyond the tag.
 
 **Note:** an enum whose variants all share the same type `T` is `enum(T)`, not `union` — see [Enums → Backed Enums](13-enums.md#backed-enums-enumt). `union` is for variants whose **payload types may differ** (`Shape { Circle(f64), Rect(f64, f64) }`). The two keywords are deliberately separated so the "category of similar values" form (enums) doesn't pay for a per-variant tag (which would be redundant when all variants share `T`).
-
-Uniform-payload unions (e.g. `union X { Foo(T), Bar(T) }` — same `T` across all variants) take the same value-pattern matching surface as `enum(T)`; heterogeneous unions keep existing destructuring-only patterns. The compiler-side implementation lands alongside the v2 `union` keyword in a follow-up parser pass — until then, `match` on a union uses the existing destructuring form.
 
 ## Constructors
 
@@ -59,12 +53,13 @@ match shape {
 
 Outside the body, the bare variant's pattern is just the variant name (`Shape.Empty =>`). The payload variants' patterns are parenthesised (`Shape.Circle(r)`, `Shape.Rect(w, h)`).
 
-For partial matches (handle only some variants, ignore the rest), use `_` as the catch-all pattern. Use this when you want a default branch without enumerating every variant. `_` catches both bare and payload variants — the code below demonstrates it covering `Rect` and `Triangle` (payload) plus `Empty` (bare). See [Exhaustiveness](#exhaustiveness) below for the catch-all paired with full enumeration:
+For partial matches (handle only some variants, ignore the rest), use `_` as the catch-all pattern. See [Exhaustiveness](#exhaustiveness) below for the catch-all paired with full enumeration:
 
 ```zag
 # Partial match — handle Circle, ignore everything else:
 match shape {
-    Shape.Circle(r) => print("circle radius: {r}\n"),        _               => print("other\n"),    # covers Rect, Triangle, Empty
+    Shape.Circle(r) => print("circle radius: {r}\n"),
+    _               => print("other\n"),    # covers Rect, Triangle, Empty
 }
 ```
 
@@ -74,14 +69,20 @@ A single `union` is free to combine bare variants and payload variants:
 
 ```zag
 union ClickEvent {
-    Hover,                      # bare
-    Press(i32),                 # one arg
-    Drag { x: f64, y: f64 },    # named-field form (records)
-    Resize { w: u32, h: u32 },
+    Hover,                       # bare
+    Press(i32),                  # one arg
+    Drag { x: f64, y: f64 },     # named-field form (records)
+    Resize { w: u32, h: u32 },   # named-field form (records)
 }
 ```
 
-This is the v2 surface — `enum X { ... }` with such a mix is the current-source spelling; v2 writes `union X { ... }`.
+All three variant shapes are supported at *declaration* time: **bare** (`Variant`), **paren-positional** (`Variant(T)`, `Variant(T, U)`), and **brace-named-field** (`Variant { name: T, ... }`). Match-side destructuring mirrors the constructor shape — destructuring by position (`Drag(w, h) => ...`) or by named field (`Drag { x: w, y: h } => ...`).
+
+For *constructors*, the current compiler expects the qualified paren-positional form: write `ClickEvent.Drag(x, y)` (parens, qualified). Today, both qualified and unqualified brace ctors route through the brace-named-field emit: write `ClickEvent.Drag(1.5, 2.5)` (qualified paren) or `Drag { x: 1.5, y: 2.5 }` (unqualified brace) — both emit `.{ .Drag = .{ .x = 1.5, .y = 2.5 } }`. The unqualified-by-name lookup is unambiguous when at most one union in the program declares the variant as brace-named; if two unions share the same brace-named variant name, the lookup falls through to the legacy positional emit and zig 0.16 surfaces a "no field named 'a'" diagnostic so the collision is loud rather than silent. See [Pattern Matching](#pattern-matching) for the matching syntax.
+
+
+
+> **Example**: see [`examples/types/named_field_match.zag`](../../examples/types/named_field_match.zag) for an end-to-end runnable demonstration of brace-named-field match-arm destructuring (`Pair { x: w, y: h } => w + h`).
 
 ## Option and Result
 
@@ -177,6 +178,8 @@ fun risky() -> Result<i32, MyError> {
 The `ErrorExt` trait (in `std.error`) is implemented for any custom error union and lets you attach a context message — see [Error Handling](18-error-handling.md).
 
 ## FFI
+
+> FFI on unions is a planned feature. See [FFI and Interop](24-ffi.md) for what's available in the current compiler. The example below shows the target surface.
 
 `#[repr(C, T)]` constrains a `union`'s tag width and discriminant layout to match a C-compatible representation. Discriminants can be pinned with `= N` for both bare and payload variants — the runtime ADT contract reserves distinct tags for unassigned variants too, but pinning is the established way to make the discriminant observable to C code:
 

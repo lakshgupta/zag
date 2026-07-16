@@ -505,6 +505,19 @@ pub const Pattern = union(enum) {
     /// `Direction.North =>`); non-null for variants carrying a payload
     /// and listing each binding name (and `_` for throw-away ones).
     enum_variant: EnumVariantPattern,
+    /// `Enum.Variant { name1: b1, name2: b2, ... }` (brace-named-field
+    /// match-side destructuring per docs/manual/14-unions §"Definition"
+    /// §"Bare Variant" / docs/manual/13-enums §"Choosing Between enum
+    /// and union" + gap #2 emit shape). Sibling variant to
+    /// `.enum_variant`; the difference is the payload-shape marker
+    /// (`(...)` → `.enum_variant`, `{...}` → `.enum_variant_named`).
+    /// Each `fields` slot is a `VariantFieldPattern` carrying the
+    /// source field name (verbatim, must match the variant-decl side)
+    /// and an optional capture ident (`null` = `_` discard). Codegen
+    /// emits `__m == .Variant` for the cond AND a preamble
+    /// `const c1 = __m.name1; ...` inside the arm block so the
+    /// captures are in scope for the arm-body Expr.
+    enum_variant_named: EnumVariantNamedPattern,
 
     pub const PatternRange = struct {
         start: *Expr,
@@ -525,6 +538,41 @@ pub const Pattern = union(enum) {
         enum_name: []const u8,
         variant_name: []const u8,
         bindings: ?[]?[]const u8,
+    };
+
+    /// Backing struct for `Pattern.enum_variant_named` — the
+    /// brace-named-field match-side destructuring form per
+    /// docs/manual/14-unions.md §"Definition" + gap #2 emit shape.
+    /// Parsed from `Variant { name1: bind1, name2: bind2, ... }` where
+    /// each `nameN` MUST match the field name declared on the variant
+    /// (the gap #2 emit preserves user-written field names on the
+    /// anonymous-struct payload, so the destructured name resolves to
+    /// the SAME field that source ctor-side `Variant { name = value }`
+    /// writes to). `enum_name` follows the same convention as
+    /// `EnumVariantPattern.enum_name` (verbatim capture, empty string
+    /// for unqualified `Variant { ... }` patterns where type is
+    /// inferred). `fields` is in declaration order — codegen emits
+    /// `const <capture> = __m.<name>;` for each non-discard entry.
+    pub const EnumVariantNamedPattern = struct {
+        enum_name: []const u8,
+        variant_name: []const u8,
+        fields: []const VariantFieldPattern,
+    };
+
+    /// One named-field slot inside a brace-named-field match pattern
+    /// (`Variant { name: bind }` after pattern-binding desugaring).
+    /// Distinct from the gap #2 ctor-side `ast.VariantField` because
+    /// the pattern side carries an optional capture name (`capture =
+    /// null` represents the `_` wildcard discard) instead of a verbatim
+    /// type-text. `name` is preserved verbatim from the source so codegen
+    /// can emit `__m.<name>` as the access path for the binding RValue.
+    /// The `name` corresponds to the variant's declared payload field
+    /// (per gap #2 codegen in `src/codegen/decl.zig`'s brace-named-field
+    /// arm); binding names are independent of the payload field names.
+    pub const VariantFieldPattern = struct {
+        name: []const u8,
+        /// `null` = wildcard `_` discard; non-null = ident to bind.
+        capture: ?[]const u8,
     };
 };
 

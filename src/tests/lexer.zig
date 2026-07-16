@@ -331,3 +331,16 @@ test "lexer: control-flow keywords (if/else/while/for/in/match/break/continue)" 
     }
 }
 
+test "lexer: union is a keyword" {
+    // Surface (a) landing (docs/manual/14-unions §"Definition"): the
+    // `union` keyword is a reserved TokenTag (`.union_kw`) for the v2
+    // split that gives `enum` (bare-only) and `union` (payload-bearing)
+    // distinct lexer tokens. Mirrors the existing `var` / `const` /
+    // `errdefer` / `unsafe` / `as` keyword tests directly above.
+    const src = "union";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    try std.testing.expectEqual(lexer_mod.TokenTag.union_kw, tokens[0].tag);
+    try std.testing.expectEqualStrings("union", tokens[0].text);
+}
+

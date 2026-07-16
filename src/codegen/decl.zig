@@ -736,99 +736,236 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genEnumDecl(self: *Codegen, ed: ast.EnumDecl, all_impls: []const ast.ImplBlock) void {
-        // Doc (docs/02 §"Doc Comments"): emit `/// ` lines BEFORE the
+        // 3-way emit shape (v2 split landing — docs/13 §"Choosing
+        // Between enum and union" + §"Backed Enums"):
+        //   1. `ed.backing_type != null` → `enum(T) { V = value, ... }`
+        //      (backed enum; requires strict-split at parser level so
+        //      variants are bare-with-value, never payload-bearing).
+        //   2. `ed.backing_type == null` AND any variant has a payload
+        //      (paren-positional OR brace-named-field) → `union(enum)
+        //      { Variant: T | struct { ... }, ... }`.
+        //   3. `ed.backing_type == null` AND no variants carry a
+        //      payload → bare `enum { V1, V2, ... }`.
+        var any_payload = false;
+        for (ed.variants) |v| {
+            if (v.payload_type != null or v.fields.len > 0) {
+                any_payload = true;
+                break;
+            }
+        }
+        // Gap #3 binary: bare-vs-payload. The codegen's nested-method
+        // loop (below) only fires on the BARE path because zig 0.16
+        // rejects methods nested inside `union(enum) { ... }` and
+        // `enum(T) { ... }` containers. The orphan-impl routing in
+        // generate() does NOT re-emit methods for matched targets, so
+        // skipping the nest on non-bare enums requires ALSO updating
+        // matched_targets_buf push logic in generate() to leave payload-
+        // bearing enum names OUT. Both layers must stay in lockstep.
+        const ed_is_bare = ed.backing_type == null and !any_payload;
+        // Doc (docs/02 §"Doc Comments"): emit `///` lines BEFORE the
         // `pub const NAME = ...` emit (mirrors genStructDecl/genFun).
         if (ed.doc) |d| self.genDocComment(d);
         self.write("pub const ");
         self.write(ed.name);
         self.write(" = ");
-        // Auto-detect payload form: any variant with non-null
-        // payload_type triggers the `union(enum)` form. All variants in
-        // a single enum share the same emission shape — mixing plain
-        // enum with union(enum) is not allowed in zig.
-        var any_payload = false;
-        for (ed.variants) |v| {
-            if (v.payload_type != null) {
-                any_payload = true;
-                break;
+        // Branches are mutually exclusive: backed-enum has no
+        // payload shape (parser-enforced); union/union(enum) has no
+        // backing type (parser-enforced via the strict-split
+        // parseEnumDecl rejecting payloads — parseUnionDecl explicitly
+        // does not capture backing_type). The any_payload /
+        // ed_is_bare computation lives at the TOP of the function
+        // (above the doc emit) so both the union-emit branch AND the
+        // nested-method loop gate consult the same values downstream.
+        if (ed.backing_type) |bt| {
+            // Backed-enum emit shape: `enum(T) { V = value, ... }`.
+            // No variant payload (parser-enforced). Each variant MAY
+            // carry a per-variant value via `v.value_text`; codegen
+            // emits `= value` only when non-null so auto-infer (zig's
+            // default incrementing) is preserved when the user omits
+            // the value text. The backing-type text goes through
+            // zagTypeToZig so `str` → `[]const u8` while primitives
+            // (`u8`, `i32`) round-trip verbatim.
+            self.write("enum(");
+            // Gap #4: preserve the user's literal `char` in the
+            // backing-type slot rather than the silent `char → u32`
+            // alias rewrite that `zagTypeToZig` applies at regular
+            // type positions. A backed enum with `char` backing
+            // would silently change to a `u32`-backed shape holding
+            // codepoints (4-byte layout), not the 1-byte byte-stream
+            // semantics a user expects when they write `enum(char)`.
+            // The `value_text` per-variant captures are NOT rewritten
+            // (they pass through verbatim including quote delimiters
+            // via `parseBackedEnumValue`), so zig accepts `'a'` as a
+            // valid char backing-enum value either way. To pick
+            // the alternative (preserve all alias rewrites including
+            // `char`), drop this branch and inline `zagTypeToZig(bt)`.
+            if (std.mem.eql(u8, bt, "char")) {
+                self.write("char");
+            } else {
+                self.write(zagTypeToZig(bt));
             }
-        }
-        if (any_payload) {
+            self.write(") {\n");
+            for (ed.variants) |v| {
+                self.write("    ");
+                self.write(v.name);
+                if (v.value_text) |vt| {
+                    self.write(" = ");
+                    self.write(vt);
+                }
+                self.write(",\n");
+            }
+        } else if (any_payload) {
+            // union(enum) emit shape: any variant with non-null
+            // payload_type OR non-empty fields triggers the tagged-
+            // union form. All variants in a single declaration share
+            // the same emission shape — mixing plain variants with
+            // payload variants in the same zig container is rejected by
+            // zig 0.16 (the `union(enum) { ... }` requires every
+            // variant to specify its payload slot OR be its own bare
+            // bare-zero-byte tag, which our emit handles by skipping
+            // the `: TYPE` tail for payload-less variants).
             self.write("union(enum) {\n");
-        } else {
-            self.write("enum {\n");
-        }
-        for (ed.variants) |v| {
-            self.write("    ");
-            self.write(v.name);
-            if (v.payload_type) |pt| {
-                // zig 0.16 rejects bare `Rect: f64, f64` (parsed as TWO
-                // variants, not one with a tuple type). Multi-arg
-                // payloads MUST be wrapped in an anonymous struct so
-                // zig's tagged-union parser sees one variant with a
-                // struct-typed payload. Single-arg payloads stay bare
-                // (`Circle: f64` is a valid union(enum) variant type).
-                //
-                // Detection: count commas in `pt`. Zero commas → single
-                // arg, emit verbatim. ≥1 comma → multi-arg, emit
-                // `struct { a: T0, b: T1, ... }` with sequential
-                // single-letter field names (a, b, c, …). The matching
-                // constructor emit (`.enum_variant_ctor` arm) uses
-                // positional init `.{ x, y }` which zig forwards to the
-                // struct's named fields in declaration order, so the
-                // emit-side letter sequence must align with the parse
-                // order of the source's comma-list.
-                var comma_count: usize = 0;
-                for (pt) |c| if (c == ',') {
-                    comma_count += 1;
-                };
-                if (comma_count == 0) {
-                    self.write(": ");
-                    self.write(zagTypeToZig(pt));
-                } else {
+            for (ed.variants) |v| {
+                self.write("    ");
+                self.write(v.name);
+                if (v.fields.len > 0) {
+                    // Brace-named-field payload
+                    // (`Drag { x: f64, y: f64 }`): emit
+                    // `struct { x: f64, y: f64 }` with the ACTUAL
+                    // field names preserved (vs. the legacy single-
+                    // letter a/b/c/... scheme used for paren-
+                    // positional). The matching constructor emit
+                    // (`.enum_variant_ctor` arm) future-work: extend
+                    // to use named-struct literal init `.{ .x = x, .y
+                    // = y }` instead of the legacy positional
+                    // `.{ arg1, arg2 }`. v1's positional ctor still
+                    // works because the auto-generated field names
+                    // (x, y) align with declaration order, but the
+                    // ctor surface for brace-named variants is
+                    // deferred until v2.1 lands named-struct-literal
+                    // codegen. match-side destructuring
+                    // (`Drag { x: w, y: h } => ...`) is similarly
+                    // deferred per docs/14 §FFI callout.
+                    //
+                    // Gap #2 side-table push (emit-side): record
+                    // (enum_name, variant_name → fields) so the
+                    // `.enum_variant_ctor` arm in genExpr can
+                    // recover the user's actual field names at
+                    // runtime ctor sites. Without this entry the
+                    // ctor arm falls back to the letter-based
+                    // alphabetical emit, which zig rejects because
+                    // the named-field struct has the user's names
+                    // (e.g. `x, y`), NOT `a, b`. The push is
+                    // unconditional here so ANY brace-named-field
+                    // variant populates the table; branches that
+                    // aren't ctor sites don't care about it.
+                    if (self.variant_fields_count < self.variant_fields_buf.len) {
+                        self.variant_fields_buf[self.variant_fields_count] = .{
+                            .enum_name = ed.name,
+                            .variant_name = v.name,
+                            .fields = v.fields,
+                        };
+                        self.variant_fields_count += 1;
+                    }
                     self.write(": struct { ");
-                    const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
-                    var seg_start: usize = 0;
-                    var idx: usize = 0;
-                    var i: usize = 0;
-                    while (i <= pt.len) : (i += 1) {
-                        if (i == pt.len or pt[i] == ',') {
-                            // Trim leading/trailing whitespace from the
-                            // captured type-text segment so
-                            // `f64, f64` doesn't emit `: a: f64, b:  f64`.
-                            var a: usize = seg_start;
-                            var b: usize = i;
-                            while (a < b and (pt[a] == ' ' or pt[a] == '\t')) a += 1;
-                            while (b > a and (pt[b - 1] == ' ' or pt[b - 1] == '\t')) b -= 1;
-                            if (idx > 0) self.write(", ");
-                            self.write(letters[idx]);
-                            self.write(": ");
-                            self.write(zagTypeToZig(pt[a..b]));
-                            idx += 1;
-                            seg_start = i + 1;
-                        }
+                    for (v.fields, 0..) |f, fi| {
+                        if (fi > 0) self.write(", ");
+                        self.write(f.name);
+                        self.write(": ");
+                        self.write(zagTypeToZig(f.type_text));
                     }
                     self.write(" }");
+                } else if (v.payload_type) |pt| {
+                    // zig 0.16 rejects bare `Rect: f64, f64` (parsed
+                    // as TWO variants, not one with a tuple type).
+                    // Multi-arg payloads MUST be wrapped in an
+                    // anonymous struct so zig's tagged-union parser
+                    // sees one variant with a struct-typed payload.
+                    // Single-arg payloads stay bare (`Circle: f64`
+                    // is a valid union(enum) variant type).
+                    //
+                    // Detection: count commas in `pt`. Zero commas
+                    // → single arg, emit verbatim. ≥1 comma → multi-
+                    // arg, emit `struct { a: T0, b: T1, ... }` with
+                    // sequential single-letter field names (a, b, c,
+                    // …). The matching constructor emit
+                    // (`.enum_variant_ctor` arm) uses positional init
+                    // `.{ x, y }` which zig forwards to the struct's
+                    // named fields in declaration order, so the emit-
+                    // side letter sequence must align with the parse
+                    // order of the source's comma-list.
+                    var comma_count: usize = 0;
+                    for (pt) |c| if (c == ',') {
+                        comma_count += 1;
+                    };
+                    if (comma_count == 0) {
+                        self.write(": ");
+                        self.write(zagTypeToZig(pt));
+                    } else {
+                        self.write(": struct { ");
+                        const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
+                        var seg_start: usize = 0;
+                        var idx: usize = 0;
+                        var i: usize = 0;
+                        while (i <= pt.len) : (i += 1) {
+                            if (i == pt.len or pt[i] == ',') {
+                                // Trim leading/trailing whitespace
+                                // from the captured type-text segment
+                                // so `f64, f64` doesn't emit
+                                // `: a: f64, b:  f64`.
+                                var a: usize = seg_start;
+                                var b: usize = i;
+                                while (a < b and (pt[a] == ' ' or pt[a] == '\t')) a += 1;
+                                while (b > a and (pt[b - 1] == ' ' or pt[b - 1] == '\t')) b -= 1;
+                                if (idx > 0) self.write(", ");
+                                self.write(letters[idx]);
+                                self.write(": ");
+                                self.write(zagTypeToZig(pt[a..b]));
+                                idx += 1;
+                                seg_start = i + 1;
+                            }
+                        }
+                        self.write(" }");
+                    }
                 }
+                self.write(",\n");
             }
-            self.write(",\n");
+        } else {
+            // Bare-enum emit shape: `enum { V1, V2, ... }`. No
+            // variants carry payloads or fields.
+            self.write("enum {\n");
+            for (ed.variants) |v| {
+                self.write("    ");
+                self.write(v.name);
+                self.write(",\n");
+            }
         }
-        // Nest matching impl methods inside the enum so zig's native
-        // pattern matching supports them. Same `genMethod` reuse as the
-        // struct decl's nested-impl path — the per-method counters and
-        // type-info map reset behaviour is identical. TRAIT-method
-        // methods are SKIPPED here too (same reason as
+        // Nest matching impl methods inside the BARE-ENUM body only.
+        // zig 0.16 rejects methods nested inside `union(enum) { ... }`
+        // (gap #3 fix) AND inside `enum(T) { ... }` containers; only
+        // the bare `enum { V1, V2, ... }` form accepts nested pub fns.
+        // Payload-bearing enums + backed enums route their impl methods
+        // through `generate()`'s orphan-impl loop (via
+        // `genFreeMethod` at module scope) — see the matched_targets_buf
+        // gate update in src/codegen/core.zig that excludes non-bare
+        // enum names so the orphan path picks them up. The bare-enum
+        // path retains the legacy nested-method emit (existing tests
+        // for `impl Direction { ... }` etc. pin this surface).
+        // TRAIT-method methods are SKIPPED here (same reason as
         // genStructDecl): they emit as renamed free fns (Target_Trait_
         // method) + vtable registration during the trait-handling
         // pass, NEVER nested inside the enum body.
-        for (all_impls) |impl| {
-            if (!std.mem.eql(u8, impl.target_type, ed.name)) continue;
-            for (impl.methods) |m| {
-                if (m.trait_name != null) continue;
-                // Phase 2 tail: thread impl-level type_params so the
-                // nested-on-enum method emits `comptime X: type`
-                // BEFORE its own params. Same path as genStructDecl.
-                self.genMethod(m, impl.type_params);
+        if (ed_is_bare) {
+            for (all_impls) |impl| {
+                if (!std.mem.eql(u8, impl.target_type, ed.name)) continue;
+                for (impl.methods) |m| {
+                    if (m.trait_name != null) continue;
+                    // Phase 2 tail: thread impl-level type_params so
+                    // the nested-on-enum method emits `comptime X:
+                    // type` BEFORE its own params. Same path as
+                    // genStructDecl.
+                    self.genMethod(m, impl.type_params);
+                }
             }
         }
         self.write("};\n\n");

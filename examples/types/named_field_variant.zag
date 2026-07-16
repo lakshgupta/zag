@@ -1,0 +1,62 @@
+# examples/types/named_field_variant.zag
+#
+# End-to-end runtime for gap #2 — the unqualified brace ctor surface
+# per docs/manual/14-unions.md §"Mixed Bare + Payload". Each
+# expression below uses the UNQUALIFIED brace form
+# (`Variant { f1: v1, f2: v2, ... }`) which routes through the new
+# parser gate at src/parser/primary.zig (calls
+# `parseEnumVariantCtorBrace(name)` when `isKnownVariant(name)` matches
+# a registered brace-named-field variant) and the new codegen helper
+# `Codegen.lookupVariantFieldsByName` (src/codegen/core.zig) to emit
+# the tagged-union-init form:
+#   const p: Pos = Pos.{ .Pair = .{ .x = 2.0, .y = 3.0 } };
+#
+# The 3 unions in this file deliberately use distinct variant names
+# (Pair / Greeting / Drag) so the lookupVariantFieldsByName single-
+# match path is exercised in three different variant shapes:
+#   - 2-field (Pair)
+#   - 1-field (Greeting)
+#   - mixed bare + brace (Hover + Drag; only Drag's brace ctor is
+#     exercised in this file)
+#
+# Source-order requirement: each union/enum decl MUST come BEFORE the
+# function body that references its variant; the parser tracks
+# registered variant names at decl-completion time and the
+# `isKnownVariant` lookup would miss a forward reference (falling
+# through to `.struct_lit` rather than `.enum_variant_ctor`).
+#
+# Match-side brace destructuring (gap #6 — `Variant { x: w, y: h } =>
+# …` patterns) is intentionally omitted from this example pending
+# the parsePatternField brace-counting fix tracked as a follow-up.
+
+union Pos {
+    Pair { x: f64, y: f64 },
+}
+
+union Msg {
+    Greeting { text: str },
+}
+
+union Click {
+    Hover,
+    Drag { x: f64, y: f64 },
+}
+
+fun main() {
+    # unqualified 2-field brace ctor → zig emit
+    # `const p: Pos = Pos.{ .Pair = .{ .x = 2.0, .y = 3.0 } };`
+    let p: Pos = Pair { x: 2.0, y: 3.0 };
+    print(p);
+
+    # unqualified 1-field brace ctor → zig emit
+    # `const m: Msg = Msg.{ .Greeting = .{ .text = "hi" } };`
+    let m: Msg = Greeting { text: "hi" };
+    print(m);
+
+    # unqualified brace ctor on the 2-field variant of a mixed
+    # bare-and-payload union (Hover is bare, no ctor form);
+    # zig emit
+    # `const click: Click = Click.{ .Drag = .{ .x = 1.5, .y = 2.5 } };`
+    let click: Click = Drag { x: 1.5, y: 2.5 };
+    print(click);
+}

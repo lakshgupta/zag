@@ -642,11 +642,47 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     // field init `.Rect = .{ .a = x, .b = y }` because
                     // genEnumDecl emits the payload struct with named
                     // fields (a, b, c, ...) for multi-type payloads.
+                    //
+                    // Gap #2 brace-named-field carve-out (lookup-side):
+                    // when the user declared the variant as
+                    // `Drag { x: f64, y: f64 }`, genEnumDecl emits the
+                    // payload struct with the user's ACTUAL field names
+                    // (`struct { x: f64, y: f64 }`) — NOT the legacy
+                    // alphabetical scheme (`struct { a: f64, b: f64 }`).
+                    // The legacy ctor emit `.{ .a = x, .b = y }` would
+                    // be rejected by zig because the named fields are
+                    // `x, y`, not `a, b`. We look up the brace-named
+                    // field list via `lookupVariantFields` (populated at
+                    // emit time in genEnumDecl) and use those names
+                    // instead. Misses (the enum was declared paren-
+                    // positional rather than brace-named, OR the enum
+                    // lives in an imported module — see lookupVariantFields
+                    // doc for cross-module deferral) fall through to the
+                    // legacy alphabetical emit which is correct for the
+                    // paren-positional shape `Rect(f64, f64)`.
                     self.write(en);
                     self.write("{ .");
                     self.write(evc.variant_name);
                     self.write(" = ");
-                    if (evc.args.len == 1) {
+                    const brace_fields = self.lookupVariantFields(en, evc.variant_name);
+                    if (brace_fields) |bf| {
+                        // Brace-named-field ctor: emit `.{ .x = a,
+                        // .y = b }` with the user's literal names.
+                        // Single-arg and multi-arg forms share the
+                        // same named-init shape; zig's named-struct
+                        // literal accepts both with the field-name
+                        // 0-list being any subset.
+                        self.write(".{ ");
+                        for (bf, 0..) |f, fi| {
+                            if (evc.args.len <= fi) break;
+                            if (fi > 0 and evc.args.len > fi) self.write(", ");
+                            self.write(".");
+                            self.write(f.name);
+                            self.write(" = ");
+                            self.genExpr(evc.args[fi]);
+                        }
+                        self.write(" }");
+                    } else if (evc.args.len == 1) {
                         self.genExpr(evc.args[0]);
                     } else {
                         // Named-field init via letter sequence (a, b, c, ...)
@@ -667,14 +703,47 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     self.write(" }");
                 } else {
                     // Unqualified payload variant — zig infers target
-                    // type from the binding's `: T` annotation. Same
-                    // named-field init as the qualified branch.
+                    // type from the binding's `: T` annotation. Gap #6
+                    // brace-named-field carry-over (gap-closure land):
+                    // when `lookupVariantFieldsByName` finds EXACTLY ONE
+                    // brace-named entry matching `evc.variant_name` (i.e.
+                    // unambiguously one enum in the program declared the
+                    // variant as brace-named), the unqualified ctor
+                    // `Pos { x: 2.0, y: 3.0 }` round-trips to the same
+                    // `.{ .Pos = .{ .x = 2.0, .y = 3.0 } }` shape as the
+                    // qualified branch. Zero matches OR multiple matches
+                    // fall through to the legacy positional emit below
+                    // (the multi-match case produces a zig 0.16 diagnostic
+                    // because the brace-declared variants' struct fields
+                    // are user-named, not the single-letter `a`/`b`/...
+                    // sequence) — Option-B collision strategy per the
+                    // gap-closure design call.
                     self.write(".{ .");
                     self.write(evc.variant_name);
                     self.write(" = ");
-                    if (evc.args.len == 1) {
+                    const brace_fields = self.lookupVariantFieldsByName(evc.variant_name);
+                    if (brace_fields) |bf| {
+                        // Brace-named-field emit (single-match path).
+                        // Same shape as the qualified branch's brace
+                        // emit `.{ .x = a, .y = b }` so zig's tagged-
+                        // union-init accepts both forms identically.
+                        self.write(".{ ");
+                        for (bf, 0..) |f, fi| {
+                            if (evc.args.len <= fi) break;
+                            if (fi > 0 and evc.args.len > fi) self.write(", ");
+                            self.write(".");
+                            self.write(f.name);
+                            self.write(" = ");
+                            self.genExpr(evc.args[fi]);
+                        }
+                        self.write(" }");
+                    } else if (evc.args.len == 1) {
                         self.genExpr(evc.args[0]);
                     } else {
+                        // Legacy positional/letter-named init (only
+                        // reached when the variant was declared as the
+                        // paren-positional form OR when collision was
+                        // detected by `lookupVariantFieldsByName`).
                         const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
                         self.write(".{ ");
                         for (evc.args, 0..) |arg, i| {

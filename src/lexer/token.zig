@@ -26,14 +26,29 @@ pub const TokenTag = enum {
     /// (`impl Vec3 { pub fun length(...) -> … { … } }`). Methods inside
     /// the block are flattened to zig free functions by codegen.
     impl_kw,
-    /// `enum` keyword — introduces an enum declaration
-    /// (`enum Direction { North, South, East, West }`). Variants are
-    /// tokenized as bare identifiers (PascalCase by convention) and
-    /// optionally carry a parenthesized payload type
-    /// (`Shape { Circle(f64), Rectangle(f64, f64) }`). Codegen emits the
+    /// `enum` keyword — introduces a bare-enumeration declaration
+    /// (`enum Direction { North, South, East, West }`). In the v2 split
+    /// landed by surfacing the keyword surface (docs/manual/14-unions
+    /// §"Definition"), `enum` strictly means bare-enumeration: variants
+    /// cannot carry a payload (the parser rejects `enum X { Foo(T) }`
+    /// with `expected variant or '}', got '('`); use `union` for
+    /// payload-bearing forms. Variants are tokenized as bare
+    /// identifiers (PascalCase by convention) and codegen emits the
     /// declared enum as zig's native `enum { ... }` form so functions
     /// over variants compile via zig's exhaustive match checking.
     enum_kw,
+    /// `union` keyword — introduces a tagged-union declaration
+    /// (`union Shape { Circle(f64), Rect(f64, f64), Empty }`). The
+    /// v2 split (docs/manual/13-enums §"Choosing Between enum and
+    /// union") reserves `union` for any type whose variants carry
+    /// payloads (or mix bare + payload variants — bare variants inside
+    /// a union are zero-cost because their slot is purely the tag).
+    /// Variants accept three shapes: bare (`Empty`), paren-positional
+    /// (`Circle(f64)`, `Rect(f64, f64)`), or brace-named-field
+    /// (`Drag { x: f64, y: f64 }`). Codegen emits the declared union as
+    /// zig's `union(enum) { ... }` form so users get exhaustive-match
+    /// checking on the tag.
+    union_kw,
     /// `trait` keyword — introduces a trait declaration
     /// (`trait Drawable { fun draw(self: *Self); fun name(self: *Self) -> str; }`).
     /// Phase 1 (this commit) scaffolds only the lexer/parser surface;

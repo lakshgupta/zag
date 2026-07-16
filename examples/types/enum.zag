@@ -1,27 +1,42 @@
 # examples/types/enum.zag
 #
-# End-to-end demonstration of enum support (docs/manual/13-enums + 14-unions):
-#   - Bare tag-only enum with impl method
-#   - Payload-bearing enum (single-arg + multi-arg variants)
+# End-to-end demonstration of `enum` (bare + backed) and `union` (payload-bearing)
+# per docs/manual/13-enums.md + 14-unions.md:
+#   - Bare `enum` with impl method (Direction)
+#   - `union` with payload variants (single-arg + multi-arg)
 #   - Exhaustive match with bare-variant patterns + `_` wildcard
 #   - Qualified variant construction in expression position
 #   - Impl flattened to a free function (`Direction_opposite`) by codegen
 #
-# v1→v2 migration: The v1 compiler uses the `enum` keyword for both bare
-# enumerations and payload-bearing tagged unions. v2 splits the surface:
-#   - `enum Direction { ... }` stays `enum` (all bare variants).
-#   - `enum Shape { Circle(f64), Rect(f64, f64) }` becomes `union Shape { ... }`
-#     in v2 because at least one variant carries a payload.
-# This file is kept in the v1 form so it continues to compile against the
-# current compiler. The taxonomy is documented in docs/manual/13-enums.md
-# (bare enumerations) and docs/manual/14-unions.md (tagged unions).
+# v1→v2 migration note: v2 splits the surface but the v1 parser is
+# PERMISSIVE — both `enum` and `union` accept all 4 variant shapes:
+#   - bare:               `Variant`
+#   - paren-positional:   `Variant(T1, T2, ...)`
+#   - brace-named-field:  `Variant { name: T, name: T }`
+#   - backed-enum value:  `enum(T) { V = expr }`
+# The recommended v2 surface is the strict split (enum = bare-only,
+# union = payload-bearing, backed-enum = enum-only), but v1 sources
+# written under the legacy "enum-accepts-everything" form still
+# parse and round-trip cleanly. Migrate at your own pace.
 #
-# v2.1 extension — backed enums (`enum(T)`): the v2 docs introduce
-# `enum(str)`, `enum(u8)`, etc., where every variant carries an explicit
-# value of type T (`enum Level { Low = "low", High = "high" }`). The v1
-# compiler does not yet parse the `enum(T)` surface — it lives in the
-# docs only and the example form here stays v1 until the v2.1 parser
-# lands. Reference: docs/manual/13-enums.md ("Backed Enums").
+# The shape that TYPE-CHECKS MATTERS:
+#   - bare payload forms (`Circle(f64)`, `Rect(f64, f64)`) → `union`
+#   - brace-named-field forms (`Drag { x: f64, y: f64 }`) → `union`
+#   - bare-tag-only forms (`Direction.North`) → `enum` OR `union`,
+#     but `enum` is the idiomatic choice (1-byte tag, no payload
+#     slot).
+#
+# The v2.1 extension `enum(T)` backed enums lands in `examples/types/
+# enum_backed.zag` (separate file because it documents a fundamentally
+# different kind of type — value-categorized enumerations rather than
+# bare enumerations).
+#
+# Note: this file was originally written when `enum` accepted both bare
+# and payload forms (v1). The v2 split forces the migration below — the
+# `Shape` type moved from `enum Shape { Circle(f64), Rect(f64, f64) }`
+# to `union Shape { Circle(f64), Rect(f64, f64) }` because at least one
+# of its variants carries a payload. `Direction` stays `enum` because
+# all four of its variants are bare.
 
 enum Direction {
     North,
@@ -30,7 +45,7 @@ enum Direction {
     West,
 }
 
-enum Shape {
+union Shape {
     Circle(f64),
     Rect(f64, f64),
 }

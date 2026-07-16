@@ -135,6 +135,33 @@ pub const Codegen = struct {
     /// first stmt (so the cast arm in `genExpr` sees the populated
     /// set when traversing function-local casts).
     tracked_trait_count: u32,
+    // Brace-named-field variant lookup side-table (gap #2 fix):
+    // genEnumDecl pushes one entry per brace-named-field variant it
+    // emits; the `.enum_variant_ctor` arm in genExpr consults the
+    // side-table to recover the user's actual field names so it can
+    // emit `.{ .x = a, .y = b }` instead of the legacy alphabetical
+    // `.{ .a = a, .b = b }` (latter is rejected by zig 0.16 because
+    // the emitted `union(enum) { Drag: struct { x: f64, y: f64 } }`
+    // container has named fields `x, y`, not `a, b`). The buf is
+    // populated at module-scope emit time (so the side-table is
+    // stable across any function-body ctor emit later in the same
+    // codegen pass); the lookup is O(N) linear scan because
+    // tot variant count is bounded by O(256) per program.
+    variant_fields_buf: [256]VariantFieldsEntry = undefined,
+    variant_fields_count: u32,
+
+/// One entry in `Codegen.variant_fields_buf` (gap #2 fix). Carries
+/// the (enum_name, variant_name) key + the user's actual field names
+/// (`[]const ast.VariantField` mirror the EnumVariant.fields slice
+/// so codegen can reuse fields directly without re-parse). The
+/// keys are stored as source-side slices so a `Drag(2.0, 3.0)` ctor
+/// at any depth in the program maps cleanly back to the same
+/// `Drag { x: f64, y: f64 }` declaration site via string equality.
+pub const VariantFieldsEntry = struct {
+    enum_name: []const u8,
+    variant_name: []const u8,
+    fields: []const ast.VariantField,
+};
 
 
     pub const collectTypedBindings = @import("stmt.zig").collectTypedBindings;
@@ -172,6 +199,33 @@ pub const Codegen = struct {
     pub const isFloatIdentType = @import("core.zig").isFloatIdentType;
     pub const isTrackedTrait = @import("core.zig").isTrackedTrait;
     pub const getSourceTypeName = @import("core.zig").getSourceTypeName;
+    // Gap #2 lookup helper registration: needed because
+    // src/codegen/expr.zig's `.enum_variant_ctor` arm calls
+    // `self.lookupVariantFields(...)` to recover the user's
+    // brace-named-field list for the ctor emit. Without this
+    // binding, zig compile-errors with `no field or member
+    // function named 'lookupVariantFields' in 'codegen.core.Codegen'`
+    // (the same diagnostic surfaced in this turn's build attempt).
+    pub const lookupVariantFields = @import("core.zig").lookupVariantFields;
+    // Gap-closure (extended `.enum_variant_ctor` unqualified arm in
+    // src/codegen/expr.zig uses `self.lookupVariantFieldsByName(...)`
+    // to recover brace-field shapes for ctors like `Pos { x: 2.0,
+    // y: 3.0 }` written without a `Pos.` prefix). Without this
+    // binding, zig compile-errors with `no field or member function
+    // named 'lookupVariantFieldsByName' in 'codegen.core.Codegen'`
+    // (mirror of the gap #2 lookupVariantFields re-export above).
+    pub const lookupVariantFieldsByName = @import("core.zig").lookupVariantFieldsByName;
+    // Gap #6 binding-preamble registration: `src/codegen/stmt.zig`'s
+    // `genMatchExpr` arm loop calls `self.emitPatternBindings(...)` so
+    // captures declared on a brace-named-field or paren-positional
+    // match pattern (`Variant { x: w, y: h } => ...` OR `Variant(w,
+    // h) => ...`) get a `const NAME = __m.field;` preamble inside the
+    // surrounding `if (...) { ... }` block. Without this binding,
+    // zig compile-errors with `no field or member function named
+    // 'emitPatternBindings' in 'codegen.core.Codegen'` (the same
+    // re-export pattern used by the gap #2 `lookupVariantFields`
+    // helper above).
+    pub const emitPatternBindings = @import("stmt.zig").emitPatternBindings;
     pub const needsIntDivShim = @import("primary.zig").needsIntDivShim;
     pub const write = @import("core.zig").write;
 };
@@ -216,6 +270,13 @@ pub const Codegen = struct {
             // never observed.
             .tracked_trait_names = undefined,
             .tracked_trait_count = 0,
+            // Brace-named-field variant side-table (gap #2 fix):
+            // empty at init(); populated by genEnumDecl when emitting
+            // brace-named-field variants. Reset ALSO at generate() entry
+            // so a Codegen reused across multiple runs (e.g. smoke +
+            // scaffold tests in the same process) starts fresh.
+            .variant_fields_buf = undefined,
+            .variant_fields_count = 0,
         };
     }
 
@@ -225,6 +286,16 @@ pub const Codegen = struct {
     }
 
     pub fn generate(self: *Codegen, prog: ast.Program) []const u8 {
+        // Brace-named-field variant side-table (gap #2 fix): reset
+        // at generate() entry so the table is fresh per
+        // codegen-pass. genEnumDecl pushes one entry per
+        // brace-named-field variant emit and the .enum_variant_ctor
+        // arm consults the table at every emission site. Resetting
+        // here mirrors the existing `matched_targets_buf` /
+        // `tracked_trait_*` per-pass pattern so a Codegen reused
+        // across multiple tests in the same process (smoke +
+        // scaffold + e2e) starts empty.
+        self.variant_fields_count = 0;
         self.write(
             \\const std = @import("std");
             \\
@@ -418,7 +489,27 @@ pub const Codegen = struct {
         var matched_targets_buf: [512][]const u8 = undefined;
         var matched_count: u32 = 0;
         for (prog.enums) |ed| {
-            if (matched_count < matched_targets_buf.len) {
+            // Gap #3 dispatch-side: only BARE enums (no variants
+            // with payload, no backing_type) register as matched. Payload-
+            // bearing enums (`union(enum) { ... }`) and backed enums
+            // (`enum(T) { ... }`) are intentionally left out so their
+            // matching impl blocks fall through to the orphan-impl loop
+            // below — emit them as module-scope free fns via
+            // `genFreeMethod` because zig 0.16 rejects methods nested
+            // inside those two container shapes. The bare-enum path
+            // keeps the legacy nested-method emit (existing tests
+            // for `impl Direction { ... }` etc. pin this surface).
+            // The mirrored emit-side gate lives in `genEnumDecl` (gap
+            // #3 emit-side) so nested methods only emit on bare enums.
+            var is_bare_enum = ed.backing_type == null;
+            if (is_bare_enum) {
+                for (ed.variants) |v| {
+                    if (v.payload_type != null or v.fields.len > 0) {
+                        is_bare_enum = false;
+                        break;
+                    }
+                }
+            }                if (is_bare_enum and matched_count < matched_targets_buf.len) {
                 matched_targets_buf[matched_count] = ed.name;
                 matched_count += 1;
             }
@@ -633,5 +724,76 @@ pub const Codegen = struct {
         for (self.type_info_buf[0..self.type_info_count]) |ti| {
             if (std.mem.eql(u8, ti.name, name)) return ti.type_name;
         }
+        return null;
+    }
+
+    /// Gap #2 lookup helper: returns the user's named-field list for
+    /// the (enum_name, variant_name) pair if a brace-named-field
+    /// decl was emitted. Called from the `.enum_variant_ctor` arm
+    /// in genExpr to recover the original field names so a ctor
+    /// like `Drag(2.0, 3.0)` emits `.{ .x = 2.0, .y = 3.0 }`
+    /// (matching the `Drag: struct { x: f64, y: f64 }` declaration
+    /// shape, NOT the legacy alphabetical `.{ .a = 2.0, .b = 3.0 }`
+    /// which zig 0.16 rejects because the struct has `x, y` fields
+    /// — `a` and `b` don't exist). Returns null on miss so the
+    /// caller falls back to the paren-positional letter-sequence
+    /// emit for union ctors whose variant is paren-positional (or
+    /// whose enum wasn't seen yet — future cross-module ctor
+    /// resolution is deferred; v1 only handles locally-declared
+    /// variants).
+    pub     fn lookupVariantFields(
+        self: *Codegen,
+        enum_name: []const u8,
+        variant_name: []const u8,
+    ) ?[]const ast.VariantField {
+        for (self.variant_fields_buf[0..self.variant_fields_count]) |e| {
+            if (std.mem.eql(u8, e.enum_name, enum_name) and
+                std.mem.eql(u8, e.variant_name, variant_name))
+            {
+                return e.fields;
+            }
+        }
+        return null;
+    }
+
+    pub     fn lookupVariantFieldsByName(
+        self: *Codegen,
+        variant_name: []const u8,
+    ) ?[]const ast.VariantField {
+        // Unqualified-by-name lookup companion for
+        // `lookupVariantFields`. Used by the `.enum_variant_ctor`
+        // arm in `src/codegen/expr.zig` when `evc.enum_name == null`
+        // — i.e. the user wrote `Pos { x: 2.0, y: 3.0 }` without a
+        // `Pos.` prefix and we're trying to recover the variant's
+        // brace-fields list from the source-side variant_name alone.
+        //
+        // Returns the brace_fields ONLY when exactly ONE brace-named
+        // entry in `variant_fields_buf` has this `variant_name`.
+        // Zero OR multiple matches return null so the caller falls
+        // through to the legacy positional emit (single-letter
+        // `a`/`b`/... naming). For the multi-match case, the legacy
+        // emit will be **loudly rejected by zig 0.16** at compile
+        // time — the brace-declared variants' payload structs have
+        // the user's literal field names (per gap #2's brace emit),
+        // not the single-letter alphabet. So `null`-return-on-
+        // ambiguity produces a useful diagnostic (\"no field named
+        // 'a' in struct\") at the user's union type-instance rather
+        // than a silent miscompile emitting `.{ .a = arg }` for a
+        // struct that has fields `.x` and `.y`. This is the Option-B
+        // collision strategy (designed and validated in gap-closure
+        // review): safe-by-default rather than best-effort.
+        var match_count: usize = 0;
+        var first_match: ?[]const ast.VariantField = null;
+        for (self.variant_fields_buf[0..self.variant_fields_count]) |e| {
+            if (std.mem.eql(u8, e.variant_name, variant_name)) {
+                match_count += 1;
+                first_match = e.fields;
+                // Early bail: more than one match means we cannot
+                // confidently route the unqualified ctor, so skip
+                // the entire buf-walk and return null.
+                if (match_count > 1) return null;
+            }
+        }
+        if (match_count == 1) return first_match;
         return null;
     }

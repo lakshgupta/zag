@@ -772,6 +772,31 @@ pub fn parsePrimary(self: *Parser) Expr {
                 if (self.peek().tag == .lparen) {
                     return self.parseCallExpr(name);
                 } else if (self.peek().tag == .lbrace and self.allow_struct_lit and
+                    name.len > 0 and name[0] >= 'A' and name[0] <= 'Z' and
+                    !self.isKnownStruct(name) and self.isKnownVariant(name))
+                {
+                    // Gap #2 closure (docs/manual/14-unions §Mixed Bare +
+                    // Payload): unqualified brace ctor when `T` matches a
+                    // registered variant name. Routes to a new
+                    // `.enum_variant_ctor { enum_name = null,
+                    // variant_name, args = ... }` AST node so the codegen's
+                    // `lookupVariantFieldsByName` helper in
+                    // src/codegen/core.zig can recover the brace-fields
+                    // list and emit `.{ .Variant = .{ .f1 = v1, .f2 = v2 } }`
+                    // Source-order requirement: the union/enum decl must
+                    // come BEFORE the function body that references the
+                    // variant (the parser tracks variant names by appending
+                    // on decl completion, so a forward reference would
+                    // miss the lookup and fall through to the struct-lit
+                    // arm below — loud zig-side error rather than silent
+                    // miscompile). The `isKnownVariant(name) == true` gate
+                    // is the disambiguation contract; bare variants and
+                    // paren-positional variants are not registered
+                    // (filter in parseEnumDecl/parseUnionDecl registration
+                    // hook), so `Bare { x: 1 }` for a bare `Bare` falls
+                    // through to `.struct_lit` as before.
+                    return self.parseEnumVariantCtorBrace(name);
+                } else if (self.peek().tag == .lbrace and self.allow_struct_lit and
                     name.len > 0 and name[0] >= 'A' and name[0] <= 'Z')
                 {
                     // Struct-literal: `Type { name: value, ... }`. The
@@ -987,4 +1012,68 @@ pub fn parseStructLit(self: *Parser, type_name: []const u8) Expr {
         @memcpy(inits, inits_buf[0..init_count]);
         return .{ .struct_lit = .{ .type_name = type_name, .inits = inits } };
     }
+
+
+/// Gap #2 closure (docs/manual/14-unions §Mixed Bare + Payload) ctor
+/// parser: parses `Variant { f1: v1, f2: v2, ... }` into an
+/// `Expr.enum_variant_ctor { enum_name = null, variant_name,
+/// args = [v1, v2, ...] }` AST node. Called from parsePrimary's
+/// `.identifier` arm when the leading ident matches a registered
+/// variant name (registered via parseEnumDecl / parseUnionDecl's
+/// `known_variant_names` table push hooks).
+///
+/// The `args` slice is captured POSITIONAL in declaration order so
+/// the codegen's `lookupVariantFieldsByName` helper can pair
+/// `args[i]` with `brace_fields[i].name` recovered from the variant's
+/// decl. The source-side field names in each `{f: v}` slot are
+/// discarded here — they MUST match the variant decl's brace-field
+/// ordering for the round-trip to emit `.{ .f = v }` in field order.
+/// (A future Phase could verify the source-side names against the decl
+/// for stronger error reporting, but v1's conservative contract is
+/// positional-order rather than name-order.)
+///
+/// Mirrors the parseStructLit walker pattern verbatim (newline + comma
+/// skipping inside `{...}`, single ident + colon + expr per slot)
+/// but builds the variant-ctor AST node instead of struct-lit's. The
+/// 16-slot cap matches parseStructLit's `inits_buf` for symmetry.
+pub fn parseEnumVariantCtorBrace(self: *Parser, variant_name: []const u8) Expr {
+    // BLOCKING #1 fix (gap #2 closure): reject EMPTY brace `Variant {}` on a
+    // brace-named-field variant because codegen iterates `fields` and reads
+    // from args by positional index — an empty args list would segfault.
+    if (self.peek().tag == .rbrace) {
+        std.debug.print("error:{d}:{d}: variant `{s}` requires named-field slots; got empty brace\n", .{ self.peek().loc.line, self.peek().loc.col, variant_name });
+        std.process.exit(1);
+    }
+    self.expect(.lbrace);
+    var args_buf: [16]Expr = undefined;
+    var arg_count: usize = 0;
+    while (self.peek().tag != .rbrace and !self.eof()) {
+        if (self.peek().tag == .newline) {
+            self.advance();
+            continue;
+        }
+        if (self.peek().tag == .comma) {
+            self.advance();
+            continue;
+        }
+        // Source-side field name is captured but DISCARDED — the
+        // codegen lookup takes its field list from the variant decl
+        // (via `Codegen.variant_fields_buf` populated by genEnumDecl),
+        // so positional ordering is sufficient. A future Phase could
+        // attach the field_name as a debug-only payload here, but
+        // v1's contract doesn't carry it on the AST node.
+        _ = self.expectIdent();
+        self.expect(.colon);
+        args_buf[arg_count] = self.parseExpr();
+        arg_count += 1;
+    }
+    self.expect(.rbrace);
+    const args = self.arena.alloc(Expr, arg_count);
+    @memcpy(args, args_buf[0..arg_count]);
+    return .{ .enum_variant_ctor = .{
+        .enum_name = null,
+        .variant_name = variant_name,
+        .args = args,
+    } };
+}
 

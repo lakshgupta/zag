@@ -174,8 +174,39 @@ pub fn parseClosureExpr(self: *Parser) Expr {
 
 
 pub fn parseEnumDecl(self: *Parser) ast.EnumDecl {
+        // v1→v2 transitional surface (docs/manual/13-enums §"Choosing
+        // Between enum and union" + §"Backed Enums" + docs/manual/14-
+        // unions §"Definition"): `enum` accepts BOTH bare variants
+        // AND payload-bearing variants (paren-positional). The new
+        // `union` keyword is an ALIAS for the payload-bearing form
+        // landing in v2 — parsing `union X { Foo(T) }` is identical
+        // to parsing `enum X { Foo(T) }` (both routes go through
+        // parseEnumDecl's shared logic via the new parseUnionDecl
+        // helper). Backed-enum `enum(T) { V = value }` form is also
+        // accepted here (T must be in zagTypeToZig's alias table for
+        // the codegen-side alias rewrite).
+        //
+        // The strict-split (enum = bare-only, union = payload-only)
+        // was rolled back in this commit because it broke 4 pre-
+        // existing parser + codegen tests that use the legacy v1
+        // payload-bearing enum shape. The v2 split lands as a
+        // NARRATIVE in the docs/13/14 manual (the user's previous
+        // commit) but the parser still accepts both shapes for both
+        // keywords. A future commit can re-introduce the strict-
+        // split once the legacy test surface migrates to `union` for
+        // payload forms (matching the example/types/enum.zag
+        // migration already landed).
         const start_loc = self.peek().loc;
         self.expect(.enum_kw);
+        // Optional backing-type `enum(T)`. Captured verbatim via
+        // collectCastType so multi-token forms round-trip; codegen
+        // routes through `zagTypeToZig` for the alias rewrite.
+        var backing_type: ?[]const u8 = null;
+        if (self.peek().tag == .lparen) {
+            self.advance();
+            backing_type = self.collectCastType();
+            self.expect(.rparen);
+        }
         const name = self.expectIdent();
         self.expect(.lbrace);
         var variants_buf: [64]ast.EnumVariant = undefined;
@@ -192,13 +223,16 @@ pub fn parseEnumDecl(self: *Parser) ast.EnumDecl {
             const variant_loc = self.peek().loc;
             const variant_name = self.expectIdent();
             var payload: ?[]const u8 = null;
+            var fields_buf: [16]ast.VariantField = undefined;
+            var field_count: usize = 0;
             if (self.peek().tag == .lparen) {
-                // Multi-arg payload (e.g. `Rect(f64, f64)`): collect one or
-                // more comma-separated type-text segments and join them
-                // with ", " so codegen emits the source verbatim. Use the
-                // existing collectCastType so multi-token pointer types
-                // (`*const T`), slice prefixes (`[]T`), and nullable
-                // prefixes (`?*T`) round-trip cleanly through codegen.
+                // Paren-positional payload (e.g. `Circle(f64)` or
+                // `Rect(f64, f64)`): join multi-token type-text with
+                // ", " so codegen emits `struct { a: T0, b: T1, ... }`
+                // with sequential single-letter field names. Mirrors
+                // the legacy parseEnumDecl payload-collection code
+                // byte-for-byte (preserves all 4 pre-existing tests'
+                // expectations).
                 self.advance(); // consume (
                 var type_texts_buf: [16][]const u8 = undefined;
                 var type_count: usize = 0;
@@ -212,11 +246,6 @@ pub fn parseEnumDecl(self: *Parser) ast.EnumDecl {
                 self.expect(.rparen);
                 var joined_buf: [512]u8 = undefined;
                 var joined_len: usize = 0;
-                // Manual-index `while` instead of `for (slice) |tt, i|` —
-                // the latter produced a "extra capture in for loop" error in
-                // zig 0.16 for this expression shape (only one such loop in
-                // the file; no impact on the other sites which iterate over
-                // string-text or arena slices with single captures).
                 var i: usize = 0;
                 while (i < type_count) : (i += 1) {
                     const tt = type_texts_buf[i];
@@ -235,18 +264,316 @@ pub fn parseEnumDecl(self: *Parser) ast.EnumDecl {
                 const payload_arena = self.arena.alloc(u8, joined_len);
                 @memcpy(payload_arena, joined_buf[0..joined_len]);
                 payload = payload_arena;
+            } else if (self.peek().tag == .lbrace) {
+                // Brace-named-field payload (e.g. `Drag { x: f64, y: f64 }`):
+                // capture structured `[{name, type_text}, ...]` so codegen
+                // emits `struct { x: f64, y: f64 }` with the user's
+                // actual names (vs. the legacy single-letter scheme used
+                // for paren-positional). Mirrors parseStructDecl's
+                // named-field loop pattern.
+                self.advance(); // consume {
+                fields_buf[field_count] = blk: {
+                    const fname = self.expectIdent();
+                    self.expect(.colon);
+                    const ftype = self.collectCastType();
+                    break :blk ast.VariantField{ .name = fname, .type_text = ftype };
+                };
+                field_count += 1;
+                while (self.peek().tag == .comma) {
+                    self.advance();
+                    fields_buf[field_count] = blk: {
+                        const fname = self.expectIdent();
+                        self.expect(.colon);
+                        const ftype = self.collectCastType();
+                        break :blk ast.VariantField{ .name = fname, .type_text = ftype };
+                    };
+                    field_count += 1;
+                }
+                self.expect(.rbrace);
             }
+            // Backed-enum per-variant value (`enum(T) { V = expr }`):
+            // only meaningful when a backing_type was captured; allowed
+            // in any `enum` or `union` decl shape for parser-uniformity
+            // (zig rejects the combination at the byte level if it
+            // would produce a malformed `union(enum) { V = expr, ... }`).
+            var value_text: ?[]const u8 = null;
+            if (self.peek().tag == .equals) {
+                self.advance();
+                value_text = self.parseBackedEnumValue();
+            }
+            const fields_arena = self.arena.alloc(ast.VariantField, field_count);
+            if (field_count > 0) @memcpy(fields_arena, fields_buf[0..field_count]);
             variants_buf[variant_count] = .{
                 .name = variant_name,
                 .payload_type = payload,
                 .loc = variant_loc,
+                .fields = fields_arena,
+                .value_text = value_text,
             };
             variant_count += 1;
         }
         self.expect(.rbrace);
         const variants = self.arena.alloc(ast.EnumVariant, variant_count);
         @memcpy(variants, variants_buf[0..variant_count]);
-        return .{ .name = name, .variants = variants, .loc = start_loc };
+        // Gap #2 closure hook (docs/manual/14-unions §Mixed Bare + Payload):
+        // register each brace-named-field variant's name into the
+        // parser's `known_variant_names` table so parsePrimary's
+        // `.identifier` arm can disambiguate `T { ... }` as a
+        // unqualified brace ctor (when `T` is in the table) vs a
+        // struct literal (when not). The registration filters by
+        // `fields.len > 0` so only brace-named-field variants get
+        // registered — bare variants and paren-positional variants
+        // do not accept brace form, so accepting `Bare { ... }` for
+        // a bare `Bare` would surface as a downstream zig-side error
+        // rather than a useful emit. Mirrors the codegen-side
+        // `variant_fields_buf` population in `genEnumDecl`'s
+        // `v.fields.len > 0` arm (src/codegen/decl.zig) so the
+        // parser's known-variant table matches the codegen's
+        // brace-fields table.
+        var vi: usize = 0;
+        while (vi < variant_count) : (vi += 1) {
+            if (variants[vi].fields.len > 0 and
+                self.known_variant_count < self.known_variant_names.len)
+            {
+                self.known_variant_names[self.known_variant_count] = variants[vi].name;
+                self.known_variant_count += 1;
+            }
+        }
+        return .{ .name = name, .variants = variants, .loc = start_loc, .backing_type = backing_type };
+    }
+
+
+pub fn parseUnionDecl(self: *Parser) ast.EnumDecl {
+        // v2 landing (docs/manual/14-unions §"Definition"): `union`
+        // hosts tagged-union types whose variants MAY carry payloads
+        // (paren-positional OR brace-named-field) OR be bare. The
+        // shared AST shape (EnumDecl / EnumVariant) with parseEnumDecl
+        // means codegen and trait-bound machinery reuse the same paths;
+        // only the variant-shape acceptance differs.
+        //
+        // Three variant shapes accepted (any combination per decl):
+        //   1. Bare:              `Variant`
+        //   2. Paren-positional:  `Variant(T1, T2, ...)`
+        //   3. Brace-named-field: `Variant { name1: T1, name2: T2 }`
+        //
+        // Backed-enum `enum(T) { V = value }` form is NOT accepted on
+        // unions (zig's `union(enum) { ... }` shape does not host
+        // per-variant backing values). Trying to write one would
+        // surface as `expected variant or '}', got '='` from the
+        // outer enum-parsing rejection surface (the user's obvious
+        // choice for backed semantics is `enum`, not `union`).
+        const start_loc = self.peek().loc;
+        self.expect(.union_kw);
+        const name = self.expectIdent();
+        self.expect(.lbrace);
+        var variants_buf: [64]ast.EnumVariant = undefined;
+        var variant_count: usize = 0;
+        while (self.peek().tag != .rbrace and !self.eof()) {
+            if (self.peek().tag == .newline) {
+                self.advance();
+                continue;
+            }
+            if (self.peek().tag == .comma) {
+                self.advance();
+                continue;
+            }
+            const variant_loc = self.peek().loc;
+            const variant_name = self.expectIdent();
+            var payload: ?[]const u8 = null;
+            var fields_buf: [16]ast.VariantField = undefined;
+            var field_count: usize = 0;
+            if (self.peek().tag == .lparen) {
+                // Paren-positional payload (e.g. `Rect(f64, f64)`):
+                // join multi-token type-text with ", " so codegen
+                // emits `struct { a: f64, b: f64, ... }` with the
+                // existing single-letter ordering. Mirrors the legacy
+                // parseEnumDecl payload-collection code so the paren
+                // form is byte-for-byte identical whether it lands
+                // through `enum` (legacy) or `union` (post-split).
+                self.advance(); // consume (
+                var type_texts_buf: [16][]const u8 = undefined;
+                var type_count: usize = 0;
+                type_texts_buf[type_count] = self.collectCastType();
+                type_count += 1;
+                while (self.peek().tag == .comma) {
+                    self.advance();
+                    type_texts_buf[type_count] = self.collectCastType();
+                    type_count += 1;
+                }
+                self.expect(.rparen);
+                var joined_buf: [512]u8 = undefined;
+                var joined_len: usize = 0;
+                var i: usize = 0;
+                while (i < type_count) : (i += 1) {
+                    const tt = type_texts_buf[i];
+                    if (i > 0) {
+                        if (joined_len + 2 <= joined_buf.len) {
+                            joined_buf[joined_len] = ',';
+                            joined_buf[joined_len + 1] = ' ';
+                            joined_len += 2;
+                        }
+                    }
+                    if (joined_len + tt.len <= joined_buf.len) {
+                        @memcpy(joined_buf[joined_len..][0..tt.len], tt);
+                        joined_len += tt.len;
+                    }
+                }
+                const payload_arena = self.arena.alloc(u8, joined_len);
+                @memcpy(payload_arena, joined_buf[0..joined_len]);
+                payload = payload_arena;
+            } else if (self.peek().tag == .lbrace) {
+                // Brace-named-field payload (e.g.
+                // `Drag { x: f64, y: f64 }`): capture structured
+                // `[{name, type_text}, ...]` so codegen emits
+                // `struct { x: f64, y: f64 }` preserving the user's
+                // actual names (vs. the legacy single-letter a/b/c/...
+                // scheme used for paren-positional). Mirrors
+                // parseStructDecl's named-field loop pattern.
+                self.advance(); // consume {
+                fields_buf[field_count] = blk: {
+                    const fname = self.expectIdent();
+                    self.expect(.colon);
+                    const ftype = self.collectCastType();
+                    break :blk ast.VariantField{ .name = fname, .type_text = ftype };
+                };
+                field_count += 1;
+                while (self.peek().tag == .comma) {
+                    self.advance();
+                    fields_buf[field_count] = blk: {
+                        const fname = self.expectIdent();
+                        self.expect(.colon);
+                        const ftype = self.collectCastType();
+                        break :blk ast.VariantField{ .name = fname, .type_text = ftype };
+                    };
+                    field_count += 1;
+                }
+                self.expect(.rbrace);
+            }
+            const fields_arena = self.arena.alloc(ast.VariantField, field_count);
+            if (field_count > 0) @memcpy(fields_arena, fields_buf[0..field_count]);
+            variants_buf[variant_count] = .{
+                .name = variant_name,
+                .payload_type = payload,
+                .loc = variant_loc,
+                .fields = fields_arena,
+                .value_text = null,
+            };
+            variant_count += 1;
+        }
+        self.expect(.rbrace);
+        const variants = self.arena.alloc(ast.EnumVariant, variant_count);
+        @memcpy(variants, variants_buf[0..variant_count]);
+        // Gap #2 closure hook (docs/manual/14-unions §Mixed Bare + Payload):
+        // mirror of the parseEnumDecl registration hook above. Each
+        // brace-named-field variant under `union X { ... }` populates
+        // the parser's `known_variant_names` table so the
+        // `.identifier` arm in parsePrimary can dispatch
+        // `VariantName { ... }` to `.enum_variant_ctor { enum_name =
+        // null, ... }` rather than the legacy `.struct_lit` arm.
+        // Filtering by `fields.len > 0` excludes bare and
+        // paren-positional variants from the table (those forms don't
+        // accept brace syntax anyway, so a brace-form match would
+        // surface as a zig-side downstream error rather than a
+        // useful emit). Same wire-up as the matched codegen-side `variant
+        // fields_buf` population in `genEnumDecl`.
+        var vi: usize = 0;
+        while (vi < variant_count) : (vi += 1) {
+            if (variants[vi].fields.len > 0 and
+                self.known_variant_count < self.known_variant_names.len)
+            {
+                self.known_variant_names[self.known_variant_count] = variants[vi].name;
+                self.known_variant_count += 1;
+            }
+        }
+        return .{ .name = name, .variants = variants, .loc = start_loc, .backing_type = null };
+    }
+
+
+pub fn parseBackedEnumValue(self: *Parser) []const u8 {
+        // Verbatim text capture from the current position until the
+        // next comma / newline / rbrace. Used for `enum(T) { V = value
+        // }` value capture. Walks the lexed tokens directly (not the
+        // source) so multi-token values like `1 << 2`, computed
+        // expressions, and named constants round-trip as-written.
+        //
+        // String-literal correction: the lexer's `.string_literal` and
+        // `.byte_string_literal` tokens carry their payload WITHOUT the
+        // surrounding quotes (matches the byte-string test in
+        // src/tests/lexer.zig: `b"hello"` has `.text == "hello"` (5
+        // chars, stripped quotes)). Naive verbatim capture would emit
+        // `Low = low,` for the source `Low = "low"` — losing the
+        // quotes and producing a malformed backing-enum value that
+        // zig rejects with `error: declaration expects a constant`.
+        // The fix: wrap the captured text in `"` for `.string_literal`
+        // and `b"` for `.byte_string_literal` so the round-trip
+        // preserves the source shape. Char literals are unaffected
+        // (their `.text` field already includes the single-quote
+        // pair per the lexer test that pins `'\n' → text = "'\\n'"`).
+        //
+        // Buffer size: most backed-enum values are 1-30 chars (e.g.
+        // `0`, `0xFF`, `1.5`, `"low"`, `'a'`, `SomeConst`); 256 bytes
+        // covers any realistic literal. A future literal-extending
+        // surface (e.g. computed initializers like `Status.Max =
+        // MyConst + 1`) may need a larger buffer; the existing carve-
+        // out truncates silently which would surface as the codegen
+        // emit of a partial expression (zig rejects malformed RHS so
+        // the user gets a clear compile error pointing at the
+        // truncated value rather than a silent parse-side corruption).
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        while (!self.eof() and self.peek().tag != .comma and
+            self.peek().tag != .rbrace and self.peek().tag != .newline)
+        {
+            const t = self.peek();
+            const is_string = t.tag == .string_literal;
+            const is_byte_string = t.tag == .byte_string_literal;
+            const needs_quotes = is_string or is_byte_string;
+            if (len > 0 and len + 1 <= buf.len) {
+                buf[len] = ' ';
+                len += 1;
+            }
+            // Per-token-kind opening delimiter. Byte-string literals
+            // carry the `b` prefix as part of the literal surface
+            // (`b"..."`); plain string literals carry only the `"`
+            // delimiter. The capture walk re-emits the prefix byte
+            // (byte-strings) and the opening `"` (both) so the
+            // captured value_text round-trips back into the emitted
+            // zigzag as a string literal of the same kind.
+            //
+            // Bug caught by the byte-string codegen test (added
+            // alongside this fix): the previous shape used a single
+            // `opening: u8 = if (is_byte_string) 'b' else '"'` and
+            // emitted ONE byte — the byte-string case produced a
+            // 1-char `b` opening (no opening `"`), so the captured
+            // value for `b"abc"` became `babc"` instead of `b"abc"`,
+            // and the codegen emitted `Foo = babc",` instead of
+            // `Foo = b"abc",`. Splitting the byte-string path into
+            // 2 emitted bytes (`b` + `"`) resolves the asymmetry.
+            if (is_byte_string) {
+                if (len + 2 <= buf.len) {
+                    buf[len] = 'b';
+                    buf[len + 1] = '"';
+                    len += 2;
+                }
+            } else if (is_string) {
+                if (len + 1 <= buf.len) {
+                    buf[len] = '"';
+                    len += 1;
+                }
+            }
+            if (len + t.text.len <= buf.len) {
+                @memcpy(buf[len..][0..t.text.len], t.text);
+                len += t.text.len;
+            }
+            if (needs_quotes and len + 1 <= buf.len) {
+                buf[len] = '"';
+                len += 1;
+            }
+            self.advance();
+        }
+        const arena = self.arena.alloc(u8, len);
+        @memcpy(arena, buf[0..len]);
+        return arena;
     }
 
 
@@ -588,7 +915,22 @@ pub fn parseStructDecl(self: *Parser) ast.StructDecl {
         self.expect(.rbrace);
         const fields_src = fields_buf[0..field_count];
         const fields = self.arena.dupe(ast.StructField, fields_src);
-        return .{ .name = name, .fields = fields, .loc = start_loc, .type_params = type_params };
+        // Gap #2 closure (docs/manual/14-unions §Mixed Bare + Payload):
+    // register `name` in known_struct_names so parsePrimary’s
+    // `.identifier` arm can detect struct/variant name collisions.
+    // When `name` appears as BOTH struct AND variant, struct wins
+    // (BLOCKING #2 fix per code-reviewer), so the user writing
+    // `T { ... }` for a struct gets the struct-lit route
+    // (existing v1 behavior), not the brace-ctor route.
+    // BLOCKING bounds check (gap #2 closure): cap struct-table pushes
+    // so a 257th struct decl does not silently corrupt memory. The
+    // sibling enum/union hooks already carry this guard; struct was
+    // missed in the initial land and is added here.
+    if (self.known_struct_count < self.known_struct_names.len) {
+        self.known_struct_names[self.known_struct_count] = name;
+        self.known_struct_count += 1;
+    }
+    return .{ .name = name, .fields = fields, .loc = start_loc, .type_params = type_params };
     }
 
 

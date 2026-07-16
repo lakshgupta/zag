@@ -1,0 +1,58 @@
+# examples/types/union_demo.zag
+#
+# End-to-end demonstration of the `union` keyword (v2 split landed,
+# docs/manual/14-unions.md §"Definition"). Covers:
+#   - Bare variants (`Empty`)
+#   - Single-arg paren-positional payload (`Circle(f64)`)
+#   - Multi-arg paren-positional payload (`Rect(f64, f64)`)
+#   - Mixed bare + payload (`Hover`, `Press(i32)`)
+#   - Impl-block method on a union type (flattened to free-fn)
+#
+# v1→v2 migration note: this example was previously written as a payload-
+# bearing `enum Shape` (v1's overloaded keyword). The v2 split forces
+# the `union` keyword for ANY variant shape that includes a payload; the
+# parser rejects `enum X { Foo(T) }` outright. `union` accepts the same
+# paren-positional payload form plus the new brace-named-field form
+# (`Drag { x: f64, y: f64 }` — see examples/types/named_field_variant.zag).
+#
+# Codegen surfaces these union shapes as zig's `union(enum) { ... }`
+# container so zig's own exhaustive-match checker enforces the docs/14
+# contract that every match must handle every variant (or fall through
+# to `_`).
+
+union Shape {
+    Circle(f64),                    # single-arg payload
+    Rect(f64, f64),                 # multi-arg payload (anonymous struct { a, b })
+    Empty,                          # bare variant (zero-cost tag slot)
+}
+
+union ClickEvent {
+    Hover,                          # bare variant
+    Press(i32),                     # single-arg payload
+}
+
+impl ClickEvent {
+    pub fun is_action(e: ClickEvent) -> bool {
+        match e {
+            ClickEvent.Hover => false,
+            _ => true,
+        }
+    }
+}
+
+fun main() {
+    let c: Shape = Shape.Circle(2.0);
+    print(c);
+
+    let r: Shape = Shape.Rect(3.0, 4.0);
+    print(r);
+
+    let e: Shape = Shape.Empty;
+    print(e);
+
+    let hover: ClickEvent = ClickEvent.Hover;
+    let press: ClickEvent = ClickEvent.Press(42);
+
+    print(ClickEvent.is_action(hover));
+    print(ClickEvent.is_action(press));
+}

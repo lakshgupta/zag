@@ -43,6 +43,33 @@ pub const MethodDecl = ast_decl.MethodDecl;
 pub const ImplBlock = ast_decl.ImplBlock;
 pub const EnumDecl = ast_decl.EnumDecl;
 pub const EnumVariant = ast_decl.EnumVariant;
+// v2-split landing (docs/manual/14-unions §\"Definition\"): the
+// brace-named-field variant syntax `Drag { x: f64, y: f64 }` requires
+// a structured AST shape per named-field slot (vs. the legacy joined-
+// text payload_type). VariantField carries the per-slot name +
+// verbatim type-text so codegen can emit `struct { x: f64, y: f64 }`
+// preserving the user's actual field names (instead of the legacy
+// single-letter a/b/c/... scheme). Without this re-export, parser/
+// decl.zig's `fields_buf[...]: ast.VariantField` references would
+// surface as `ast.VariantField not found` at compile time.
+pub const VariantField = ast_decl.VariantField;
+// gap #6 (docs/manual/14-unions §\"Definition\" + docs/manual/13-enums
+// §\"Choosing Between enum and union\"): brace-named-field MATCH-side
+// destructuring (`Variant { x: w, y: h } => ...`) is a parallel
+// sibling to gap #2 ctor-side. The pattern-side `Pattern.EnumVariant
+// NamedPattern` carries the same per-slot structured shape as
+// gap #2's `EnumVariant.fields` (`ast.VariantField`), but the
+// pattern instead of a type-text is `name` + optional `capture`
+// ident (null = `_` wildcard discard). These nested types live
+// inside the `pub const Pattern = union(enum) { ... }` block
+// in `src/ast/expr.zig`; without these top-level re-exports the
+// parser-side `field_buf: [16]ast.VariantFieldPattern` references
+// in `src/parser/stmt.zig`'s brace-form walker surface as
+// `root source file struct 'ast' has no member named
+// 'VariantFieldPattern'` at compile time (the exact diagnostic
+// surfaced in this turn's first build attempt).
+pub const VariantFieldPattern = ast_expr.Pattern.VariantFieldPattern;
+pub const EnumVariantNamedPattern = ast_expr.Pattern.EnumVariantNamedPattern;
 // Traits (docs/17). TraitDecl + TraitMethodDecl are the decl-side
 // AST nodes for trait declarations. Phase 1 (this commit) scaffolds
 // only lexer/AST/parser; codegen for vtable + dispatch shims lives

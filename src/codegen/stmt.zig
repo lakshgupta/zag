@@ -645,6 +645,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(scrut_name);
                 self.write("; ");
             }
+            // gap #6 — emit named/positional payload-binding
+            // preamble BEFORE `break :blk EXPR;` so the captures
+            // declared on the pattern (`Variant { x: w, y: h }` or
+            // `Variant(w, h)`) are in lexical scope for the EXPR
+            // that follows. The brace-form walker and paren-pos
+            // walker both route through `emitPatternBindings`
+            // which is a no-op for `.literal`/`.range`/`.ident`/
+            // `.discard` patterns. See `emitPatternBindings` doc
+            // for the zig 0.16 unused-const throwaway rationale.
+            self.emitPatternBindings(scrut_name, arm.pat);
             self.write("break :blk ");
             // `arm.expr` is `*Expr` (cycle-breaking pointer) — deref before
             // emitting the arm-body expression.
@@ -731,5 +741,133 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(" == .");
                 self.write(ev.variant_name);
             },
+            .enum_variant_named => |env| {
+                // gap #6 — brace-named-field match-side destructuring
+                // (docs/manual/14-unions §"Definition" + docs/manual/
+                // 13-enums §"Choosing Between enum and union"). Cond
+                // is the SAME `__m == .Variant` shape as the paren-
+                // positional `.enum_variant` arm; the NAMED-field
+                // binding preamble (`const w = __m.x; ...`) is
+                // emitted separately by `emitPatternBindings` from
+                // `genMatchExpr`'s arm loop, OUTSIDE this cond, so
+                // the `const` declarations land INSIDE the
+                // `if (cond) { ... }` block where they're in scope
+                // for the arm body's `break :blk EXPR`. We chose to
+                // share the cond with `.enum_variant` rather than
+                // refactor into a single tag-cond because the emit
+                // shape is byte-for-byte identical — the only
+                // delta is the binding preamble, kept in a parallel
+                // arm so this cond stays trivial.
+                self.write(scrut_name);
+                self.write(" == .");
+                self.write(env.variant_name);
+            },
+        }
+    }
+
+
+    pub     fn emitPatternBindings(self: *Codegen, scrut_name: []const u8, p: ast.Pattern) void {
+        // gap #6 — emit per-arm payload-binding preamble so captures
+        // declared on the pattern (`Variant { x: w, y: h }` for the
+        // brace-named form OR `Variant(w, h)` for the paren-pos
+        // form) are in lexical scope for the arm-body EXPR that
+        // follows `break :blk`. Emit is called from `genMatchExpr`'s
+        // arm loop AFTER the `if (arm.pat == .ident)` block (the
+        // legacy ident-binding path) and BEFORE the
+        // `self.write("break :blk ")` line, so the `const` decls
+        // land inside the surrounding `if (cond) { ... }` block
+        // — the exact spot zig 0.16 requires for the EXPR's
+        // identifier scope to include them.
+        //
+        // zig 0.16 also rejects UNUSED local consts. The user's
+        // arm body may or may not reference each capture, and our
+        // codegen doesn't analyse the EXPR for usage, so we silhouette
+        // every captured binding with a no-op `_ = NAME;` throwaway
+        // line. The throwaway has zero runtime cost (it's a load
+        // into `_` which the optimizer drops) and silences zig's
+        // "unused local variable" diagnostic regardless of whether
+        // the user actually consumed the capture.
+        //
+        // Paren-positional (`Pattern.enum_variant.bindings`):
+        // emits `const NAME = __m.a;` etc. using single-letter field
+        // names per the gap #2 legacy emit shape (zig 0.16's
+        // anonymous-struct naming requires sequential lowercase
+        // letters because `Variant(a, b)` two-arg users see `.a`/`.b`
+        // — not user-named fields). The `letters` table bounds the
+        // arity at 26 — variants with more than 26 payload fields
+        // would exhaust this alphabet and require a v2 emit shape,
+        // but the current spec caps payload arity at the tuple-
+        // destructuring ceiling (16 per the `bind_buf: [16]` size
+        // in `parsePattern`); 26 is comfortably above that ceiling.
+        switch (p) {
+            .enum_variant => |ev| {
+                if (ev.bindings) |bs| {
+                    const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
+                    for (bs, 0..) |b, i| {
+                        if (b) |name| {
+                            self.write("const ");
+                            self.write(name);
+                            self.write(" = ");
+                            self.write(scrut_name);
+                            self.write(".");
+                            // Bug #2 fix (zig 0.16 paren-positional match): emit
+                            // `__m_0.<variant_name>.<single-letter>` instead of
+                            // `__m_0.<single-letter>` so zig can dispatch through
+                            // the active union variant. Symmetric with the brace-
+                            // named-field arm above; required because zig 0.16's
+                            // union(enum) does not expose anonymous-struct fields
+                            // directly (`p.a` rejected, but `p.Pair.a` accepted).
+                            // The `if (__m_0 == .Variant)` cond already established
+                            // the active variant so the prefix is statically sound.
+                            self.write(ev.variant_name);
+                            self.write(".");
+                            self.write(letters[i]);
+                            self.write("; ");
+                        }
+                    }
+                }
+            },
+            .enum_variant_named => |env| {
+                for (env.fields) |f| {
+                    if (f.capture) |name| {
+                        // gap #2 brace-named-field emit preserves
+                        // user-written field names on the anonymous-
+                        // struct payload (`Drag { x: f64, y: f64 }`
+                        // becomes `struct { x: f64, y: f64 }` in
+                        // zag output, which zig accepts because the
+                        // user's source field NAMES are kept intact).
+                        // The pattern-side `f.name` must match the
+                        // variant-decl-side field name — the AST
+                        // walker in `parsePattern` doesn't validate
+                        // this match (the source-side pattern walker
+                        // accepts any ident as field name); zig's
+                        // anonymous-struct resolver rejects mismatches
+                        // at compile time so the user gets a clear
+                        // "no field named 'foo' in struct" diagnostic
+                        // if they typo the field name on the pattern
+                        // side.
+                        self.write("const ");
+                        self.write(name);
+                        self.write(" = ");
+                        self.write(scrut_name);
+                        self.write(".");
+                        // Bug #2 fix (zig 0.16 brace-named-field match): emit
+                        // `__m_0.<variant_name>.<field_name>` instead of
+                        // `__m_0.<field_name>` so zig can dispatch through
+                        // the active union variant. union(enum) does not
+                        // expose struct fields directly — `p.x` is rejected,
+                        // but `p.Pair.x` is accepted by zig 0.16 because
+                        // the variant name resolves the tagged-union dispatch
+                        // before the field access. The `if (__m == .Pair)`
+                        // cond already established Pair is active so the
+                        // variant-prefixed field access is statically sound.
+                        self.write(env.variant_name);
+                        self.write(".");
+                        self.write(f.name);
+                        self.write("; ");
+                    }
+                }
+            },
+            .literal, .range, .ident, .discard => {},
         }
     }

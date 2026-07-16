@@ -1,6 +1,24 @@
 # Enums
 
-> **v1→v2 migration note.** In the unified v2 taxonomy, `enum` is reserved for **bare enumerations** (variants carry no payload). For any type whose variants carry payload — or for a type mixing bare and payload variants — use `union` instead; see [Unions](14-unions.md). For v1 (the current compiler), the `enum` keyword continues to accept bare and payload forms alike: `enum Direction { North, South }` and `enum Option<T> { Some(T), None }` both compile today. The split is forward-looking — once the v2 `union` keyword lands, payload-bearing declarations move to `union`.
+## Choosing Between `enum` and `union`
+
+| Use `enum` when...                           | Use `union` when...                                |
+|----------------------------------------------|----------------------------------------------------|
+| All variants are bare (no payload)           | Any variant carries a payload                      |
+| Variants all share one backing type `T`      | Variants' payload types may differ                 |
+| You want a 1-byte tag (≤256 variants)        | You want a tagged-union layout (tag + max payload) |
+| You want value-equality across variants      | You want payload binding in match arms (`V(x) =>`) |
+
+**Layout reference (zig-equivalent):**
+- `enum { North, South }` ⇒ `pub const Direction = enum { North, South };` — bare enum, 1-byte tag.
+- `enum(u8) { Ok = 0, Err = 1 }` ⇒ `pub const Status = enum(u8) { Ok = 0, Err = 1 };` — backed enum, no per-variant tag, storage is `sizeof(u8)`.
+- `union { Circle(f64), Rect(f64, f64) }` ⇒ `pub const Shape = union(enum) { Circle: f64, Rect: [2]f64 };` — tagged union, tag + max payload size; payload fields are anonymous.
+
+`enum(T)` (backed enum) is for "category of similar values" — all variants share `T` and storage is `sizeof(T)` directly. `union` is for variants whose payload types may differ (`Shape { Circle(f64), Rect(f64, f64) }`). The two keywords are deliberately separated so the "category of similar values" form (enums) doesn't pay for a per-variant tag that's redundant when all variants share `T`.
+
+**Pick the keyword that matches your payload shape — not both.** A declaration is either an enum OR a union, not both. If you start typing `enum` and realize you need a heterogeneous payload, switch the keyword to `union` (and vice-versa). Both keywords support pattern matching in `match` arms; the distinction is payload-binding (`V(x) =>` extracts the payload's fields) which only `union` (and `enum(T)`'s bare variants) provide.
+
+> **Today's compiler.** The keywords are interchangeable in today's compiler — both `enum` and `union` accept bare, paren-positional, and brace-named-field declaration shapes. The split above describes the canonical direction: bare-only for `enum`, payload-bearing for `union`. Prefer `union` for any payload-bearing declaration so your source aligns with the canonical surface.
 
 ## Definition
 
@@ -42,7 +60,7 @@ match dir {
 }
 ```
 
-For partial matches, use `_` as the catch-all pattern. This works for both bare `enum` and `enum(T)` — in the backed-enum case `_` catches both unmatched identifiers *and* unmatched `T`-value literals (see [Backed Enums](#backed-enums-enumt) below):
+For partial matches, use `_` as the catch-all pattern:
 
 ```zag
 match dir {
@@ -89,11 +107,15 @@ fun is_north(d: Direction) -> bool {
 
 Use qualified names when the type is ambiguous or for clarity.
 
-## Backed Enums (`enum(T)`)
+## Backed Enums (`enum(T)`) — Planned for v2.1
+
+> ⚠️ **Not yet available in the current compiler.** Backed enums (`enum(T)` with explicit per-variant values) are a planned v2.1 feature. The current compiler accepts the bare `enum { Variant1, Variant2 }` form only. Use [Definition](#definition)'s bare `enum` plus a separate field if you need value-categorised variants today.
+>
+> The code samples below illustrate the *planned* API surface. They are **not yet runnable** in the current compiler.
 
 Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](16-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type.
 
-For v2.1, an `enum` may declare a backing type `T`. The supported `T` universe is restricted to integer types, `bool`, `char`, and `str` — custom `Copy` struct/enum/array types as `T` are deferred. Each variant identifier is bound to a value of type `T` at compile time.
+When backed enums land, an `enum` may declare a backing type `T`. The supported `T` universe will be restricted to integer types, `bool`, `char`, and `str` — custom `Copy` struct/enum/array types as `T` are deferred. Each variant identifier is bound to a value of type `T` at compile time:
 
 ```zag
 # String-backed enum (TypeScript / PHP BackedEnum / Swift-style)
@@ -111,8 +133,8 @@ enum(u8) Status {
 }
 ```
 
-**Rules:**
-- `enum(T)` requires explicit `= v` for every variant. Implicit values are not supported in v1.
+**Rules (planned surface — see supported-by-version note above):**
+- `enum(T)` requires explicit `= v` for every variant. Implicit values are not supported.
 - Default `enum { V1, V2 }` (no `T`) keeps bare-only behavior; tag-only memory layout (1-byte tag for ≤256 variants).
 - Storage: `sizeof(T)` per value. The variant identifier IS the value — there is no extra tag byte.
 - Variants remain bare; there is no per-variant payload type distinct from `T`.
@@ -131,24 +153,24 @@ match lvl {
     _            => print("…"),    # catch-all
 }
 
-# Synthesized equality compares T-values:
+# Equality compares T-values:
 let ok_high: bool = (Level.High == "high");      # true — the value IS "high"
 let ok_eq:    bool = (Status.Ok   == Status.Ok);  # true — both 0
 let ok_neq:   bool = (Status.Ok   != Status.Err); # true — 0 != 2
 ```
 
-**Synthesized methods (auto-generated):**
-- `__eq__` — **value-based** for `enum(T)`: compares `T`-values across both T families. `Level.High == "high"` (T=str) and `Status.Ok == Status.Ok` (T=u8) are both `true`. Compare with default `enum { … }`, where `__eq__` is **tag-based** (variants are equal only to themselves and never equal to their `T`-value-shapes).
-- `from_str(s: str) -> Option<Enum>` — synthesized whenever `T = str`; returns `None` for unrecognized strings.
-- `Display::write` — auto-implemented; writes the `T`-value via `T`'s own `Display`.
+**Provided methods (auto-generated when `enum(T)` lands):**
+- **Equality (`==`)** — **value-based** for `enum(T)`: compares `T`-values. `Level.High == "high"` (T=str) and `Status.Ok == Status.Ok` (T=u8) are both `true`. Compare with default `enum { … }`, where equality is **tag-based** (variants are equal only to themselves).
+- **`from_str(s: str) -> Option<Enum>`** — provided whenever `T = str`; returns `None` for unrecognized strings.
+- **Display** — auto-implemented; writes the `T`-value via `T`'s own display formatter.
 
 **Cross-construction rules:**
 - `let x: Level = "low";` — bind by T-value; compile error if `"low"` doesn't match a registered variant.
 - `Level.High` and the literal `"high"` are interchangeable **in any binding position whose expected type is `Level`** (`: Level` annotation, `match` scrutinee of type `Level`, function parameter of type `Level`). In free-context bindings (e.g. `let s = "high";`, no annotation), the literal is a borrowed string view, not `Level` — there is no implicit coercion.
 
-> **Rust users take note:** `enum(str) Level { High = "high" }` introduces true value-equality (`Level.High == "high"`). This differs from Rust's bare-reference enum, where `High == "high"` is a compile error (different types). Read the synthesized methods above as the binding contract.
+> **Rust users take note:** `enum(str) Level { High = "high" }` introduces true value-equality (`Level.High == "high"`). This differs from Rust's bare-reference enum, where `High == "high"` is a compile error (different types). Read the provided methods above as the binding contract.
 
-**Combining with FFI:** `#[repr(C, T1)] enum(T2) X { … }` keeps `T2` as the Zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries. See [FFI and Interop](24-ffi.md) for the full interaction.
+**Combining with FFI:** `#[repr(C, T1)] enum(T2) X { … }` keeps `T2` as the zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries. See [FFI and Interop](24-ffi.md) for the full interaction.
 
 ## Repr Control
 
