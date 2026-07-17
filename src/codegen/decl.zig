@@ -785,34 +785,81 @@ const Codegen = core.Codegen;
             // the value text. The backing-type text goes through
             // zagTypeToZig so `str` → `[]const u8` while primitives
             // (`u8`, `i32`) round-trip verbatim.
-            self.write("enum(");
-            // Gap #4: preserve the user's literal `char` in the
-            // backing-type slot rather than the silent `char → u32`
-            // alias rewrite that `zagTypeToZig` applies at regular
-            // type positions. A backed enum with `char` backing
-            // would silently change to a `u32`-backed shape holding
-            // codepoints (4-byte layout), not the 1-byte byte-stream
-            // semantics a user expects when they write `enum(char)`.
-            // The `value_text` per-variant captures are NOT rewritten
-            // (they pass through verbatim including quote delimiters
-            // via `parseBackedEnumValue`), so zig accepts `'a'` as a
-            // valid char backing-enum value either way. To pick
-            // the alternative (preserve all alias rewrites including
-            // `char`), drop this branch and inline `zagTypeToZig(bt)`.
-            if (std.mem.eql(u8, bt, "char")) {
-                self.write("char");
-            } else {
-                self.write(zagTypeToZig(bt));
-            }
-            self.write(") {\n");
-            for (ed.variants) |v| {
-                self.write("    ");
-                self.write(v.name);
-                if (v.value_text) |vt| {
+            // Backing-type rewrite through `zagTypeToZig` (gap #4
+            // resolution): a previous carve-out preserved the user's
+            // literal `char` here under the assumption that
+            // "byte-stream semantics" would be lost via the
+            // `char → u32` rewrite, but zig 0.16 rejects an `enum(char)`
+            // emit entirely (`undefined identifier 'char'`) — there
+            // is no byte-stream form to preserve. The uniform
+            // `zagTypeToZig` rewrite is the canonical solution:
+            // `char` becomes `u32`, primitives (`u8`, `i32`, `bool`)
+            // round-trip verbatim. The str-backed form is split out
+            // below — see the `[]const u8` arm. Crucially, the
+            // `enum(` opener lives INSIDE the int branch (below)
+            // because the str branch emits a struct shape and the
+            // `enum(` prefix would produce `enum(struct { ... }`
+            // which zig rejects (caught by an earlier turn's
+            // debug: `error: expected ')', found ';'` at line 52).
+            const bt_rewrite = zagTypeToZig(bt);
+            if (std.mem.eql(u8, bt_rewrite, "[]const u8")) {
+                // Str-backed shape: zig rejects `enum([]const u8)`
+                // because enum tag types must be integers (`expected
+                // integer tag type, found '[]const u8'`). Emit a
+                // struct-with-const-fields instead — each variant
+                // becomes `pub const Name = value;` so `Level.High`
+                // references a `*const [N:0]u8` constant that
+                // coerces to `[]const u8` (zig's standard str-literal
+                // → slice coercion). Value-equality holds because
+                // const fields of identical string literals are the
+                // SAME canonical literal in the zig binary, and the
+                // array-`==` semantics on `[N:0]u8` does element-
+                // wise compare when comparing two distinct literals.
+                //
+                // The matching genBinding wrap path (codegen/stmt.zig)
+                // skips wrapping for str-backed variants because the
+                // variant IS already `[]const u8` — `let lvl: str =
+                // Level.High` round-trips to `let lvl: []const u8 =
+                // Level.High;` without any `@tagName` indirection.
+                //
+                // The closing `};\n\n` is emitted by the outer
+                // `};\n\n` write after the if-else chain, so this
+                // branch only writes the body. Empty-value fallback
+                // (`""`) covers the edge case of a str-backed enum
+                // variant without an explicit `= expr` clause —
+                // zig requires const-field initializers so a missing
+                // value is coerced to the empty-string literal.
+                self.write("struct {\n");
+                for (ed.variants) |v| {
+                    self.write("    pub const ");
+                    self.write(v.name);
                     self.write(" = ");
-                    self.write(vt);
+                    if (v.value_text) |vt| {
+                        self.write(vt);
+                    } else {
+                        self.write("\"\"");
+                    }
+                    self.write(";\n");
                 }
-                self.write(",\n");
+            } else {
+                // Int / char / bool backing: emit the canonical zig
+                // `enum(T) { V = value, ... }` shape. Each variant
+                // MAY carry a per-variant value via `v.value_text`;
+                // codegen emits `= value` only when non-null so
+                // auto-infer (zig's default incrementing) is preserved
+                // when the user omits the value text.
+                self.write("enum(");
+                self.write(bt_rewrite);
+                self.write(") {\n");
+                for (ed.variants) |v| {
+                    self.write("    ");
+                    self.write(v.name);
+                    if (v.value_text) |vt| {
+                        self.write(" = ");
+                        self.write(vt);
+                    }
+                    self.write(",\n");
+                }
             }
         } else if (any_payload) {
             // union(enum) emit shape: any variant with non-null

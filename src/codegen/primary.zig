@@ -211,7 +211,52 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.genTemplateLit(t, .debug_print);
             },
             else => {
-                self.write("__zag_print(\"{any}\", .{");
+                // Type-aware formatter (gap #6): when the arg is
+                // an `.ident` bound to a `str` (`[]const u8`)
+                // annotation, use zig's `{s}` formatter which
+                // prints the slice as its contents. The default
+                // `{any}` formatter prints the byte elements as
+                // a list (`{ 104, 105, 103, 104 }`), which is
+                // correct for `u8` arrays but wrong for
+                // `[]const u8` slices — the user expects the
+                // human-readable string (`high`).
+                //
+                // The type-info lookup walks `self.type_info_buf`
+                // (populated by `collectTypedBindings` in codegen/
+                // stmt.zig for each `let X: T = ...` binding).
+                // Annotations are stored verbatim (e.g. `"str"`)
+                // so the `zagTypeToZig` rewrite is required to
+                // match against zig's `[]const u8` canonical
+                // form. Non-`[]const u8` idents (e.g. `u8`, `i32`,
+                // `bool`) fall through to the `{any}` default
+                // which zig formats correctly for primitive
+                // scalars.
+                //
+                // For non-ident args (e.g. method calls, binary
+                // expressions, enum-variant ctors) the lookup
+                // doesn't fire — the format falls back to
+                // `{any}` which works for the existing
+                // codegen-tested print surfaces (`{a + b}`,
+                // `{obj.f()}`, etc.). The `{s}` widening is
+                // opt-in via the explicit `let lvl: str = ...`
+                // annotation so users keep full control over the
+                // emitted format spec.
+                var format_spec: []const u8 = "{any}";
+                if (arg == .ident) {
+                    const ident_name = arg.ident;
+                    var i: u32 = 0;
+                    while (i < self.type_info_count) : (i += 1) {
+                        if (std.mem.eql(u8, self.type_info_buf[i].name, ident_name) and
+                            std.mem.eql(u8, zagTypeToZig(self.type_info_buf[i].type_name), "[]const u8"))
+                        {
+                            format_spec = "{s}";
+                            break;
+                        }
+                    }
+                }
+                self.write("__zag_print(\"");
+                self.write(format_spec);
+                self.write("\", .{");
                 self.genExpr(arg);
                 self.write(",})");
             },

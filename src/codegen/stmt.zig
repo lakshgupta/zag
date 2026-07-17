@@ -406,7 +406,80 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             self.write(zagTypeToZig(t));
         }
         self.write(" = ");
-        self.genExpr(init_expr);
+        // Backed-enum typed-bind unwrap (gap #5): when the let-
+        // binding carries a `: T` annotation AND the RHS is a
+        // `.enum_variant_ctor` reference AND the enum's backing
+        // type (post `zagTypeToZig` rewrite) matches the
+        // annotation (also rewritten), wrap the RHS so zig accepts
+        // the assignment. The bare `Enum.Variant` form has zig-
+        // type `enum(T)`, which zig rejects as a value of plain
+        // `T` even though the user's source declared them
+        // interchangeably (the docs/13 "category of similar values"
+        // semantic). `@intFromEnum` lowers an int-/char-/bool-
+        // backed enum variant to its T value; `@tagName` does the
+        // equivalent for `enum(str)` (returns the str backing-
+        // value as a `[]const u8`).
+        //
+        // The wrap ONLY fires when annotation == backing_type —
+        // `let s: Status = Status.Ok;` (target IS the enum, not the
+        // backing) emits the bare `Status.Ok` form unchanged so
+        // zig sees the enum-typed binding site as-is.
+        var backed_wrap: ?[]const u8 = null;
+        if (b.type_name) |tn| {
+            if (init_expr == .enum_variant_ctor) {
+                const evc = init_expr.enum_variant_ctor;
+                // `enum_name` is `?[]const u8` because the
+                // brace-form brace-named-field ctor can be
+                // unqualified (`Variant { x = v }` when only one
+                // union in the program declares the variant).
+                // Skip the wrap on the unqualified form — without
+                // an enum-name we have no entry in
+                // `self.prog.enums` to resolve the backing type
+                // against, and the bare variant emits as
+                // `.Variant` which zig resolves via its own
+                // tag-type machinery (no @intFromEnum needed).
+                if (evc.enum_name) |enum_name| {
+                    const annot_rewrite = zagTypeToZig(tn);
+                    for (self.prog.enums) |ed| {
+                        if (ed.backing_type) |bt| {
+                            const bt_rewrite = zagTypeToZig(bt);
+                            if (std.mem.eql(u8, ed.name, enum_name) and
+                                std.mem.eql(u8, bt_rewrite, annot_rewrite))
+                            {
+                            // Str-backed enum variants are emitted
+                            // as struct-with-const-fields (see the
+                            // matching `enum(str)` arm in codegen/
+                            // decl.zig's genEnumDecl) so the
+                            // variant identifier IS already a
+                            // `[]const u8` constant — wrapping it
+                            // with `@tagName(...)` would fail because
+                            // the operand is not a zig enum. Skip
+                            // the wrap entirely (leave `backed_wrap`
+                            // null so the else-branch emits the bare
+                            // variant form). Int-/char-/bool-backed
+                            // enums retain the `@intFromEnum(...)`
+                            // wrap because their bare variant form
+                            // is type-`enum(T)` which zig rejects
+                            // when bound to a plain `T` slot.
+                            backed_wrap = if (std.mem.eql(u8, bt_rewrite, "[]const u8"))
+                                null
+                            else
+                                "@intFromEnum";
+                            break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (backed_wrap) |wrap| {
+            self.write(wrap);
+            self.write("(");
+            self.genExpr(init_expr);
+            self.write(")");
+        } else {
+            self.genExpr(init_expr);
+        }
         self.write(";\n");
     }
 

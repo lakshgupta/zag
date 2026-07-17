@@ -34,6 +34,26 @@ const BindingTypeInfo = struct {
 pub const Codegen = struct {
     out_buf: [65536]u8,
     out_len: usize,
+    /// Reference to the parsed `ast.Program` this codegen pass
+    /// operates on. `init()` leaves it undefined; `generate()`
+    /// sets it to `&prog` immediately at entry so every emit
+    /// function (genStmt → genBinding → …) can walk
+    /// `self.prog.enums` / `self.prog.structs` etc. without
+    /// threading the program reference through dozens of call
+    /// sites. The pointer is stable for the duration of one
+    /// `generate()` call because `prog` is a stack-local by-value
+    /// parameter whose address doesn't change once the function
+    /// is entered — every emit during that pass sees the same
+    /// pointer.
+    ///
+    /// Used at minimum by:
+    ///   - `genBinding` (codegen/stmt.zig) when wrapping a
+    ///     backed-enum variant RHS with `@intFromEnum` /
+    ///     `@tagName` (gap #5 fix). Walks `self.prog.enums` to
+    ///     resolve `Status` → its `backing_type`.
+    ///   - any future emit pass that needs to look up an enclosing
+    ///     type for a nested emit site.
+    prog: *const ast.Program,
     /// Per-function counter for destructuring temps. Reset to 0 by `genFun`
     /// so each `pub fn` body has its own `__destruct_0`, `__destruct_1`,
     /// ... sequence. Multiple destructurings in the same body produce
@@ -277,6 +297,12 @@ pub const VariantFieldsEntry = struct {
             // scaffold tests in the same process) starts fresh.
             .variant_fields_buf = undefined,
             .variant_fields_count = 0,
+            // `prog` is set by `generate()` immediately on entry
+            // (see the `self.prog = &prog;` line at the top of
+            // `generate`). Leaving it undefined here is intentional
+            // — every emit call goes through `generate()` so prog
+            // is always populated before any field that reads it.
+            .prog = undefined,
         };
     }
 
@@ -286,6 +312,15 @@ pub const VariantFieldsEntry = struct {
     }
 
     pub fn generate(self: *Codegen, prog: ast.Program) []const u8 {
+        // Store a stable pointer to the stack-local `prog` parameter
+        // on the Codegen struct so every emit function (genStmt →
+        // genBinding → ...) can resolve type lookups (e.g. backed-
+        // enum backing-type for @intFromEnum wrapping at typed-bind
+        // sites) via `self.prog.enums` without threading the program
+        // reference through every helper. The pointer is stable for
+        // the duration of this call because `prog` is a by-value
+        // parameter on a fixed stack frame.
+        self.prog = &prog;
         // Brace-named-field variant side-table (gap #2 fix): reset
         // at generate() entry so the table is fresh per
         // codegen-pass. genEnumDecl pushes one entry per

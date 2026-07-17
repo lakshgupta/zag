@@ -107,15 +107,13 @@ fun is_north(d: Direction) -> bool {
 
 Use qualified names when the type is ambiguous or for clarity.
 
-## Backed Enums (`enum(T)`) — Planned for v2.1
+## Backed Enums (`enum(T)`) — v2.1
 
-> ⚠️ **Not yet available in the current compiler.** Backed enums (`enum(T)` with explicit per-variant values) are a planned v2.1 feature. The current compiler accepts the bare `enum { Variant1, Variant2 }` form only. Use [Definition](#definition)'s bare `enum` plus a separate field if you need value-categorised variants today.
->
-> The code samples below illustrate the *planned* API surface. They are **not yet runnable** in the current compiler.
+> Backed enums (`enum(T)` with explicit per-variant values) landed in v2.1. The bare `enum { Variant1, Variant2 }` form continues to work and was migrated to the v2 surface earlier; see [`examples/types/enum_backed.zag`](../../examples/types/enum_backed.zag) for the end-to-end runnable demonstration covering `enum(u8)`, `enum(str)`, `enum(char)`, and the auto-inferred `enum(u8)` shape.
 
 Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](16-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type.
 
-When backed enums land, an `enum` may declare a backing type `T`. The supported `T` universe will be restricted to integer types, `bool`, `char`, and `str` — custom `Copy` struct/enum/array types as `T` are deferred. Each variant identifier is bound to a value of type `T` at compile time:
+An `enum` may declare a backing type `T`. The supported `T` universe is restricted to integer types, `bool`, `char`, and `str` — custom `Copy` struct/enum/array types as `T` are deferred. Each variant identifier is bound to a value of type `T` at compile time:
 
 ```zag
 # String-backed enum (TypeScript / PHP BackedEnum / Swift-style)
