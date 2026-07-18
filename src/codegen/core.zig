@@ -247,6 +247,16 @@ pub const VariantFieldsEntry = struct {
     // helper above).
     pub const emitPatternBindings = @import("stmt.zig").emitPatternBindings;
     pub const needsIntDivShim = @import("primary.zig").needsIntDivShim;
+    // Gap #6 widening helper (`typeAwareFmtSpec`): intentionally
+    // NOT re-exported here. Both current call sites (`genPrintCall`
+    // else arm + `genTemplateLit` interpolation slot) live inside
+    // primary.zig itself, so the helper consumes via direct
+    // file-scope lookup without a Codegen-struct indirection.
+    // Re-export here is meant to land in lockstep with the FIRST
+    // cross-bucket consumer — half-installed re-exports rot, so we
+    // register only when there's an actual stmt.zig / expr.zig /
+    // decl.zig caller. The helper definition in primary.zig is
+    // stable across that future registration.
     pub const write = @import("core.zig").write;
 };
 

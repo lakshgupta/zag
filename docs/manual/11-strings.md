@@ -107,6 +107,8 @@ off the first `:` and applied to the placeholder (e.g.
 
 **Memory:** Interpolation allocates a `String` via `Display.write`. Use `with_writer` for zero-alloc formatting in hot paths.
 
+**Byte-slice printing (`{s}` vs `{any}`):** Interpolated byte-slice bindings (`let s: []const u8 = ...` OR `let s: str = ...`) route through zig's `{s}` formatter and display the slice's contents (`hello`) rather than the byte-element list (`{ 104, 101, 108, 108, 111 }`). Optional byte-slice bindings (`let s: ?[]const u8 = ...`) ALSO route through `{s}` but the arg slot is wrapped with `orelse ""` so the non-null value emits and null displays as an empty string. Unannotated bindings and primitive scalar types (`i32`, `bool`, `f64`, ...) preserve the legacy `{any}` default. The widening applies to BOTH `print(arg)` (direct call) and `print("v={arg}\n")` (template interpolation) surfaces.
+
 ## String Slicing
 
 ```

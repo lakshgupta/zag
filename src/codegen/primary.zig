@@ -36,6 +36,95 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         };
     }
 
+    // Type-aware format specifier (gap #6 widening, DRY'd out of the
+    // duplicated in-line widening that previously lived in BOTH
+    // `genPrintCall`'s else arm AND `genTemplateLit`'s interpolation
+    // slot — ~12 lines of byte-identical logic at each site). Walks
+    // `self.type_info_buf` (populated by `collectTypedBindings` for
+    // every `let X: T = ...`) and returns the bare format specifier
+    // (`"s"` for byte-slice family, `"any"` otherwise) plus a flag
+    // for whether the source-side annotation is leading-`?`
+    // (`?[]const u8` family), which the caller appends via `orelse
+    // ""` so zig's strictly-typed `{s}` formatter accepts the
+    // non-optional slice.
+    //
+    // The matcher uses substring `[]const u8` (after `zagTypeToZig`
+    // rewrite) so it catches BOTH canonical `[]const u8` AND the
+    // `str` alias (which rewrites to `[]const u8`); the leading-`?`
+    // optional-gate keeps `*?[]const u8` (pointer-to-optional,
+    // requiring deref-then-orelse codegen we don't yet emit) from
+    // silently mis-routing through `orelse ""` and zig rejecting at
+    // the call site.
+    //
+    // Sites call this with the `.ident` payload they already have:
+    //   - genPrintCall else arm: `typeAwareFmtSpec(self, arg.ident)`
+    //     then prepend/append `{`/`}` around the returned spec.
+    //   - genTemplateLit interpolation slot: same helper call; the
+    //     for-loop that builds `fmt_buf` already adds braces around
+    //     each spec char.
+    //
+    // Both sites use FREE-FN call style (`typeAwareFmtSpec(self, x)`)
+    // rather than method-call (`self.typeAwareFmtSpec(x)`) because the
+    // helper is defined in this file's scope and the call sites are
+    // also in this file — file-scope lookup resolves the symbol
+    // without a Codegen-struct re-export. Switching to method-call
+    // would require re-registering `typeAwareFmtSpec` on `Codegen`
+    // via the `pub const X = @import("primary.zig").X;` table in
+    // core.zig's struct definition; not done because no current
+    // stmt.zig / expr.zig / decl.zig caller would benefit (DRY-extracted
+    // widening is internal to primary.zig only). When the first
+    // cross-bucket consumer lands, switch all 4 call sites to
+    // method-call syntax AND register the helper.
+    //
+    // Both sites eliminate the previous duplicate substring walk
+    // and the equivalent `type_name[0] == '?'` leading-`?` check;
+    // any future widening (e.g. mutable `[]u8` byte-slice,
+    // `[*]const u8` many-ptr) lands here once and both sites
+    // automatically benefit.
+    pub fn typeAwareFmtSpec(self: *Codegen, ident_name: []const u8) struct { spec: []const u8, is_optional_byte_slice: bool } {
+        var i: u32 = 0;
+        while (i < self.type_info_count) : (i += 1) {
+            if (std.mem.eql(u8, self.type_info_buf[i].name, ident_name)) {
+                const rewritten = zagTypeToZig(self.type_info_buf[i].type_name);
+                // Pointer-to-optional byte slice (`*?[]const u8`) is OUT
+                // of scope for v1 widening — deref-then-orelse codegen
+                // (`s.? orelse \"\"`) needs a separate pass. Until then,
+                // skip the widening for any leading-`*` source type so
+                // we don't emit `__zag_print(\"{s}\", .{s,})` on a
+                // `*?[]const u8` arg that zig would reject at the call
+                // site (`{s}` strictly requires non-optional `[]const
+                // u8`).
+                if (self.type_info_buf[i].type_name.len > 0 and
+                    self.type_info_buf[i].type_name[0] != '*' and
+                    std.mem.indexOf(u8, rewritten, "[]const u8") != null)
+                {
+                    return .{
+                        .spec = "s",
+                        // Source-side annotation leading-`?`
+                        // (`?[]const u8`) — caller wraps with
+                        // `orelse ""` so the strictly-typed `{s}`
+                        // formatter sees a non-optional slice.
+                        // `*?[]const u8` (pointer-to-optional) is
+                        // NOT supported in v1; the substring match
+                        // widens its format spec to `{s}` but the
+                        // leading-`?` gate correctly leaves
+                        // `is_optional_byte_slice` false so the
+                        // emitted call site is `.{s,}` (no `orelse
+                        // ""`). zig would reject the call anyway
+                        // because `{s}` requires non-optional
+                        // `[]const u8`; that's a known-limitation
+                        // punt to v1.2 (dereference-then-orelse
+                        // codegen for pointer-to-optional is the
+                        //                     // wanted widening).
+                        .is_optional_byte_slice = self.type_info_buf[i].type_name.len > 0 and
+                            self.type_info_buf[i].type_name[0] == '?',
+                    };
+                }
+            }
+        }
+        return .{ .spec = "any", .is_optional_byte_slice = false };
+    }
+
     pub     fn getTopElements(expr: ast.Expr) []const ast.Expr {
         return switch (expr) {
             .tuple_lit => |els| els,
@@ -241,23 +330,41 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // opt-in via the explicit `let lvl: str = ...`
                 // annotation so users keep full control over the
                 // emitted format spec.
-                var format_spec: []const u8 = "{any}";
+                // Type-aware formatter (gap #6 widening, DRY-extracted
+                // to `typeAwareFmtSpec`): when the arg is an `.ident`
+                // bound to a byte-slice annotation (`[]const u8` family
+                // — direct or `str` alias via `zagTypeToZig` rewrite),
+                // use zig's `{s}` formatter which prints the slice as
+                // its contents (`hello`) instead of the byte-element
+                // list (`{ 104, 101, 108, 108, 111 }`).
+                //
+                // The helper handles the substring walk AND the
+                // leading-`?` optional-unwrap decision; this site
+                // just consumes the returned tuple and emits the
+                // `{<spec>}` format placeholder + the optional
+                // `orelse ""` arg wrap when matched. The same
+                // helper is reused verbatim in `genTemplateLit`'s
+                // interpolation slot so any future widening lands
+                // once for both surfaces.
+                var format_spec: []const u8 = "any";
+                var is_optional_byte_slice = false;
                 if (arg == .ident) {
-                    const ident_name = arg.ident;
-                    var i: u32 = 0;
-                    while (i < self.type_info_count) : (i += 1) {
-                        if (std.mem.eql(u8, self.type_info_buf[i].name, ident_name) and
-                            std.mem.eql(u8, zagTypeToZig(self.type_info_buf[i].type_name), "[]const u8"))
-                        {
-                            format_spec = "{s}";
-                            break;
-                        }
-                    }
+                    // Free-fn call (no `self.foo(a)` form) — the
+                    // `typeAwareFmtSpec` helper is defined in this
+                    // file's scope, so file-scope lookup resolves
+                    // without a Codegen-struct re-export. Renamed
+                    // from `t` → `info` to avoid shadowing
+                    // `genTemplateLit's outer parameter (also named
+                    // `t`).
+                    const info = typeAwareFmtSpec(self, arg.ident);
+                    format_spec = info.spec;
+                    is_optional_byte_slice = info.is_optional_byte_slice;
                 }
-                self.write("__zag_print(\"");
+                self.write("__zag_print(\"{");
                 self.write(format_spec);
-                self.write("\", .{");
+                self.write("}\", .{");
                 self.genExpr(arg);
+                if (is_optional_byte_slice) self.write(" orelse \"\"");
                 self.write(",})");
             },
         }
@@ -461,32 +568,90 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 lit_idx += 1;
             }
             } else if (part.expr) |expr| {
-                // `{any}` accepts any Zig type at the format-arg site. If the
-                // user wrote a printf-style format spec (e.g. `:.5`, `:5`,
-                // `:x`), we append it verbatim after `{any}` so zig's debug
-                // formatter produces the requested precision/width/format.
-                // Empirical zig 0.16 testing confirmed `{any:.N}` IS honoured
-                // for numeric values (zig applies the spec to the underlying
-                // numeric type when the value is rendered via the `{any}`
-                // argument slot — the Spec slot follows the same rules as it
-                // would on a type-specific placeholder).
-                if (fmt_len + 5 <= fmt_buf.len) {
+                // Gap #6 carry (template-literal arm): when the
+                // interpolated expr is an `.ident` whose typed-
+                // binding source-type rewrites to `[]const u8`
+                // via `zagTypeToZig` (covering both explicit
+                // `[]const u8` annotations AND the `str` alias
+                // per docs/07's transparent-`[]const u8` contract),
+                // emit `{s}` so zig's string formatter displays
+                // the slice's contents (`hello`) instead of the
+                // element list (`{ 104, 101, 108, 108, 111 }`).
+                // The `{any}` default still works correctly for
+                // primitive scalar types (i32, bool, u8, f64, ...)
+                // so they fall through unchanged.
+                //
+                // Optional byte slices (`?[]const u8`) are NOT
+                // routed through `{s}` because zig's `{s}`
+                // formatter strictly requires `[]const u8` and
+                // rejects the optional form. The `{any}` fallback
+                // emits a zigzag-native discriminant display
+                // (`null` or `.{ ... }`) which the user can re-
+                // extract via `.?` for the string form:
+                // `print("{maybe_s.?}")` forces the non-null
+                // slot. This mirrors the fall-through gap #6
+                // already made in `genPrintCall`'s else arm —
+                // aligning the two sites keeps print behaviour
+                // consistent across both `print(arg)` and
+                // `print(\"v={arg}\")` surfaces.
+                //
+                // Closes pointers.zag's residual `also_slice =
+                // { 104, 101, 108, 108, 111 }` bug where the
+                // typed binding `let also_slice: ?[]const u8`
+                // (with literal-cover traversal now emitting
+                // a non-null value of type `[]const u8`)
+                // printed as bytes; the optional cover case is
+                // unaffected (still emits discriminant), only
+                // the non-optional annotated byte-slice
+                // interpolation surfaces the string instead.
+                // Gap #6 widening, DRY-extracted to
+                // `typeAwareFmtSpec`: this interpolation-slot site
+                // reuses the same helper that `genPrintCall`'s else
+                // arm calls. `fmt_buf` writes `{<spec>}` itself
+                // (the surrounding `{...}` brace handling for the
+                // template-literal form is downstream of this
+                // helper call), so the spec returned is bare (`s`
+                // or `any`) and the for-loop that builds
+                // `fmt_buf` below adds the braces. The
+                // `is_optional_byte_slice` flag is consumed
+                // identically in both sites — appending `orelse
+                // ""` after the genExpr'd ident so the
+                // strictly-typed `{s}` formatter accepts the
+                // non-optional slice.
+                //
+                // Optional byte slices (`?[]const u8`) ARE
+                // routed through `{s}` here (vs. the prior
+                // gap #6 narrowing that left them on `{any}`)
+                // because the helper's substring match
+                // catches the rewritten type while the
+                // leading-`?` gate fires the optional-unwrap.
+                // This divergence from the genPrintCall else
+                // arm's docs is intentional and documented in
+                // the helper's docblock above.
+                var format_spec: []const u8 = "any";
+                var is_optional_byte_slice = false;
+                if (expr == .ident) {
+                    // Free-fn call (matching genPrintCall arm):
+                    // locals named `info` rather than `t` to avoid
+                    // shadowing `genTemplateLit's outer parameter
+                    // (also named `t`).
+                    const info = typeAwareFmtSpec(self, expr.ident);
+                    format_spec = info.spec;
+                    is_optional_byte_slice = info.is_optional_byte_slice;
+                }
+                if (fmt_len + 1 + format_spec.len + (if (part.spec) |spec| 1 + spec.len else 0) + 1 <= fmt_buf.len) {
                     fmt_buf[fmt_len] = '{';
                     fmt_len += 1;
-                    fmt_buf[fmt_len] = 'a';
-                    fmt_len += 1;
-                    fmt_buf[fmt_len] = 'n';
-                    fmt_len += 1;
-                    fmt_buf[fmt_len] = 'y';
-                    fmt_len += 1;
+                    for (format_spec) |c| {
+                        fmt_buf[fmt_len] = c;
+                        fmt_len += 1;
+                    }
                     if (part.spec) |spec| {
-                        if (fmt_len + 1 + spec.len <= fmt_buf.len) {
-                            fmt_buf[fmt_len] = ':';
+                        fmt_buf[fmt_len] = ':';
+                        fmt_len += 1;
+                        for (spec) |c| {
+                            fmt_buf[fmt_len] = c;
                             fmt_len += 1;
-                            for (spec) |c| {
-                                fmt_buf[fmt_len] = c;
-                                fmt_len += 1;
-                            }
                         }
                     }
                     fmt_buf[fmt_len] = '}';
@@ -494,6 +659,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
                 if (!first_arg) args_cg.write(", ");
                 args_cg.genExpr(expr);
+                if (is_optional_byte_slice) args_cg.write(" orelse \"\"");
                 first_arg = false;
             }
         }

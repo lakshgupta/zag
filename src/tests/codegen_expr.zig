@@ -40,8 +40,8 @@ test "codegen: template preserves LF byte in literal via \\n escape" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "\"a{any}a\\n\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"a{any}a\\n\", .{x,})") != null);
-}
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"a{any}a\\n\", .{x,})") != null);}
+
 
 test "codegen: binary emission is parenthesised" {
     // The generated zigzag source must wrap binary expressions in `()` so
