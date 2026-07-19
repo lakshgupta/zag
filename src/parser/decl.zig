@@ -744,6 +744,59 @@ pub fn parseImplBlock(self: *Parser) ast.ImplBlock {
             type_params = self.parseTypeParams();
         }
         const target_type = self.expectIdent();
+        // Canonical trait-spec clause (docs/17 §"Implementing"):
+        // `impl Type with T1 (m1, m2)?, T2 (m3)? { ... }`. Optional —
+        // when absent, falls back to the legacy non-trait impl path
+        // (empty `trait_specs`). Each spec is one `IDENT` optionally
+        // followed by a parenthesised comma-separated method-name
+        // list — the diamond disambiguator that binds a method body
+        // to that trait's vtable. The clause is terminated by the
+        // opening `{`. At least one trait spec is required when the
+        // `with` keyword is present; `with` without any spec is a
+        // compile error (`expected IDENT, got '{'`).
+        var trait_specs: []const ast.TraitSpec = &[_]ast.TraitSpec{};
+        if (self.peek().tag == .with_kw) {
+            self.advance(); // consume `with`
+            var specs_buf: [16]ast.TraitSpec = undefined;
+            var specs_count: usize = 0;
+            // First spec is mandatory; the comma-loop below only
+            // runs while a comma follows a complete spec.
+            while (true) {
+                const spec_name = self.expectIdent();
+                var methods_buf: [16][]const u8 = undefined;
+                var methods_count: usize = 0;
+                if (self.peek().tag == .lparen) {
+                    self.advance(); // consume `(`
+                    if (self.peek().tag != .rparen) {
+                        while (true) {
+                            methods_buf[methods_count] = self.expectIdent();
+                            methods_count += 1;
+                            if (self.peek().tag == .comma) {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(.rparen);
+                }
+                const pref = self.arena.alloc([]const u8, methods_count);
+                @memcpy(pref, methods_buf[0..methods_count]);
+                specs_buf[specs_count] = .{
+                    .name = spec_name,
+                    .preferred_methods = pref,
+                };
+                specs_count += 1;
+                if (self.peek().tag == .comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            const specs_slice = self.arena.alloc(ast.TraitSpec, specs_count);
+            @memcpy(specs_slice, specs_buf[0..specs_count]);
+            trait_specs = specs_slice;
+        }
         self.expect(.lbrace);
         var methods_buf: [64]ast.MethodDecl = undefined;
         var method_count: usize = 0;
@@ -758,7 +811,13 @@ pub fn parseImplBlock(self: *Parser) ast.ImplBlock {
         self.expect(.rbrace);
         const methods = self.arena.alloc(ast.MethodDecl, method_count);
         @memcpy(methods, methods_buf[0..method_count]);
-        return .{ .target_type = target_type, .methods = methods, .loc = start_loc, .type_params = type_params };
+        return .{
+            .target_type = target_type,
+            .methods = methods,
+            .loc = start_loc,
+            .type_params = type_params,
+            .trait_specs = trait_specs,
+        };
     }
 
 
