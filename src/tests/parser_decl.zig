@@ -122,6 +122,48 @@ test "parser: array lit multi-dim single-line" {
     try std.testing.expectEqual(@as(usize, 2), init.array_lit.elements.len);
 }
 
+// v1.5 A2 newline-skip single-dim multi-line body (docs/10 §"Multi-Dim
+// Arrays" companion): the OUTER parseArrayLit's element-collection
+// accepts `.newline` tokens between elements so
+// `[3]i32 {\n    1,\n    2,\n    3,\n}` walks commas cleanly. Without
+// skipNewlines, the leading newline after `{` would misroute through
+// parseExpr → parsePrimary's default ident arm, and the trailing
+// newlines before `}` would surface as `expected expression, found '}'`.
+// Pins the 3-element shape across 5 source lines.
+test "parser: array lit single-dim multi-line body" {
+    const src = "fun f() {\n    let a = [3]i32 {\n        1,\n        2,\n        3,\n    };\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init.?;
+    try std.testing.expect(init == .array_lit);
+    try std.testing.expectEqual(@as(u32, 3), init.array_lit.size);
+    try std.testing.expectEqualStrings("i32", init.array_lit.type_name);
+    try std.testing.expectEqual(@as(usize, 3), init.array_lit.elements.len);
+    try std.testing.expect(init.array_lit.sizes == null);
+}
+
+// v1.5 trailing-comma guard (docs/10 §"Multi-Dim Arrays" companion):
+// `[N]i32 { 1, 2, 3, }` parses via the new `if (peek == rbrace) break;`
+// escape inside parseArrayLit's comma-while loop. Without the guard
+// parseExpr would fire against peek=.rbrace and surface as `expected
+// expression, found '}'`. Pin a 3-element trailing-comma shape fully
+// inline so this fixture isn't coupled to A2's newline-skip surface.
+test "parser: array lit single-dim trailing comma" {
+    const src = "fun f() {\n    let a = [3]i32 { 1, 2, 3, };\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init.?;
+    try std.testing.expect(init == .array_lit);
+    try std.testing.expectEqual(@as(u32, 3), init.array_lit.size);
+    try std.testing.expectEqual(@as(usize, 3), init.array_lit.elements.len);
+}
+
 test "parser: let with type annotation" {
     // Pre-carve-out tests inadvertently regressed to bare `let x = 42` when
     // the static-typed-coercion migration commit landed (the carve-out makes

@@ -747,5 +747,17 @@ pub const Parser = struct {
     // qualified form `Enum.Variant(args)`. Mirrors the existing
     // `parsePrimary`/`parseStructLit` re-exports via `@import` indirection.
     pub const parseEnumVariantCtorBrace = @import("primary.zig").parseEnumVariantCtorBrace;
+    // A2 newline-skip helper re-export (commit 2 of v1.5 multi-dim split,
+    // docs/10 §"Multi-Dim Arrays"): parseArrayLit's element-collection
+    // loop calls `self.skipNewlines()` to walk past `.newline` tokens
+    // emitted by the zag lexer between source lines (leading-newline
+    // after `{`, inter-comma newlines, trailing-before-`}` newlines).
+    // Surfaced as `Parser.skipNewlines` via the standard
+    // `@import("primary.zig").X` re-export pattern so the helper stays
+    // a single file-scope definition in primary.zig (matching the
+    // `looksLikeTemplateLiteral` precedent for file-scope parsers)
+    // while `self.skipNewlines()` resolves from any Parser call site
+    // — no cross-file import plumbing at the use sites.
+    pub const skipNewlines = @import("primary.zig").skipNewlines;
 
 };

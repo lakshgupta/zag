@@ -183,6 +183,11 @@ pub fn parseArrayLit(self: *Parser) Expr {
         } else null;
         const type_name = self.expectIdent();
         self.expect(.lbrace);
+        // A2 newline-skip (lands as separate per-topic commit from the
+        // bracket-loop — see commit message for full rationale). Skip
+        // leading newlines so the first non-newline peek is the first
+        // element expr (or `}` for a zero-element array).
+        self.skipNewlines();
 
         var elements_buf: [64]Expr = undefined;
         var element_count: usize = 0;
@@ -191,10 +196,22 @@ pub fn parseArrayLit(self: *Parser) Expr {
         if (self.peek().tag != .rbrace) {
             elements_buf[element_count] = self.parseExpr();
             element_count += 1;
+            // Skip newlines between elements so `[N]i32 {
+            //     1,
+            //     2,
+            //     3, }`
+            // walks commas cleanly.
+            self.skipNewlines();
             while (self.peek().tag == .comma) {
                 self.advance();
+                self.skipNewlines();
+                // Trailing-comma escape: `[N]i32 { 1, 2, }` (comma
+                // directly before `}`). Without this break the loop
+                // would call parseExpr with peek = `}`.
+                if (self.peek().tag == .rbrace) break;
                 elements_buf[element_count] = self.parseExpr();
                 element_count += 1;
+                self.skipNewlines();
             }
         }
 
@@ -209,6 +226,9 @@ pub fn parseArrayLit(self: *Parser) Expr {
             }
         }
 
+        // Skip trailing newlines before `}` so `1, 2, 3,
+        // }` closes cleanly.
+        self.skipNewlines();
         self.expect(.rbrace);
         const elements = self.arena.alloc(Expr, element_count);
         @memcpy(elements, elements_buf[0..element_count]);
@@ -222,6 +242,29 @@ pub fn parseArrayLit(self: *Parser) Expr {
             .sizes = sizes,
         } };
     }
+
+
+/// File-scope newline-skip helper used by `parseArrayLit`'s element-
+/// collection loop. The zag lexer emits `.newline` tokens between
+/// source lines, and the OUTER `parseArrayLit`'s body needs to skip
+/// leading newlines after `{`, trailing newlines before `}`, and
+/// inter-element newlines around commas. Without this helper,
+/// `while (peek == .comma)` would skip an element whose first token
+/// is `.newline` (since `.newline != .rbrace`, the prior
+/// `if (peek != rbrace)` enters parseExpr — parsePrimary's default
+/// arm consumes the newline, parsePostfix then misroutes the row's
+/// leading `[` as postfix indexing, the OUTER's element becomes a
+/// bizarre `.index(.ident, int_lit)`, and the OUTER's `expect(.rbrace)`
+/// fires against the row's type ident). Defining here (NOT as a
+/// `Parser` method) mirrors `looksLikeTemplateLiteral`'s file-scope
+/// precedent in this same file; the helper is currently only used
+/// inside `parseArrayLit`, so a cross-bucket re-export is premature.
+/// Future widening (e.g., `parseStructLit`'s inline newline-skip in
+/// the `{` walker) can promote this to `core.zig`'s Parser struct
+/// once a second bucket needs it.
+pub fn skipNewlines(self: *Parser) void {
+    while (self.peek().tag == .newline) self.advance();
+}
 
 
 pub fn parseCallExpr(self: *Parser, name: []const u8) Expr {
