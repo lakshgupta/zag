@@ -28,13 +28,36 @@ let len = arr.len;      # compile-time constant: 5
 ## Slicing — Borrowing a View
 
 ```
-let arr = [10]i32 { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+var arr = [10]i32 { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
 let slice: []i32 = arr[2..7];        # elements 2, 3, 4, 5, 6
 let view: []const i32 = arr[..];     # full array view
 let partial: []i32 = arr[5..];       # elements 5..9
 ```
 
+`arr` is `var` (not `let`) here so the `[]i32`-annotated slices carry the intended mutable-element view. For a `let`-bound source the slice type would be `[]const T` instead — see the note below.
+
 **Memory:** Slicing produces a stack-allocated slice `{ ptr: *T, len: usize }`. It borrows the original array — no elements are copied. The slice is valid only while the array is alive.
+
+### Note: `let`-Bound Sources Require `[]const T`
+
+The slice expression `arr[a..b]` yields its type directly from the source's pointee. When `arr` is `let`-bound, the source's pointee is `*const T`, so the slice itself has type `[]const T` — there is no further coercion to `[]T`:
+
+```
+let arr: [3]i32 = [3]i32 { 1, 2, 3 };
+let view: []const i32 = arr[1..3];   # ✓ matches the slice-expression type
+let bad:  []i32       = arr[1..3];   # ✗ zig: expected []i32, found []const i32
+```
+
+Zig will not widen `[]const T` to `[]T` because doing so would let you write through a pointer to const memory (undefined behaviour). Reading through either slice type is interchangeable.
+
+To get a `[]T`-typed slice (mutable element access), declare the source as `var`:
+
+```
+var arr: [3]i32 = [3]i32 { 1, 2, 3 };
+let view: []i32 = arr[1..3];   # ✓ var-source slice expression has type []i32
+```
+
+Caveat: `var` makes the **binding** reassignable (`arr = other;`) in addition to letting the slice's elements be mutable. If you only want the latter (mutable elements, fixed binding), you must copy into a `var` source or accept the read-only view — there is no "let-binding, mutable-element slice" mode.
 
 ## Slice Layout
 
