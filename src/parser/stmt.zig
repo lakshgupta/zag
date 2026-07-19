@@ -891,6 +891,44 @@ pub fn parseStmt(self: *Parser) Stmt {
                 return .{ .continue_stmt = {} };
             },
             .return_kw => return .{ .return_stmt = self.parseReturnStmt() },
+            .star => {
+                // `*p = value;` dereference-write (zag's mirror of zig
+                // 0.16's `p.* = value;` postfix-deref-write form). 3-token
+                // lookahead disambiguates "deref-write" from "bare deref-
+                // as-expression" by inspecting the immediate successor
+                // tokens for the `identifier, equals` triplet. If the
+                // triple is present we consume all 3 tokens and emit a
+                // `DerefAssignStmt`: after consuming `.star`, the inner
+                // `expectIdent` captures the bare pointer name (no
+                // descriptive deref-tree support yet — users needing
+                // `*obj.field = x` should extract a local first), then
+                // `expect(.equals)` consumes the assignment operator,
+                // then `parseExpr` captures the RHS expr. If the triple
+                // is NOT present (e.g. `*p;` no-op deref-stmt or
+                // `*p.method(args)` whose next tokens break the
+                // identifier-then-equals sequence), we fall through to
+                // the `else => expr_stmt` arm so the existing unary-
+                // deref expr_stmt surface keeps working. Mirrors the
+                // 4-token `name . ident =` lookahead for `.field_assign`
+                // above (which sits at the `.identifier` arm) — the
+                // difference here is starting-token `.star` plus the
+                // shorter (3-token) lookahead because no `.field` is
+                // possible in the deref-write form (we only support
+                // bare-ident LHS for deref-write; richer trees are
+                // future work per the `DerefAssignStmt` doc comment in
+                // src/ast/stmt.zig).
+                if (self.pos + 2 < self.tokens.len and
+                    self.tokens[self.pos + 1].tag == .identifier and
+                    self.tokens[self.pos + 2].tag == .equals)
+                {
+                    self.advance(); // consume `.star`
+                    const name = self.expectIdent();
+                    self.expect(.equals);
+                    const value = self.parseExpr();
+                    return .{ .deref_assign = .{ .name = name, .value = value } };
+                }
+                return .{ .expr_stmt = self.parseExpr() };
+            },
             else => return .{ .expr_stmt = self.parseExpr() },
         }
     }

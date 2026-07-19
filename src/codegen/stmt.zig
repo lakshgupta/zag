@@ -305,6 +305,27 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.genExpr(fa.value);
                 self.write(";\n");
             },
+            .deref_assign => |da| {
+                // `*p = value;` writes through the pointer on the LHS.
+                // zig 0.16's postfix-deref-write `p.* = value;` is
+                // precisely equivalent — `.*` postfix applied to a
+                // pointer expression gives write-through semantics.
+                // Mirrors the `.assign` arm shape (just `name`, `.* = `,
+                // value, `;\n`) with the `.*` interleaved so zig's
+                // tagged-union / pointer dispatch accepts the
+                // assignment. Used by `examples/memory/pointers.zag`
+                // line ~25 (`*p_mut = 42;`). The LHS is restricted to
+                // a bare identifier because the parser's `.star` arm
+                // performs `expectIdent` after consuming `.star`; the
+                // AST slot does not carry a richer `*target` Expr so
+                // complex deref-trees like `*obj.field = x` would need
+                // either AST widening or a parser carve-out (deferred).
+                self.write("    ");
+                self.write(da.name);
+                self.write(".* = ");
+                self.genExpr(da.value);
+                self.write(";\n");
+            },
         }
     }
 

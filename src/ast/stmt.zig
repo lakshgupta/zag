@@ -141,6 +141,17 @@ pub const Stmt = union(enum) {
     /// cleanly via parsePostfix; `value` is value-typed Expr because
     /// it's the leaf of the assignment.
     field_assign: FieldAssignStmt,
+    /// `*p = expr` dereference-write statement. Distinct from
+    /// `.assign` because the LHS is a deref of a bare-named pointer
+    /// rather than a rebind. The 3-token lookahead at parseStmt's
+    /// `.star` arm dispatches into this variant when the pattern
+    /// `star identifier equals` is detected. The parser restricts the
+    /// LHS to a bare identifier (no complex deref-trees like
+    /// `*obj.field` or `*arr[i]` for this slot; users wanting those
+    /// forms should extract a local first). Codegen emits
+    /// `name.* = value;` -- zig 0.16's postfix deref-and-write form,
+    /// semantically equivalent to the source-side `*p = x`.
+    deref_assign: DerefAssignStmt,
 
     /// Backing struct for all three binding kinds (`let`, `var`, `const`).
     /// The kind is carried *by the union tag* on `Stmt`, not duplicated here
@@ -268,6 +279,22 @@ pub const Stmt = union(enum) {
     pub const FieldAssignStmt = struct {
         target: *Expr,
         field_name: []const u8,
+        value: Expr,
+    };
+
+    /// `*p = value` dereference-write. The LHS pointer must be a bare
+    /// identifier (the parser's `.star` arm enforces this via
+    /// `expectIdent`); complex deref-trees are not supported by this
+    /// AST slot. Zig's postfix deref-write `p.* = value` is the
+    /// canonical emit shape -- the user-facing syntax `*p = value`
+    /// matches the canonical zig surface because zig's `.star` is
+    /// left-associative: `*p = value` parses as `*(p = value)` in
+    /// zig, which is exactly the deref-write form. `name` carries
+    /// the bare identifier text (no leading `*`); `value` is the
+    /// value-typed Expr (leaf position, value-typed not pointer-typed
+    /// because it is the RHS of an assignment, not a target).
+    pub const DerefAssignStmt = struct {
+        name: []const u8,
         value: Expr,
     };
 };
