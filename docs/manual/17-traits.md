@@ -2,13 +2,13 @@
 
 A trait declares shared behavior. Use a trait when a Type must be usable wherever the trait is expected — function parameter, list element, or generic bound.
 
-**One syntax** for trait implementation: `impl Type with Trait { ... }`. The block header names both the type and the trait; the body supplies every required method. Default methods are optional overrides.
+**One canonical syntax** for trait implementation: `impl Type with Trait1 (m1, m2), Trait2, Trait3 (m3) { ... }`. The header names the type and one or more traits (comma-separated). Each trait optionally lists zero or more method names in parens — the diamond disambiguator that owners that method body's vtable slot. The body supplies required method definitions; default methods are optional overrides.
 
 **Memory:** Traits are fat pointers (data pointer + vtable pointer). 16 bytes on 64-bit. Vtable dispatch is one indirect call.
 
 This chapter uses one running example (`Button` + `Drawable`) and progressively extends it through each section.
 
-> **Parser status.** The v2 parser does NOT yet parse `impl Type with Trait { ... }` — that form requires an `ImplBlock.trait_name` AST field that is planned for v2.1. Until the parser-side commit lands, write source using the per-method prefix (`pub fun Trait.method`) or the nested `with Trait { ... }` group-clause. Both routes emit byte-identical zig to the canonical form would. § Trait Rules lists the equivalent source for every canonical declaration. New code should follow the canonical form's review so the future migration to v2.1 source is mechanical.
+> **Parser status.** The v2 parser does NOT yet parse `impl Type with Trait { ... }` — that form requires an `ImplBlock.trait_specs : []TraitSpec` AST field plus a `with_kw` TokenTag in the lexer. Both land alongside the per-file commits listed in § Implementation Plan below. Until the parser-side commit lands, write source using the per-method prefix (`pub fun Trait.method`) or the nested `with Trait { ... }` group-clause. Both accepted forms emit byte-identical zig to the canonical form would. § Trait Rules maps the accepted forms to the canonical source shape.
 
 ## Definition
 
@@ -25,43 +25,55 @@ trait Drawable {
 
 ## Implementing
 
-Until v2.1 lands, write implementation using ONE of these two accepted forms:
-
-```
-# Form A — per-method prefix (current v2 surface)
-impl Button {
-    pub fun Drawable.draw(self: *Button) {
-        print("Button: ", self.label);
-    }
-    # Drawable.name is inherited as the default.
-}
-
-# Form B — nested with-clause (parser sugar)
-impl Button {
-    with Drawable {
-        pub fun draw(self: *Button) {
-            print("Button: ", self.label);
-        }
-    }
-}
-```
-
-The canonical v2.1 form (target — not yet parseable) is one block header that names both type and trait:
+The canonical form names the type and one or more traits at the block header:
 
 ```
 impl Button with Drawable {
     pub fun draw(self: *Button) {
         print("Button: ", self.label);
     }
+    # Drawable.name is inherited as the default — no need to write
+    # it unless you want different behavior.
+}
+```
+
+### Multi-trait single block
+
+Comma-separate the trait names when a Type implements multiple traits at once:
+
+```
+impl Button with Drawable, Clickable {
+    pub fun draw(self: *Button) { ... }       # unique to Drawable — dispatches automatically
+    pub fun click(self: *Button) { ... }      # unique to Clickable — dispatches automatically
+}
+```
+
+When a method name is unique to one of the comma-separated traits, the compiler dispatches the body to that trait's vtable automatically. When the name appears in more than one trait (the diamond shape), the parenthesised `(method_name, ...)` list on the trait names owns the body.
+
+### Diamond disambiguation via parenthesised preferred_methods
+
+```
+impl Button with Drawable (print), Show {
+    pub fun print(self: *Button) { ... }      # binds to Drawable's vtable only;
+                                              # Show's `print` slot stays unfulfilled
+}
+```
+
+The `(print)` after `Drawable` declares: "the `print` body in this block registers on Drawable's vtable only." `Show`'s `print` slot remains unfulfilled (a partial impl). When you want BOTH traits to register the same body on their respective vtables, list the method name in parens on multiple traits:
+
+```
+impl Button with Drawable (print), Show (print) {
+    pub fun print(self: *Button) { ... }      # registers on BOTH vtables — one body, two fns
 }
 ```
 
 Rules:
 
-- One trait per block in v2. To implement multiple traits on the same Type, write multiple blocks.
+- Comma-separated trait names in the `with Trait (methods)?` clause — one or more.
 - Required methods (no body in trait) MUST appear in the impl block. Missing one is a compile error.
 - Default methods are optional. Omit them to inherit the trait's body; supply them to override.
-- The compiler registers each method on the matching vtable slot. `obj as Trait` packages the data pointer + vtable pointer into a 16-byte fat pointer at the use site.
+- For methods with parens-listed preferred_methods on a trait, the parens own the dispatch. For methods without parens, the compiler resolves by uniqueness across the block's traits (compile error if ambiguous).
+- The compiler emits one `Button_Trait_method` free fn per (Type, Trait) registration and threads each body into the matching vtable slot.
 
 ### Structural embedding (composition without dispatch)
 
@@ -112,19 +124,19 @@ trait Logger {
 }
 
 # Console implements one required method — the two defaults are inherited:
-impl Console {
-    pub fun Logger.log(self: *Console, msg: str) {
+impl Console with Logger {
+    pub fun log(self: *Console, msg: str) {
         print(msg);
     }
 }
 
 # FileLogger overrides ONE default while leaving the other inherited:
-impl FileLogger {
-    pub fun Logger.log(self: *FileLogger, msg: str) {
+impl FileLogger with Logger (warn) {
+    pub fun log(self: *FileLogger, msg: str) {
         self.file.write(msg);
     }
 
-    pub fun Logger.warn(self: *FileLogger, msg: str) {    # override default
+    pub fun warn(self: *FileLogger, msg: str) {    # override default
         self.file.write("WARN [" ++ self.level ++ "]: " ++ msg);
     }
     # Logger.error is inherited from the trait default
@@ -135,7 +147,7 @@ Default methods inherit `Self` as the implementing type and may call other trait
 
 ## Multiple Traits
 
-Write one `impl` block per trait. Each block registers methods on that block's vtable only:
+Comma-separate the trait names in the block header:
 
 ```
 trait Printable {
@@ -145,39 +157,43 @@ trait Serializable {
     pub fun serialize(self: *Self) -> str;
 }
 
-impl Button {
-    pub fun Printable.print(self: *Button) { /* Display body */ }
-    pub fun Serializable.serialize(self: *Button) -> str { /* Sequence body */ }
+impl Button with Printable, Serializable {
+    pub fun print(self: *Button)         { /* Display body */ }
+    pub fun serialize(self: *Button) -> str { /* Sequence body */ }
 }
 ```
 
-**Diamond.** Two traits sharing a method name is the diamond shape. Two cases:
+**Diamond.** Two traits sharing a method name is the diamond shape. Pick one of three resolutions:
 
-1. **Body diverges per trait** (Display must HTML-escape; Show must print raw). Write one impl block per trait — each block's method body is independent:
+1. **Body diverges per trait** (Display must HTML-escape; Show must print raw). Parenthesise the method on the trait whose body should diff — the non-parenthesised trait's slot stays unfulfilled:
 
 ```
-impl Button {
-    pub fun Display.print(self: *Button) {
-        print(self.label.html_escape());    # HTML-escaped body
+impl Button with Display (print), Show (render) {
+    pub fun print(self: *Button) {
+        print(self.label.html_escape());   # Display body — HTML-escaped
     }
-    pub fun Show.print(self: *Button) {
-        print(self.label.raw());            # raw body — different from Display's
+    pub fun render(self: *Button) {
+        print(self.label.raw());           # Show body — raw
     }
 }
 ```
 
-The compiler keeps both bodies side-by-side, registration is per (Type, Trait) by Form A's per-method prefix (or Form B's with-clause association). Revising one body does not touch the other.
+2. **Body is genuinely shared across the diamond.** Parenthesise the method on every trait whose vtable should register it. Same body twice, distinct per vtable:
 
-2. **Body is genuinely shared across traits.** Factor the work into a private helper function and call it from each block. Compiler does not deduplicate bodies across vtables; a helper avoids drift if the shared work changes:
+```
+impl Button with Display (print), Show (print) {
+    pub fun print(self: *Button) { /* Display-format body */ }
+    # Same body registers on both vtables (the compiler emits two free fns).
+}
+```
+
+3. **Body per trait differs in style but shares work.** Factor shared work into a private helper; call from each block. The parens still disambiguate which vtable registers which body:
 
 ```
 fun button_format(self: *Button) -> str { /* shared work */ }
 
-impl Button {
-    pub fun Display.print(self: *Button) {
-        print(button_format(self));
-    }
-    pub fun Show.print(self: *Button) {
+impl Button with Display (print), Show (print) {
+    pub fun print(self: *Button) {
         print(button_format(self));
     }
 }
@@ -216,8 +232,8 @@ trait Handler {
     pub fun handle(self: *Self, req: *Request) -> *Response;
 }
 
-impl MyHandler {
-    async fun Handler.handle(self: *MyHandler, req: *Request) -> *Response {
+impl MyHandler with Handler {
+    async fun handle(self: *MyHandler, req: *Request) -> *Response {
         let data = await read_data(req)?;
         return process(data);
     }
@@ -230,15 +246,25 @@ The trait declares `-> *Response`; the impl writes `-> *Response`; the compiler 
 
 | Surface                              | Mapping                                                                                                                       |
 |--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| Canonical impl form (v2.1)           | `impl Type with Trait { ... }`                                                                                                 |
-| v2 accepted form A (current parser)  | `impl Type { pub fun Trait.method(self: *Type) { ... } ... }`                                                                 |
-| v2 accepted form B (current parser)  | `impl Type { with Trait { pub fun method(self: *Type) { ... } ... } }`                                                        |
-| Method binding                       | The block's trait registers the method on the matching vtable slot                                                            |
+| Canonical impl form (v2.1)           | `impl Type with T1 (m1, m2)?, T2 (m3)?, T3 { ... }`                                                                          |
+| v2 accepted form A (current parser)  | `impl Type { pub fun T1.m1(self: *Type) { ... } pub fun T2.m1(self: *Type) { ... } ... }`                                     |
+| v2 accepted form B (current parser)  | `impl Type { with T1 { pub fun m1(self: *Type) { ... } } with T2 { pub fun m1(self: *Type) { ... } } ... }`                   |
+| Method body dispatch                 | If `pub fun T.m` form A prefix set, bind to T. Else if `with T(m)` parenthesised on T, bind to T. Else pick the unique trait that declares the method; compile error if ambiguous |
 | Required in impl block?              | Yes for trait methods without a body; missing is a compile error                                                              |
 | Optional in impl block?              | Yes for trait methods with a body (defaults); same-named body in the impl block overrides                                      |
-| Multiple traits on one Type          | One impl block per trait                                                                                                      |
+| Multiple traits on one Type          | Comma-separate trait names: `with T1, T2, T3`                                                                                  |
+| Diamond disambiguation               | Per-trait parenthesised method list: `with T1(m1), T2(m1) { fun m1(...) ... }` — each parenthesised name binds to that specific trait's vtable; missing entries leave the slot unfulfilled or fall back to trait uniqueness |
 | Fat pointer construction             | `obj as Trait`                                                                                                                |
-| Diamond (two traits sharing a method)| One impl block per trait; diverge per-block or share via helper function                                                       |
 | Structural composition (no vtable)   | Bare `EmbedType,` row in struct body — promotes fields and methods at compile time                                            |
 | Async                                | `async fun` on impl-block method; caller awaits                                                                               |
 | Associated types                     | Not in v1                                                                                                                     |
+
+## Implementation Plan
+
+The canonical form lands through a staged sequence of per-file commits. Each step is small, backward-compatible, and individually shippable; the doc's "Parser status" callout tracks the unblocked surface as each commit lands.
+
+1. **Lexer (`src/lexer/token.zig`).** Add `with_kw` TokenTag + `with` keyword to the lexer keyword table. No source-code semantic change yet — just lex recognition.
+2. **AST (`src/ast/decl.zig` + `src/ast.zig`).** Add `pub const TraitSpec = struct { name: []const u8, preferred_methods: []const []const u8 = &[_][]const u8{} }`. Add `trait_specs : []const TraitSpec = &[_]TraitSpec{}` field to `ImplBlock`. Re-export `TraitSpec` from `src/ast.zig` alongside the existing decl-side types.
+3. **Parser (`src/parser/decl.zig` `parseImplBlock`).** After consuming the target_type ident and before the `{`, optionally consume `with` + one-or-more comma-separated `IDENT (method_list)?` specs, terminated by `{`. Empty `with` clause falls through to legacy Form A/Form B parsing — preserves the v2 accepted forms.
+4. **Codegen (`src/codegen/decl.zig` `genTraitRegistration`).** Per-method dispatch rule: (a) `MethodDecl.trait_name` non-null → bind to that trait (Form A path); (b) any block-level `TraitSpec.preferred_methods` contains `method.name` → bind to that spec's name; (c) `trait_specs` empty AND exactly one trait in scope declares the method → bind to that trait; (d) else compile error with the diamond-disambiguator hint.
+5. **Tests (`src/tests/codegen_decl.zig` + `src/tests/parser_decl.zig`).** Add four fixture cases covering the four dispatch paths: Form A prefix, preferred_methods single-trait lopsided case, trait-uniqueness inference, ambiguity compile-error.
