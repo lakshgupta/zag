@@ -16,6 +16,7 @@ fun main() {
     # kind, but we annotate for clarity.
     let read_only: i32 = 100;
     let p_const: *const i32 = &read_only;
+    print("p_const = {p_const}\n");
 
     # Deref: read through a pointer.
     let initial: i32 = *p_mut;
@@ -30,15 +31,29 @@ fun main() {
     # the entire array; `arr[a..]` runs from `a` to end; `arr[..b]`
     # runs from start to index `b - 1`.
     let data: [5]i32 = [5]i32 { 10, 20, 30, 40, 50 };
-    let middle: []i32 = data[1..4];     # [20, 30, 40]
-    let tail: []i32 = data[3..];        # [40, 50]
-    let head: []i32 = data[..3];        # [10, 20, 30]
-    let all:  []i32 = data[..];         # [10, 20, 30, 40, 50]
+    let middle: []const i32 = data[1..4];     # [20, 30, 40]
+    let tail: []const i32 = data[3..];        # [40, 50]
+    print("tail = {tail[0]} {tail[1]}\n");
+    let head: []const i32 = data[..3];        # [10, 20, 30]
+    print("head = {head[0]} {head[1]} {head[2]}\n");
+    let all:  []const i32 = data[..];         # [10, 20, 30, 40, 50]
+    print("all = {all[0]} {all[1]} {all[2]} {all[3]} {all[4]}\n");
 
     # Inclusive slicing: `arr[a...b]` includes index `b`. Codegen emits
     # the half-open form with `+ 1` adjustment, so `data[1...3]` is
     # equivalent to `data[1..4]` for integer slices.
-    let inclusive: []i32 = data[1...3]; # [20, 30, 40]
+    #
+    # Note on `[]const i32` vs `[]i32`: zig 0.16 returns a sized
+    # array-tail pointer (`*const [b-a]i32`) from slicing a const
+    # value-type array, not an unsized slice. The binding
+    # annotation therefore uses the immutable-slice type `[]const i32`
+    # to match the inferred RHS — using `[]i32` here triggers
+    # `expected type '[]i32', found '*const [3]i32'` plus a cascade
+    # of "unused local constant" diagnostics on every sibling
+    # let-binding (the build halts at line 54 before codegen reaches
+    # them). Mirrors zig's canonical idiom for slicing immutable data.
+    let inclusive: []const i32 = data[1...3]; # [20, 30, 40]
+    print("inclusive = {inclusive[0]} {inclusive[1]} {inclusive[2]}\n");
 
     # Iteration: `for` consumes the slice and yields one element per
     # iteration. Indexing into a slice (`middle[0]`) gives the i-th
@@ -63,6 +78,7 @@ fun main() {
     # (codegen-decl.zig: `?*const T annotation round-trips in let binding`)
     var counter_r: i32 = 50;
     let maybe_ro: ?*const i32 = null;
+    print("maybe_ro = {maybe_ro}\n");
     let also_ro: ?*const i32 = &counter_r;
     print("also_ro = {also_ro}\n");
 
@@ -80,6 +96,7 @@ fun main() {
     # type for environment lookups that may fail. (codegen-decl.zig:
     # `?[]const u8 annotation round-trips in let binding`)
     let maybe_slice: ?[]const u8 = null;
+    print("maybe_slice = {maybe_slice}\n");
     let hello_const: []const u8 = "hello";
     let also_slice: ?[]const u8 = hello_const;
     print("also_slice = {also_slice}\n");
@@ -128,7 +145,7 @@ fun main() {
     unsafe {
         let p: *raw u8 = &raw_buf;
         let q: *raw u8 = p.add(2);     # p + 2 * sizeof(u8) = p + 2 bytes
-        let n: i64 = q.offset(p);      # (q - p) / sizeof(u8) = 2
+        let n: usize = q.offset(p);    # (q - p) / sizeof(u8) = 2 — `.offset` zig-fallback returns `usize` per zig's `@intFromPtr` intrinsic; annotate the LHS as `usize` to match, or wrap in `as i64` if a signed offset is required.
         print("q.offset(p) = {n}\n");
     }
 }
