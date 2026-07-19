@@ -141,23 +141,6 @@ pub const Stmt = union(enum) {
     /// cleanly via parsePostfix; `value` is value-typed Expr because
     /// it's the leaf of the assignment.
     field_assign: FieldAssignStmt,
-    /// `*name = value` deref-write (e.g. `*p_mut = 42;`). Distinct from
-    /// `.assign` because the LHS is a deref-write through a pointer
-    /// rather than a bare-name rebinding; distinct from `.index_assign`
-    /// because the destination is `name.*` (a struct field on the
-    /// pointer's pointee), not `target[index]` (a runtime-keyed
-    /// container element). Codegen emits `name.* = value;` directly.
-    /// `name` is the bare identifier after the `*` token (no Expr
-    /// wrapping needed — the grammar `*IDENT = EXPR` keeps the
-    /// deref-target ident-only by convention, matching the read-side
-    /// form `value: T = *IDENT;`). The parser's `.star` lookahead
-    /// arm in `parseStmt` (src/parser/stmt.zig) detects the
-    /// `*IDENT = EXPR` shape and dispatches here; without this
-    /// variant, `*p_mut = 42;` would split into three malformed
-    /// statements (`p_mut.*;`, `=;`, `42;`) because the `.star`
-    /// token falls through to the expr_stmt fallback and the
-    /// deref-expr swallows up to the `=` token before exiting.
-    deref_assign: DerefAssignStmt,
 
     /// Backing struct for all three binding kinds (`let`, `var`, `const`).
     /// The kind is carried *by the union tag* on `Stmt`, not duplicated here
@@ -285,18 +268,6 @@ pub const Stmt = union(enum) {
     pub const FieldAssignStmt = struct {
         target: *Expr,
         field_name: []const u8,
-        value: Expr,
-    };
-
-    /// `*name = value` deref-write backing. `value` is value-typed Expr
-    /// because it is the leaf of the assignment; `name` is the ident
-    /// text post-`*` (NOT a `*Expr` — see the variant doc for why the
-    /// grammar keeps it ident-only). Symmetric with `AssignStmt` so the
-    /// codegen arm can mirror the existing `.assign` emit shape
-    /// verbatim, with `name` followed by `.* = <value>;` instead of the
-    /// bare `name = <value>;` form.
-    pub const DerefAssignStmt = struct {
-        name: []const u8,
         value: Expr,
     };
 };
