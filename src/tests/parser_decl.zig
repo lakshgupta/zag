@@ -1028,3 +1028,87 @@ test "parser: Trait.method-prefixed impl method sets MethodDecl.trait_name" {
     try std.testing.expect(regular_m.trait_name == null);
     try std.testing.expect(std.mem.eql(u8, regular_m.name, "regular_method"));
 }
+
+// Canonical `with Trait (m)` clause (docs/17 §"Implementing" +
+// §"Diamond Disambiguation"). The parser must capture the trait
+// list verbatim on `ImplBlock.trait_specs`, including the
+// parenthesised preferred-method names that disambiguate the
+// diamond. Companion regression check: an impl block WITHOUT the
+// `with` clause leaves `trait_specs` empty so the legacy
+// non-trait path keeps round-tripping.
+test "parser: impl with `with Trait` clause populates trait_specs" {
+    const src =
+        \\trait Drawable {
+        \\    fun draw(self: *Self);
+        \\}
+        \\struct Button {
+        \\    label: str,
+        \\}
+        \\impl Button with Drawable {
+        \\    pub fun draw(self: *Button) {
+        \\        print("Button");
+        \\    }
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.impls.len == 1);
+    try std.testing.expect(prog.impls[0].trait_specs.len == 1);
+    try std.testing.expect(std.mem.eql(u8, prog.impls[0].trait_specs[0].name, "Drawable"));
+    try std.testing.expectEqual(@as(usize, 0), prog.impls[0].trait_specs[0].preferred_methods.len);
+    // The method itself is unchanged — body and trait_specs are
+    // independent AST slots (the codegen dispatch rule resolves the
+    // binding at emit time, NOT the parser).
+    try std.testing.expect(std.mem.eql(u8, prog.impls[0].methods[0].name, "draw"));
+    try std.testing.expect(prog.impls[0].methods[0].trait_name == null);
+}
+
+test "parser: impl with `with Trait (m1, m2)` captures preferred_methods" {
+    const src =
+        \\trait Display {
+        \\    fun print(self: *Self);
+        \\}
+        \\trait Show {
+        \\    fun print(self: *Self);
+        \\    fun render(self: *Self);
+        \\}
+        \\impl Button with Display (print), Show (print, render) {
+        \\    pub fun print(self: *Button) { print("x"); }
+        \\    pub fun render(self: *Button) { print("y"); }
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.impls.len == 1);
+    try std.testing.expectEqual(@as(usize, 2), prog.impls[0].trait_specs.len);
+
+    try std.testing.expect(std.mem.eql(u8, prog.impls[0].trait_specs[0].name, "Display"));
+    try std.testing.expectEqual(@as(usize, 1), prog.impls[0].trait_specs[0].preferred_methods.len);
+    try std.testing.expect(std.mem.eql(u8, prog.impls[0].trait_specs[0].preferred_methods[0], "print"));
+
+    try std.testing.expect(std.mem.eql(u8, prog.impls[0].trait_specs[1].name, "Show"));
+    try std.testing.expectEqual(@as(usize, 2), prog.impls[0].trait_specs[1].preferred_methods.len);
+    try std.testing.expect(std.mem.eql(u8, prog.impls[0].trait_specs[1].preferred_methods[0], "print"));
+    try std.testing.expect(std.mem.eql(u8, prog.impls[0].trait_specs[1].preferred_methods[1], "render"));
+}
+
+test "parser: impl without `with` clause leaves trait_specs empty" {
+    const src =
+        \\impl Button {
+        \\    pub fun draw(self: *Button) { print("Button"); }
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.impls.len == 1);
+    try std.testing.expectEqual(@as(usize, 0), prog.impls[0].trait_specs.len);
+}
