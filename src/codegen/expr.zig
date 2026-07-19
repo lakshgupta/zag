@@ -816,19 +816,23 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         // the `@typeInfo` strip rationale).
                         // Paren balance: 6 opens (outer `(`, two
                         // `@intFromPtr(`, `@sizeOf(`, `@typeInfo(`,
-                        // `@TypeOf(`) and 6 closes — the final
-                        // `))).pointer.child))` sequence closes
+                        // `@TypeOf(`) and 6 closes — the trailing
+                        // `)).pointer.child)` sequence closes
                         // @TypeOf, @typeInfo (via `.pointer.child)`),
-                        // and @sizeOf. A previous draft dropped the
-                        // final `)` and produced 6 opens + 5 closes,
-                        // leaving `@sizeOf(` open.
+                        // and @sizeOf. The prior emit shape was an
+                        // over-correction (an EXTRA trailing `)`
+                        // after `.pointer.child`) producing 6 opens
+                        // + 7 closes. The unbalanced leaf tripped
+                        // zig's parser on examples/memory/pointers.zag's
+                        // `q.offset(p)` call site; removing the extra
+                        // `)` restores 6+6 balance.
                         self.write("(@intFromPtr(");
                         self.genExpr(mc.target.*);
                         self.write(") - @intFromPtr(");
                         self.genExpr(mc.args[0]);
                         self.write(")) / @sizeOf(@typeInfo(@TypeOf(");
                         self.genExpr(mc.target.*);
-                        self.write(")).pointer.child))");
+                        self.write(")).pointer.child)");
                         return;
                     }
                 }
