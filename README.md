@@ -2,6 +2,14 @@
 
 A small, statically-typed systems programming language for games, databases, HTTP servers, and high-performance AI. Targets the Zig toolchain: the compiler emits Zig source and uses `zig` for native code generation and linking.
 
+## Development Approach
+
+Zag is being developed with **heavy use of AI tools**. The compiler source (`src/`), the example catalog (`examples/`), the language manual (`docs/manual/`), the test suite (`src/tests/`), and most architectural decisions are drafted by AI coding assistants (Claude, GPT, Gemini) under the maintainer's design review. AI is the primary drafting layer; humans own the design proposals, the language semantics, and the per-topic commit discipline that decides how a change splits across commits.
+
+**To be explicit about scope**: the *use of AI* is in the *development process*, not in the compiler itself. Zag is a regular compiler — no in-compiler inference, no AI-driven codegen, no autonomous refactoring at compile time, no ML-based type elision. The compiler emits Zig source and uses `zig` for native codegen + linking exactly as documented in the Installation section. AI assists the humans who write the compiler, but produces no runtime behaviour that a human-authored compiler would not produce.
+
+Every change still lands via the standard validation cycle (`zig build` + `zig build test` + `zag run` on the affected examples), so the authoring style — human or AI-assisted — is indistinguishable at the artefact level. The commit graph is the working evidence: feature commits, regression fixes, per-topic discipline, and the fixture/test splits that pin surface contracts are landed the same way regardless of whether the draft was first written by a human or by a model. Each commit body explains the per-topic discipline, the alternative paths considered, and the empirical validation that motivated the change.
+
 ## Design Principles
 
 - **Small core** — minimal keywords, orthogonal features
