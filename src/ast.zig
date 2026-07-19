@@ -41,6 +41,11 @@ pub const StructDecl = ast_decl.StructDecl;
 pub const MethodParam = ast_decl.MethodParam;
 pub const MethodDecl = ast_decl.MethodDecl;
 pub const ImplBlock = ast_decl.ImplBlock;
+/// TraitSpec (docs/17 §"Implementing"): one entry in an ImplBlock's
+/// `with Trait (m1, m2)?, ...` clause. Re-exported here so parser-side
+/// `ast.TraitSpec` references in `parseImplBlock` resolve uniformly
+/// with the sibling decl-side types.
+pub const TraitSpec = ast_decl.TraitSpec;
 pub const EnumDecl = ast_decl.EnumDecl;
 pub const EnumVariant = ast_decl.EnumVariant;
 // v2-split landing (docs/manual/14-unions §\"Definition\"): the

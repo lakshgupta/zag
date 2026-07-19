@@ -227,6 +227,36 @@ pub const ImplBlock = struct {
     /// shape; the codegen rewrite pass on `type_text` then converts
     /// `*List<T>` → `*List(T)` for thunk-form struct receivers.
     type_params: []const TypeParam = &[_]TypeParam{},
+    /// Trait-spec list parsed from the `with Trait (m1, m2)?, Trait2 (m3)?`
+    /// clause of the canonical impl form (docs/17 §"Implementing"). Empty
+    /// slice preserves the legacy non-trait `impl Type { ... }` path so
+    /// every existing parser call site that constructs an ImplBlock
+    /// literal without `trait_specs` keeps round-tripping. Non-empty
+    /// triggers codegen's diamond-disambiguator dispatch rule:
+    /// (a) a method whose name appears in some TraitSpec's
+    ///     `preferred_methods` binds to that spec's trait's vtable;
+    /// (b) otherwise, if exactly one listed trait declares the method,
+    ///     bind to that trait;
+    /// (c) `trait_specs` empty → emit as a regular type method (no
+    ///     vtable entry);
+    /// (d) ambiguous (no parens, multiple traits declare the method) →
+    ///     compile error with the diamond-disambiguator hint.
+    /// `preferred_methods` is empty-by-default so a bare `with T1, T2`
+    /// clause (no parens) enters the uniqueness path (b).
+    trait_specs: []const TraitSpec = &[_]TraitSpec{},
+};
+
+/// One entry in an `ImplBlock.trait_specs` list — parsed from a single
+/// `Trait (m1, m2)?` clause inside `impl Type with T1 (m1), T2 { ... }`
+/// (docs/17 §"Diamond Disambiguation"). `name` is the verbatim trait
+/// ident; `preferred_methods` is the verbatim method-name list when
+/// parenthesised, empty when the trait appears without parens. The
+/// parser preserves source order across the comma-separated clauses so
+/// codegen emits `Type_Trait_method` free fns and vtable registrations
+/// in declaration order.
+pub const TraitSpec = struct {
+    name: []const u8,
+    preferred_methods: []const []const u8 = &[_][]const u8{},
 };
 
 /// One enum declaration of the form
