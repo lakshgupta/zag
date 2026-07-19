@@ -2600,3 +2600,143 @@ test "codegen: unqualified brace ctor routes through brace-named-field emit via 
     try std.testing.expect(std.mem.indexOf(u8, zig, ".a = 2.0") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, ".b = 3.0") == null);
 }
+
+// v1.5 backed-enum codegen (docs/manual/13-enums.md §"Backed Enums"):
+// the parser captures `enum(T) { V = value }` (backing type via
+// collectCastType on the `(T)` slot, per-variant value_text verbatim)
+// and codegen/decl.zig:795-879 routes the four emit shapes:
+//   1. int-/char-backed explicit → `enum(T) { V = N, ... };`
+//   2. str-backed falls back to synthesized struct (zig rejects
+//      `enum([]const u8)` tag types)
+//   3. char-backed routes through zagTypeToZig's `char → u32` rewrite
+//   4. int-backed auto-infer omits `= N` when value_text is null
+// The 4 fixtures below pin each surface individually so future
+// regressions can't silently collapse one shape into another.
+test "codegen: backed-enum(u8) explicit emits enum(u8) { V = N, ... }" {
+    const src =
+        \\enum(u8) Status { Ok = 0, Warn = 1, Err = 2 }
+        \\
+        \\fun main() { let s: u8 = Status.Ok; print(s); }
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum(u8) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Ok = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Warn = 1,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Err = 2,") != null);
+    // Sanity: NOT the bare-enum form (`enum {\n    Ok,`) nor the str-
+    // backed struct fallback.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum {\n    Ok,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "struct {") == null);
+}
+
+test "codegen: backed-enum(str) falls back to struct { pub const V = \"...\" }" {
+    // zig rejects `enum([]const u8)` because enum tag types must be
+    // integers; the codegen synthesizes a struct-with-const-fields
+    // instead, so each variant becomes `pub const Name = value;`
+    // and `Level.High` references a byte-string const that coerces to
+    // `[]const u8` (zig's standard str-literal → slice coercion).
+    const src =
+        \\enum(str) Level { Low = "low", Medium = "medium", High = "high" }
+        \\
+        \\fun main() { let lvl: str = Level.High; print(lvl); }
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Low = \"low\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Medium = \"medium\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const High = \"high\";") != null);
+    // Sanity: NOT the int-backed `enum(u8) {` form, NOT the str-tagged
+    // `enum(str) {` form (zig rejects both with `expected integer tag type`
+    // or `undefined identifier 'str'`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum(str) {") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum([]const u8) {") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum(u8) {") == null);
+}
+
+test "codegen: backed-enum(char) routes through zagTypeToZig's char→u32 rewrite" {
+    // The char-backed emit shape: `enum(char) Vowel { A = 'a', ... }`
+    // traverses zagTypeToZig's `char → u32` rewrite (the codegen-side
+    // half of docs/features.md §08 v2 4-byte Unicode char row, gap (a))
+    // so the zig emit is `pub const Vowel = enum(u32) { A = 97, ... };`
+    // The char_lit codepoints round-trip through the lexer's brace-form
+    // normalization to decimal values.
+    const src =
+        \\enum(char) Vowel { A = 'a', E = 'e', I = 'i', O = 'o', U = 'u' }
+        \\
+        \\fun main() { let a: char = Vowel.A; print(a); }
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum(u32) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "A = 'a',") != null);
+    // Sanity: the codegen does NOT convert the value-side char
+    // literal to its u32 codepoint (97) — it passes value_text
+    // through verbatim and zig's char-literal → u32 coercion
+    // resolves the value at compile time. A regression that
+    // pre-converted would silently pass the positive pin above.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "A = 97,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "E = 'e',") != null);
+    // Sanity: codegen does NOT convert char-literal value to its
+    // u32 codepoint (zig coerces char literals at compile time).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "E = 101,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "I = 'i',") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "I = 105,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "O = 'o',") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "O = 111,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "U = 'u',") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "U = 117,") == null);
+    // Sanity: NOT the raw `enum(char) {` form (zig 0.16 rejects the bare
+    // `char` ident with `undefined identifier`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum(char) {") == null);
+}
+
+test "codegen: backed-enum(u8) auto-infer omits = value when value_text is null" {
+    // Integer-backed variants WITHOUT an explicit `= expr` clause are
+    // emitted as bare identifiers (no `= N` assignment) so zig's own
+    // `enum(T) { V1, V2, V3 }` auto-walker picks 0, 1, 2 successively.
+    // A regression that emitted `First = 0,` instead would suppress
+    // zig's auto-infer and silently double-bump the tag values.
+    const src =
+        \\enum(u8) AutoInfer { First, Second, Third }
+        \\
+        \\fun main() { let third: u8 = AutoInfer.Third; print(third); }
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum(u8) {") != null);
+    // Variants emitted as bare identifiers + trailing comma (no
+    // `= N` assignment — auto-infer is zig's responsibility).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    First,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    Second,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    Third,\n") != null);
+    // Sanity: NO `= N` ASSIGNMENT for any of the three variants.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "First = ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Second = ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Third = ") == null);
+}

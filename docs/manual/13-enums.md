@@ -107,9 +107,9 @@ fun is_north(d: Direction) -> bool {
 
 Use qualified names when the type is ambiguous or for clarity.
 
-## Backed Enums (`enum(T)`) — v2.1
+## Backed Enums (`enum(T)`)
 
-> Backed enums (`enum(T)` with explicit per-variant values) landed in v2.1. The bare `enum { Variant1, Variant2 }` form continues to work and was migrated to the v2 surface earlier; see [`examples/types/enum_backed.zag`](../../examples/types/enum_backed.zag) for the end-to-end runnable demonstration covering `enum(u8)`, `enum(str)`, `enum(char)`, and the auto-inferred `enum(u8)` shape.
+Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](16-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type. See [`examples/types/enum_backed.zag`](../../examples/types/enum_backed.zag) for the end-to-end runnable demonstration covering `enum(u8)`, `enum(str)`, `enum(char)`, and the auto-inferred `enum(u8)` shape.
 
 Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](16-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type.
 
@@ -131,8 +131,12 @@ enum(u8) Status {
 }
 ```
 
-**Rules (planned surface — see supported-by-version note above):**
-- `enum(T)` requires explicit `= v` for every variant. Implicit values are not supported.
+**Rules:**
+- For str-backed enums, every variant MUST carry `= "value"` (zig's `const`-field requires an initializer; zig rejects an empty const-decl without one). Omitting the value routes through the codegen's `""` fallback (same string-literal syntax as the empty `="\\"\\""` source-side form).
+- For int-/char/bool-backed enums, `= v` is OPTIONAL — variants without an explicit value auto-infer (zig picks the next T-value, walking up from the prior variant — `First = 0`, `Second = 1`, `Third = 2` for an all-implicit `enum(u8)`).
+- Default `enum { V1, V2 }` (no `T`) keeps bare-only behavior; tag-only memory layout (1-byte tag for ≤256 variants).
+- Storage: `sizeof(T)` per value. The variant identifier IS the value — there is no extra tag byte.
+- Variants remain bare; there is no per-variant payload type distinct from `T`.
 - Default `enum { V1, V2 }` (no `T`) keeps bare-only behavior; tag-only memory layout (1-byte tag for ≤256 variants).
 - Storage: `sizeof(T)` per value. The variant identifier IS the value — there is no extra tag byte.
 - Variants remain bare; there is no per-variant payload type distinct from `T`.
@@ -157,7 +161,7 @@ let ok_eq:    bool = (Status.Ok   == Status.Ok);  # true — both 0
 let ok_neq:   bool = (Status.Ok   != Status.Err); # true — 0 != 2
 ```
 
-**Provided methods (auto-generated when `enum(T)` lands):**
+**Provided methods:**
 - **Equality (`==`)** — **value-based** for `enum(T)`: compares `T`-values. `Level.High == "high"` (T=str) and `Status.Ok == Status.Ok` (T=u8) are both `true`. Compare with default `enum { … }`, where equality is **tag-based** (variants are equal only to themselves).
 - **`from_str(s: str) -> Option<Enum>`** — provided whenever `T = str`; returns `None` for unrecognized strings.
 - **Display** — auto-implemented; writes the `T`-value via `T`'s own display formatter.
