@@ -123,7 +123,7 @@ A Type is `Drawable` through trait impl, AND it's a Widget-shaped concrete type 
 ```
 struct Button {
     Widget,
-    label: String,
+    label: str,
 }
 
 impl Button {
@@ -158,18 +158,18 @@ impl Button {
 ```
 impl Button {
     with Drawable {
-        fun draw(self: *Button) {                  # auto-bound: Drawable::draw
+        pub fun draw(self: *Button) {              # auto-bound: Drawable::draw
             print("button: ");
             print(self.label);
         }
-        fun name(self: *Button) -> str {           # auto-bound: Drawable::name
+        pub fun name(self: *Button) -> str {       # auto-bound: Drawable::name
             return self.label;
         }
     }
 }
 ```
 
-At codegen time the parser maps each `with`-block method to `pub fun Trait.method(self) { ... }` — the existing pipeline picks up the `trait_name` slot unchanged. The with-clause does not introduce new AST fields; it is a parser-side grouping affordance over the existing per-method prefix surface.
+At codegen time the parser maps each `with`-block method to `pub fun Trait.method(self) { ... }` — the existing pipeline picks up the `trait_name` slot unchanged. The with-clause does not introduce new AST fields; it is a parser-side grouping affordance over the existing per-method prefix surface. (Examples in this section show `pub fun` to keep signature shape parallel with the per-method prefix form; the parser accepts both `pub fun` and `fun`, and codegen always emits `pub fn`.)
 
 ### All-impl form
 
@@ -239,6 +239,8 @@ impl Display for List<T> {          impl List<T> { with Display {
 
 The per-(Type, Trait) coherence rule still holds in zag: at most one `with Trait` clause per Type per impl block; a second `with Display { ... }` for the same Type in the same impl block is a compile error ("Display already bound for List<T>"). The sugar does not relax coherence — it simply paints the rule with a less-verbose syntax.
 
+> **Implementation perf note:** the `with` clause is parser-only sugar; the emitted zig is byte-identical to the per-method prefix form. Identical performance characteristics, identical vtable layout, identical binary size. The choice between `with Trait { ... }` and `pub fun Trait.method` is purely stylistic — pick whichever reads more clearly.
+
 ## Default Methods
 
 Default methods reduce boilerplate. A trait can provide a fallback implementation that types inherit unless they override it:
@@ -296,30 +298,6 @@ trait Sortable {
 }
 ```
 
-## Using Traits
-
-```
-fun render(d: Drawable) {
-    d.draw();          # indirect call via vtable
-    let n = d.name();  # indirect call via vtable (uses default if not overridden)
-}
-
-let btn = Button { ... };
-render(btn as Drawable);    # fat pointer conversion
-```
-
-**Memory:** Calling a trait method is one indirect call (vtable lookup). Use in hot paths only if indirection is measurable.
-
-## Trait Rules
-
-- Traits declare method signatures. Methods without a body are **required**; methods with a body are **defaults**.
-- `Self` refers to the implementing type
-- A type implements a trait by declaring methods in `impl Type { ... }` with `fun Trait.method` prefix
-- The compiler validates all required methods are present; default methods are optional
-- Trait values are fat pointers
-- A type can implement multiple traits
-- No associated types in v1
-
 ## Performance
 
 ```
@@ -338,7 +316,31 @@ fun render_any(items: []Drawable) {
 }
 ```
 
-Prefer generics for tight loops. Use traits for pluggable boundaries (HTTP handlers, drivers).
+> **Multi-trait vtable overhead:** Casting a Type to a trait is cheap (constructing a fat pointer). However, casting a fat pointer to *another* trait (e.g. `obj_as_a as B`) requires a runtime lookup if the compiler cannot prove the underlying Type implements B. Prefer generic bounds `<T: A + B>` where possible to resolve the vtables at compile time.
+
+## Using Traits
+
+```
+fun render(d: Drawable) {
+    d.draw();          # indirect call via vtable
+    let n = d.name();  # indirect call via vtable (uses default if not overridden)
+}
+
+let btn: Button = Button { label: "click me" };
+render(btn as Drawable);    # fat pointer conversion
+```
+
+**Memory:** Calling a trait method is one indirect call (vtable lookup). Use in hot paths only if indirection is measurable.
+
+## Trait Rules
+
+- Traits declare method signatures. Methods without a body are **required**; methods with a body are **defaults**.
+- `Self` refers to the implementing type
+- A type implements a trait by declaring methods in `impl Type { ... }` with `fun Trait.method` prefix
+- The compiler validates all required methods are present; default methods are optional
+- Trait values are fat pointers
+- A type can implement multiple traits
+- No associated types in v1
 
 ## Async Trait Methods
 
