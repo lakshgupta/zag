@@ -1,0 +1,40 @@
+# Diamond disambiguation — shared body with a private helper
+# (docs/17 §"Diamond Disambiguation"). When the per-trait bodies
+# differ in style but share work, factor the shared work into a
+# top-level helper. The parens still disambiguate which vtable each
+# body registers on; the helper is just a regular module-scope fn.
+
+trait Display {
+    fun print(self: *Self);
+}
+
+trait Show {
+    fun print(self: *Self);
+}
+
+struct Button {
+    label: str,
+}
+
+# Shared helper: formats the button once; both trait bodies call it.
+fun button_format(self: *Button) -> str {
+    return self.label;
+}
+
+impl Button with Display (print), Show (print) {
+    # Single source body calling the helper. Registers on BOTH
+    # vtables via the two renamed free fns Button_Display_print and
+    # Button_Show_print — both referencing the same code.
+    pub fun print(self: *Button) {
+        print(button_format(self));
+        print("\n");
+    }
+}
+
+fun main() {
+    let btn: Button = Button { label: "ok" };
+    let d: Display = btn as Display;
+    d.print<Button>();
+    let s: Show = btn as Show;
+    s.print<Button>();
+}

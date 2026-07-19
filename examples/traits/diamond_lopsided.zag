@@ -1,0 +1,52 @@
+# Diamond disambiguation — lopsided (docs/17 §"Diamond Disambiguation").
+# When two listed traits share a method name (the diamond shape), the
+# parenthesised `(method)` list on a trait name owns the body. The
+# trait LISTED WITHOUT the parens leaves that method's slot
+# unfulfilled — a partial impl. A second impl block may complete it
+# (out of scope for this single-file demo).
+#
+# Here `print` is declared by both Display and Show. The parens
+# `(print)` after Display mean "Drawable is the source of truth for
+# print — register this body on Display's vtable only". Show's
+# `print` slot stays unfulfilled. The `render` method is unique to
+# Show, so it dispatches automatically (path (b)).
+
+trait Display {
+    fun print(self: *Self);
+}
+
+trait Show {
+    fun print(self: *Self);
+    fun render(self: *Self);
+}
+
+struct Button {
+    label: str,
+}
+
+impl Button with Display (print), Show (render) {
+    pub fun print(self: *Button) {
+        print("[display] ");
+        print(self.label);
+        print("\n");
+    }
+
+    pub fun render(self: *Button) {
+        print("[show] ");
+        print(self.label);
+        print("\n");
+    }
+}
+
+fun main() {
+    let btn: Button = Button { label: "ok" };
+    # Display's vtable carries `print`; casting through Display
+    # dispatches to Button_Display_print.
+    let d: Display = btn as Display;
+    d.print<Button>();
+    # Show's vtable carries `render` only (its `print` slot is
+    # unfulfilled — calling it would surface a zig compile error
+    # because the vtable entry is missing).
+    let s: Show = btn as Show;
+    s.render<Button>();
+}

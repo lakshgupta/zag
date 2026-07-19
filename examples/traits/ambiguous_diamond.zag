@@ -1,0 +1,41 @@
+# Ambiguous diamond — compile error (docs/17 §"Diamond Disambiguation").
+# When two listed traits share a method name AND no parenthesised
+# disambiguator picks one, the zag compiler surfaces a compile error
+# with the disambiguator hint rather than silently picking the first
+# match.
+#
+# This file is NOT expected to compile. Run it with `zag check
+# examples/traits/ambiguous_diamond.zag` and you should see:
+#
+#   error: ambiguous trait binding for method 'print' on type 'Button'
+#   — multiple `with`-listed traits declare it. Add a parenthesised
+#   disambiguator, e.g. `with T1 (print), T2`
+#
+# Fix by adding parens to one (lopsided) or both (shared) traits —
+# see diamond_lopsided.zag and diamond_shared.zag for the two valid
+# resolutions.
+
+trait Display {
+    fun print(self: *Self);
+}
+
+trait Show {
+    fun print(self: *Self);
+}
+
+struct Button {
+    label: str,
+}
+
+# Ambiguous: both Display and Show declare `print`; no parens
+# disambiguate. The zag compile-error fires at codegen time.
+impl Button with Display, Show {
+    pub fun print(self: *Button) {
+        print(self.label);
+    }
+}
+
+fun main() {
+    let b: Button = Button { label: "x" };
+    print(b.label);
+}

@@ -1,0 +1,44 @@
+# Multiple traits on one impl block (docs/17 §"Multiple Traits in One
+# Block"). When a method name is unique to one of the listed traits,
+# the compiler binds the body to that trait's vtable automatically — no
+# parenthesised disambiguator needed (dispatch path (b): uniqueness
+# inference).
+#
+# This example lists Drawable and Clickable on the same impl block.
+# `draw` is unique to Drawable; `click` is unique to Clickable. The
+# compiler emits Button_Drawable_draw + Button_Clickable_click free
+# fns and one vtable registration per trait.
+
+trait Drawable {
+    fun draw(self: *Self);
+}
+
+trait Clickable {
+    fun click(self: *Self);
+}
+
+struct Button {
+    label: str,
+}
+
+impl Button with Drawable, Clickable {
+    pub fun draw(self: *Button) {
+        print("draw: ");
+        print(self.label);
+        print("\n");
+    }
+
+    pub fun click(self: *Button) {
+        print("click: ");
+        print(self.label);
+        print("\n");
+    }
+}
+
+fun main() {
+    let btn: Button = Button { label: "ok" };
+    let d: Drawable = btn as Drawable;
+    let c: Clickable = btn as Clickable;
+    d.draw<Button>();
+    c.click<Button>();
+}
