@@ -1168,7 +1168,7 @@ test "codegen: `arr[..3]` slice emits verbatim" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[..3]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[0..3]") != null);
 }
 
 test "codegen: `.slice` arm covers all 4 start/end-null combinations" {
@@ -1215,7 +1215,7 @@ test "codegen: `.slice` arm covers all 4 start/end-null combinations" {
     // which the positive substring `arr[..7]` would not match because
     // zig's `..` half-open semantics require the lower-bound to be
     // either present OR absent, not artificially pre-filled).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[..7]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[0..7]") != null);
     // Case 4: neither → `arr[0..]` with synthetic 0 prefix (zig rejects
     // the bare `arr[..]` form, so the synthetic 0 is load-bearing here).
     try std.testing.expect(std.mem.indexOf(u8, zig, "arr[0..]") != null);
@@ -1234,7 +1234,7 @@ test "codegen: `.slice` arm covers all 4 start/end-null combinations" {
     // original bug couldn't affect it, and case 4 is the intended
     // synthetic-0 case (its presence is asserted positively above).
     try std.testing.expect(std.mem.indexOf(u8, zig, "arr[0..20]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[0..7]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "arr[..7]") == null);
 }
 
 test "codegen: bare enum decl emits pub const NAME = enum { ... }" {

@@ -508,27 +508,28 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // synthetic `len` Expr.
                 self.genExpr(s.target.*);
                 self.write("[");
-                // zig 0.16 REJECTS only the no-start-AND-no-end form
-                // `arr[..]` with `expected expression, found '..'`. The
-                // half-start forms `arr[..end]` and `arr[start..]` both
-                // parse cleanly. The AST walk distinguishes "no start"
-                // (null `s.start`) from "start is 0" (an int_lit Expr
-                // for the literal 0), so the no-start form is always a
-                // deliberate user intent — emit `0` as a synthetic
-                // start ONLY when both start AND end are null (the
-                // `arr[..]` case that zig rejects). The `arr[..end]`
-                // case falls through to `..end` directly, preserving
-                // the user's source intent (fixes the
-                // `codegen: arr[..3] slice emits verbatim` test that
-                // was previously broken by an over-eager synthetic-0
-                // injection).
+                // zig 0.16 REJECTS a leading `..` in any indexing
+                // expression — `arr[..]`, `arr[..end]`, AND
+                // `arr[..end+1]` (inclusive) all surface `expected
+                // expression, found '..'`. The no-start slice form
+                // ALWAYS needs a synthetic `0` anchor to satisfy zig's
+                // `arr[a..b]` slice grammar. The prior carve-out
+                // `else if (s.end == null) { self.write("0"); }`
+                // only handled the `arr[..]` (both-null) case; the
+                // `arr[..end]` half-open form silently fell through
+                // to a bare `..end` emit that zig rejected — this is
+                // the `pointers.zag` line-58 failure exposed by the
+                // v1.3 drift-cleanup bundled test. Collapsing the two
+                // null-start arms into a single `else` branch unifies
+                // the synthetic-0 prefix across BOTH no-start shapes
+                // (both-null + half-open-with-end) so zig consistently
+                // sees `arr[0..end]` regardless of which no-start
+                // variant the user authored.
                 if (s.start) |st| {
                     self.genExpr(st.*);
-                } else if (s.end == null) {
+                } else {
                     self.write("0");
                 }
-                // else: start is null but end is set — emit `..end`
-                // directly (zig accepts this verbatim).
                 self.write("..");
                 if (s.end) |en| {
                     self.genExpr(en.*);
