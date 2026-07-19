@@ -437,6 +437,88 @@ options.addOption([]const u8, "cli_zag_source", readStubFile(b, "lib/cli.zag"));
     const run_e2e = b.addRunArtifact(e2e_runner_exe);
     const e2e_step = b.step("e2e", "End-to-end render+compile+run integration test (spawns `zig run` subprocess; opt-in to avoid forking CI sandboxes)");
     e2e_step.dependOn(&run_e2e.step);
+
+    // -------------------------------------------------------------------
+    // `zig build runtime_smoke` -- runtime-correctness smoke for trait
+    // vtable dispatch against the doc/17 trait examples.
+    //
+    // Mirrors the `zig build e2e` / `zig build smoke` / `zig build
+    // scaffold_tests` architecture: a SEPARATE zig module rooted at
+    // `tests/runtime_smoke.zig` wired through its own `b.addExecutable`
+    // + `b.addRunArtifact` step, NOT a `b.addTest` step. Same one-
+    // liner rationale: keeps the fast in-process `zig build test`
+    // (~240 tests, <1s) free of fork overhead and isolates the
+    // ~500ms-2s subprocess cost to an EXPLICITLY-invoked step that
+    // CI sandboxes blocking fork can omit.
+    //
+    // The runtime smoke covers what e2e cannot: it actually RUNS the
+    // compiled zag binary against the doc/17 trait examples
+    // (canonical_with.zag, multi_trait.zag, diamond_distinct.zag) and
+    // asserts byte-for-byte equality between stdout and the pre-
+    // captured runtime output. e2e's pipe+execve-of-`zig run` for a
+    // single in-process generated source string only proves the
+    // pipeline reaches `zig run`; it does NOT prove the trait dispatch
+    // site fires through and reaches stdout intact after the
+    // zig-vtable-construction pass. runtime_smoke closes that gap by
+    // shelling out to the installed zag binary against the published
+    // example .zag files.
+    //
+    // Path resolution: the runtime smoke binary is built and run by
+    // `addRunArtifact`, with CWD = build.zig's directory (zig build's
+    // documented convention). `./zig-out/bin/zag` and
+    // `examples/traits/*.zag` are relative paths from project root,
+    // so they resolve correctly without absolute-path resolution.
+    //
+    // Skip semantics: the runner probes `./zig-out/bin/zag` via
+    // posix_openat on entry; ENOENT gets a graceful SKIP-to-stderr
+    // + exit-0 so a fresh checkout (before `zig build install`)
+    // doesn't trigger a hard test failure. Same architectural
+    // precedent as tests/smoke.zig's "fixture missing → SKIP" exit-0.
+    //
+    // Deliberately NOT calling `b.installArtifact` -- same reasoning
+    // as e2e/smoke above; a plain `zig build install` shouldn't
+    // surface a runtime-smoke-runner in `./zig-out/bin/` alongside
+    // `zag`. The runner is a build-time-only verification artifact.
+    //
+    // No `parser` or `env_path` imports needed: the runtime smoke
+    // does NOT in-process lex+parse+codegen (e2e owns that lane).
+    // It only shells out to the installed zag binary, so the module
+    // stays lightweight and avoids the file-membership-collision
+    // trap documented on the `e2e_tests_mod` wiring above.
+    // -------------------------------------------------------------------
+    const runtime_smoke_mod = b.addModule("runtime_smoke-tests", .{
+        .root_source_file = b.path("tests/runtime_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // tests/runtime_smoke.zig uses `@import("env_path").readEnviron`
+    // for envp_z construction (mirroring tests/e2e.zig's exact
+    // pattern: zig 0.16 doesn't expose std.posix.environ at the
+    // expected path, so the env_path module owns the
+    // /proc/self/environ -> sentinel-terminated-pointer-array
+    // translation). The runtime smoke must import env_path via
+    // addImport (NOT @import-the-file directly) because file
+    // resolution across the tests/ -> src/ directory boundary is
+    // forbidden in zig's per-module path scope.
+    //
+    // Deliberately NOT call addOptions("build_options", options) on
+    // runtime_smoke_mod: env_path.zig itself doesn't transitively
+    // import build_options, and threading build_options through a
+    // third module would trigger zig 0.16's auto-numbering rename to
+    // `build_options0` + the file-membership-collision diagnostic
+    // documented on the env_path_mod addImport block above. The
+    // runtime smoke doesn't need a compile-time `-Dz_install`
+    // because it doesn't reach the zag-cache code path; it only
+    // shells out to the installed zag binary which has its own
+    // already-baked build_options snapshot.
+    runtime_smoke_mod.addImport("env_path", env_path_mod);
+    const runtime_smoke_exe = b.addExecutable(.{
+        .name = "runtime_smoke-runner",
+        .root_module = runtime_smoke_mod,
+    });
+    const run_runtime_smoke = b.addRunArtifact(runtime_smoke_exe);
+    const runtime_smoke_step = b.step("runtime_smoke", "Runtime smoke for trait vtable dispatch -- spawns `./zig-out/bin/zag run <example>` per trait example and asserts stdout matches the pre-captured runtime output (opt-in like e2e)");
+    runtime_smoke_step.dependOn(&run_runtime_smoke.step);
 }
 
 /// openat(2) probe to detect `vendor/zig/zig` (or
