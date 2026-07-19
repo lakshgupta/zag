@@ -1593,7 +1593,17 @@ test "codegen: block-form const `const x: str = const { ... }` expands `: str` t
     try std.testing.expect(std.mem.indexOf(u8, zig, "const x: str =") == null);
 }
 
-test "codegen: var param injection emits var x = x; at body entry" {
+test "codegen: var param name-isolation rename + fresh-local shadow (zig 0.16)" {
+    // zig 0.16's pass-by-value default already isolates `var`
+    // parameters from the caller for value types — the body mutation
+    // needs only a MUTABLE local to write to. The shadow pattern
+    // required for pre-0.16 code (`var x = x;`) is rejected by zig
+    // 0.16 as a name collision with the parameter. The fix: rename the
+    // parameter to `__zag_local_x` and inject a fresh local
+    // `var x = __zag_local_x;` at body entry. The body still uses `x`
+    // verbatim (resolves to the new mutable local), the parameter
+    // carries the caller's pass-by-value copy, and the public contract
+    // (caller unaffected by body mutations) is preserved.
     const src = "fun bump(var x: i32) {\n    x += 1;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -1602,8 +1612,19 @@ test "codegen: var param injection emits var x = x; at body entry" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn bump(x: i32) void") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    var x = x;") != null);
+    // Renamed parameter — different name from the local.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn bump(__zag_local_x: i32) void") != null);
+    // Shadow emit at body entry.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    var x = __zag_local_x;") != null);
+    // Legacy same-name shadow rejected (caller of the legacy emit).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    var x = x;") == null);
+    // Body mutation still round-trips.
+    // The compound-assign `x += 1;` desugars at parse time to
+    // `x = x + 1;` (parser/stmt.zig:parseCompoundAssign lowers
+    // `lhs OP= rhs` to `AssignStmt { lhs, BinaryExpr { lhs, OP, rhs } }`,
+    // which codegen emits as a plain assignment). The original source
+    // form `+=` therefore never appears in the generated zig.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "x = (x + 1)") != null);
 }
 
 test "codegen: unannotated closure binding still rewrites call to .call(...)" {

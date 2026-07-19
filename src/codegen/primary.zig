@@ -470,6 +470,23 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         var fmt_buf: [4096]u8 = undefined;
         var fmt_len: usize = 0;
         var args_cg = Codegen.init();
+        // Copy the parent's `type_info` map into args_cg so the
+        // child's genExpr routes through `.call` arm closure-bound
+        // detection (`isClosureBound` consults type_info_buf to
+        // identify `<name>.call(...)` rewrite targets). Without this
+        // transfer the placeholder `args_cg.genExpr(expr)` call sees
+        // a fresh Codegen with `type_info_count == 0` and falls
+        // through to the bare `<name>(<args>)` emit, which zig then
+        // rejects as `type 'main__struct_X' not a function` when the
+        // `<name>` is a closure binding. The user's `print("double(5)
+        // = {double(5)}\n")` demo relies on this; the previous
+        // shape passed because zig-side type resolution was more
+        // lenient (or the test surface didn't exercise closure-in-
+        // template). Now that zig 0.16's stricter dispatch is wired,
+        // the transfer is required. Mirrors the `type_info =
+        // type_info::init()` pattern at codegen struct init.
+        args_cg.type_info_buf = self.type_info_buf;
+        args_cg.type_info_count = self.type_info_count;
         var first_arg = true;
 
         for (t.parts) |part| {

@@ -135,6 +135,15 @@ const Codegen = core.Codegen;
         const generics_preamble = self.genTypeParamsPreamble(impl_type_params);
         for (m.params, 0..) |p, i| {
             if (i > 0 or generics_preamble) self.write(", ");
+            // Phase 2 var-p name-isolation (zig 0.16 fix): when
+            // `is_var` is set, rename the parameter to
+            // `__zag_local_<name>` so the body's
+            // `var <name> = __zag_local_<name>;` introduces a fresh
+            // local rather than shadowing the parameter. zig 0.16
+            // rejects any local variable that shares a name with a
+            // function parameter (`local variable 'x' shadows
+            // function parameter from outer scope`).
+            if (p.is_var) self.write("__zag_local_");
             self.write(p.name);
             self.write(": ");
             self.rewriteReceiverType(zagTypeToZig(p.type_text), impl_type_params);
@@ -169,12 +178,20 @@ const Codegen = core.Codegen;
         // entry so unresolved impl-block generic bounds surface
         // as a zag compile-error at the user's source-line.
         self.genBoundsGuards(impl_type_params);
-        // Phase 2 var-params injection — mirrors genMethod/genFun.
+        // Phase 2 var-p name-isolation (zig 0.16 fix): for each
+        // `is_var = true` param (renamed to `__zag_local_<name>` above),
+        // inject `var <name> = __zag_local_<name>;` at body entry. The
+        // fresh local `<name>` is mutable (allowing body mutations like
+        // `x += 1`), and the parameter carrying the caller's value
+        // passes through zig's pass-by-value default — caller isolation
+        // is preserved. The body still references `<name>` verbatim; the
+        // local shadows nothing because the parameter has a different
+        // name (`__zag_local_<name>`).
         for (m.params) |p| {
             if (p.is_var) {
                 self.write("    var ");
                 self.write(p.name);
-                self.write(" = ");
+                self.write(" = __zag_local_");
                 self.write(p.name);
                 self.write(";\n");
             }
@@ -311,6 +328,15 @@ const Codegen = core.Codegen;
         const generics_preamble = self.genTypeParamsPreamble(impl_type_params);
         for (m.params, 0..) |p, i| {
             if (i > 0 or generics_preamble) self.write(", ");
+            // Phase 2 var-p name-isolation (zig 0.16 fix): when
+            // `is_var` is set, rename the parameter to
+            // `__zag_local_<name>` so the body's
+            // `var <name> = __zag_local_<name>;` introduces a fresh
+            // local rather than shadowing the parameter. zig 0.16
+            // rejects any local variable that shares a name with a
+            // function parameter (`local variable 'x' shadows
+            // function parameter from outer scope`).
+            if (p.is_var) self.write("__zag_local_");
             self.write(p.name);
             self.write(": ");
             self.rewriteReceiverType(zagTypeToZig(p.type_text), impl_type_params);
@@ -350,15 +376,20 @@ const Codegen = core.Codegen;
         // for the method's own locals (not the enclosing pub fn's).
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
-        // Phase 2 (docs/15 §"Parameters"): inject `var p = p;` for each
-        // `is_var = true` param so mutations stay local. Mirrors the
-        // genFun patch so `pub fun bump(var x: i32) { x += 1; }` round-
-        // trips to a `bump` method that mutates a stack-local copy.
+        // Phase 2 var-p name-isolation (zig 0.16 fix): for each
+        // `is_var = true` param (renamed to `__zag_local_<name>` above),
+        // inject `var <name> = __zag_local_<name>;` at body entry. The
+        // fresh local `<name>` is mutable (allowing body mutations like
+        // `x += 1`), and the parameter carrying the caller's value
+        // passes through zig's pass-by-value default — caller isolation
+        // is preserved. The body still references `<name>` verbatim; the
+        // local shadows nothing because the parameter has a different
+        // name (`__zag_local_<name>`).
         for (m.params) |p| {
             if (p.is_var) {
-                self.write("        var ");
+                self.write("    var ");
                 self.write(p.name);
-                self.write(" = ");
+                self.write(" = __zag_local_");
                 self.write(p.name);
                 self.write(";\n");
             }
@@ -1078,6 +1109,14 @@ const Codegen = core.Codegen;
         // explicit `return expr;` to yield a value, which zig's type
         // checker validates against the emitted `RET_TYPE` signature.
         self.fn_returns_value = false;
+        // Phase 2 var-p name-isolation (zig 0.16 fix): for each
+        // `is_var = true` param (renamed to `__zag_local_<name>` above),
+        // inject `var <name> = __zag_local_<name>;` at body entry. The
+        // fresh local `<name>` is mutable (allowing body mutations like
+        // `x += 1`), and the parameter carrying the caller's value
+        // passes through zig's pass-by-value default — caller isolation
+        // is preserved. The body still references `<name>` verbatim; the
+        // local shadows nothing because the parameter has a different
         for (fun.body) |stmt| {
             self.collectTypedBindings(stmt);
         }
@@ -1121,6 +1160,14 @@ const Codegen = core.Codegen;
         const generics_preamble = self.genTypeParamsPreamble(fun.type_params);
         for (fun.params, 0..) |p, i| {
             if (i > 0 or generics_preamble or is_main) self.write(", ");
+            // Phase 2 var-p name-isolation (zig 0.16 fix): when
+            // `is_var` is set, rename the parameter to
+            // `__zag_local_<name>` so the body's
+            // `var <name> = __zag_local_<name>;` introduces a fresh
+            // local rather than shadowing the parameter. zig 0.16
+            // rejects any local variable that shares a name with a
+            // function parameter.
+            if (p.is_var) self.write("__zag_local_");
             self.write(p.name);
             self.write(": ");
             self.write(zagTypeToZig(p.type_text));
@@ -1171,15 +1218,16 @@ const Codegen = core.Codegen;
         // can't rebind a param directly through `p = ...`; this
         // shadow-rebind is the simplest path that honors the
         // "var copies the value to a stack-local mutable" contract.
-        for (fun.params) |p| {
-            if (p.is_var) {
-                self.write("    var ");
-                self.write(p.name);
-                self.write(" = ");
-                self.write(p.name);
-                self.write(";\n");
-            }
-        }
+        // The Phase 2 `var p = p;` shadow-rebind was a workaround
+        // for mutable-param emulation that zig 0.16 rejects as
+        // `local variable 'p' shadows function parameter`. zig's
+        // own pass-by-value defaults satisfy zag's caller-isolated-
+        // mutation semantic. The `is_var` slot on `ast.MethodParam`
+        // is no longer consulted here at codegen time but remains
+        // on the AST for documentation / future-tooling use.
+        // (No-op loop: removed to avoid zig 0.16's
+        // `pointless discard of capture` warning on a
+        // `if (p.is_var) { _ = p; }` marker.)
         // zig 0.16 main-signature migration: capture argv at main
         // entry into the module-level `__zag_argv` global. The
         // `init.minimal.args.toSlice(allocator)` call is the ONLY
@@ -1199,6 +1247,22 @@ const Codegen = core.Codegen;
                 self.write("    __zag_io = init.io;\n");
         }
 
+        // Phase 2 var-p name-isolation (zig 0.16 fix): for each
+        // `is_var = true` param (renamed to `__zag_local_<name>` above),
+        // inject `var <name> = __zag_local_<name>;` at body entry.
+        // The fresh local `<name>` is mutable (allowing body mutations
+        // like `x += 1`), and the parameter carrying the caller's
+        // value passes through zig's pass-by-value default — caller
+        // isolation is preserved.
+        for (fun.params) |p| {
+            if (p.is_var) {
+                self.write("    var ");
+                self.write(p.name);
+                self.write(" = __zag_local_");
+                self.write(p.name);
+                self.write(";\n");
+            }
+        }
         for (fun.body) |stmt| {
             self.genStmt(stmt, false);
         }

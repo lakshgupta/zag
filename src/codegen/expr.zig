@@ -131,9 +131,24 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // `{}` and refuses to return a value; if the user
                 // needs a returned value, the docs require the
                 // explicit `-> T` annotation.
-                self.write("(struct { pub fn call(");
-                for (cl.params, 0..) |p, i| {
-                    if (i > 0) self.write(", ");
+                // Phase 2 (zig 0.16 closure-as-method dispatch):
+                // pre-Phase-2 emit `(struct { pub fn call(x: i32) i32 { ... } }){}`
+                // which zig 0.16 rejected when the call-site was `instance.call(x)`:
+                // `call` was a static (namespace) function because it lacked a
+                // self-shaped parameter, so zig told us `no field or member
+                // function named 'call' in 'instance_type'`. The simplest fix is
+                // to prepend `_: @This()` — a self-shaped but unused parameter —
+                // so zig recognizes `call` as a member function bound to the
+                // struct instance and dispatches `instance.call(x)` correctly.
+                // `_:` keeps the unused param quiet (no `unused variable` warning).
+                self.write("(struct { pub fn call(_: @This()");
+                // Unconditional `, ` separator: `_: @This()` is always the first
+                // parameter so the user-supplied params always follow it with
+                // a leading comma. Empty `cl.params` (e.g. `||  { ... }`) emits
+                // cleanly because the loop body never executes and the trailing
+                // `") "` closes the signature with just `_: @This()`.
+                for (cl.params) |p| {
+                    self.write(", ");
                     self.write(p.name);
                     self.write(": ");
                     self.write(zagTypeToZig(p.type_text));

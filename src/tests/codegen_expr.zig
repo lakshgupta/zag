@@ -405,7 +405,14 @@ test "codegen: closure-literal |x: str| -> str expands str in pub fn call(...)" 
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call(x: []const u8) []const u8") != null);
+    // Phase 2 (zig 0.16 closure-as-method dispatch): the `call` method
+    // now carries `_:` as a self-shaped but unused first parameter so
+    // zig recognizes it as a member function bound to the struct
+    // instance (otherwise `instance.call(...)` dispatch fails with
+    // `no field or member function named 'call'`). The fix prepends
+    // `_: @This()` to the closure-literal's signature emit in
+    // src/codegen/expr.zig's `.closure` arm.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call(_: @This(), x: []const u8) []const u8") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call(x: str") == null);
 }
 
@@ -418,7 +425,9 @@ test "codegen: closure emit shapes anonymous struct with call method" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call(x: i32) i32") != null);
+    // Phase 2 (zig 0.16 closure-as-method dispatch): same `_:` prepend
+    // as the closure-literal test above.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call(_: @This(), x: i32) i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "return (x * 2);") != null);
 }
 

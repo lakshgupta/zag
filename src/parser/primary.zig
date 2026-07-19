@@ -62,22 +62,99 @@ pub fn buildTemplate(self: *Parser, raw: []const u8) Expr {
                 }
 
                 i = end_i + 1; // skip '}'
-                if (has_spec) {
-                    const expr_text = raw[expr_start .. spec_start - 1];
-                    const spec_text = raw[spec_start..end_i];
-                    parts_buf[part_count] = .{
-                        .literal = null,
-                        .expr = .{ .ident = expr_text },
-                        .spec = spec_text,
-                    };
-                } else {
-                    const expr_text = raw[expr_start..end_i];
-                    parts_buf[part_count] = .{
-                        .literal = null,
-                        .expr = .{ .ident = expr_text },
-                        .spec = null,
-                    };
+                const expr_text = if (has_spec) raw[expr_start .. spec_start - 1] else raw[expr_start..end_i];
+                // Closure-call widening for template-literal interpolations
+                // (docs/15 §\"Closures\" + basic.zag section 3). The pre-fix
+                // code unconditionally wrapped the interpolation text as
+                // `.{ .ident = expr_text }`, even when the text was
+                // `name(args)` — meaning `{x}` and `{double(5)}` BOTH
+                // surfaced as `Expr.ident(\"...\")`, and codegen emitted
+                // the literal text into the args tuple. zig then parsed
+                // the inline `double(5)` as a fresh bare dispatch and
+                // rejected with `type 'main__struct_X' not a function`
+                // because `double` is a closure-struct value (with a
+                // `call(x) i32` method), not a free fn.
+                //
+                // The `.call` Expr shape unlocks the existing closure-
+                // rewrite hook in codegen/expr.zig's `.call` arm
+                // (`isClosureBound(c.name)` → emit `<name>.call(<args>)`)
+                // which was previously unreachable from the template
+                // path because the AST was forced to `.ident`. Now: if
+                // the bracketed text matches `name(...)` — `(` appears
+                // somewhere in the text, the trailing byte is `)` —
+                // build a real `.call` Expr with each top-level
+                // comma-separated arg parsed as `.int_lit` (digit walk)
+                // or `.ident` (text ident). All other interpolation
+                // shapes (`{x}`, `{a + b}`, `{obj.f()}` etc.) keep the
+                // legacy `.ident` emit so pre-existing behaviour is
+                // preserved exactly. `a + b` and `obj.f()` are still
+                // non-functional templates — that's a pre-existing gap
+                // not introduced by this fix.
+                var build_expr: ast.Expr = .{ .ident = expr_text };
+                // Scan for the first `(` (top-level; the args segment
+                // is tracked separately with depth-aware comma-split
+                // below, so nested brackets inside `name(...)` don't
+                // need outer-bracket tracking here).
+                var lparen_idx: ?usize = null;
+                {
+                    var scan_i: usize = 0;
+                    while (scan_i < expr_text.len) : (scan_i += 1) {
+                        if (expr_text[scan_i] == '(') {
+                            lparen_idx = scan_i;
+                            break;
+                        }
+                    }
                 }
+                if (lparen_idx) |lparen| {
+                    if (expr_text.len > 0 and expr_text[expr_text.len - 1] == ')') {
+                        const name_text = std.mem.trim(u8, expr_text[0..lparen], " \t");
+                        const args_text = std.mem.trim(u8, expr_text[lparen + 1 .. expr_text.len - 1], " \t");
+                        var args_buf: [16]ast.Expr = undefined;
+                        var arg_count: usize = 0;
+                        var seg_start: usize = 0;
+                        {
+                            var depth: usize = 0;
+                            var pos: usize = 0;
+                            while (pos <= args_text.len) : (pos += 1) {
+                                if (pos == args_text.len or (args_text[pos] == ',' and depth == 0)) {
+                                    var seg_end = pos;
+                                    while (seg_start < seg_end and (args_text[seg_start] == ' ' or args_text[seg_start] == '\t')) seg_start += 1;
+                                    while (seg_end > seg_start and (args_text[seg_end - 1] == ' ' or args_text[seg_end - 1] == '\t')) seg_end -= 1;
+                                    if (seg_end > seg_start) {
+                                        const seg = args_text[seg_start..seg_end];
+                                        var is_int = seg.len > 0;
+                                        for (seg) |c| {
+                                            if (c < '0' or c > '9') is_int = false;
+                                        }
+                                        if (is_int) {
+                                            args_buf[arg_count] = .{ .int_lit = seg };
+                                        } else {
+                                            args_buf[arg_count] = .{ .ident = seg };
+                                        }
+                                        arg_count += 1;
+                                    }
+                                    seg_start = pos + 1;
+                                } else {
+                                    const c = args_text[pos];
+                                    if (c == '(' or c == '[' or c == '{') depth += 1;
+                                    if (c == ')' or c == ']' or c == '}') {
+                                        if (depth > 0) depth -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        if (arg_count > 0 and name_text.len > 0) {
+                            const args_arena = self.arena.alloc(ast.Expr, arg_count);
+                            @memcpy(args_arena, args_buf[0..arg_count]);
+                            build_expr = .{ .call = .{ .name = name_text, .args = args_arena } };
+                        }
+                    }
+                }
+                parts_buf[part_count] = .{
+                    .literal = null,
+                    .expr = build_expr,
+                    .spec = if (has_spec) raw[spec_start..end_i] else null,
+                };
                 part_count += 1;
                 literal_start = i;
             } else {
