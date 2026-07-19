@@ -975,8 +975,8 @@ test "codegen: `?*raw T` annotation round-trips in let binding" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, ": ?*raw u8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const p: ?*raw u8 = null;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": ?[*]u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const p: ?[*]u8 = null;") != null);
     // Sanity: the pre-space-form failures (would indicate the
     // prev_was_ptr flag was reset between `*` and `raw`).
     try std.testing.expect(std.mem.indexOf(u8, zig, "?* raw") == null);
@@ -1048,7 +1048,7 @@ test "codegen: `*raw T` annotation round-trips in let binding" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, ": *raw u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": [*]u8") != null);
 }
 
 test "codegen: `for v in slice { ... }` iter emits `for (slice) |v|` verbatim" {

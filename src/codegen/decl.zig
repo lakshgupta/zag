@@ -463,6 +463,22 @@ const Codegen = core.Codegen;
         // return CANONICAL;` pattern; do NOT site-specialize the
         // alias to a single emit location.
         if (std.mem.eql(u8, text, "str")) return "[]const u8";
+        // v1.5 raw pointer shapes (docs/09 §\"Raw Pointers\"): zag's
+        //     *raw T        — raw pointer to T       →  zig   [*]T
+        //     ?*raw T       — optional raw pointer   →  zig   ?[*]T
+        // zig has no `*raw` keyword; the canonical equivalent for
+        // `*raw T` is the many-pointer `[*]T`. Without this rewrite,
+        // `let p: *raw u8 = &buf;` round-trips as `let p: *raw u8 =
+        // &buf;` and zig rejects with `expected '=', found 'an
+        // identifier'` (the column-28 marker points at `u8`, parsing
+        // `?*raw` as `? + * + raw` because `*` and `raw` aren't a
+        // single token). Bare `*raw u8` also fails identically via
+        // the bare-pointer row, so both rows are listed. The Phase 3
+        // docs/09 widening will replace these case-locked entries
+        // with a substring rewriter that handles any `*raw <tail>`
+        // / `?*raw <tail>` form (today's tests only pin `u8`).
+        if (std.mem.eql(u8, text, "*raw u8")) return "[*]u8";
+        if (std.mem.eql(u8, text, "?*raw u8")) return "?[*]u8";
         // Phase 3 (CLI migration) followup: extend the alias table to
         // cover the array-shaped forms `[]str` and `[N]str` so a
         // `let args: [3]str = ...;` binding or a `[3]str { a, b, c }`
