@@ -17,6 +17,108 @@ Methods without a body are **required** — the `impl` block must provide them. 
 
 **Memory:** Traits are fat pointers (data pointer + vtable pointer). 16 bytes on 64-bit.
 
+## How Trait Membership Is Established
+
+Zag has **two orthogonal paths** that establish a Type's relationship with the rest of the world. Both are wire-up mechanisms; neither implies class-style "is-a" inheritance — zag has no class hierarchy, no base classes, and no `extends` keyword. The two paths are not competing alternatives — they answer different questions and stack freely on the same Type.
+
+### Path 1 — Trait impl (`pub fun Trait.method`)
+
+The Type implements the Trait by declaring individual methods as `pub fun Trait.method(self: *Type)`. The `Trait.method` prefix names the trait the method registers against, and each method registration produces one entry in the Type's per-trait vtable. This is the path that wires up **vtable dispatch** — `obj as Trait` reads the matching vtable slot and packages both the data pointer and the vtable pointer into a 16-byte fat pointer.
+
+```
+trait Drawable {
+    fun draw(self: *Self);
+}
+
+struct Button {
+    label: str,
+}
+
+impl Button {
+    pub fun Drawable.draw(self: *Button) {
+        print("Button: ");
+        print(self.label);
+    }
+}
+
+fun render(d: Drawable) {
+    d.draw();          # indirect call through Drawable's vtable
+}
+
+let btn: Button = Button { label: "hi" };
+render(btn as Drawable);
+```
+
+Use this path when you want `obj as Trait` to compile, when a generic bound `<T: Trait>` must hold for a Type, or when you need runtime dispatch over a heterogeneous list of values.
+
+### Path 2 — Structural composition (struct field embedding)
+
+The Type's struct body includes a bare `EmbedType,` row that promotes that type's fields and methods into the outer struct. This is composition **without** vtable dispatch — every call resolves through the embedded value at compile time.
+
+```
+struct Widget {
+    pos: Position,
+}
+
+impl Widget {
+    pub fun click(self: *Widget) {
+        # ...
+    }
+}
+
+struct Button {
+    Widget,            # bare row — embeds Widget by value; promotes
+                          # Widget's fields (pos) and impl methods (click)
+                          # into Button's namespace.
+    label: str,
+}
+
+fun main() {
+    let btn: Button = Button { ... };
+    btn.click();       # direct call — resolved through the embedded
+                          # Widget position, no fat pointer
+    let p = btn.pos;   # direct field read
+}
+```
+
+Calls through embedding are **monomorphized** — no fat pointer, no vtable lookup, no indirect call. This is the path to choose for concrete-type field-and-method reuse.
+
+### When to use each
+
+Use Path 1 (trait impl) for vtable dispatch (`obj as Trait`) and generic bounds (`<T: Trait>`). Use Path 2 (embedding) for concrete field/method reuse where the Type is known at compile time. A single Type can freely use both if it needs dynamic dispatch and concrete field reuse — the example below demonstrates.
+
+### A type can use both paths at once
+
+Trait impl and embedding are complementary. A common pattern: define a `Widget` struct for concrete field-and-method reuse, then have specific Widget-shaped types embed it for structural reuse AND add a trait impl for runtime dispatch over a mixed-type list:
+
+```
+# Drawable defined above (Path 1); Widget defined above (Path 2).
+
+struct Button {
+    Widget,                        # path 2 — Widget's fields and methods promoted
+    label: str,
+}
+
+impl Button {
+    pub fun Drawable.draw(self: *Button) {   # path 1 — Button's draw
+                                              # registered on the Drawable vtable
+        print("Button: ");
+        print(self.label);
+    }
+    # Button.click() promoted through Widget embedding — no separate
+    # trait impl required; vtable dispatch on Drawable still works
+    # because the impl block declares Drawable.draw.
+}
+
+fun render_any(items: []Drawable) {
+    for d in items {
+        d.draw();                # vtable dispatch
+    }
+}
+```
+
+A Type is `Drawable` through trait impl, AND it's a Widget-shaped concrete type through embedding. Two separate, explicit wires; neither implies subtype-of semantics.
+
 ## Implementing
 
 ```
