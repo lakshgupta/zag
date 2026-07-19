@@ -143,6 +143,44 @@ pub fn parseArrayLit(self: *Parser) Expr {
         }
         self.advance();
         self.expect(.rbracket);
+        // v1.5 multi-dim bracket loop (docs/10 \u00a7"Multi-Dim Arrays"):
+        // accumulates additional `[K]` brackets before the type ident
+        // so `[3][3]i32 { ... }` parses a 2-deep dim list. The loop
+        // terminates when the next token is `.identifier`. `sizes[0]`
+        // mirrors `size` for backward-compat; `sizes[1..]` are the
+        // OUTER dim brackets emitted as a prefix in `genArrayLit`.
+        // Identifier-size multi-dim (`[N][M]T`) is OUT of scope; the
+        // dynamic dim-tok gate rejects with a Phase-3 deferral message
+        // rather than silently misparsing.
+        var sizes_buf: [8]u32 = undefined;
+        sizes_buf[0] = size;
+        var dim_count: usize = 1;
+        while (self.peek().tag == .lbracket) {
+            self.advance();
+            const dim_tok = self.peek();
+            if (dim_tok.tag != .integer_literal) {
+                std.debug.print(
+                    "error:{d}:{d}: multi-dim bracket must be integer literal (got '{s}'); identifier-size multi-dim deferred to Phase 3\n",
+                    .{ dim_tok.loc.line, dim_tok.loc.col, dim_tok.text },
+                );
+                std.process.exit(1);
+            }
+            var dim: u32 = 0;
+            for (dim_tok.text) |c| {
+                if (c >= '0' and c <= '9') {
+                    dim = dim * 10 + @as(u32, c - '0');
+                }
+            }
+            sizes_buf[dim_count] = dim;
+            dim_count += 1;
+            self.advance();
+            self.expect(.rbracket);
+        }
+        const sizes = if (dim_count > 1) blk: {
+            const alloc = self.arena.alloc(u32, dim_count);
+            @memcpy(alloc, sizes_buf[0..dim_count]);
+            break :blk alloc;
+        } else null;
         const type_name = self.expectIdent();
         self.expect(.lbrace);
 
@@ -172,7 +210,6 @@ pub fn parseArrayLit(self: *Parser) Expr {
         }
 
         self.expect(.rbrace);
-
         const elements = self.arena.alloc(Expr, element_count);
         @memcpy(elements, elements_buf[0..element_count]);
         return .{ .array_lit = .{
@@ -182,6 +219,7 @@ pub fn parseArrayLit(self: *Parser) Expr {
             .elements = elements,
             .fill = fill,
             .progression = progression,
+            .sizes = sizes,
         } };
     }
 

@@ -427,6 +427,33 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         }
 
         // Explicit list: `[N]T{ v1, v2, ..., vK }`.
+        // v1.5 multi-dim widening (docs/10 \u00a7"Multi-Dim Arrays"):
+        // when `a.sizes` is set, OUTER dim brackets `[s0][s1]...[sN-1]`
+        // are pre-fixed (inner-most bracket consumes the legacy
+        // single-bracket emit and the type slot). Single-dim
+        // (`a.sizes == null`) keeps pre-v1.5 shape byte-identical
+        // (existing `parser_decl.zig` line 64-98 fixtures pin
+        // `init.array_lit.size` and do not touch `sizes`).
+        if (a.sizes) |sizes| {
+            for (sizes[0 .. sizes.len - 1]) |s| {
+                var s_buf: [16]u8 = undefined;
+                const s_str = std.fmt.bufPrint(&s_buf, "{d}", .{s}) catch "0";
+                self.write("[");
+                self.write(s_str);
+                self.write("]");
+            }
+            self.write("[");
+            self.write(size_str);
+            self.write("]");
+            self.write(zagTypeToZig(a.type_name));
+            self.write("{ ");
+            for (a.elements, 0..) |el, idx| {
+                if (idx > 0) self.write(", ");
+                self.genExpr(el);
+            }
+            self.write(" }");
+            return;
+        }
         self.write("[");
         self.write(size_str);
         self.write("]");

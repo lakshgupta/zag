@@ -300,7 +300,7 @@ pub const Expr = union(enum) {
         /// `.identifier` size branch; the `.integer_literal` branch
         /// leaves it null.
         size_text: ?[]const u8 = null,
-        /// Element type identifier (e.g. "i32" in `[3]i32`).
+        /// Element type identifier (e.g. "i32" in `[3][3]i32`).
         type_name: []const u8,
         /// Explicit element expressions before any `...`.
         elements: []const Expr,
@@ -309,6 +309,18 @@ pub const Expr = union(enum) {
         /// Arithmetic-progression mode: `[N]T { v1, v2 ... }` extends
         /// by `v2 - v1` until the array is `size` long.
         progression: bool,
+        /// v1.5 multi-dim bracket list (docs/10 \u00a7"Multi-Dim Arrays"):
+        /// when non-null, captures ALL `[K]` brackets before the type
+        /// identifier in the `[N][M]...T { ... }` LHS. `sizes[0]` mirrors
+        /// `size` for backward-compat (single-dim/readers of the legacy
+        /// `size` field keep working); the additional entries
+        /// `sizes[1..]` are the OUTER dim brackets emitted as a prefix in
+        /// `genArrayLit`'s explicit-list arm (zig equivalent:
+        /// `[sizes[0]][sizes[1]]...[sizes[n-1]]T { ... }`).
+        /// `null` for the LEGACY single-dim shape. All existing codesites
+        /// that read `size`/`type_name`/`elements` continue to work
+        /// because they do not touch this slot.
+        sizes: ?[]const u32 = null,
     };
 
     // TemplateLitExpr: source of truth moved to template.zig;

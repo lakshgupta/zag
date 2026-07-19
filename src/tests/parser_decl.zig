@@ -98,6 +98,30 @@ test "parser: array lit progression" {
     try std.testing.expectEqual(@as(usize, 2), init.array_lit.elements.len);
 }
 
+// v1.5 multi-dim single-line (docs/10 \u00a7"Multi-Dim Arrays"): the
+// bracket-accumulation loop in parseArrayLit captures additional
+// `[K]` brackets before the type ident. The OUTER array_lit gains
+// `sizes = [2, 2]` (mirroring `size == 2` for legacy single-dim
+// readers); 2 inner rows each a single-row array_lit. Tests
+// pin the new field alongside the legacy surface.
+test "parser: array lit multi-dim single-line" {
+    const src = "fun f() {\n    let m = [2][2]i32 { [2]i32 { 1, 2 }, [2]i32 { 3, 4 } };\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const init = prog.functions[0].body[0].let.init.?;
+    try std.testing.expect(init == .array_lit);
+    try std.testing.expectEqual(@as(u32, 2), init.array_lit.size);
+    try std.testing.expect(init.array_lit.sizes != null);
+    try std.testing.expectEqual(@as(usize, 2), init.array_lit.sizes.?.len);
+    try std.testing.expectEqual(@as(u32, 2), init.array_lit.sizes.?[0]);
+    try std.testing.expectEqual(@as(u32, 2), init.array_lit.sizes.?[1]);
+    try std.testing.expectEqualStrings("i32", init.array_lit.type_name);
+    try std.testing.expectEqual(@as(usize, 2), init.array_lit.elements.len);
+}
+
 test "parser: let with type annotation" {
     // Pre-carve-out tests inadvertently regressed to bare `let x = 42` when
     // the static-typed-coercion migration commit landed (the carve-out makes
