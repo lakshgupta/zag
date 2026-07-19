@@ -57,6 +57,14 @@ pub const TokenTag = enum {
     /// verbatim into MethodParam.type_text and rewrite happens at
     /// codegen time so we don't add a new lexer token in Phase 1).
     trait_kw,
+    /// `with` keyword — introduces the trait-spec list on an impl block
+    /// (`impl Button with Drawable (print), Show { ... }`, docs/17 §"Implementing").
+    /// The clause that follows names one or more traits this block
+    /// implements, each optionally parenthesised with preferred method
+    /// names that disambiguate the diamond (same method name appearing
+    /// in multiple listed traits). Phase: lands as part of the canonical
+    /// `impl Type with Trait (m) { ... }` form rollout.
+    with_kw,
     /// `pub` keyword — visibility modifier on top-level decls and
     /// methods. Spec framing reserves privacy enforcement to a followup;
     /// current parser accepts-and-ignores it (the keyword is preserved

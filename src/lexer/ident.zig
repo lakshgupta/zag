@@ -48,6 +48,8 @@ pub     fn readIdent(self: *Lexer, start_loc: ast.Loc) void {
         .union_kw
     else if (std.mem.eql(u8, text, "trait"))
         .trait_kw
+    else if (std.mem.eql(u8, text, "with"))
+        .with_kw
     else if (std.mem.eql(u8, text, "pub"))
         .pub_kw
     else if (std.mem.eql(u8, text, "import"))
