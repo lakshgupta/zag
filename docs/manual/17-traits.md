@@ -151,6 +151,94 @@ impl Button {
 }
 ```
 
+## With-Clause Sugar
+
+`with Trait { ... }` is sugar for Path 1 (trait impl). The `Trait.method` prefix is auto-applied to every method declared inside the `with` block:
+
+```
+impl Button {
+    with Drawable {
+        fun draw(self: *Button) {                  # auto-bound: Drawable::draw
+            print("button: ");
+            print(self.label);
+        }
+        fun name(self: *Button) -> str {           # auto-bound: Drawable::name
+            return self.label;
+        }
+    }
+}
+```
+
+At codegen time the parser maps each `with`-block method to `pub fun Trait.method(self) { ... }` — the existing pipeline picks up the `trait_name` slot unchanged. The with-clause does not introduce new AST fields; it is a parser-side grouping affordance over the existing per-method prefix surface.
+
+### All-impl form
+
+When a Type implements every required method for a Trait (no defaults inherited), the `with` block groups them under one header instead of repeating the `Trait.` prefix per method:
+
+```
+impl List<T> {
+    with Display {                  # all 3 -> Display::vtable
+        fun fmt(self: *List<T>) { ... }
+        fun pretty(self: *List<T>) { ... }
+        fun print(self: *List<T>) { ... }
+    }
+    with Show {                     # all 1 -> Show::vtable
+        fun print(self: *List<T>) { ... }
+    }
+}
+```
+
+`obj as Display` and `obj as Show` both compile: the `with Display` block registers `fmt`, `pretty`, and `print` on List's Display vtable; `with Show` registers `print` on List's Show vtable. The two registrations of `print` are independent (distinct entries on distinct vtables), just as they would be in the per-method prefix form.
+
+### Partial-impl opt-out: `with Display(print)`
+
+When two traits share a method name, write the with-clause with the parenthesised name on the trait that should KEEP that method's body — the other trait's slot becomes unfulfilled (a partial impl):
+
+```
+impl List<T> {
+    with Display(print) {           # print -> Display::vtable only;
+                                   # Show::print stays unfulfilled
+        fun fmt(self: *List<T>) { ... }
+        fun print(self: *List<T>) { ... }
+    }
+    with Show {                     # Show is fully implemented except print
+        fun render(self: *List<T>) { ... }
+    }
+}
+```
+
+The parenthesised name inside `with Trait(name)` declares an **explicit decl-site qualifier**: this concrete method body belongs to the with-trait only and is not also used to satisfy the same method name on adjacent trait vtables. zig sees Display::print as fulfilled and Show::print as unfulfilled; `obj as List<T> as Show` is rejected by the type checker because the Show contract is missing one of its required methods.
+
+If the user wants `print` to satisfy BOTH Display::print AND Show::print (the classic diamond problem of registering the same body in two vtables), write two with-clauses — one per trait — and accept that there are now two method bodies side-by-side:
+
+```
+impl List<T> {
+    with Display {
+        fun print(self: *List<T>) { /* Display-formatted body */ }
+    }
+    with Show {
+        fun print(self: *List<T>) { /* same body or variant */ }
+    }
+}
+```
+
+The with-clause, like the per-method prefix, requires a method body per trait-method registration.
+
+### Coherence: Rust's per-(Type, Trait) pair rule
+
+Rust enforces **at most one `impl Trait for Type` block per (Type, Trait) pair**: every method inside `impl Display for List<T> { ... }` is implicitly bound to Display's vtable; the user cannot write two competing `impl Display for List<T>` blocks in the same crate. zag's `with` clause is a sugar for the same surface:
+
+```
+# Rust                              # zag equivalent (with sugar)
+impl Display for List<T> {          impl List<T> { with Display {
+    fn fmt(&self)       { ... }          fun fmt   (self: *List<T>) { ... }
+    fn pretty(&self)   { ... }          fun pretty(self: *List<T>) { ... }
+    fn print(&self)    { ... }          fun print (self: *List<T>) { ... }
+}                                  } }
+```
+
+The per-(Type, Trait) coherence rule still holds in zag: at most one `with Trait` clause per Type per impl block; a second `with Display { ... }` for the same Type in the same impl block is a compile error ("Display already bound for List<T>"). The sugar does not relax coherence — it simply paints the rule with a less-verbose syntax.
+
 ## Default Methods
 
 Default methods reduce boilerplate. A trait can provide a fallback implementation that types inherit unless they override it:
