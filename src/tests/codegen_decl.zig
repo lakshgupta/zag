@@ -1803,7 +1803,7 @@ test "codegen: trait vtable registration emits <Trait>_VTable_for_<Type> with @p
     // Positive: the @ptrCast bridge is present, target name matches
     // the renamed free fn exactly.
     // destination fn-pointer type matches VTable entry (zig 0.16 needs both @ptrCast args)
-    try std.testing.expect(std.mem.indexOf(u8, zig, ".draw = @ptrCast(*const fn (ptr: *anyopaque) void, &Button_Drawable_draw),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".draw = @ptrCast(&Button_Drawable_draw),") != null);
     // Sanity: no bare `.draw = Button_Drawable_draw,` assignment - that
     // would signal the @ptrCast bridge regressed.
     try std.testing.expect(std.mem.indexOf(u8, zig, "        .draw = Button_Drawable_draw,") == null);
@@ -1837,7 +1837,7 @@ test "codegen: cast `x as Trait` emits fat-pointer container + VTable_for_<Sourc
     const zig = cg.generate(prog);
     // Positive: trait-cast arm emitted the fat-pointer container
     // with the matching vtable registration reference.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @ptrCast(&btn), .vtable = &Drawable_VTable_for_Button") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @constCast(&btn), .vtable = &Drawable_VTable_for_Button") != null);
     // Negative 1: legacy @as cast did NOT appear in the trait-cast
     // path (a regression that drops the trait-detect gate silently
     // produces this).
@@ -1954,9 +1954,9 @@ test "codegen: trait + impl + cast + dispatch end-to-end emits full pipeline sha
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Drawable_draw(self: *Button) void") != null);
     // 3. vtable registration (Phase 2 surface)
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Drawable_VTable_for_Button: Drawable.VTable = .{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, ".draw = @ptrCast(*const fn (ptr: *anyopaque) void, &Button_Drawable_draw),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".draw = @ptrCast(&Button_Drawable_draw),") != null);
     // 4. cast arm shape (value-typed source → @ptrCast(&btn))
-    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @ptrCast(&btn), .vtable = &Drawable_VTable_for_Button") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @constCast(&btn), .vtable = &Drawable_VTable_for_Button") != null);
     // 5. dispatch turbofish (`d.draw(Button)`)
     try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw(Button);") != null);
 }
@@ -2760,4 +2760,185 @@ test "codegen: backed-enum(u8) auto-infer omits = value when value_text is null"
     try std.testing.expect(std.mem.indexOf(u8, zig, "First = ") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "Second = ") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "Third = ") == null);
+}
+
+// Canonical `with Trait (m)` clause dispatch (docs/17 §"Implementing"
+// + §"Diamond Disambiguation"). The parser captures the trait list
+// on ImplBlock.trait_specs; codegen's resolveTraitBinding routes
+// each method body to the right vtable slot via the per-method
+// dispatch rule:
+//   (a) preferred_methods match → that spec's trait,
+//   (b) uniqueness across listed traits → that trait,
+//   (c) trait_specs empty → regular type method,
+//   (d) ambiguous (multiple traits declare the method, no parens)
+//       → compile error with the diamond-disambiguator hint.
+// These tests pin paths (a), (b), and the shared-body shape so
+// parser+AST+codegen for the canonical `with` form round-trips.
+
+test "codegen: with Trait (m) preferred_methods binds body to trait's vtable (path a)" {
+    // Diamond shape: both Display and Show declare `print`. The
+    // parenthesised `(print)` on Drawable owns the body, so
+    // codegen emits `Button_Drawable_print` and registers it on
+    // Drawable's vtable. Show's `print` slot stays unfulfilled
+    // (intentional partial impl — a second impl block completes
+    // it; out of scope for this codegen test).
+    const src =
+        \\trait Display { fun print(self: *Self); }
+        \\trait Show    { fun print(self: *Self); fun render(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button with Display (print), Show (render) {
+        \\    pub fun print(self: *Button)  { }
+        \\    pub fun render(self: *Button) { }
+        \\}
+        \\fun main() { let x: i32 = 0; }
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Path (a): the `print` body registers on Display's vtable via
+    // the <Target>_<Trait>_<Method> rename. The `render` body
+    // registers on Show's vtable (preferred_methods match too).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Display_print(self: *Button) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Show_render(self: *Button) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Display_VTable_for_Button: Display.VTable = .{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Show_VTable_for_Button: Show.VTable = .{") != null);
+    // Sanity: no legacy `pub fn Button_print` orphan (path (c)).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_print(") == null);
+}
+
+test "codegen: with Trait (m) shared body registers on both vtables" {
+    // Shared-body diamond: the parenthesised `(print)` on BOTH
+    // traits owns the body. One body, two vtable entries — codegen
+    // emits two renamed free fns (`Button_Display_print` and
+    // `Button_Show_print`) pointing at the same source body, plus
+    // both vtable registrations.
+    const src =
+        \\trait Display { fun print(self: *Self); }
+        \\trait Show    { fun print(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button with Display (print), Show (print) {
+        \\    pub fun print(self: *Button) { }
+        \\}
+        \\fun main() { let x: i32 = 0; }
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The single `print` body landed on BOTH vtables. Because
+    // codegen uses body-by-value copy + per-trait rename, the same
+    // body emits as two free fns — one per (target, trait) pair.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Display_print(self: *Button) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Show_print(self: *Button) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Display_VTable_for_Button: Display.VTable = .{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Show_VTable_for_Button: Show.VTable = .{") != null);
+}
+
+test "codegen: with Trait uniqueness infers binding when method name is unique (path b)" {
+    // Path (b): a method whose name appears in EXACTLY ONE of the
+    // listed traits dispatches automatically — no parens needed.
+    // `draw` is unique to Drawable, `click` is unique to Clickable
+    // even though both traits are listed without parenthesised
+    // method lists.
+    const src =
+        \\trait Drawable  { fun draw(self: *Self); }
+        \\trait Clickable { fun click(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button with Drawable, Clickable {
+        \\    pub fun draw(self: *Button)  { }
+        \\    pub fun click(self: *Button) { }
+        \\}
+        \\fun main() { let x: i32 = 0; }
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Both methods route to their owning trait's vtable via the
+    // uniqueness path (no parens, but each method name is declared
+    // by exactly one of the listed traits).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Drawable_draw(self: *Button) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Clickable_click(self: *Button) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Drawable_VTable_for_Button: Drawable.VTable = .{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Clickable_VTable_for_Button: Clickable.VTable = .{") != null);
+}
+
+test "codegen: with Trait regular method (not in any listed trait) emits as orphan (path c)" {
+    // Path (c): a method whose name appears in NO listed trait
+    // stays a regular type method — no vtable registration, no
+    // `<Target>_<Trait>_<Method>` rename. The struct-matching path
+    // nests such methods INSIDE the zig struct body (emitted by
+    // `genStructDecl`), so the emitted form is `pub fn log(...)`
+    // (4-space indent) inside `pub const Button = struct { ... };`.
+    // The trait-bound method (`draw`) skips nesting and emits as
+    // a renamed module-scope free fn.
+    const src =
+        \\trait Drawable { fun draw(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button with Drawable {
+        \\    pub fun draw(self: *Button) { }
+        \\    pub fun log(self: *Button) { }
+        \\}
+        \\fun main() { let x: i32 = 0; }
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // `draw` bound to Drawable's vtable (path b uniqueness). The
+    // trait-binding rename `<Target>_<Trait>_<Method>` applies.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Drawable_draw(self: *Button) void {") != null);
+    // `log` is NOT in Drawable — regular type method, path (c).
+    // It nests INSIDE the struct as `pub fn log(...)` (4-space
+    // indent preceding `pub fn`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    pub fn log(self: *Button) void {") != null);
+    // Sanity: no `Button_Drawable_log` rename crept in (regular
+    // methods never get the trait-name infix).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Button_Drawable_log") == null);
+}
+
+test "codegen: with Trait ambiguity (no parens, two traits declare same method) compile-errors" {
+    // Path (d): when multiple listed traits share a method name and
+    // no parenthesised disambiguator picks one, the compiler
+    // surfaces a zag-level compile error with the disambiguator
+    // hint. The error message names the colliding method and the
+    // target type and suggests the `with T1 (m), T2` sugar.
+    //
+    // NOTE: this test executes `std.process.exit(1)` via the
+    // codegen pass, which kills the test runner. To verify the
+    // diagnostic WITHOUT crashing the suite, this test only parses
+    // and AST-checks — it does NOT invoke `cg.generate`. The
+    // dispatch rule fires at codegen time; the parser accepts the
+    // shape and `trait_specs` records the specs.
+    const src =
+        \\trait Display { fun print(self: *Self); }
+        \\trait Show    { fun print(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button with Display, Show {
+        \\    pub fun print(self: *Button) { }
+        \\}
+        \\fun main() { let x: i32 = 0; }
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    // Sanity: the parser captured both specs without parens.
+    try std.testing.expectEqual(@as(usize, 2), prog.impls[0].trait_specs.len);
+    try std.testing.expectEqual(@as(usize, 0), prog.impls[0].trait_specs[0].preferred_methods.len);
+    try std.testing.expectEqual(@as(usize, 0), prog.impls[0].trait_specs[1].preferred_methods.len);
 }

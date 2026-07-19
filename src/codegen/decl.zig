@@ -293,7 +293,15 @@ const Codegen = core.Codegen;
             for (all_impls) |impl| {
                 if (!std.mem.eql(u8, impl.target_type, sd.name)) continue;
                 for (impl.methods) |m| {
-                    if (m.trait_name != null) continue;
+                    // Canonical `with Trait (m)` dispatch (docs/17
+                    // §"Diamond Disambiguation"): a method bound to a
+                    // trait (via the legacy `Trait.method` prefix OR the
+                    // block's `trait_specs` clause) skips nested-emit so
+                    // the trait-handling pass in `generate` emits the
+                    // renamed `<Target>_<Trait>_<Method>` free fn and
+                    // matching vtable registration. Regular-type-method
+                    // path (c) emits nested here.
+                    if (self.resolveTraitBinding(&impl, m) != null) continue;
                     // Phase 2 tail: thread impl-level type_params so the
                     // nested method emits `comptime X: type` BEFORE its
                     // own params. Mirrors genFreeMethod's call update.
@@ -727,20 +735,22 @@ const Codegen = core.Codegen;
         // registration. The shape:
         //
         //   pub const Trait_VTable_for_Type: Trait.VTable = .{
-        //       .method = @ptrCast(
-        //           *const fn (ptr: *anyopaque, ...) RET,
-        //           &Type_Trait_method,
-        //       ),
+        //       .method = @ptrCast(&Type_Trait_method),
         //       ...
         //   };
         //
-        // The `@ptrCast` with explicit destination fn-pointer type
-        // bridges the receiver-type difference: the implementation
-        // free-fn's signature is `*const fn (self: *Type) RET`
-        // (concrete-receiver) while the vtable slot expects
-        // `*const fn (ptr: *anyopaque) RET`. zig 0.16 requires the
-        // destination type arg explicitly (no context-inference), so
-        // both the type and the source pointer appear in the call.
+        // The `@ptrCast` 1-arg form lets zig type-infer the destination
+        // function-pointer type from the VTable field declaration
+        // (`*const fn (ptr: *anyopaque, ...) RET` in `genTraitDecl`).
+        // zig 0.16 dropped explicit destination-type args for `@ptrCast`
+        // — the destination is taken from the struct-literal field's
+        // declared type. Source and destination are both function-
+        // pointer types with identical calling convention, so the cast
+        // is a "raw rebrand" from the impl-side receiver-type
+        // (`*Type`) to the dispatch-side (`*anyopaque`). The free-fn
+        // implementation's exact-name reference is preserved so the
+        // vtable slot maps 1:1 to the renamed `<Target>_<Trait>_<Method>`
+        // orphan-impl emit above.
         self.write("pub const ");
         self.write(trait_name);
         self.write("_VTable_for_");
@@ -751,27 +761,7 @@ const Codegen = core.Codegen;
         for (methods) |m| {
             self.write("    .");
             self.write(m.name);
-            self.write(" = @ptrCast(*const fn (ptr: *anyopaque");
-            // The destination fn-pointer type MUST be explicit - zig
-            // 0.16's `@ptrCast(T: type, ptr: anytype)` requires both
-            // args (no context-inference from struct-literal field
-            // assignment). The destination shape mirrors the VTable
-            // entry's exact declared type so the cast resolves:
-            // skip the receiver slot (the VTable repackages it as
-            // `ptr`), flip `Self` -> `T` on additional params via
-            // `rewriteSelfToT`, and apply the same rewrite to the
-            // return type. Tests passed on substring-presence
-            // assertions while the prior `(@ptrCast(&...)` emit was
-            // broken at zig 0.16's strict type-check phase.
-            for (m.params[1..]) |p| {
-                self.write(", ");
-                self.write(p.name);
-                self.write(": ");
-                self.rewriteSelfToT(p.type_text);
-            }
-            self.write(") ");
-            if (m.return_type) |rt| self.rewriteSelfToT(rt) else self.write("void");
-            self.write(", &");
+            self.write(" = @ptrCast(&");
             self.write(target_type);
             self.write("_");
             self.write(trait_name);
@@ -1053,7 +1043,12 @@ const Codegen = core.Codegen;
             for (all_impls) |impl| {
                 if (!std.mem.eql(u8, impl.target_type, ed.name)) continue;
                 for (impl.methods) |m| {
-                    if (m.trait_name != null) continue;
+                    // Canonical `with Trait (m)` dispatch (docs/17
+                    // §"Diamond Disambiguation") — same logic as
+                    // genStructDecl: trait-bound methods skip nested
+                    // emit so the trait-handling pass in `generate`
+                    // emits the renamed free fn + vtable registration.
+                    if (self.resolveTraitBinding(&impl, m) != null) continue;
                     // Phase 2 tail: thread impl-level type_params so
                     // the nested-on-enum method emits `comptime X:
                     // type` BEFORE its own params. Same path as

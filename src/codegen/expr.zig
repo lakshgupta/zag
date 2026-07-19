@@ -326,8 +326,18 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         // struct-literal type inference picks up
                         // `Drawable` from the trailing-without-dot
                         // leading-identifier in the cast-arm shape.
+                        // The `.ptr` field expects `*anyopaque`, and
+                        // `&<const_var>` produces `*const T`. zig 0.16
+                        // rejects implicit `*const T` → `*T` (const-
+                        // discard) so we wrap with `@constCast` to
+                        // strip the outer `const` qualifier, leaving
+                        // `*T`. The pointer-kind change to `*anyopaque`
+                        // happens via zig's implicit coercion from
+                        // `*T` → `*anyopaque` driven by the field's
+                        // declared destination type — no explicit
+                        // `@ptrCast` wrapper needed.
                         self.write(c.type_text);
-                        self.write("{ .ptr = @ptrCast(");
+                        self.write("{ .ptr = @constCast(");
                         if (!is_pointer_source) self.write("&");
                         self.write(source_ident);
                         self.write("), .vtable = &");

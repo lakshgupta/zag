@@ -169,6 +169,16 @@ pub const Codegen = struct {
     // tot variant count is bounded by O(256) per program.
     variant_fields_buf: [256]VariantFieldsEntry = undefined,
     variant_fields_count: u32,
+    /// Scratch buffer for `resolveTraitBindings` (docs/17 §"Diamond
+    /// Disambiguation"): holds the trait-name slice returned to the
+    /// caller — usually 0 entries (regular type method) or 1 (normal
+    /// trait binding); the shared-body diamond shape fills 2+ entries
+    /// (`with T1 (m), T2 (m)` resolves `m` to BOTH `T1` and `T2`).
+    /// Overwritten on each call; the slice the caller receives is
+    /// valid only until the next invocation. Bounded at 8 — v1
+    /// surface won't realistically list more than 8 traits on a
+    /// single `impl Type with ...` block.
+    trait_binding_buf: [8][]const u8 = undefined,
 
 /// One entry in `Codegen.variant_fields_buf` (gap #2 fix). Carries
 /// the (enum_name, variant_name) key + the user's actual field names
@@ -219,6 +229,20 @@ pub const VariantFieldsEntry = struct {
     pub const isFloatIdentType = @import("core.zig").isFloatIdentType;
     pub const isTrackedTrait = @import("core.zig").isTrackedTrait;
     pub const getSourceTypeName = @import("core.zig").getSourceTypeName;
+    // Canonical `with Trait (m)` dispatch (docs/17 §"Diamond
+    // Disambiguation"). The two helpers below are file-scope
+    // functions — like their sibling `getSourceTypeName` — re-exported
+    // into the Codegen struct so cross-bucket callers in
+    // decl.zig (genStructDecl/genEnumDecl) and core.zig (generate)
+    // can invoke them as `self.resolveTraitBinding(impl, m)` /
+    // `self.traitDeclaresMethod(trait, method)` without manually
+    // importing the file-scope definition. Without these re-exports
+    // zig compiles-error with `no field or member function named
+    // '<name>' in 'codegen.core.Codegen'` (mirror of the
+    // getSourceTypeName re-export pattern above).
+    pub const traitDeclaresMethod = @import("core.zig").traitDeclaresMethod;
+    pub const resolveTraitBindings = @import("core.zig").resolveTraitBindings;
+    pub const resolveTraitBinding = @import("core.zig").resolveTraitBinding;
     // Gap #2 lookup helper registration: needed because
     // src/codegen/expr.zig's `.enum_variant_ctor` arm calls
     // `self.lookupVariantFields(...)` to recover the user's
@@ -622,7 +646,16 @@ pub const VariantFieldsEntry = struct {
             }
             if (is_matched) continue;
             for (impl.methods) |m| {
-                if (m.trait_name != null) continue;
+                // Canonical `with Trait (m)` dispatch (docs/17
+                // §"Diamond Disambiguation"): if the block's
+                // trait_specs (or the legacy `Trait.method` prefix)
+                // bind this method to a trait, skip it here so the
+                // trait-handling pass below emits the renamed
+                // `<Target>_<Trait>_<Method>` free fn and the matching
+                // vtable registration. Methods with no trait binding
+                // (regular-type-method path (c)) emit through the
+                // orphan free-fn shape here.
+                if (self.resolveTraitBinding(&impl, m) != null) continue;
                 // Phase 2 generics: thread impl-level type_params so the
                 // orphan free-fn emits `comptime X: type` BEFORE its own
                 // params. Same wire-up as genStructDecl/genEnumDecl on
@@ -662,32 +695,58 @@ pub const VariantFieldsEntry = struct {
         var trait_reg_count: usize = 0;
         for (prog.impls) |impl| {
             for (impl.methods) |m| {
-                const trait_name = m.trait_name orelse continue;
-                // Emit the renamed free fn (genFreeMethod applies the
-                // <Target>_<Trait>_<Method> shape itself).
-                self.genFreeMethod(impl.target_type, m, impl.type_params);
-                // Group (trait, target_type) for the vtable registration.
-                var found = false;
-                var fi: usize = 0;
-                while (fi < trait_reg_count) : (fi += 1) {
-                    if (std.mem.eql(u8, trait_reg_buf[fi].trait, trait_name) and
-                        std.mem.eql(u8, trait_reg_buf[fi].target, impl.target_type))
-                    {
-                        if (trait_reg_buf[fi].method_count < trait_reg_buf[fi].methods.len) {
-                            trait_reg_buf[fi].methods[trait_reg_buf[fi].method_count] = m;
-                            trait_reg_buf[fi].method_count += 1;
+                // Canonical `with Trait (m)` dispatch (docs/17
+                // §"Diamond Disambiguation"): resolveTraitBindings
+                // returns the LIST of traits whose vtables should
+                // register this body — 0 entries → regular type
+                // method (already emitted by the orphan walk above);
+                // 1 entry → normal trait binding; 2+ entries → the
+                // shared-body diamond (`with T1 (m), T2 (m)` registers
+                // the same body on BOTH vtables, emitting one renamed
+                // free fn per owning trait).
+                const bindings = self.resolveTraitBindings(&impl, m);
+                if (bindings.len == 0) continue;
+                for (bindings) |trait_name| {
+                    // Copy m with the resolved trait_name so genFreeMethod's
+                    // `<Target>_<Trait>_<Method>` rename and the vtable
+                    // registration both reference the bound trait. The
+                    // AST is `[]const` (immutable) so we copy locally;
+                    // the original MethodDecl is untouched. Each
+                    // binding in the list produces its own renamed fn
+                    // so the shared-body shape lands as two distinct
+                    // free fns referencing the same impl body.
+                    var m_resolved = m;
+                    m_resolved.trait_name = trait_name;
+                    // Emit the renamed free fn (genFreeMethod applies
+                    // the <Target>_<Trait>_<Method> shape itself).
+                    self.genFreeMethod(impl.target_type, m_resolved, impl.type_params);
+                    // Group (trait, target_type) for the vtable
+                    // registration. The shared-body shape tiles the
+                    // same method into multiple `(trait, target)`
+                    // buckets so each trait's VTable gets its own
+                    // `@ptrCast` bridge into the renamed fn.
+                    var found = false;
+                    var fi: usize = 0;
+                    while (fi < trait_reg_count) : (fi += 1) {
+                        if (std.mem.eql(u8, trait_reg_buf[fi].trait, trait_name) and
+                            std.mem.eql(u8, trait_reg_buf[fi].target, impl.target_type))
+                        {
+                            if (trait_reg_buf[fi].method_count < trait_reg_buf[fi].methods.len) {
+                                trait_reg_buf[fi].methods[trait_reg_buf[fi].method_count] = m_resolved;
+                                trait_reg_buf[fi].method_count += 1;
+                            }
+                            found = true;
+                            break;
                         }
-                        found = true;
-                        break;
                     }
-                }
-                if (!found) {
-                    if (trait_reg_count < trait_reg_buf.len) {
-                        trait_reg_buf[trait_reg_count].trait = trait_name;
-                        trait_reg_buf[trait_reg_count].target = impl.target_type;
-                        trait_reg_buf[trait_reg_count].method_count = 1;
-                        trait_reg_buf[trait_reg_count].methods[0] = m;
-                        trait_reg_count += 1;
+                    if (!found) {
+                        if (trait_reg_count < trait_reg_buf.len) {
+                            trait_reg_buf[trait_reg_count].trait = trait_name;
+                            trait_reg_buf[trait_reg_count].target = impl.target_type;
+                            trait_reg_buf[trait_reg_count].method_count = 1;
+                            trait_reg_buf[trait_reg_count].methods[0] = m_resolved;
+                            trait_reg_count += 1;
+                        }
                     }
                 }
             }
@@ -770,6 +829,122 @@ pub const VariantFieldsEntry = struct {
             if (std.mem.eql(u8, ti.name, name)) return ti.type_name;
         }
         return null;
+    }
+
+    /// Diamond disambiguator support (docs/17 §"Diamond Disambiguation"):
+    /// walks `prog.traits` for the decl named `trait_name` and returns
+    /// true iff one of its `TraitMethodDecl`s is named `method_name`.
+    /// Used by `resolveTraitBindings`'s uniqueness check (b): "exactly
+    /// one listed trait declares the method → bind to that trait".
+    /// Returns false when the trait name is unknown to this program
+    /// (the dispatch rule then leaves the slot unfulfilled, surfacing
+    /// as a zig compile-error at the vtable registration step).
+    pub     fn traitDeclaresMethod(self: *Codegen, trait_name: []const u8, method_name: []const u8) bool {
+        for (self.prog.traits) |td| {
+            if (std.mem.eql(u8, td.name, trait_name)) {
+                for (td.methods) |tm| {
+                    if (std.mem.eql(u8, tm.name, method_name)) return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /// Canonical impl-form dispatch rule (docs/17 §"Implementing"
+    /// + §"Diamond Disambiguation"). Resolves the LIST of traits
+    /// whose vtables should register `m`'s body. Most methods have
+    /// 0 (regular type method) or 1 (normal trait binding) entries;
+    /// the shared-body diamond shape returns 2+ — e.g.
+    /// `with Drawable (print), Show (print)` resolves `print` to
+    /// BOTH `Drawable` and `Show`, emitting one renamed free fn per
+    /// trait (`<Target>_<Trait>_<Method>` per entry). Resolution
+    /// order mirrors the design spec's per-method rule:
+    ///   (0) `m.trait_name` set (legacy `Trait.method` prefix) → a
+    ///       singleton list with that trait. Explicit per-method
+    ///       binding takes precedence over any block-level `with`
+    ///       clause so pre-canonical source keeps round-tripping.
+    ///   (a) every `impl.trait_specs[i].preferred_methods` containing
+    ///       `m.name` → that spec's trait joins the list. Returns
+    ///       multiple entries when the same name is parenthesised
+    ///       on several traits (the shared-body diamond).
+    ///   (b) no parens match, but `trait_specs` non-empty AND exactly
+    ///       one listed trait declares `m.name` → singleton list.
+    ///   (c) `trait_specs` empty AND `m.trait_name` null → empty
+    ///       list (regular type method, no vtable entry).
+    ///   (d) Multiple listed traits declare `m.name` and no parens
+    ///       disambiguate → compile error with the disambiguator hint.
+    /// The returned slice is owned by `self.trait_binding_buf`
+    /// (overwritten on each call — caller must copy or finish with
+    /// the slice before the next invocation). Bounded at 8 entries
+    /// (v1 surface won't realistically list more than 8 traits on a
+    /// single impl block).
+    pub     fn resolveTraitBindings(self: *Codegen, impl: *const ast.ImplBlock, m: ast.MethodDecl) []const []const u8 {
+        // (0) Explicit `Trait.method` prefix still wins — singleton.
+        if (m.trait_name) |tn| {
+            self.trait_binding_buf[0] = tn;
+            return self.trait_binding_buf[0..1];
+        }
+        if (impl.trait_specs.len == 0) return self.trait_binding_buf[0..0];
+
+        // (a) Preferred-methods match — collect EVERY listed trait
+        // whose parenthesised names contain `m.name`. The shared-body
+        // diamond (`with T1 (m), T2 (m)`) yields BOTH entries so
+        // codegen emits one renamed free fn per owning trait.
+        var count: u32 = 0;
+        for (impl.trait_specs) |spec| {
+            for (spec.preferred_methods) |pm| {
+                if (std.mem.eql(u8, pm, m.name)) {
+                    if (count < self.trait_binding_buf.len) {
+                        self.trait_binding_buf[count] = spec.name;
+                        count += 1;
+                    }
+                    break; // one match per spec suffices
+                }
+            }
+        }
+        if (count > 0) return self.trait_binding_buf[0..count];
+
+        // (b) Uniqueness across listed traits: count how many of the
+        // listed traits declare a method named `m.name`.
+        var match: ?[]const u8 = null;
+        var match_count: u32 = 0;
+        for (impl.trait_specs) |spec| {
+            if (self.traitDeclaresMethod(spec.name, m.name)) {
+                match = spec.name;
+                match_count += 1;
+            }
+        }
+        if (match_count == 1) {
+            self.trait_binding_buf[0] = match.?;
+            return self.trait_binding_buf[0..1];
+        }
+        if (match_count == 0) return self.trait_binding_buf[0..0]; // method not declared by any listed trait → regular method
+
+        // (d) Ambiguous: multiple listed traits declare this method
+        // and no parenthesised name picked one. Surface a zag
+        // compile-error with the diamond-disambiguator hint rather
+        // than silently picking the first match.
+        std.debug.print(
+            "error: ambiguous trait binding for method '{s}' on type '{s}' — multiple `with`-listed traits declare it. Add a parenthesised disambiguator, e.g. `with T1 ({s}), T2`\n",
+            .{ m.name, impl.target_type, m.name },
+        );
+        std.process.exit(1);
+    }
+
+    /// Singleton-handling convenience wrapper for callers that want
+    /// the legacy single-trait shape (`?[]const u8` — null when the
+    /// method is regular, non-null when it binds to exactly one
+    /// trait). The first walk in `generate` uses this to skip
+    /// trait-bound methods in the orphan-emit path; the second walk
+    /// uses the slice form (`resolveTraitBindings`) so the
+    /// shared-body diamond emits per-trait free fns. The wrapper
+    /// surfaces the (d) ambiguous path the same way
+    /// `resolveTraitBindings` does (compile error + exit).
+    pub     fn resolveTraitBinding(self: *Codegen, impl: *const ast.ImplBlock, m: ast.MethodDecl) ?[]const u8 {
+        const bindings = self.resolveTraitBindings(impl, m);
+        if (bindings.len == 0) return null;
+        return bindings[0];
     }
 
     /// Gap #2 lookup helper: returns the user's named-field list for
