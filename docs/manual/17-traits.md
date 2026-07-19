@@ -74,10 +74,9 @@ struct Button {
 }
 
 fun main() {
-    let btn: Button = Button { ... };
-    btn.click();       # direct call — resolved through the embedded
-                          # Widget position, no fat pointer
-    let p = btn.pos;   # direct field read
+    let btn: Button = Button { label: "press" };
+    btn.click();       # direct call resolved through Widget slot
+    let p = btn.pos;   # direct field read through Widget slot
 }
 ```
 
@@ -95,7 +94,7 @@ Trait impl and embedding are complementary. A common pattern: define a `Widget` 
 # Drawable defined above (Path 1); Widget defined above (Path 2).
 
 struct Button {
-    Widget,                        # path 2 — Widget's fields and methods promoted
+    Widget,                        # path 2 — Widget's `pos` field and `click` method promoted
     label: str,
 }
 
@@ -117,7 +116,7 @@ fun render_any(items: []Drawable) {
 }
 ```
 
-A Type is `Drawable` through trait impl, AND it's a Widget-shaped concrete type through embedding. Two separate, explicit wires; neither implies subtype-of semantics.
+A Type is `Drawable` through trait impl, AND it's a Widget-shaped concrete type through embedding. Two separate, mutual mechanisms; neither implies subtype-of semantics.
 
 ## Implementing
 
