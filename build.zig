@@ -2,6 +2,9 @@ const std = @import("std");
 
 const MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 
+// Stripped-CI safety net for defaultZInstall's no-env fallback.
+const FALLBACK_ZINSTALL: []const u8 = "/tmp/zag-cache";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -70,25 +73,30 @@ pub fn build(b: *std.Build) void {
     // parent in main.zig stays verbatim and the bytes-on-disk layout
     // (`<dir>/zig`) users can `ls` is unchanged.
     //
-    // The user-installed zig at `zig_install_path` (the dev-machine
-    // fallback) is unchanged and remains the no-payload / materialize-
-    // failure path. Default `/home/lex/.local/zag` matches the
-    // pre-Phase-2 hardcode so an unoption'd build behaves identically.
+    // The default is computed by `defaultZInstall` from the build-
+    // time env so any developer can run `zig build` on a fresh
+    // checkout without passing `-Dz_install` (the prior hardcoded
+    // `/home/lex/.local/zag` only worked on the original author's
+    // machine, breaking anyone else's first build). Order mirrors
+    // the runtime priority chain in `src/env_path.zig`'s
+    // `resolveZagCacheDir`: $ZAG_HOME > $XDG_CACHE_HOME/zag >
+    // $HOME/.cache/zag > /tmp/zag-cache.
     // -------------------------------------------------------------------
     // Phase 3 (delivered): the runtime in `src/main.zig` (and its
     // mirror in `tests/smoke.zig`'s `resolveZagCacheDir`) consults
     // `$ZAG_HOME` > `$XDG_CACHE_HOME/zag` > `$HOME/.cache/zag`
-    // BEFORE this build-time default. This `-Dz_install` only acts
-    // as the no-env fallback (e.g. when running on a stripped CI
-    // container, or for projects that pin the cache to a non-
-    // standard path). See `src/env_path.zig`'s `resolveZagCacheDir`
+    // AT RUNTIME, superseding this build-time default. The runtime
+    // env resolution wins when `$ZAG_HOME` is set; this build-time
+    // default acts as the no-env fallback (e.g. when running on a
+    // stripped CI container, or for projects that pin the cache to a
+    // non-standard path). See `src/env_path.zig`'s `resolveZagCacheDir`
     // for the full priority chain and reasoning.
     // -------------------------------------------------------------------
     const z_install_path = b.option(
         []const u8,
         "z_install",
-        "Path to the zag-managed zig cache directory (default: /home/lex/.local/zag)",
-    ) orelse "/home/lex/.local/zag";
+        "Path to the zag-managed zig cache directory (default: $ZAG_HOME > $XDG_CACHE_HOME/zag > $HOME/.cache/zag > /tmp/zag-cache)",
+    ) orelse defaultZInstall();
 
     const mod = b.addModule("zag", .{
         .root_source_file = b.path("src/main.zig"),
@@ -234,8 +242,8 @@ pub fn build(b: *std.Build) void {
     // module reads. Without this, smoke's `materialize_default` would
     // diverge from main's `zag_cache_zig_path` under any non-default
     // `-Dz_install=<dir>` -- the produced zag binary writes to
-    // `<dir>/zig` while smoke's check stays hardcoded at
-    // `/home/lex/.local/zag/zig/zig`, breaking Step 4 + Step 6 of
+    // `<dir>/zig` while a hardcoded smoke check would stay pointing
+    // at any obsolete install default, breaking Step 4 + Step 6 of
     // the assertion pipeline. Sharing the same `options` instance
     // keeps the smoke binary coherent with the main binary at compile
     // time (one fewer invariant to keep in sync across phases).
@@ -498,6 +506,56 @@ pub fn build(b: *std.Build) void {
     const run_runtime_smoke = b.addRunArtifact(runtime_smoke_exe);
     const runtime_smoke_step = b.step("runtime_smoke", "Runtime smoke for trait vtable dispatch -- spawns `./zig-out/bin/zag run <example>` per trait example and asserts stdout matches the pre-captured runtime output (opt-in like e2e)");
     runtime_smoke_step.dependOn(&run_runtime_smoke.step);
+}
+
+/// Compute the default `-Dz_install` value at build-config time by
+/// mirroring the runtime priority chain in `src/env_path.zig`'s
+/// `resolveZagCacheDir`. Each tier reads at compile time via
+/// `std.posix.getenv` -- the verified-working env-read surface in
+/// this codebase (this is the first build-time env read in
+/// build.zig, so we deliberately avoid `std.process.getEnvVarOwned`
+/// whose zig 0.16 shape has not been empirically verified here).
+///
+/// Returns `[]const u8` either an arena-copied env value or a
+/// literal fallback string; lifetime is the build-arena's, which
+/// spans the full build process -- the caller stores the slice
+/// verbatim into `build_options.z_install`.
+///
+/// Priority chain (matches runtime `resolveZagCacheDir` exactly):
+///   1. $ZAG_HOME verbatim          -- explicit user override
+///   2. $XDG_CACHE_HOME/zag         -- freedesktop.org cache convention
+///   3. $HOME/.cache/zag            -- POSIX $HOME fallback
+///   4. `/tmp/zag-cache` literal    -- stripped-CI safety net
+///
+/// The literal fallback is only reached on a fully-stripped CI
+/// container with no $HOME / $XDG_CACHE_HOME / $ZAG_HOME -- main.zig's
+/// runtime `<dir>/zig` materialize dir still has a writable cache
+/// in that case because runtime-and-build resolve to the same path.
+fn defaultZInstall() []const u8 {
+    // Build-time env reads via std.c.getenv (libc shim). Returns
+    // `?[*:0]u8` -- a sentinel-terminated pointer into libc-managed
+    // env storage -- coerced via std.mem.span into []const u8.
+    // Zero-copy (no allocator dance), matching the verified
+    // pointer-to-span idiom in src/env_path.zig line 115
+    // (`std.mem.span(entry_ptr)`). The build host is zig itself,
+    // a regular Linux executable that links against libc, so
+    // std.c bindings are available without explicit -lc directives.
+    //
+    // Priority chain (mirrors runtime env_path.zig's resolveZagCacheDir):
+    //   1. $ZAG_HOME verbatim (zero-copy libc pointer)
+    //   2. $XDG_CACHE_HOME/zag (one allocPrint, freedesktop convention)
+    //   3. $HOME/.cache/zag (one allocPrint, POSIX $HOME fallback)
+    //   4. FALLBACK_ZINSTALL literal (stripped-CI safety net)
+    if (std.c.getenv("ZAG_HOME")) |ptr| return std.mem.span(@ptrCast(ptr));
+    if (std.c.getenv("XDG_CACHE_HOME")) |ptr| {
+        const xdg = std.mem.span(@ptrCast(ptr));
+        return std.fmt.allocPrint(std.heap.page_allocator, "{s}/zag", .{xdg}) catch FALLBACK_ZINSTALL;
+    }
+    if (std.c.getenv("HOME")) |ptr| {
+        const home = std.mem.span(@ptrCast(ptr));
+        return std.fmt.allocPrint(std.heap.page_allocator, "{s}/.cache/zag", .{home}) catch FALLBACK_ZINSTALL;
+    }
+    return FALLBACK_ZINSTALL;
 }
 
 /// openat(2) probe to detect `vendor/zig/zig` (or
