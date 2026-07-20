@@ -179,6 +179,23 @@ pub const Codegen = struct {
     /// surface won't realistically list more than 8 traits on a
     /// single `impl Type with ...` block.
     trait_binding_buf: [8][]const u8 = undefined,
+    /// v1.6 byte-slice member_access widening: read by
+    /// `genPrintCall`'s else arm + `genTemplateLit`'s interpolation
+    /// slot to widen the format spec from `{any}` to `{s}` when
+    /// the user writes `print(self.byte_slice_field)` inside an
+    /// impl-block method body. Set by `genFreeMethod`
+    /// (target_type-driven orphan emit) and by `genStructDecl`'s +
+    /// `genEnumDecl`'s nested-method loops (each pass sets
+    /// `impl.target_type` BEFORE calling `genMethod`). Reset to
+    /// null at top of `genFun` (top-level `pub fun` declarations
+    /// don't have a method receiver). The reason we don't reuse
+    /// `type_info_buf` (the existing per-fn let-binding map):
+    /// method receivers (`self: *Button`) are NOT `let` bindings
+    /// — they're function parameters — so they never populate
+    /// `type_info_buf`. A separate `?[]const u8` field keeps the
+    /// let-binding invariant clean and the per-body "what struct
+    /// am I receiving" lookup cost-free (no map scan).
+    current_receiver_struct_name: ?[]const u8 = null,
 
 /// One entry in `Codegen.variant_fields_buf` (gap #2 fix). Carries
 /// the (enum_name, variant_name) key + the user's actual field names
@@ -331,6 +348,10 @@ pub const VariantFieldsEntry = struct {
             // scaffold tests in the same process) starts fresh.
             .variant_fields_buf = undefined,
             .variant_fields_count = 0,
+            // v1.6 byte-slice widening: init-time null per the
+            // genFun-resets-at-body-entry contract (see the field's
+            // docblock above).
+            .current_receiver_struct_name = null,
             // `prog` is set by `generate()` immediately on entry
             // (see the `self.prog = &prog;` line at the top of
             // `generate`). Leaving it undefined here is intentional

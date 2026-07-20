@@ -81,7 +81,107 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     // any future widening (e.g. mutable `[]u8` byte-slice,
     // `[*]const u8` many-ptr) lands here once and both sites
     // automatically benefit.
-    pub fn typeAwareFmtSpec(self: *Codegen, ident_name: []const u8) struct { spec: []const u8, is_optional_byte_slice: bool } {
+    // Named return-type alias shared between
+    // `typeAwareFmtSpec` (.ident-widening) and its v1.6 sibling
+    // `typeAwareFmtSpecFromExpr` (.member_access widening). Both
+    // helpers previously returned an anonymous struct literal
+    // `struct { spec, is_optional_byte_slice }` which zig treats
+    // as distinct types PER function — calling `typeAwareFmtSpec`
+    // from inside `typeAwareFmtSpecFromExpr`'s `.ident` arm produces
+    // an `expected type X, found Y` compile error even when
+    // structurally identical. Sharing the named alias makes the
+    // two helpers return-type compatible.
+    pub const FmtSpec = struct {
+        spec: []const u8,
+        is_optional_byte_slice: bool,
+    };
+    // v1.6 byte-slice widening, member-access sibling helper
+    // (gap-closure over gap #6's `.ident`-only widening). When the
+    // expr is `.member_access { target: &.ident(X), name: Y }` and
+    // we're emitting an impl-block method body whose receiver is an
+    // instance of struct X, look up the `Y` field on `X`'s decl via
+    // `self.prog.structs` and check whether its type (after
+    // `zagTypeToZig` rewrite) is a byte-slice family
+    // (`[]const u8` or `str` alias). If yes, return the same
+    // `{s}` widening as the typed-binding path does for `.ident`
+    // args. If no (e.g. field is `i32`, or `X` has no field `Y`,
+    // or we're not in a method body), fall through to
+    // `{any}` so the LHS still gets the codegen-tested
+    // byte-deferred formatter that zig renders correctly for
+    // scalars/structs.
+    //
+    // Returning a struct {spec, is_optional_byte_slice} (rather
+    // than mutating shared scratch fields) lets BOTH call sites
+    // (`genPrintCall` else arm + `genTemplateLit` interpolation
+    // slot) consume the result byte-for-byte in lockstep with the
+    // `.ident` branch's `typeAwareFmtSpec(self, ident_name)` call.
+    // The widening triggers on EITHER:
+    //   (1) leading-`?` optional annotation on `Y`'s type_text —
+    //       `is_optional_byte_slice = true` → caller appends
+    //       `orelse \"\"` so zig's strictly-typed `{s}` formatter
+    //       accepts the rewritten non-optional slice;
+    //   (2) leading-`*` pointer-annotation (`*[]const u8`) — out of
+    //       scope for v1 widening (no deref-then-orelse codegen).
+    //       Surfaced as `{any}` so we don't emit `{s}` against a
+    //       `*[]const u8` arg that zig would reject at the call
+    //       site.
+    //
+    // Identifier-name heuristic: the user wrote `print(self.label)`
+    // because the receiver param is conventionally named `self`.
+    // If a user invents a non-`self` receiver (`print(this.x)` in an
+    // `impl Foo { fun bar(this: *Foo) { ... } }` body), we still
+    // accept `this` as the receiver because the helper is gated on
+    // `current_receiver_struct_name` (the STRUCT), not on `self`
+    // (the IDENT). The receiver ident's name doesn't matter — only
+    // the receiver struct type does. This preserves the user-facing
+    // freedom to call their receiver pointees whatever they want.
+    pub fn typeAwareFmtSpecFromExpr(self: *Codegen, expr: ast.Expr) FmtSpec {
+        if (expr == .ident) {
+            return typeAwareFmtSpec(self, expr.ident);
+        }
+        if (expr == .member_access) {
+            const recv_name_opt = self.current_receiver_struct_name;
+            if (recv_name_opt == null) return .{ .spec = "any", .is_optional_byte_slice = false };
+            const recv_name = recv_name_opt.?;
+            const ma = expr.member_access;
+            if (ma.target.* != .ident) return .{ .spec = "any", .is_optional_byte_slice = false };
+            // We do NOT gate the field walk on the receiver IDENT
+            // text (`self`/`this`/`me`/etc.) because the STRUCT
+            // name match is the only correctness predicate. The
+            // struct-name uniqueness in zag (each struct gets one
+            // decl, fields are flat and uniquely named inside it)
+            // makes the receiver-struct match definitive.
+            for (self.prog.structs) |sd| {
+                if (!std.mem.eql(u8, sd.name, recv_name)) continue;
+                for (sd.fields) |f| {
+                    if (f.kind != .named) continue;
+                    if (!std.mem.eql(u8, f.kind.named.name, ma.name)) continue;
+                    const tt = f.kind.named.type_text;
+                    const rewritten = zagTypeToZig(tt);
+                    if (tt.len > 0 and tt[0] != '*' and
+                        std.mem.indexOf(u8, rewritten, "[]const u8") != null)
+                    {
+                        return .{
+                            .spec = "s",
+                            .is_optional_byte_slice = tt.len > 0 and tt[0] == '?',
+                        };
+                    }
+                    // Field exists but isn't a byte-slice family.
+                    // Fall through to `{any}` rather than returning
+                    // here — a wider struct-walk could also find a
+                    // DIFFERENT struct with a matching field name
+                    // and a byte-slice type. In practice the user's
+                    // struct's field declaration is definitive, so
+                    // the early-return on first match above is fine.
+                    return .{ .spec = "any", .is_optional_byte_slice = false };
+                }
+            }
+            return .{ .spec = "any", .is_optional_byte_slice = false };
+        }
+        return .{ .spec = "any", .is_optional_byte_slice = false };
+    }
+
+    pub fn typeAwareFmtSpec(self: *Codegen, ident_name: []const u8) FmtSpec {
         var i: u32 = 0;
         while (i < self.type_info_count) : (i += 1) {
             if (std.mem.eql(u8, self.type_info_buf[i].name, ident_name)) {
@@ -348,18 +448,21 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // once for both surfaces.
                 var format_spec: []const u8 = "any";
                 var is_optional_byte_slice = false;
-                if (arg == .ident) {
-                    // Free-fn call (no `self.foo(a)` form) — the
-                    // `typeAwareFmtSpec` helper is defined in this
-                    // file's scope, so file-scope lookup resolves
-                    // without a Codegen-struct re-export. Renamed
-                    // from `t` → `info` to avoid shadowing
-                    // `genTemplateLit's outer parameter (also named
-                    // `t`).
-                    const info = typeAwareFmtSpec(self, arg.ident);
-                    format_spec = info.spec;
-                    is_optional_byte_slice = info.is_optional_byte_slice;
-                }
+                // v1.6 byte-slice widening, gap-closure: route
+                // through `typeAwareFmtSpecFromExpr` so
+                // `.member_access` args (`self.label` /
+                // `this.byte_slice_field` etc.) widen to `{s}`
+                // when the field on the current method's
+                // receiver struct is a byte-slice family. The
+                // `.ident` arm keeps its existing behaviour
+                // unchanged (delegate to `typeAwareFmtSpec`).
+                // No `== .ident` gate here — fire on every
+                // shape so captures from non-current-receiver
+                // contexts still resolve through the helper's
+                // fallback-to-`{any}` path.
+                const info = typeAwareFmtSpecFromExpr(self, arg);
+                format_spec = info.spec;
+                is_optional_byte_slice = info.is_optional_byte_slice;
                 self.write("__zag_print(\"{");
                 self.write(format_spec);
                 self.write("}\", .{");
@@ -674,15 +777,17 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // the helper's docblock above.
                 var format_spec: []const u8 = "any";
                 var is_optional_byte_slice = false;
-                if (expr == .ident) {
-                    // Free-fn call (matching genPrintCall arm):
-                    // locals named `info` rather than `t` to avoid
-                    // shadowing `genTemplateLit's outer parameter
-                    // (also named `t`).
-                    const info = typeAwareFmtSpec(self, expr.ident);
-                    format_spec = info.spec;
-                    is_optional_byte_slice = info.is_optional_byte_slice;
-                }
+                // v1.6 byte-slice widening, gap-closure: identical
+                // to the genPrintCall else arm above — route
+                // through `typeAwareFmtSpecFromExpr` so
+                // `.member_access` interpolation args widen to
+                // `{s}` when the accessed field is a byte-slice.
+                // The fmt_buf append here mirrors the existing
+                // brace-wrapping pattern (`{` + spec + optional
+                // `:` + spec + `}`).
+                const info = typeAwareFmtSpecFromExpr(self, expr);
+                format_spec = info.spec;
+                is_optional_byte_slice = info.is_optional_byte_slice;
                 if (fmt_len + 1 + format_spec.len + (if (part.spec) |spec| 1 + spec.len else 0) + 1 <= fmt_buf.len) {
                     fmt_buf[fmt_len] = '{';
                     fmt_len += 1;

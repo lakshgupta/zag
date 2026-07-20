@@ -429,17 +429,124 @@ test "codegen: closure emit shapes anonymous struct with call method" {
     // as the closure-literal test above.
     try std.testing.expect(std.mem.indexOf(u8, zig, "(struct { pub fn call(_: @This(), x: i32) i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "return (x * 2);") != null);
+}test "codegen: closure-typed call site rewrites double(5) to double.call(5)" {
+	const src = "fun main() {\n    let double = |x: i32| -> i32 { return x * 2; };\n    let result = double(5);\n    print(\"{result}\\n\");\n}\n";
+	var l = lexer_mod.Lexer.init(src);
+	const tokens = l.tokenize();
+	var arena = ast.Arena.init();
+	var p = parser_mod.Parser.init(tokens, &arena);
+	const prog = p.parse();
+	var cg = codegen_mod.Codegen.init();
+	const zig = cg.generate(prog);
+	try std.testing.expect(std.mem.indexOf(u8, zig, "double.call(5)") != null);
+	try std.testing.expect(std.mem.indexOf(u8, zig, "double(5)") == null);
 }
 
-test "codegen: closure-typed call site rewrites double(5) to double.call(5)" {
-    const src = "fun main() {\n    let double = |x: i32| -> i32 { return x * 2; };\n    let result = double(5);\n    print(\"{result}\\n\");\n}\n";
-    var l = lexer_mod.Lexer.init(src);
-    const tokens = l.tokenize();
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-    var cg = codegen_mod.Codegen.init();
-    const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "double.call(5)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "double(5)") == null);
+test "codegen: print(self.byte_slice_field) widens to {s} on impl-block member_access" {
+	// v1.6 byte-slice widening, gap-closure over gap #6 .ident-only
+	// widening (per codegen/primary.zig's typeAwareFmtSpecFromExpr
+	// helper). The pre-fix emit `__zag_print("{any}", .{self.label,})`
+	// round-tripped as a byte-element list `{ 104, 101, ... }` at
+	// runtime, breaking `examples/traits/canonical_with.zag`'s
+	// expected stdout. The widening now fires because the receiver
+	// (struct Button via `current_receiver_struct_name` setter on
+	// impl-block method entry) has a `label: str` field whose
+	// `zagTypeToZig` rewrite contains `[]const u8`.
+	//
+	// Positive pin: the format spec widens to `{s}`, the args tuple
+	// preserves `self.label` as the bare ident (no `blk: { ... }`
+	// wrap, no manual `.? orelse ""` -- non-optional byte-slice).
+	//
+	// Negative pin: `{any}` for byte-slice fields must NOT appear
+	// (would be the pre-fix regression). A future rework that
+	// silently flips back to `{any}` would surface as a substring
+	// match here, protecting the v1.6 contract.
+	//
+	// MIRRORS `tests/runtime_smoke.zig`'s canonical_with case --
+	// the runtime-level pin is at the canonical_with binary's
+	// stdout; this unit-level pin is at the codegen-emit shape.
+	// Both are required: runtime protects end-to-end correctness,
+	// codegen protects future-refactor safety.
+	const src =
+		\\struct Button { label: str, }
+		\\impl Button {
+		\\    pub fun show(self: *Button) {
+		\\        print(self.label);
+		\\    }
+		\\}
+		\\
+	;
+	var l = lexer_mod.Lexer.init(src);
+	const tokens = l.tokenize();
+	var arena = ast.Arena.init();
+	var p = parser_mod.Parser.init(tokens, &arena);
+	const prog = p.parse();
+	var cg = codegen_mod.Codegen.init();
+	const zig = cg.generate(prog);
+	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{s}\", .{self.label,})") != null);
+	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{self.label,})") == null);
 }
+
+test "codegen: print(self.i32_field) stays at {any} on impl-block member_access" {
+	// Negative counterpart: when the field's type is NOT a byte-slice
+	// family (i32 in this case), the widening must NOT fire. This
+	// protects against false-positive widenings in impl-block
+	// methods where `print(self.x)` could silently flip from
+	// `{any}` to `{s}` (and zig would reject `i32` against the
+	// strictly-typed `{s}` formatter).
+	const src =
+		\\struct Box { count: i32, }
+		\\impl Box {
+		\\    pub fun show(self: *Box) {
+		\\        print(self.count);
+		\\    }
+		\\}
+		\\
+	;
+	var l = lexer_mod.Lexer.init(src);
+	const tokens = l.tokenize();
+	var arena = ast.Arena.init();
+	var p = parser_mod.Parser.init(tokens, &arena);
+	const prog = p.parse();
+	var cg = codegen_mod.Codegen.init();
+	const zig = cg.generate(prog);
+	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{self.count,})") != null);
+	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{s}\", .{self.count,})") == null);
+}
+
+test "codegen: print(label) for non-method body stays at {any}" {
+	// Cross-fn leak guard: after an impl-block method body emit
+	// ends, `current_receiver_struct_name` is reset to null so a
+	// subsequent top-level `pub fun` declaration does NOT inherit
+	// the prior impl's receiver. The `label` ident here would
+	// resolve as a free binding with no struct context, so the
+	// {any} fallback applies (no widening). This test pins the
+	// genFun body-entry reset path.
+	const src =
+		\\struct Box { label: str, }
+		\\impl Box {
+		\\    pub fun show(self: *Box) {
+		\\        print(self.label);
+		\\    }
+		\\}
+		\\fun main() {
+		\\    print(label);
+		\\}
+		\\
+	;
+	var l = lexer_mod.Lexer.init(src);
+	const tokens = l.tokenize();
+	var arena = ast.Arena.init();
+	var p = parser_mod.Parser.init(tokens, &arena);
+	const prog = p.parse();
+	var cg = codegen_mod.Codegen.init();
+	const zig = cg.generate(prog);
+	// First, the impl-block pattern DOES widen (positive pin from
+	// the previous test, reproduced inline for context here):
+	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{s}\", .{self.label,})") != null);
+	// Second, the top-level `print(label)` line stays at {any}
+	// because no current-receiver context carries over into main.
+	// We pin `__zag_print("{any}", .{label,})` substring:
+	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{label,})") != null);
+}
+

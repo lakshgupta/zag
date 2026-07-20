@@ -174,6 +174,13 @@ const Codegen = core.Codegen;
         // its emit is a single inline statement with no temp names.
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
+        // v1.6 byte-slice widening: set the per-body method-receiver
+        // struct-name so `print(self.byte_slice_field)` widens the
+        // format spec to `{s}` (per typeAwareFmtSpecFromExpr in
+        // src/codegen/primary.zig). Reset on next genFun body entry
+        // or on the next non-impl member set, so subsequent fns /
+        // orphans don't inherit this impl's receiver by mistake.
+        self.current_receiver_struct_name = target_type;
         // Trait-bounds guards (docs/16 §3) — mirrors genFun's body
         // entry so unresolved impl-block generic bounds surface
         // as a zag compile-error at the user's source-line.
@@ -198,6 +205,13 @@ const Codegen = core.Codegen;
         }
         for (m.body) |s| self.collectTypedBindings(s);
         for (m.body, 0..) |s, i| self.genStmt(s, self.fn_returns_value and i == m.body.len - 1);
+        // Reset ONLY the receiver-tracking field at body end —
+        // `fn_returns_value` is set per-body by every genFun/
+        // genMethod/genFreeMethod entry, so an explicit reset
+        // would be redundant (and was previously rejected by the
+        // code-reviewer as a stray copy-paste — left as a comment
+        // here so future drive-by cleanups don't reintroduce it).
+        self.current_receiver_struct_name = null;
         self.write("}\n");
     }
 
@@ -302,10 +316,16 @@ const Codegen = core.Codegen;
                     // matching vtable registration. Regular-type-method
                     // path (c) emits nested here.
                     if (self.resolveTraitBinding(&impl, m) != null) continue;
+                    // v1.6 byte-slice widening: set receiver-struct
+                    // before emitting the nested method body so
+                    // `print(self.byte_slice_field)` widens correctly.
+                    // Mirrors genFreeMethod's setting.
+                    self.current_receiver_struct_name = impl.target_type;
                     // Phase 2 tail: thread impl-level type_params so the
                     // nested method emits `comptime X: type` BEFORE its
                     // own params. Mirrors genFreeMethod's call update.
                     self.genMethod(m, impl.type_params);
+                    self.current_receiver_struct_name = null;
                 }
             }
         }
@@ -1049,11 +1069,17 @@ const Codegen = core.Codegen;
                     // emit so the trait-handling pass in `generate`
                     // emits the renamed free fn + vtable registration.
                     if (self.resolveTraitBinding(&impl, m) != null) continue;
+                    // v1.6 byte-slice widening: set receiver-struct
+                    // before emitting the nested method body so
+                    // `print(self.byte_slice_field)` widens correctly.
+                    // Mirror of genStructDecl's setting.
+                    self.current_receiver_struct_name = impl.target_type;
                     // Phase 2 tail: thread impl-level type_params so
                     // the nested-on-enum method emits `comptime X:
                     // type` BEFORE its own params. Same path as
                     // genStructDecl.
                     self.genMethod(m, impl.type_params);
+                    self.current_receiver_struct_name = null;
                 }
             }
         }
@@ -1071,6 +1097,14 @@ const Codegen = core.Codegen;
         // happens — the predicates need to see this map when each
         // binary/literal expression hits the `.binary` arm.
         self.type_info_count = 0;
+        // v1.6 byte-slice widening: top-level `pub fun` declarations
+        // have no method receiver. Reset to null so any stale value
+        // from a previous impl-block method body doesn't carry over
+        // into a regular fn body (which would over-widen to `{s}` on
+        // first print, e.g. a `print(self.foo)` written inside `fun
+        // main` would resolve against the most-recent impl's
+        // receiver even though there's no `self` in main).
+        self.current_receiver_struct_name = null;
         // Reset the `new`-temp counter at the top of each function so
         // sibling `pub fn` declarations don't reuse the same `__p_<N>`
         // names (zig's redeclaration-error would reject a collision).

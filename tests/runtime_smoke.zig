@@ -100,34 +100,43 @@ const cases = [_]TestCase{
     .{
         .name = "canonical_with: Drawable dispatch fires",
         .example = "examples/traits/canonical_with.zag",
-        // `button: { 99, 108, 105, 99, 107, 32, 109, 101 }` -- bytes
-        // for "click me" round-tripped through the trait dispatch
-        // site `d.draw<Button>()` and the `{any}` byte-deferred
-        // formatter.
+        // v1.6 byte-slice widening: zig's `{any}` formatter used to
+        // dump byte elements `{ 99, 108, ... }` here, but the v1.6
+        // member_access widening (codegen/primary.zig's
+        // typeAwareFmtSpecFromExpr helper) routes `self.label` (a
+        // `label: str` field) through zig's `{s}` formatter, which
+        // prints the slice as its string contents. The expected
+        // stdout is now the human-readable string instead of the
+        // byte-deferred `{ 99, 108, ... }` list.
         .expected =
-            "button: { 99, 108, 105, 99, 107, 32, 109, 101 }\n",
+            "button: click me\n",
     },
     .{
         .name = "multi_trait: Drawable + Clickable dispatch independently",
         .example = "examples/traits/multi_trait.zag",
-        // `draw: { 111, 107 }` (\"ok\") + newline + `click: { 111, 107 }`
-        // + newline. Confirms BOTH trait vtables fire the same
-        // body and the bytes reach stdout intact.
+        // Both `draw` and `click` print `self.label` (a `str` field).
+        // v1.6 widening emits `{s}` for both call sites so the
+        // expected stdout is `draw: ok` + newline + `click: ok` +
+        // newline (instead of the legacy byte-deferred
+        // `draw: { 111, 107 }` form). Confirms BOTH trait vtables
+        // fire the same body and the bytes reach stdout intact.
         .expected =
-            "draw: { 111, 107 }\n" ++
-            "click: { 111, 107 }\n",
+            "draw: ok\n" ++
+            "click: ok\n",
     },
     .{
         .name = "diamond_distinct: trait-name-keyed vtable pick",
         .example = "examples/traits/diamond_distinct.zag",
         // Display's `print` wraps the value in `<span>...</span>`;
         // Show's `render` wraps nothing. Two different vtable slots,
-        // two different bodies, same input byte sequence ("ok" = { 111,
-        // 107 }). Confirms trait-name-keyed dispatch picks the right
-        // one for each call.
+        // two different bodies, same input value ("ok"). v1.6
+        // widening routes `self.label` through `{s}` for the raw
+        // render AND for the HTML-escaped print, so the expected
+        // stdout is `<span>ok</span>` + newline + `ok` + newline
+        // (instead of the byte-deferred form).
         .expected =
-            "<span>{ 111, 107 }</span>\n" ++
-            "{ 111, 107 }\n",
+            "<span>ok</span>\n" ++
+            "ok\n",
     },
 };
 
