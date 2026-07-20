@@ -25,6 +25,17 @@ const build_options = @import("build_options");
 
 var zig_install_path: []const u8 = "";
 
+/// Materialized location of the embedded zig payload (when the
+/// `zag` binary was built with `-Dzig_payload=<path>`). Captured
+/// ONCE at startup inside `main`; consulted by `resolveZigPath`
+/// as the lowest-priority fallback (per
+/// `docs/manual/35-zag-toml-schema.md` §[toolchain]: project toml
+/// > `$ZAG_ZIG_PATH` > embedded). Empty when no payload was
+/// embedded at build time, in which case `resolveZigPath` returns
+/// with `zig_install_path` empty and the dispatched cmd exits via
+/// `needZig()`.
+var embedded_zig_path: []const u8 = "";
+
 pub fn main() !void {
     env_path.readEnviron();
 
@@ -66,13 +77,17 @@ pub fn main() !void {
             var magic: [4]u8 = undefined;
             const n = std.os.linux.read(f, &magic, magic.len);
             if (n == 4 and magic[0] == 0x7f and magic[1] == 'E' and magic[2] == 'L' and magic[3] == 'F') {
-                zig_install_path = dest_buf[0..dl];
+                embedded_zig_path = dest_buf[0..dl];
             }
         }
     }
-    if (env_path.getenv("ZAG_ZIG_PATH")) |zp| {
-        zig_install_path = zp;
-    }
+    // Per-cmd zig path resolution happens INSIDE the dispatched
+    // fn (cmdRun / cmdBuild / cmdCheck / cmdTest) via the
+    // `resolveZigPath` helper. The priority chain
+    // (`[toolchain].zig` > `$ZAG_ZIG_PATH` > embedded) is computed
+    // fresh per invocation so a project-mode dispatch can apply
+    // its `cfg.zig_path` override before falling back to env /
+    // embedded. See `resolveZigPath` below for the full chain.
     const args = try parseArgs();
 
     if (args.len >= 2 and std.mem.startsWith(u8, args[1], "--leaf-process=")) {
@@ -105,18 +120,19 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "run")) {
-        if (zig_install_path.len == 0) return needZig();
         return try cmdRun(args);
     }
     if (std.mem.eql(u8, cmd, "build")) {
-        if (zig_install_path.len == 0) return needZig();
         return try cmdBuild(args);
     }
     if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "test")) {
-        if (zig_install_path.len == 0) return needZig();
         if (args.len >= 3 and hasZagExt(args[2])) {
+            resolveZigPath(null);
+            if (zig_install_path.len == 0) return needZig();
             try leafProcess(cmd, args[2], null, &.{});
         } else if (try project_mod.detectProject("")) |cfg| {
+            resolveZigPath(cfg);
+            if (zig_install_path.len == 0) return needZig();
             try projectCmd(cmd, cfg, &.{});
         } else {
             std.debug.print("error: missing file argument\n\n", .{});
@@ -159,8 +175,12 @@ fn cmdRun(args: []const []const u8) !void {
     };
 
     if (zag_file) |file| {
+        resolveZigPath(null);
+        if (zig_install_path.len == 0) return needZig();
         try leafProcess("run", file, null, extra_args);
     } else if (try project_mod.detectProject("")) |cfg| {
+        resolveZigPath(cfg);
+        if (zig_install_path.len == 0) return needZig();
         try projectCmd("run", cfg, extra_args);
     } else {
         std.debug.print("error: missing file argument. Provide a .zag file or run from a project directory.\n\n", .{});
@@ -192,8 +212,12 @@ fn cmdBuild(args: []const []const u8) !void {
 
     if (file_arg) |file| {
         const out = output_path orelse file[0..file.len - ".zag".len];
+        resolveZigPath(null);
+        if (zig_install_path.len == 0) return needZig();
         try leafProcess("build", file, out, &.{});
     } else if (try project_mod.detectProject("")) |cfg| {
+        resolveZigPath(cfg);
+        if (zig_install_path.len == 0) return needZig();
         try projectCmd("build", cfg, &.{});
     } else {
         std.debug.print("error: missing file argument. Provide a .zag file or run from a project directory.\n\n", .{});
@@ -253,6 +277,56 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     }
 }
 
+/// Resolve the zig compiler binary path that the current
+/// invocation will use, applying the project's `[toolchain].zig`
+/// override at highest priority and falling back through the env
+/// var to the embedded payload in that order. Mirrors
+/// `docs/manual/35-zag-toml-schema.md` §[toolchain]:
+///   1. `[toolchain].zig` from `cfg.zig_path` (project-specific file)
+///   2. `$ZAG_ZIG_PATH` env var                              (machine-wide)
+///   3. `embedded_zig_path` from `-Dzig_payload=...`        (compile-time)
+///
+/// Called from each cmd-branch that uses zig (cmdRun / cmdBuild /
+/// cmdCheck / cmdTest / leafProcess's `check`-via-file flow) AFTER
+/// the file-vs-project dispatch is decided. File-mode callers pass
+/// `null` so the toml branch is skipped. Empty `cfg.zig_path`
+/// falls through to the env branch which falls through to the
+/// embedded fallback.
+///
+/// On success, `zig_install_path` is populated with the chosen
+/// path; callers guard with
+/// `if (zig_install_path.len == 0) return needZig();` to handle
+/// the all-three-empty case (build without `-Dzig_payload` AND no
+/// `$ZAG_ZIG_PATH` AND no `zag.toml` -- typical cross-distro
+/// installs that expect a per-machine zig binary).
+fn resolveZigPath(cfg: ?project_mod.ProjectConfig) void {
+    // 1. Project-level override (highest priority). A user-set
+    //    `[toolchain].zig` in the current project's `zag.toml`
+    //    wins regardless of any env-var override -- this matches
+    //    Cargo's `[source.crates-io]` > `CARGO_REGISTRIES_*`
+    //    ordering and rustup's `rust-toolchain.toml` > `RUSTUP_TOOLCHAIN`
+    //    ordering: project-contextual config beats machine-wide env.
+    if (cfg) |c| {
+        if (c.zig_path) |zp| {
+            zig_install_path = zp;
+            return;
+        }
+    }
+    // 2. Machine-wide env override.
+    if (env_path.getenv("ZAG_ZIG_PATH")) |zp| {
+        zig_install_path = zp;
+        return;
+    }
+    // 3. Embedded payload (lowest priority). Populated at startup
+    //    via `toolchain.materializeZigToCache` against
+    //    `build_options.zig_payload` -- only present when the
+    //    compiler binary was built with `-Dzig_payload=<path>`.
+    if (embedded_zig_path.len > 0) {
+        zig_install_path = embedded_zig_path;
+        return;
+    }
+}
+
 fn srcPath(root: []const u8, sub: []const u8) []const u8 {
     _ = root;
     return sub;
@@ -263,7 +337,25 @@ fn hasZagExt(name: []const u8) bool {
 }
 
 fn needZig() noreturn {
-    std.debug.print("error: zig compiler not found. Set ZAG_ZIG_PATH to the zig binary path, or build with -Dzig_payload=<path> to embed a zig compiler.\n", .{});
+    // Tri-clause help line: enumerate the three resolution tiers
+    // the user can configure so the failure path itself is
+    // discoverability for the v2.1 `[toolchain].zig` project-level
+    // override. The priority chain order (toml > env > embedded)
+    // matches the docs/manual/35-zag-toml-schema.md §[toolchain]
+    // description.
+    //
+    // Multi-line literal (zig 0.16 `\\` raw-string syntax) sidesteps
+    // the `++` operator requirements (must be at comptime on
+    // `*const u8` literals) and gives one self-contained
+    // print-and-exit call site.
+    std.debug.print(
+        \\error: zig compiler not found.
+        \\  resolution order (each tier may hold the answer):
+        \\    1. project-level: `[toolchain] zig = "..."` in zag.toml
+        \\    2. machine-wide:  $ZAG_ZIG_PATH=/path/to/zig
+        \\    3. compiled-in:   build zag with -Dzig_payload=<path>
+        \\
+    , .{});
     std.process.exit(1);
 }
 
