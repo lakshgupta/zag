@@ -76,8 +76,9 @@ pub fn build(b: *std.Build) void {
     // The default is computed by `defaultZInstall` from the build-
     // time env so any developer can run `zig build` on a fresh
     // checkout without passing `-Dz_install` (the prior hardcoded
-    // `/home/lex/.local/zag` only worked on the original author's
-    // machine, breaking anyone else's first build). Order mirrors
+    // `<local-zag>` path only worked on the original author's
+    // machine, breaking anyone else's first build -- exactly the
+    // failure mode this helper rewires). Order mirrors
     // the runtime priority chain in `src/env_path.zig`'s
     // `resolveZagCacheDir`: $ZAG_HOME > $XDG_CACHE_HOME/zag >
     // $HOME/.cache/zag > /tmp/zag-cache.
