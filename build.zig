@@ -98,27 +98,6 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "zig_payload", zig_payload_bytes);
-    // Mirror zig_payload: src/main.zig cannot @embedFile "../lib/cli.zag"
-    // because src/* is a separate zig package in zig 0.16 and
-    // @embedFile cannot escape its package boundary. Instead build.zig,
-    // which IS in the root package, reads lib/cli.zag through its own
-    // @embedFile and routes the bytes through build_options. The
-    // embedded_cli_zag_source const in main.zig reads it back via
-    // `@import("build_options").cli_zag_source`.
-    // Phase 3 cache-invalidation fix: switch from @embedFile to readStubFile
-// so the cli.zag content is read at build-runner execution time rather
-// than baked at build-graph construction. The runtime-read path mutates
-// the Options step hash on every `zig build` invocation, forcing the
-// `build_options` module to rebuild and the zag binary to recompile
-// when lib/cli.zag changes. The previous @embedFile path was
-// missing zig 0.16's dependency tracking for the build-runner's
-// global cache, so changes to lib/cli.zag (e.g. the
-// doc_comment-skip parser fix) didn't invalidate the binary — the
-// runner kept executing with the stale embedded bytes. The
-// readStubFile helper is the same one used for the lib/std/*.zag
-// scaffold-stub embeds (further down in this file) and shares the
-// 64KB scratch buffer + posix.openat + std.os.linux.read surface.
-options.addOption([]const u8, "cli_zag_source", readStubFile(b, "lib/cli.zag"));
     options.addOption([]const u8, "z_install", z_install_path);
     mod.addOptions("build_options", options);
 
