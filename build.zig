@@ -548,7 +548,14 @@ fn readEnvVar(env_bytes: []const u8, key: []const u8, allocator: std.mem.Allocat
         const entry = env_bytes[i..entry_end];
         if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
             if (eq == key.len and std.mem.eql(u8, entry[0..eq], key)) {
-                return allocator.dupe(u8, entry[eq + 1 ..]) catch null;
+                // On dupe failure (vanishingly rare — only fires when the
+                // build-arena can't satisfy a small allocation), fall to
+                // the universal FALLBACK_ZINSTALL rather than returning
+                // null. Returning null would silently cascade to the next
+                // priority tier, incorrectly masking the env value as if
+                // $ZAG_HOME hadn't been set; FALLBACK_ZINSTALL is the
+                // correct universal fallback for any build-config failure.
+                return allocator.dupe(u8, entry[eq + 1 ..]) catch FALLBACK_ZINSTALL;
             }
         }
         i = entry_end + 1;
