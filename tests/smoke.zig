@@ -96,18 +96,10 @@ const zig_install = "./zig-out/bin/zag";
 /// `~/.local/zig/zig` whenever it is present at smoke-time.
 const zig_vendor = "vendor/zig/zig";
 
-/// Dev-machine zig fallback. The historical `src/main.zig`
-/// `zig_install_path` style hardcode; used when no vendored zig is
-/// available (i.e. the smoke is running on a machine where
-/// `install.sh` was never invoked, or where the user's clone
-/// predated the vendoring support).
-const zig_dev_local = "/home/lex/.local/zig/zig";
-
 /// Runtime-resolved zig path. `resolveZigPath` runs at smoke
 /// startup and prefers the vendored zig if present, falling back to
-/// the dev-machine install. The runtime check avoids baking the
-/// wrong path into the smoke binary at compile-time when the user
-/// has installed but also has a legacy dev-machine zig.
+/// `ZAG_ZIG_PATH`. The runtime check avoids baking the
+/// wrong path into the smoke binary at compile-time.
 var zig_path: []const u8 = undefined;
 
 /// Phase 3 mirror of `src/main.zig`'s `zag_cache_dir` +
@@ -126,28 +118,17 @@ var materialize_buf: [4096]u8 = undefined;
 
 /// Pick the runnable zig for the pre-build invocation: vendored (when
 /// install.sh populated `vendor/zig/zig` during a clone-aware install)
-/// first, dev-machine install (`~/.local/zig/zig`) as the legacy
-/// fallback. The vendored path wins because that binary is the one the
-/// user explicitly mirrored -- avoiding a stale dev-machine path can
-/// mask regressions where the user's dev zig is older than the project
-/// floor.
-///
-/// Why openat for the existence check instead of `std.fs.cwd().statFile`:
-/// zig 0.16's sparse `std.fs.*` surface rejected those calls in earlier
-/// rounds. `posix.openat` is the verified-working surface and already
-/// used by `fileExists` elsewhere in this file.
-///
-/// One-line `smoke: zig resolved to ...` diagnostic so a CI failure
-/// with the wrong zig picked (e.g., stale dev-machine fallback after
-/// a fresh clone where vendor/zig/ is unpopulated) is bisectable by
-/// grep without rerunning with extra logging flags attached.
+/// first, then `ZAG_ZIG_PATH` env var.
 fn resolveZigPath() []const u8 {
     if (fileExists(zig_vendor) catch false) {
         std.debug.print("smoke: zig resolved to {s} (vendor)\n", .{zig_vendor});
         return zig_vendor;
     }
-    std.debug.print("smoke: zig resolved to {s} (dev fallback)\n", .{zig_dev_local});
-    return zig_dev_local;
+    if (std.posix.getenv("ZAG_ZIG_PATH")) |zp| {
+        std.debug.print("smoke: zig resolved to {s} (ZAG_ZIG_PATH)\n", .{zp});
+        return zp;
+    }
+    @panic("zag smoke: zig not found. Set ZAG_ZIG_PATH or populate vendor/zig/zig with a real zig binary.");
 }
 
 // `readEnviron` / env-pass arrays / `getenv` / `resolveZagCacheDir`

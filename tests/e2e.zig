@@ -470,31 +470,22 @@ fn scrubImportLines(src: []const u8, dst: *[65536]u8) !usize {
     return dst_i;
 }
 
-/// Mirror `tests/smoke.zig`'s `resolveZigPath` shape: prefer
-/// `vendor/zig/zig` (populated by `scripts/install.sh`) over the
-/// dev-machine fallback at `/home/lex/.local/zig/zig`. Returns a
-/// heap-allocated absolute path the caller frees (mirrors the
-/// smoke-runner's `resolveZigPath` return shape but `dupe[u8]`
-/// here since smoke was `[]const u8` from a file-scope const).
-///
-/// Why ELF-magic check (vs smoke's plain `fileExists`):
-/// this project's `vendor/zig/zig` is a 100-byte STUB placeholder
-/// in some checkout states -- it's +x and exists, but it is NOT
-/// a real zig binary. Plain existence + x-bit check would have
-/// execve-failed in our child (exit 127 -- matches the basher's
-/// first e2e fail). Reading the first 4 bytes and matching the
-/// ELF magic `\x7fELF` is the cheapest reliable gate: rejects
-/// stubs, shell scripts, zero-byte files, and short garbage, all
-/// in one read. Real zig binaries are ~50MB ELF executables.
+/// Resolve zig binary path — prefer vendored zig over `ZAG_ZIG_PATH`.
+/// Uses ELF-magic gate (not plain `fileExists`) because
+/// `vendor/zig/zig` is a 100-byte STUB placeholder in some checkout
+/// states — it is +x and exists, but is NOT a real zig binary.
 fn resolveZigPath(allocator: std.mem.Allocator) ![]u8 {
     const vendor = "vendor/zig/zig";
-    const dev = "/home/lex/.local/zig/zig";
     if (isRunnableZig(vendor)) {
         std.debug.print("e2e: zig resolved to {s} (vendor)\n", .{vendor});
         return try allocator.dupe(u8, vendor);
     }
-    std.debug.print("e2e: zig resolved to {s} (dev fallback)\n", .{dev});
-    return try allocator.dupe(u8, dev);
+    if (std.posix.getenv("ZAG_ZIG_PATH")) |zp| {
+        std.debug.print("e2e: zig resolved to {s} (ZAG_ZIG_PATH)\n", .{zp});
+        return try allocator.dupe(u8, zp);
+    }
+    std.debug.print("e2e: zig not found. Set ZAG_ZIG_PATH or populate vendor/zig/zig with a real zig binary.\n", .{});
+    return error.ZigNotFound;
 }
 
 /// ELF-magic + ELF-header-class + X_OK gate: open `path` for read

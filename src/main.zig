@@ -23,7 +23,7 @@ const project_mod = @import("project.zig");
 const toolchain = @import("toolchain.zig");
 const build_options = @import("build_options");
 
-var zig_install_path: []const u8 = "/home/lex/.local/zig/zig";
+var zig_install_path: []const u8 = "";
 
 pub fn main() !void {
     env_path.readEnviron();
@@ -31,11 +31,10 @@ pub fn main() !void {
     // Priority chain for locating zig:
     //   1. Embedded zig payload — materialize to cache dir, validate ELF, use it
     //   2. $ZAG_ZIG_PATH env var
-    //   3. Hardcoded dev fallback
+    //   3. Error with a clear message
     if (toolchain.has_payload()) {
         var cache_buf: [4096]u8 = undefined;
         const cache_dir = env_path.resolveZagCacheDir(&cache_buf, build_options.z_install);
-        // Build dest path: <cache_dir>/zig/zig with null terminator for syscalls
         var dest_buf: [4096]u8 = undefined;
         var dl: usize = 0;
         @memcpy(dest_buf[0..cache_dir.len], cache_dir);
@@ -48,7 +47,6 @@ pub fn main() !void {
         @memcpy(dest_buf[dl..][0..zig_bin.len], zig_bin);
         dl += zig_bin.len;
         dest_buf[dl] = 0;
-        // Ensure zig/ subdir exists (null-terminate at the / before zig)
         var sub_buf: [4096]u8 = undefined;
         var sl: usize = 0;
         @memcpy(sub_buf[0..cache_dir.len], cache_dir);
@@ -61,9 +59,6 @@ pub fn main() !void {
         sl += 3;
         sub_buf[sl] = 0;
         _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&sub_buf), 0o755);
-
-        // Materialize; if it succeeds AND the file is a valid ELF
-        // binary (not the 100-byte vendor placeholder), use it.
         toolchain.materializeZigToCache(dest_buf[0..dl]) catch {};
         const fd = posix.openat(posix.AT.FDCWD, dest_buf[0..dl], .{ .ACCMODE = .RDONLY }, 0) catch null;
         if (fd) |f| {
@@ -78,7 +73,6 @@ pub fn main() !void {
     if (env_path.getenv("ZAG_ZIG_PATH")) |zp| {
         zig_install_path = zp;
     }
-
     const args = try parseArgs();
 
     if (args.len >= 2 and std.mem.startsWith(u8, args[1], "--leaf-process=")) {
@@ -111,12 +105,15 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "run")) {
+        if (zig_install_path.len == 0) return needZig();
         return try cmdRun(args);
     }
     if (std.mem.eql(u8, cmd, "build")) {
+        if (zig_install_path.len == 0) return needZig();
         return try cmdBuild(args);
     }
     if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "test")) {
+        if (zig_install_path.len == 0) return needZig();
         if (args.len >= 3 and hasZagExt(args[2])) {
             try leafProcess(cmd, args[2], null, &.{});
         } else if (try project_mod.detectProject("")) |cfg| {
@@ -263,6 +260,11 @@ fn srcPath(root: []const u8, sub: []const u8) []const u8 {
 
 fn hasZagExt(name: []const u8) bool {
     return std.mem.endsWith(u8, name, ".zag");
+}
+
+fn needZig() noreturn {
+    std.debug.print("error: zig compiler not found. Set ZAG_ZIG_PATH to the zig binary path, or build with -Dzig_payload=<path> to embed a zig compiler.\n", .{});
+    std.process.exit(1);
 }
 
 fn usage() void {
