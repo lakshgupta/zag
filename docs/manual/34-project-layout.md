@@ -71,7 +71,7 @@ myproj/
 
 | Path | Required? | Purpose |
 |------|-----------|---------|
-| `zag.toml` | yes | package manifest |
+| `zag.toml` | yes | package manifest (incl. optional `[toolchain].zig` compiler-path override; see [Schema → §toolchain](35-zag-toml-schema.md#toolchain)) |
 | `src/main.zag` | for bin packages | entry point with `fun main()` |
 | `src/lib.zag` | for lib packages | library root |
 | `tests/` | no (recommended) | unit + integration tests |

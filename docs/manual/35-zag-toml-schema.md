@@ -9,6 +9,7 @@ The schema is deliberately decoupled from zig's `build.zig.zon`. `zag build` tra
 ```toml
 [package]            # required
 [project]            # recommended
+[toolchain]          # optional: compiler path override (v2.1+)
 [lib]                # optional (library package)
 [[bin]]              # 0..N binary targets
 [build]              # default build settings
@@ -59,6 +60,36 @@ authors     = ["Lex <e@example.com>"]
 keywords    = ["lock-free", "ring-buffer"]
 categories  = ["data-structures"]
 ```
+
+## `[toolchain]`
+
+Optional. Lets a project pin the zig compiler binary that compiles its sources, overriding machine-wide and compile-time defaults. Today's sole field is `zig`:
+
+| Field  | Type   | Default | Notes                                              |
+|--------|--------|---------|----------------------------------------------------|
+| `zig`  | string | _unset_ | Absolute path to the `zig` binary to invoke       |
+
+```toml
+[toolchain]
+zig = "/opt/zig-0.16/zig"
+```
+
+### Resolution priority chain
+
+`zag` resolves the compiler binary via this three-tier chain; a higher-tier value shadows lower-tier values:
+
+| Tier | Source                                  | Scope                  |
+|------|-----------------------------------------|------------------------|
+| 1    | `[toolchain].zig` from project's `zag.toml` | this project        |
+| 2    | `$ZAG_ZIG_PATH` env var                  | machine-wide         |
+| 3    | Embedded payload (`-Dzig_payload=<path>` at `zag`'s build time) | compile-time vendoring |
+
+The tier order means a project that needs a specific zig (for example, a project pinned to zig 0.13 for ABI-compat with vendored libraries) keeps its setting even when your shell exports `$ZAG_ZIG_PATH` to something different — just like Cargo's `[source.crates-io]` overrides `CARGO_REGISTRIES_*` and rustup's `rust-toolchain.toml` overrides `RUSTUP_TOOLCHAIN`.
+
+The path value is **verbatim** — no shell expansion. If your path lives under `$HOME`, write `$HOME/zig-bin/zig` literally, or set `$ZAG_ZIG_PATH` for a machine-wide alias. The runtime does not pre-flight the path: if the resolved binary is missing or non-executable, the spawned `zig` invocation surfaces its own `execve` error — match the upstream message of `zig build-exe` / `zig run` / `zig test` for debugging. (A future commit may add an upfront stat-and-warn check; today the
+trust-then-fail contract matches `$ZAG_ZIG_PATH`'s behaviour.)
+
+Resolution happens at every `zag run / build / check / test` invocation after the file-vs-project dispatch is decided; in file-mode (no `zag.toml` in scope) tier 1 is skipped and the chain collapses to env > embedded — same as pre-v2.1 behaviour.
 
 ## `[lib]`
 
