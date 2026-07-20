@@ -41,8 +41,8 @@
 // an older zig version. zig 0.16's stdlib has substantially 
 // reorganised:
 //   - `std.ChildProcess` was renamed/split; the replacement 
-//     `std.process.Child` at /home/lex/.local/zig/lib/std/process/
-//     Child.zig requires a new StdIo.pipe-shape spawn config + a
+//     `std.process.Child` at `<local-zig>/lib/std/process/
+//     Child.zig` requires a new StdIo.pipe-shape spawn config + a
 //     new `Io` argument to `wait()` that is not empirically verified
 //     in this codebase today.
 //   - `std.io.fixedBufferStream` is not at its expected path in
@@ -233,7 +233,7 @@ pub fn main() !u8 {
     var out_total: usize = 0;
     while (out_total < out.len) {
         // `std.os.linux.read` expects a many-pointer `[*]u8` (per
-        // its signature at /home/lex/.local/zig/lib/std/os/linux.zig),
+        // its signature at `<local-zig>`/lib/std/os/linux.zig),
         // NOT a single-pointer `*u8`. Zig rejects `&out[out_total]`
         // with "a single pointer cannot cast into a many pointer".
         // The idiomatic shape is `out[out_total..].ptr` -- the slice's

@@ -213,7 +213,7 @@ pub fn main() !u8 {
 ///
 /// zig 0.16's std.posix.ACCMODE is a bit-mask enum that exposes
 /// RDONLY/WRONLY/RDWR but NOT X_OK (per upstream zig install at
-/// /home/lex/.local/zig/lib/std/posix.zig). build.zig's proven
+/// `<local-zig>`/lib/std/posix.zig). build.zig's proven
 /// pattern for binary probing uses RDONLY + handle-the-missing-
 /// fixture upstream; if you can read a file, the perms for a
 /// subsequent execve are reasonable to assume. (If the binary lacks
