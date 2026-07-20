@@ -97,7 +97,7 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "z_install",
         "Path to the zag-managed zig cache directory (default: $ZAG_HOME > $XDG_CACHE_HOME/zag > $HOME/.cache/zag > /tmp/zag-cache)",
-    ) orelse defaultZInstall();
+    ) orelse defaultZInstall(b.allocator);
 
     const mod = b.addModule("zag", .{
         .root_source_file = b.path("src/main.zig"),
@@ -532,29 +532,78 @@ pub fn build(b: *std.Build) void {
 /// container with no $HOME / $XDG_CACHE_HOME / $ZAG_HOME -- main.zig's
 /// runtime `<dir>/zig` materialize dir still has a writable cache
 /// in that case because runtime-and-build resolve to the same path.
-fn defaultZInstall() []const u8 {
-    // Build-time env reads via std.c.getenv (libc shim). Returns
-    // `?[*:0]u8` -- a sentinel-terminated pointer into libc-managed
-    // env storage -- coerced via std.mem.span into []const u8.
-    // Zero-copy (no allocator dance), matching the verified
-    // pointer-to-span idiom in src/env_path.zig line 115
-    // (`std.mem.span(entry_ptr)`). The build host is zig itself,
-    // a regular Linux executable that links against libc, so
-    // std.c bindings are available without explicit -lc directives.
-    //
-    // Priority chain (mirrors runtime env_path.zig's resolveZagCacheDir):
-    //   1. $ZAG_HOME verbatim (zero-copy libc pointer)
-    //   2. $XDG_CACHE_HOME/zag (one allocPrint, freedesktop convention)
-    //   3. $HOME/.cache/zag (one allocPrint, POSIX $HOME fallback)
-    //   4. FALLBACK_ZINSTALL literal (stripped-CI safety net)
-    if (std.c.getenv("ZAG_HOME")) |ptr| return std.mem.span(@ptrCast(ptr));
-    if (std.c.getenv("XDG_CACHE_HOME")) |ptr| {
-        const xdg = std.mem.span(@ptrCast(ptr));
-        return std.fmt.allocPrint(std.heap.page_allocator, "{s}/zag", .{xdg}) catch FALLBACK_ZINSTALL;
+/// Scan `env_bytes` (a NUL-separated /proc/self/environ snapshot)
+/// for an entry of the form `key=value` and return the value as an
+/// allocator-owned slice. Mirrors src/env_path.zig's readEnviron
+/// parsing loop but returns one value rather than populating a
+/// 512-entry array (the build-config call site consults 3 keys,
+/// not the full env surface). Returns null when no matching key
+/// exists OR when allocator.dupe fails (caller falls through to
+/// the next priority tier).
+fn readEnvVar(env_bytes: []const u8, key: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    var i: usize = 0;
+    while (i < env_bytes.len) {
+        var entry_end: usize = i;
+        while (entry_end < env_bytes.len and env_bytes[entry_end] != 0) : (entry_end += 1) {}
+        const entry = env_bytes[i..entry_end];
+        if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
+            if (eq == key.len and std.mem.eql(u8, entry[0..eq], key)) {
+                return allocator.dupe(u8, entry[eq + 1 ..]) catch null;
+            }
+        }
+        i = entry_end + 1;
     }
-    if (std.c.getenv("HOME")) |ptr| {
-        const home = std.mem.span(@ptrCast(ptr));
-        return std.fmt.allocPrint(std.heap.page_allocator, "{s}/.cache/zag", .{home}) catch FALLBACK_ZINSTALL;
+    return null;
+}
+
+/// Compute the default `-Dz_install` value at build-config time by
+/// mirroring the runtime priority chain in `src/env_path.zig`'s
+/// `resolveZagCacheDir`. Each tier reads at compile time via a
+/// /proc/self/environ byte-walk -- NOT `std.c.getenv` (which the
+/// codebase's zig 0.16 install rejects with "dependency on libc
+/// must be explicitly specified in the build command") and NOT
+/// `std.process.getEnvVarOwned` (which is missing from std.process
+/// on this codebase's zig install). The /proc/self/environ raw
+/// syscall surface -- posix.openat + std.os.linux.read -- is
+/// verified-working in src/env_path.zig's readEnviron at line ~80,
+/// so the same pattern is portable into build-config time.
+///
+/// Returns `[]const u8` either an allocator-owned env value or
+/// a literal fallback string; lifetime is the build-arena's,
+/// which spans the full build process -- the caller stores the
+/// slice verbatim into `build_options.z_install`.
+///
+/// Priority chain (matches runtime `resolveZagCacheDir` exactly):
+///   1. $ZAG_HOME verbatim          -- explicit user override
+///   2. $XDG_CACHE_HOME/zag         -- freedesktop.org cache convention
+///   3. $HOME/.cache/zag            -- POSIX $HOME fallback
+///   4. `/tmp/zag-cache` literal    -- stripped-CI safety net
+///
+/// All three env reads use the SAME /proc/self/environ buffer
+/// (one read per build invocation -- cheap, ~128 KB read into a
+/// stack-allocated array). The literal fallback is only reached
+/// on a fully-stripped CI container with no $HOME /
+/// $XDG_CACHE_HOME / $ZAG_HOME -- main.zig's runtime `<dir>/zig`
+/// materialize dir still has a writable cache in that case because
+/// runtime-and-build resolve to the same path.
+fn defaultZInstall(allocator: std.mem.Allocator) []const u8 {
+    var buf: [131072]u8 = undefined;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return FALLBACK_ZINSTALL;
+    defer _ = std.os.linux.close(fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.os.linux.read(fd, buf[total..].ptr, buf.len - total);
+        if (n > std.math.maxInt(isize)) return FALLBACK_ZINSTALL;
+        if (n == 0) break;
+        total += n;
+    }
+
+    if (readEnvVar(buf[0..total], "ZAG_HOME", allocator)) |home| return home;
+    if (readEnvVar(buf[0..total], "XDG_CACHE_HOME", allocator)) |xdg| {
+        return std.fmt.allocPrint(allocator, "{s}/zag", .{xdg}) catch FALLBACK_ZINSTALL;
+    }
+    if (readEnvVar(buf[0..total], "HOME", allocator)) |home| {
+        return std.fmt.allocPrint(allocator, "{s}/.cache/zag", .{home}) catch FALLBACK_ZINSTALL;
     }
     return FALLBACK_ZINSTALL;
 }
