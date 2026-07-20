@@ -20,11 +20,61 @@ const codegen_mod = @import("codegen.zig");
 const ast = @import("ast.zig");
 const env_path = @import("env_path");
 const project_mod = @import("project.zig");
+const toolchain = @import("toolchain.zig");
+const build_options = @import("build_options");
 
 var zig_install_path: []const u8 = "/home/lex/.local/zig/zig";
 
 pub fn main() !void {
     env_path.readEnviron();
+
+    // Priority chain for locating zig:
+    //   1. Embedded zig payload — materialize to cache dir, validate ELF, use it
+    //   2. $ZAG_ZIG_PATH env var
+    //   3. Hardcoded dev fallback
+    if (toolchain.has_payload()) {
+        var cache_buf: [4096]u8 = undefined;
+        const cache_dir = env_path.resolveZagCacheDir(&cache_buf, build_options.z_install);
+        // Build dest path: <cache_dir>/zig/zig with null terminator for syscalls
+        var dest_buf: [4096]u8 = undefined;
+        var dl: usize = 0;
+        @memcpy(dest_buf[0..cache_dir.len], cache_dir);
+        dl += cache_dir.len;
+        if (cache_dir.len > 0 and cache_dir[cache_dir.len - 1] != '/') {
+            dest_buf[dl] = '/';
+            dl += 1;
+        }
+        const zig_bin = "zig/zig";
+        @memcpy(dest_buf[dl..][0..zig_bin.len], zig_bin);
+        dl += zig_bin.len;
+        dest_buf[dl] = 0;
+        // Ensure zig/ subdir exists (null-terminate at the / before zig)
+        var sub_buf: [4096]u8 = undefined;
+        var sl: usize = 0;
+        @memcpy(sub_buf[0..cache_dir.len], cache_dir);
+        sl += cache_dir.len;
+        if (cache_dir.len > 0 and cache_dir[cache_dir.len - 1] != '/') {
+            sub_buf[sl] = '/';
+            sl += 1;
+        }
+        @memcpy(sub_buf[sl..][0..3], "zig");
+        sl += 3;
+        sub_buf[sl] = 0;
+        _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&sub_buf), 0o755);
+
+        // Materialize; if it succeeds AND the file is a valid ELF
+        // binary (not the 100-byte vendor placeholder), use it.
+        toolchain.materializeZigToCache(dest_buf[0..dl]) catch {};
+        const fd = posix.openat(posix.AT.FDCWD, dest_buf[0..dl], .{ .ACCMODE = .RDONLY }, 0) catch null;
+        if (fd) |f| {
+            defer _ = std.os.linux.close(f);
+            var magic: [4]u8 = undefined;
+            const n = std.os.linux.read(f, &magic, magic.len);
+            if (n == 4 and magic[0] == 0x7f and magic[1] == 'E' and magic[2] == 'L' and magic[3] == 'F') {
+                zig_install_path = dest_buf[0..dl];
+            }
+        }
+    }
     if (env_path.getenv("ZAG_ZIG_PATH")) |zp| {
         zig_install_path = zp;
     }
