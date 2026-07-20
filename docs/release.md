@@ -148,19 +148,21 @@ The packager's `TARGETS` array (`scripts/package.sh` lines 60–67) is the singl
 Before publishing, exercise each archive on a clean extract to catch a broken binary before users do:
 
 ```bash
+# Run these commands from the repo root (the `dist/` path is relative).
+
 # x86_64
-mkdir /tmp/verify-x86 && cd /tmp/verify-x86
-tar -xzf /home/lex/Documents/github/zag/dist/${VERSION}/zag-linux-x86_64.tar.gz
-file ./zag                                   # -> ELF 64-bit LSB executable, x86-64
-./zag version                                 # -> ${VERSION}
-cd /tmp && rm -rf /tmp/verify-x86
+mkdir -p /tmp/verify-x86
+tar -xzf dist/${VERSION}/zag-linux-x86_64.tar.gz -C /tmp/verify-x86
+file /tmp/verify-x86/zag                      # -> ELF 64-bit LSB executable, x86-64
+/tmp/verify-x86/zag version                   # -> ${VERSION}
+rm -rf /tmp/verify-x86
 
 # arm64 (best on real arm64 hardware; QEMU user-mode is acceptable for a quick check)
-mkdir /tmp/verify-arm && cd /tmp/verify-arm
-tar -xzf /home/lex/Documents/github/zag/dist/${VERSION}/zag-linux-arm64.tar.gz
-file ./zag                                   # -> ELF 64-bit LSB executable, ARM aarch64
-./zag version                                 # -> ${VERSION}
-cd /tmp && rm -rf /tmp/verify-arm
+mkdir -p /tmp/verify-arm
+tar -xzf dist/${VERSION}/zag-linux-arm64.tar.gz -C /tmp/verify-arm
+file /tmp/verify-arm/zag                      # -> ELF 64-bit LSB executable, ARM aarch64
+/tmp/verify-arm/zag version                   # -> ${VERSION}
+rm -rf /tmp/verify-arm
 ```
 
 A failure here means the binary is broken before users see it — debug locally on the target arch before publishing. The `file` output proves the cross-compile landed in the right ELF class. Running `zig version` (rather than a `.zag` compile) keeps the smoke check fast and self-contained.
@@ -245,9 +247,9 @@ chmod +x  /tmp/zag-staging/bin/zag-linux-{x86_64,arm64}
 ./scripts/package.sh "${VERSION}" --bin-dir /tmp/zag-staging/bin
 
 # Step 6 — smoke-test (un-comment / adapt for arm64 verification)
-# mkdir /tmp/verify-x86 && cd /tmp/verify-x86
-# tar -xzf /home/lex/Documents/github/zag/dist/${VERSION}/zag-linux-x86_64.tar.gz
-# ./zag version && cd /tmp && rm -rf /tmp/verify-x86
+# mkdir -p /tmp/verify-x86
+# tar -xzf dist/${VERSION}/zag-linux-x86_64.tar.gz -C /tmp/verify-x86
+# /tmp/verify-x86/zag version && rm -rf /tmp/verify-x86
 
 # Step 7 — tag
 git tag -a "${TAG}" -m "Zag ${TAG}"
