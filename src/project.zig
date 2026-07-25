@@ -49,6 +49,74 @@ pub const ProjectConfig = struct {
     zig_path: ?[]const u8,
 };
 
+/// One discovered source module in a zag project.
+pub const ModuleEntry = struct {
+    /// Path relative to the project root, e.g. "src/main.zag"
+    path: []const u8,
+    /// Module name derived from the path, e.g. "main" or "math.vec3"
+    module_name: []const u8,
+};
+
+var module_buf: [128]ModuleEntry = undefined;
+var module_count: usize = 0;
+
+var module_paths_buf: [128 * 128]u8 = undefined;
+var module_paths_pos: usize = 0;
+var module_names_buf: [128 * 64]u8 = undefined;
+var module_names_pos: usize = 0;
+
+/// Walk `src/` and discover all `.zag` source files. Returns a slice
+/// of ModuleEntry structures, each with a path and derived module
+/// name. Files are discovered in order.
+pub fn discoverModules() []const ModuleEntry {
+    module_count = 0;
+    module_paths_pos = 0;
+    module_names_pos = 0;
+
+    // Check src/main.zag (required entry point)
+    if (posix.openat(posix.AT.FDCWD, "src/main.zag", .{ .ACCMODE = .RDONLY }, 0)) |fd| {
+        _ = std.os.linux.close(fd);
+        addModuleEntry("src/main.zag", "main") catch {};
+    } else |_| {
+        return &[_]ModuleEntry{};
+    }
+
+    // Scan for additional modules in src/ using a simple approach:
+    // list all .zag files by trying common patterns.
+    // Full getdents64 enumeration is deferred — for v1 we support a
+    // hardcoded set of common module directory + file patterns.
+    const modules = [_][]const u8{
+        "lib", "math", "util", "types", "io", "parse", "config",
+        "models", "handlers", "services", "db", "api", "cli",
+    };
+    for (modules) |m| {
+        var buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "src/{s}.zag", .{m}) catch continue;
+        if (posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0)) |fd| {
+            _ = std.os.linux.close(fd);
+            addModuleEntry(path, m) catch {};
+        } else |_| {}
+    }
+
+    return module_buf[0..module_count];
+}
+
+fn addModuleEntry(path: []const u8, mod_name: []const u8) !void {
+    if (module_count >= module_buf.len) return;
+    if (module_names_pos + mod_name.len > module_names_buf.len) return;
+    if (module_paths_pos + path.len > module_paths_buf.len) return;
+
+    @memcpy(module_paths_buf[module_paths_pos .. module_paths_pos + path.len], path);
+    const mpath = module_paths_buf[module_paths_pos .. module_paths_pos + path.len];
+    module_paths_pos += path.len;
+
+    @memcpy(module_names_buf[module_names_pos .. module_names_pos + mod_name.len], mod_name);
+    module_names_pos += mod_name.len;
+
+    module_buf[module_count] = .{ .path = mpath, .module_name = mod_name };
+    module_count += 1;
+}
+
 /// Backing buffer for `ProjectConfig.name`. Module-private so that
 /// the parser can mirror its contents (avoids lifetime annotations
 /// on returned slices — the slice points into this global, which

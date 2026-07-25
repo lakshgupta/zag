@@ -119,6 +119,9 @@ pub fn main() !void {
         }
         return;
     }
+    if (std.mem.eql(u8, cmd, "generate")) {
+        return try cmdGenerate(args);
+    }
     if (std.mem.eql(u8, cmd, "run")) {
         return try cmdRun(args);
     }
@@ -133,7 +136,7 @@ pub fn main() !void {
         } else if (try project_mod.detectProject("")) |cfg| {
             resolveZigPath(cfg);
             if (zig_install_path.len == 0) return needZig();
-            try projectCmd(cmd, cfg, &.{});
+            try projectCmd(cmd, cfg, &.{}, false);
         } else {
             std.debug.print("error: missing file argument\n\n", .{});
             usage();
@@ -181,7 +184,7 @@ fn cmdRun(args: []const []const u8) !void {
     } else if (try project_mod.detectProject("")) |cfg| {
         resolveZigPath(cfg);
         if (zig_install_path.len == 0) return needZig();
-        try projectCmd("run", cfg, extra_args);
+        try projectCmd("run", cfg, extra_args, false);
     } else {
         std.debug.print("error: missing file argument. Provide a .zag file or run from a project directory.\n\n", .{});
         usage();
@@ -190,9 +193,10 @@ fn cmdRun(args: []const []const u8) !void {
 }
 
 fn cmdBuild(args: []const []const u8) !void {
-    // Parse -o / --output
+    // Parse -o / --output and -g / --generate
     var output_path: ?[]const u8 = null;
     var file_arg: ?[]const u8 = null;
+    var generate_flag = false;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -205,6 +209,8 @@ fn cmdBuild(args: []const []const u8) !void {
                 std.debug.print("error: -o/--output requires a path argument\n", .{});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, a, "-g") or std.mem.eql(u8, a, "--generate")) {
+            generate_flag = true;
         } else if (hasZagExt(a)) {
             file_arg = a;
         }
@@ -218,7 +224,7 @@ fn cmdBuild(args: []const []const u8) !void {
     } else if (try project_mod.detectProject("")) |cfg| {
         resolveZigPath(cfg);
         if (zig_install_path.len == 0) return needZig();
-        try projectCmd("build", cfg, &.{});
+        try projectCmd("build", cfg, &.{}, generate_flag);
     } else {
         std.debug.print("error: missing file argument. Provide a .zag file or run from a project directory.\n\n", .{});
         usage();
@@ -226,40 +232,95 @@ fn cmdBuild(args: []const []const u8) !void {
     }
 }
 
-fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8) !void {
-    const root = cfg.root_dir;
+fn cmdGenerate(args: []const []const u8) !void {
+    var output_dir: []const u8 = "build/gen";
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-o") or std.mem.eql(u8, args[i], "--output")) {
+            if (i + 1 < args.len) {
+                output_dir = args[i + 1];
+                i += 1;
+            }
+        }
+    }
+
+    if (try project_mod.detectProject("")) |cfg| {
+        _ = cfg;
+        try generateProjectFiles();
+        std.debug.print("generated zig project at {s}/\n", .{output_dir});
+        return;
+    }
+
+    // File mode: transpile single file
+    if (args.len >= 3 and hasZagExt(args[2])) {
+        const source = try readFile(args[2]);
+        const zig_src = try transpile(source);
+        // Use output dir as file path
+        const out_path = if (std.mem.eql(u8, output_dir, "build/gen")) "build/gen/main.zig" else output_dir;
+        _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
+        _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
+        try writeFile(out_path, zig_src);
+        std.debug.print("generated {s}\n", .{out_path});
+        return;
+    }
+
+    std.debug.print("error: no project found. Run from a directory with zag.toml, or pass a .zag file.\n", .{});
+    std.process.exit(1);
+}
+
+fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8, generate: bool) !void {
 
     // Ensure build/gen/ and build/bin/ exist
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
-
-    // build/gen/
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
-
-    // build/bin/
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/bin", 0o755);
 
-    // Find src/main.zag
-    const src_main = srcPath(root, "src/main.zag");
-    const source = readFile(src_main) catch {
-        std.debug.print("error: {s}/src/main.zag not found\n", .{if (root.len > 0) root else "."});
+    // Discover modules and transpile each
+    const modules = project_mod.discoverModules();
+    const has_main = for (modules) |m| {
+        if (std.mem.eql(u8, m.module_name, "main")) break true;
+    } else false;
+
+    if (!has_main) {
+        std.debug.print("error: no src/main.zag found\n", .{});
         std.process.exit(1);
-    };
+    }
 
-    const zig_src = try transpile(source);
+    // Transpile and write each module
+    for (modules) |mod| {
+        const source = readFile(mod.path) catch {
+            std.debug.print("error: could not read {s}\n", .{mod.path});
+            std.process.exit(1);
+        };
+        const zig_src = transpile(source) catch |e| {
+            std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
+            std.process.exit(1);
+        };
 
-    try writeFile("build/gen/main.zig", zig_src);
+        // Output path: build/gen/<module>.zig
+        var out_buf: [512]u8 = undefined;
+        const out_path = if (std.mem.eql(u8, mod.module_name, "main"))
+            std.fmt.bufPrint(&out_buf, "build/gen/main.zig", .{}) catch "build/gen/main.zig"
+        else
+            std.fmt.bufPrint(&out_buf, "build/gen/{s}.zig", .{mod.module_name}) catch "build/gen/module.zig";
 
-    var out_bin_buf: [128]u8 = undefined;
-    const out_bin = std.fmt.bufPrint(&out_bin_buf, "build/bin/{s}", .{cfg.name}) catch "build/bin/out";
+        try writeFile(out_path, zig_src);
+    }
 
-    var emit_buf: [256]u8 = undefined;
-    const f_emit = std.fmt.bufPrint(&emit_buf, "-femit-bin={s}", .{out_bin}) catch "-femit-bin=build/bin/out";
+    // Generate build.zig for the project
+    try generateBuildZig(modules);
 
-    const build_code = try runCommand(null, &.{
-        zig_install_path, "build-exe", f_emit, "build/gen/main.zig",
-    });
+    if (generate) {
+        std.debug.print("generated zig project at build/gen/\n", .{});
+        if (std.mem.eql(u8, mode, "generate")) return;
+    }
+
+    // Use zig build system with the generated build.zig
+    const build_step: []const u8 = if (std.mem.eql(u8, mode, "run")) "run" else "build";
+
+    const build_code = try runCommand(null, &.{ zig_install_path, "build", build_step, "--build-file", "build/gen/build.zig" });
     if (build_code != 0) {
-        std.debug.print("error: zig build-exe failed for {s} (exit {d})\n", .{ src_main, build_code });
+        std.debug.print("error: zig build failed (exit {d})\n", .{build_code});
         std.process.exit(build_code);
     }
 
@@ -268,13 +329,90 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
         return;
     }
     if (std.mem.eql(u8, mode, "build")) {
-        std.debug.print("build ok: {s}\n", .{out_bin});
+        std.debug.print("build ok\n", .{});
         return;
     }
     if (std.mem.eql(u8, mode, "run")) {
-        const run_code = try runCommandWithArgs(out_bin, extra_args);
+        // Find the binary for run
+        var run_buf: [256]u8 = undefined;
+        const run_bin = std.fmt.bufPrint(&run_buf, "zig-out/bin/{s}", .{cfg.name}) catch unreachable;
+        const run_code = try runCommandWithArgs(run_bin, extra_args);
         std.process.exit(run_code);
     }
+}
+
+/// Generate a build.zig for the multi-module zag project.
+fn generateBuildZig(modules: []const project_mod.ModuleEntry) !void {
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+
+    const header = "const std = @import(\"std\");\n\npub fn build(b: *std.Build) !void {\n    const target = b.resolveTargetQuery(.{});\n    const optimize = b.standardOptimizeOption(.{});\n    const exe = b.addExecutable(.{\n        .name = \"main\",\n        .root_source_file = b.path(\"main.zig\"),\n        .target = target,\n        .optimize = optimize,\n    });\n";
+    @memcpy(buf[pos..][0..header.len], header);
+    pos += header.len;
+
+    for (modules) |mod| {
+        if (std.mem.eql(u8, mod.module_name, "main")) continue;
+
+        const line1 = "    _ = exe.addModule(\"";
+        const line2 = "\", b.createModule(.{ .root_source_file = b.path(\"";
+        const line3 = ".zig\") }));\n";
+
+        // Build the line: _ = exe.addModule("modname", b.createModule(.{ .root_source_file = b.path("modname.zig") }));
+        @memcpy(buf[pos..][0..line1.len], line1);
+        pos += line1.len;
+        @memcpy(buf[pos..][0..mod.module_name.len], mod.module_name);
+        pos += mod.module_name.len;
+        @memcpy(buf[pos..][0..line2.len], line2);
+        pos += line2.len;
+        @memcpy(buf[pos..][0..mod.module_name.len], mod.module_name);
+        pos += mod.module_name.len;
+        @memcpy(buf[pos..][0..line3.len], line3);
+        pos += line3.len;
+    }
+
+    const footer = "    b.installArtifact(exe);\n}\n";
+    @memcpy(buf[pos..][0..footer.len], footer);
+    pos += footer.len;
+
+    try writeFile("build/gen/build.zig", buf[0..pos]);
+}
+
+/// Generate all project files (modules + build.zig) without building.
+/// Used by `zag generate`.
+fn generateProjectFiles() !void {
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
+
+    const modules = project_mod.discoverModules();
+    const has_main = for (modules) |m| {
+        if (std.mem.eql(u8, m.module_name, "main")) break true;
+    } else false;
+
+    if (!has_main) {
+        std.debug.print("error: no src/main.zag found\n", .{});
+        std.process.exit(1);
+    }
+
+    for (modules) |mod| {
+        const source = readFile(mod.path) catch {
+            std.debug.print("error: could not read {s}\n", .{mod.path});
+            std.process.exit(1);
+        };
+        const zig_src = transpile(source) catch |e| {
+            std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
+            std.process.exit(1);
+        };
+
+        var out_buf: [512]u8 = undefined;
+        const out_path = if (std.mem.eql(u8, mod.module_name, "main"))
+            std.fmt.bufPrint(&out_buf, "build/gen/main.zig", .{}) catch "build/gen/main.zig"
+        else
+            std.fmt.bufPrint(&out_buf, "build/gen/{s}.zig", .{mod.module_name}) catch "build/gen/module.zig";
+
+        try writeFile(out_path, zig_src);
+    }
+
+    try generateBuildZig(modules);
 }
 
 /// Resolve the zig compiler binary path that the current
@@ -364,10 +502,14 @@ fn usage() void {
     std.debug.print("  zag run [<file.zag>] [-- <args>]   Compile and run (file or project)\n", .{});
     std.debug.print("  zag check [<file.zag>]             Type-check a file or project\n", .{});
     std.debug.print("  zag build [<file.zag>] [-o <path>] Compile to binary\n", .{});
+    std.debug.print("  zag generate [-o <dir>]            Transpile to zig project\n", .{});
     std.debug.print("  zag test [<file.zag>]              Run tests in a file or project\n", .{});
     std.debug.print("  zag init [<dir>]                   Create a new Zag project\n", .{});
     std.debug.print("  zag version                        Print version information\n", .{});
     std.debug.print("  zag help                           Show this help message\n", .{});
+    std.debug.print("\nOptions:\n", .{});
+    std.debug.print("  -g, --generate    Also emit .zig output in build/gen/\n", .{});
+    std.debug.print("  -o, --output      Output path (binary for build, dir for generate)\n", .{});
 }
 
 fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extra_args: []const []const u8) !void {
