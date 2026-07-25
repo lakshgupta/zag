@@ -94,6 +94,9 @@ pub const TokenTag = enum {
     in_kw,
     match_kw,
     break_kw,
+    /// `catch` keyword — introduces error-handling expression
+    /// (`risky_call() catch 0` or `risky_call() catch |err| handle(err)`).
+    catch_kw,
     continue_kw,
     true_kw,
     false_kw,

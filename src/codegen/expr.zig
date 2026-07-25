@@ -151,10 +151,10 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     self.write(", ");
                     self.write(p.name);
                     self.write(": ");
-                    self.write(zagTypeToZig(p.type_text));
+                    self.writeType(p.type_text);
                 }
                 self.write(") ");
-                if (cl.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
+                if (cl.return_type) |rt| self.writeType(rt) else self.write("void");
                 self.write(" {\n");
                 for (cl.body) |s| self.genStmt(s, false);
                 self.write("    } }){}");
@@ -230,7 +230,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     self.write("(");
                     for (c.type_args, 0..) |ta, i| {
                         if (i > 0) self.write(", ");
-                        self.write(zagTypeToZig(ta));
+                        self.writeType(ta);
                     }
                     if (c.args.len > 0 and c.type_args.len > 0) self.write(", ");
                     for (c.args, 0..) |arg, i| {
@@ -270,7 +270,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 } else {
                     self.write(" = try std.heap.page_allocator.create(");
                 }
-                self.write(zagTypeToZig(n.type_name));
+                self.writeType(n.type_name);
                 self.write("); ");
                 self.write(name);
                 self.write(".* = ");
@@ -336,12 +336,12 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         // `*T` → `*anyopaque` driven by the field's
                         // declared destination type — no explicit
                         // `@ptrCast` wrapper needed.
-                        self.write(c.type_text);
+                        self.writeType(c.type_text);
                         self.write("{ .ptr = @constCast(");
                         if (!is_pointer_source) self.write("&");
                         self.write(source_ident);
                         self.write("), .vtable = &");
-                        self.write(c.type_text);
+                        self.writeType(c.type_text);
                         self.write("_VTable_for_");
                         self.write(base_type);
                         self.write(" }");
@@ -422,7 +422,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     }
                 }
                 self.write("@as(");
-                self.write(target_zig);
+                self.writeType(c.type_text);
                 self.write(", ");
                 self.genExpr(c.expr.*);
                 self.write(")");
@@ -631,7 +631,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // wrap-on-turbofish-only pattern but applied
                 // unconditionally because struct-literal type names
                 // are the user-visible type, not a type-param slot.
-                self.write(zagTypeToZig(sl.type_name));
+                self.writeType(sl.type_name);
                 self.write("{ ");
                 for (sl.inits, 0..) |fi, i| {
                     if (i > 0) self.write(", ");
@@ -892,13 +892,18 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // Args are comma-separated and emitted verbatim via the
                 // existing `genExpr` recursion.
                 //\n                // Phase 3 trait dispatch (docs/17 §"Using Traits"): the\n                // user supplies the vtable's source-type via turbofish\n                // at the call site so the dispatch shim's `comptime T:\n                // type` parameter resolves to the registered\n                // source-type — `d.draw<Button>()` emits `d.draw(Button)`\n                // which binds Button to the shim's `T` placeholder\n                // (the shim discards T via `_ = T;` and forwards to\n                // the vtable slot). Empty type_args keeps the verbatim\n                // `target.method(args)` emit shape so non-turbofish\n                // call sites round-trip byte-identical with the\n                // pre-Phase-3 baseline. Wrap through `zagTypeToZig`\n                // so turbofish on a trait call site honours the\n                // docs/07 transparent-alias contract (`str` becomes\n                // `[]const u8`) identically to the `.call` arm.
+                // Call-site direct dispatch for `obj.Trait.method()`:
+                // when the AST is method_call(member_access(ident, "TraitName"), "method", args)
+                // and the middle identifier matches a known trait, emit
+                // ConcreteType_TraitName_methodName(ident, args) — a
+                // direct monomorphized call with zero vtable overhead.
                 self.genExpr(mc.target.*);
                 self.write(".");
                 self.write(mc.name);
                 self.write("(");
                 for (mc.type_args, 0..) |ta, i| {
                     if (i > 0) self.write(", ");
-                    self.write(zagTypeToZig(ta));
+                    self.writeType(ta);
                 }
                 if (mc.args.len > 0 and mc.type_args.len > 0) self.write(", ");
                 for (mc.args, 0..) |a, i| {
@@ -906,6 +911,34 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     self.genExpr(a);
                 }
                 self.write(")");
+            },
+            .try_op => |t| {
+                // `expr?` — postfix try/unwrap. Emit a labeled block +
+                // compile-time `@hasField` discriminators so the same
+                // codegen works for both `Result<T,E>` (has Ok/Err) and
+                // `Option<T>` (has Some/None). The early-return wraps
+                // the error/none value in the appropriate constructor
+                // so the enclosing function's return type matches.
+                self.write("(blk: { const __try = ");
+                self.genExpr(t.expr.*);
+                self.write("; if (@hasField(@TypeOf(__try), \"Ok\")) { switch (__try) { .Ok => |__v| break :blk __v, .Err => |__e| return @as(@TypeOf(__try), .{ .Err = __e }), }; } else { switch (__try) { .Some => |__v| break :blk __v, .None => return @as(@TypeOf(__try), .{ .None = {} }), }; } })");
+            },
+            .catch_expr => |c| {
+                // `expr catch HANDLER` or `expr catch |err| HANDLER` —
+                // emits a label-block with compile-time type discriminator
+                // (same approach as try_op). When `err_binding` is
+                // set (the `|err|` form), the Err value is bound before
+                // evaluating the handler. For the None case (Option<T>),
+                // the binding is unused but the handler expression runs.
+                self.write("(blk: { const __cgt = ");
+                self.genExpr(c.expr.*);
+                self.write("; if (@hasField(@TypeOf(__cgt), \"Ok\")) { switch (__cgt) { .Ok => |__v| break :blk __v, .Err => |");
+                if (c.err_binding) |eb| { self.write(eb); } else { self.write("_"); }
+                self.write("| break :blk ");
+                self.genExpr(c.handler.*);
+                self.write(", }; } else { switch (__cgt) { .Some => |__v| break :blk __v, .None => break :blk ");
+                self.genExpr(c.handler.*);
+                self.write(", }; } })");
             },
             .binary => |b| {
                 // zig 0.16 string-comparison shim. The bare `(lhs == rhs)`

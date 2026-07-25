@@ -1,12 +1,18 @@
-# Diamond disambiguation — shared body (docs/17 §"Diamond Disambiguation").
-# When the same method name is parenthesised on EVERY listed trait,
-# the single body registers on ALL their vtables. The compiler emits
-# one renamed free fn per (target, trait) pair — same body, two fns:
+# Diamond disambiguation — shared body with a private helper
+# (docs/17 §"Dot-qualified methods" + §"Resolving methods").
+# When both traits share a method name and both need the same
+# body, qualify each with `Trait.method` and factor shared work
+# into a module-scope helper. The helper is a regular fn, not a
+# trait method — no vtable entry.
+#
+# The dot-qualified bodies register on Display's and Show's
+# vtables respectively. The compiler emits one renamed free fn
+# per (target, trait) pair — same body, two fns:
 #   Button_Display_print   ← registers on Display's vtable
 #   Button_Show_print       ← registers on Show's vtable
 #
-# Use this when the body is genuinely shared across the diamond (both
-# traits want the same observable behavior for the method).
+# Use this when the body is genuinely shared — both traits want
+# the same observable behavior for the method.
 
 trait Display {
     fun print(self: *Self);
@@ -20,19 +26,22 @@ struct Button {
     label: str,
 }
 
-impl Button with Display (print), Show (print) {
-    pub fun print(self: *Button) {
-        print(self.label);
-        print("\n");
-    }
+fn print_button(self: *Button) {
+    print(self.label);
+    print("\n");
+}
+
+impl Button with Display, Show {
+    pub fun Display.print(self: *Button) { print_button(self); }
+    pub fun Show.print(self: *Button)    { print_button(self); }
 }
 
 fun main() {
     let btn: Button = Button { label: "ok" };
     # One body, two vtable entries — both casts dispatch to the
-    # SAME source body via different renamed free fns.
+    # same source body via different renamed free fns.
     let d: Display = btn as Display;
-    d.print<Button>();
+    d.print();
     let s: Show = btn as Show;
-    s.print<Button>();
+    s.print();
 }

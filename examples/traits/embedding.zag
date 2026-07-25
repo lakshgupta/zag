@@ -1,0 +1,50 @@
+# Structural embedding (docs/17 §"Structural Embedding").
+# Embed Widget into Button — Widget's fields and methods are
+# promoted into Button's namespace via forwarded getter/setter and
+# method wrappers. No vtable overhead — direct calls only.
+#
+# `btn.x()` reads Widget's field via a getter.
+# `btn.show()` calls Widget's show method via a forwarding wrapper.
+
+struct Widget {
+    x: i32,
+    y: i32,
+}
+
+impl Widget {
+    pub fun show(self: *Widget) {
+        print("Widget at (");
+        print(self.x);
+        print(", ");
+        print(self.y);
+        print(")\n");
+    }
+}
+
+struct Button {
+    Widget,                    # embeds Widget — fields and methods promoted
+    label: str,
+}
+
+impl Button {
+    pub fun click(self: *Button) {
+        print("clicked: ");
+        print(self.label);
+        print("\n");
+    }
+}
+
+fun main() {
+    let btn: Button = Button {
+        Widget { x: 10, y: 20 },
+        label: "ok",
+    };
+    # Widget's fields accessible via getter methods
+    print("x = ");
+    print(btn.x());
+    print("\n");
+    # Widget's methods forwarded to Button
+    btn.show();
+    # Button's own methods still work
+    btn.click();
+}

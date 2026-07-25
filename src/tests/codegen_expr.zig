@@ -550,3 +550,74 @@ test "codegen: print(label) for non-method body stays at {any}" {
 	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{label,})") != null);
 }
 
+test "codegen: ? postfix try-operator unwraps Result with label-block" {
+    // Using ? after an expression should emit a labeled block
+    // with @hasField discriminator for Result (Ok/Err).
+    const src =
+        \\fun helper() -> Result<i32, str> {
+        \\    return Ok(5);
+        \\}
+        \\fun f() -> Result<i32, str> {
+        \\    let x: i32 = helper()?;
+        \\    return Ok(x);
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The ? emits a blk label with @hasField discriminator
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@hasField(@TypeOf(__try), \"Ok\")") != null);
+    // On Ok, break with unwrapped value
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".Ok => |__v| break :blk __v") != null);
+    // On Err, return the error
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".Err => |__e| return") != null);
+}
+
+test "codegen: catch expression emits fallback with @hasField discriminator" {
+    const src =
+        \\fun helper() -> Result<i32, str> {
+        \\    return Err("fail");
+        \\}
+        \\fun f() -> i32 {
+        \\    return helper() catch 0;
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // catch emits @hasField discriminator
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@hasField(@TypeOf(__cgt), \"Ok\")") != null);
+    // On Ok, break with unwrapped value
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".Ok => |__v| break :blk __v") != null);
+    // On Err, break with the handler value (fallback)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk 0") != null);
+}
+
+test "codegen: catch with error binding emits err variable in handler" {
+    const src =
+        \\fun helper() -> Result<i32, str> {
+        \\    return Err("fail");
+        \\}
+        \\fun f() -> i32 {
+        \\    return helper() catch |msg| 0;
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // err_binding |msg| should appear in the Err arm
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".Err => |msg|") != null);
+}
+

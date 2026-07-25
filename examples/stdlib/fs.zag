@@ -23,6 +23,6 @@ import std.fs.{read_file};
 
 fun main() {
     let data: []u8 = read_file("examples/basics/hello.zag");
-    defer free data;
+    defer free(data);
     print("read {data.len} bytes\n");
 }

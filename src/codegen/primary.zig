@@ -517,7 +517,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             // `[1]T{ v } ** N` — Zig's repeat operator. The leading element is
             // present by grammar whenever `fill` is true.
             self.write("[1]");
-            self.write(zagTypeToZig(a.type_name));
+            self.writeType(a.type_name);
             self.write("{ ");
             if (a.elements.len >= 1) self.genExpr(a.elements[0]);
             self.write(" } ** ");
@@ -530,7 +530,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             self.write("(blk: { var __arr: [");
             self.write(size_str);
             self.write("]");
-            self.write(zagTypeToZig(a.type_name));
+            self.writeType(a.type_name);
             self.write(" = undefined; ");
             if (k > 0) {
                 self.write("const __pat: [");
@@ -538,7 +538,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 const k_str = std.fmt.bufPrint(&k_buf, "{d}", .{k}) catch "0";
                 self.write(k_str);
                 self.write("]");
-                self.write(zagTypeToZig(a.type_name));
+                self.writeType(a.type_name);
                 self.write(" = .{ ");
                 for (a.elements, 0..) |el, i| {
                     if (i > 0) self.write(", ");
@@ -574,7 +574,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             self.write("[");
             self.write(size_str);
             self.write("]");
-            self.write(zagTypeToZig(a.type_name));
+            self.writeType(a.type_name);
             self.write("{ ");
             for (a.elements, 0..) |el, idx| {
                 if (idx > 0) self.write(", ");
@@ -586,7 +586,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         self.write("[");
         self.write(size_str);
         self.write("]");
-        self.write(zagTypeToZig(a.type_name));
+        self.writeType(a.type_name);
         self.write("{ ");
         for (a.elements, 0..) |el, i| {
             if (i > 0) self.write(", ");

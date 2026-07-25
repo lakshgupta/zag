@@ -5,7 +5,7 @@
 #   3. impl block whose `with Trait` header binds the method body to
 #      Drawable's vtable via the diamond-disambiguator clause
 #   4. cast arm: `btn as Drawable` emitting the fat-pointer container
-#   5. dispatch arm: `d.draw<Button>()` calling through the vtable
+#   5. dispatch arm: `d.draw()` calling through the vtable
 #
 # Compared to `basic_draw.zag` (the legacy `pub fun Drawable.draw`
 # prefix form), this example uses the canonical surface: the impl
@@ -32,5 +32,5 @@ impl Button with Drawable {
 fun main() {
     let btn: Button = Button { label: "click me" };
     let d: Drawable = btn as Drawable;
-    d.draw<Button>();
+    d.draw();
 }

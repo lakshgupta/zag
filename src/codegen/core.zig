@@ -1,5 +1,7 @@
 const std = @import("std");
 const ast = @import("../ast.zig");
+const ast_decl = @import("../ast/decl.zig");
+const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 // CYCLE ANCHOR: parser → codegen → parser. Codegen uses
 // `Parser.resolveStdImport` and `Parser.joinDottedPath` for the
 // import-preamble emit at `generate()` entry. The mirror
@@ -179,6 +181,10 @@ pub const Codegen = struct {
     /// surface won't realistically list more than 8 traits on a
     /// single `impl Type with ...` block.
     trait_binding_buf: [8][]const u8 = undefined,
+    /// Scratch buffer for short string formatting (e.g. vtable field
+    /// name suffix computation in `traitMethodVtableName`). Not
+    /// shared across nested calls; each use overwrites.
+    scratch_buf: [128]u8 = undefined,
     /// v1.6 byte-slice member_access widening: read by
     /// `genPrintCall`'s else arm + `genTemplateLit`'s interpolation
     /// slot to widen the format spec from `{any}` to `{s}` when
@@ -299,6 +305,7 @@ pub const VariantFieldsEntry = struct {
     // decl.zig caller. The helper definition in primary.zig is
     // stable across that future registration.
     pub const write = @import("core.zig").write;
+    pub const writeType = @import("core.zig").writeType;
 };
 
 // ============================================================
@@ -364,6 +371,34 @@ pub const VariantFieldsEntry = struct {
     pub     fn write(self: *Codegen, s: []const u8) void {
         @memcpy(self.out_buf[self.out_len .. self.out_len + s.len], s);
         self.out_len += s.len;
+    }
+
+    /// Writes a type text to out_buf, applying (1) transparent-alias expansion
+    /// via `zagTypeToZig` and (2) generic-parameter bracket rewrite:
+    ///   `Result<T, E>` → `Result(T, E)`   and   `Option<T>` → `Option(T)`
+    /// zag uses `<T>` syntax for generics but zig uses `(T)` function syntax.
+    /// Every type-emit site that could reference these generic types must use
+    /// this function (or call `zagTypeToZig` + bracket-replace by hand).
+    pub fn writeType(self: *Codegen, text: []const u8) void {
+        const expanded = zagTypeToZig(text);
+        // Intermediate buffer large enough for alias-expanded + bracket-replaced
+        // text (max expansion ~3× `str` → `[]const u8`).
+        var buf: [1024]u8 = undefined;
+        if (expanded.len > buf.len) {
+            // Safety fallback: emit unreachable for now; we can widen buf
+            // if real-world type texts ever exceed 1024 bytes.
+            @panic("writeType: type text too long for intermediate buffer");
+        }
+        var len: usize = 0;
+        for (expanded) |c| {
+            buf[len] = switch (c) {
+                '<' => '(',
+                '>' => ')',
+                else => c,
+            };
+            len += 1;
+        }
+        self.write(buf[0..len]);
     }
 
     pub fn generate(self: *Codegen, prog: ast.Program) []const u8 {
@@ -453,6 +488,39 @@ pub const VariantFieldsEntry = struct {
             // without a per-call io parameter. The `var` is needed
             // because it's assigned at runtime from init.io.
             \\var __zag_io: std.Io = undefined;
+            \\
+            // Result<T,E> and Option<T> — error-handling fundamental types
+            // (docs/manual/18-error-handling.md). Defined as generic zig
+            // union(enum) types so the `?` try/unwrap operator and `catch`
+            // expression can emit switch-based extraction at codegen time.
+            // `Result(T, E)` carries Ok(T) and Err(E) payloads; `Option(T)`
+            // carries Some(T) and None (void). Both types defined here in
+            // the preamble so every generated zig module can reference them
+            // without an explicit import.
+            \\fn Result(comptime T: type, comptime E: type) type {
+            \\    return union(enum) {
+            \\        Ok: T,
+            \\        Err: E,
+            \\        pub fn unwrap(self: @This()) T {
+            \\            return switch (self) {
+            \\                .Ok => |v| v,
+            \\                .Err => @panic("unwrap on Err"),
+            \\            };
+            \\        }
+            \\    };
+            \\}
+            \\fn Option(comptime T: type) type {
+            \\    return union(enum) {
+            \\        Some: T,
+            \\        None: void,
+            \\        pub fn unwrap(self: @This()) T {
+            \\            return switch (self) {
+            \\                .Some => |v| v,
+            \\                .None => @panic("unwrap on None"),
+            \\            };
+            \\        }
+            \\    };
+            \\}
             \\
         );
 
@@ -641,6 +709,33 @@ pub const VariantFieldsEntry = struct {
             }
         }
 
+        // Emit default method free functions for trait methods that
+        // have a body. Named `<Trait>__<Method>` with the first
+        // parameter `self: *anyopaque` matching the vtable function-
+        // pointer signature and the body's `self` references.
+        for (prog.traits) |td| {
+            for (td.methods, 0..) |tm, tmi| {
+                if (tm.body == null) continue;
+                const vtable_name = traitMethodVtableName(td, tmi);
+                self.write("pub fn ");
+                self.write(td.name);
+                self.write("__");
+                self.write(vtable_name);
+                self.write("(self: *anyopaque");
+                for (tm.params[1..]) |p| {
+                    self.write(", ");
+                    self.write(p.name);
+                    self.write(": ");
+                    self.writeType(p.type_text);
+                }
+                self.write(") ");
+                if (tm.return_type) |rt| self.writeType(rt) else self.write("void");
+                self.write(" {\n");
+                for (tm.body.?) |s| self.genStmt(s, false);
+                self.write("}\n\n");
+            }
+        }
+
         // Orphan impls (target_type not declared as a struct) emit as
         // module-level free functions with `_<target_type>_<name>` names
         // so a stray `impl Foo { pub fun bar() -> i32 { ... } }` line
@@ -738,6 +833,23 @@ pub const VariantFieldsEntry = struct {
                     // free fns referencing the same impl body.
                     var m_resolved = m;
                     m_resolved.trait_name = trait_name;
+                    // For overloaded methods, suffix the method name
+                    // in the free fn so `@ptrCast` can uniquely
+                    // reference it (zig can't resolve overloaded
+                    // function names in `@ptrCast` without a suffix).
+                    for (prog.traits) |td1| {
+                        if (!std.mem.eql(u8, td1.name, trait_name)) continue;
+                        for (td1.methods, 0..) |tm1, tmi1| {
+                            if (std.mem.eql(u8, tm1.name, m.name) and tm1.params.len == m.params.len) {
+                                const vfn = traitMethodVtableName(td1, tmi1);
+                                if (!std.mem.eql(u8, vfn, m.name)) {
+                                    m_resolved.name = vfn;
+                                }
+                                break;
+                            }
+                        }
+                        break;
+                    }
                     // Emit the renamed free fn (genFreeMethod applies
                     // the <Target>_<Trait>_<Method> shape itself).
                     self.genFreeMethod(impl.target_type, m_resolved, impl.type_params);
@@ -772,18 +884,86 @@ pub const VariantFieldsEntry = struct {
                 }
             }
         }
+        // Post-pass: for impl blocks with trait_specs but zero method
+        // bodies (all defaults inherited), create a vtable registration
+        // entry so the defaults get registered. Without this, a
+        // completely-defaults impl like `impl Widget with Greeter {}`
+        // would never get a VTable.
+        for (prog.impls) |impl| {
+            if (impl.trait_specs.len == 0) continue;
+            for (impl.trait_specs) |spec| {
+                // Check if this (trait, target) pair already has an entry
+                var already_exists = false;
+                var ei: usize = 0;
+                while (ei < trait_reg_count) : (ei += 1) {
+                    if (std.mem.eql(u8, trait_reg_buf[ei].trait, spec.name) and
+                        std.mem.eql(u8, trait_reg_buf[ei].target, impl.target_type))
+                    {
+                        already_exists = true;
+                        break;
+                    }
+                }
+                if (!already_exists and trait_reg_count < trait_reg_buf.len) {
+                    trait_reg_buf[trait_reg_count].trait = spec.name;
+                    trait_reg_buf[trait_reg_count].target = impl.target_type;
+                    trait_reg_buf[trait_reg_count].method_count = 0;
+                    trait_reg_count += 1;
+                }
+            }
+        }
         // VTable registrations: emit one `<Trait>_VTable_for_<Type>`
         // per unique (trait, target_type) pair, populating each
         // registration with the grouped method names. The order of
         // registration emission follows the trait_reg_buf's append
         // order (effectively source-decl order), which matches the
         // user's mental model ("what I declared first comes out first").
+        // For each pair, check the trait's full method list for
+        // default methods the impl did not provide and register those
+        // too — they reference the <Trait>__<Method> default free fns.
         var ri: usize = 0;
         while (ri < trait_reg_count) : (ri += 1) {
+            var default_buf: [16][]const u8 = undefined;
+            var default_field_buf: [16][]const u8 = undefined;
+            var default_count: usize = 0;
+            var method_field_buf: [16][]const u8 = undefined;
+            for (prog.traits) |td| {
+                if (!std.mem.eql(u8, td.name, trait_reg_buf[ri].trait)) continue;
+                for (td.methods, 0..) |tm, tmi| {
+                    if (tm.body == null) continue;
+                    var already_impl = false;
+                    for (trait_reg_buf[ri].methods[0..trait_reg_buf[ri].method_count]) |im| {
+                        if (std.mem.eql(u8, im.name, tm.name) and im.params.len == tm.params.len) {
+                            already_impl = true;
+                            break;
+                        }
+                    }
+                    if (!already_impl and default_count < default_buf.len) {
+                        default_buf[default_count] = tm.name;
+                        default_field_buf[default_count] = traitMethodVtableName(td, tmi);
+                        default_count += 1;
+                    }
+                }
+                // Compute vtable field names for impl-provided methods
+                for (trait_reg_buf[ri].methods[0..trait_reg_buf[ri].method_count], 0..) |im, ii| {
+                    var found = false;
+                    for (td.methods, 0..) |tm, tmi| {
+                        if (std.mem.eql(u8, im.name, tm.name) and im.params.len == tm.params.len) {
+                            method_field_buf[ii] = traitMethodVtableName(td, tmi);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) method_field_buf[ii] = im.name;
+                }
+                break;
+            }
             self.genTraitRegistration(
                 trait_reg_buf[ri].trait,
                 trait_reg_buf[ri].target,
                 trait_reg_buf[ri].methods[0..trait_reg_buf[ri].method_count],
+                method_field_buf[0..trait_reg_buf[ri].method_count],
+                default_buf[0..default_count],
+                default_field_buf[0..default_count],
             );
         }
 
@@ -872,6 +1052,44 @@ pub const VariantFieldsEntry = struct {
         return false;
     }
 
+    /// Returns the VTable field name for a trait method. When the
+    /// method name is unique within the trait, it returns the name
+    /// unchanged. When multiple trait methods share the same name
+    /// (overloaded), appends an index suffix `_N` — e.g. `render`
+    /// and `render_f64` → `render_0` and `render_1`.
+    /// The returned slice points into a static scratch buffer valid
+    /// until the next call to this function.
+    pub     fn traitMethodVtableName(trait_decl: ast.TraitDecl, method_index: usize) []const u8 {
+        if (method_index >= trait_decl.methods.len) return "";
+        const method_name = trait_decl.methods[method_index].name;
+
+        var dup_count: usize = 0;
+        var my_dup_index: usize = 0;
+        for (trait_decl.methods, 0..) |tm, i| {
+            if (std.mem.eql(u8, tm.name, method_name)) {
+                if (i < method_index) my_dup_index += 1;
+                dup_count += 1;
+            }
+        }
+        if (dup_count <= 1) return method_name;
+
+        // Use a thread-local buffer for the suffixed name. Each call
+        // overwrites; callers must consume the result before the next
+        // call.
+        const tls_buf = struct {
+            var buf: [128]u8 = undefined;
+        };
+        @memcpy(tls_buf.buf[0..method_name.len], method_name);
+        const suffix = std.fmt.bufPrint(
+            tls_buf.buf[method_name.len + 1 .. tls_buf.buf.len],
+            "{d}",
+            .{my_dup_index},
+        ) catch "0";
+        tls_buf.buf[method_name.len] = '_';
+        const total_len = method_name.len + 1 + suffix.len;
+        return tls_buf.buf[0..total_len];
+    }
+
     /// Canonical impl-form dispatch rule (docs/17 §"Implementing"
     /// + §"Diamond Disambiguation"). Resolves the LIST of traits
     /// whose vtables should register `m`'s body. Most methods have
@@ -943,11 +1161,48 @@ pub const VariantFieldsEntry = struct {
         if (match_count == 0) return self.trait_binding_buf[0..0]; // method not declared by any listed trait → regular method
 
         // (d) Ambiguous: multiple listed traits declare this method
-        // and no parenthesised name picked one. Surface a zag
-        // compile-error with the diamond-disambiguator hint rather
-        // than silently picking the first match.
+        // and no parenthesised name picked one. Check for a Raku-style
+        // resolving method pattern: if OTHER methods in the same impl
+        // block have the same name with `trait_name` set for ALL
+        // conflicting traits, this unqualified method is a resolver
+        // — a regular type method, no vtable entry. It dispatches
+        // to the preferred trait at runtime with zero overhead.
+        //
+        // If not ALL conflicts are covered, surface a compile-error.
+        var conflicts: [8][]const u8 = undefined;
+        var conflict_count: u32 = 0;
+        for (impl.trait_specs) |spec| {
+            if (self.traitDeclaresMethod(spec.name, m.name)) {
+                if (conflict_count < conflicts.len) {
+                    conflicts[conflict_count] = spec.name;
+                    conflict_count += 1;
+                }
+            }
+        }
+        if (conflict_count < 2) return self.trait_binding_buf[0..0];
+
+        // Scan other methods in the same impl block for qualified
+        // counterparts covering the conflicting traits.
+        var covered: [8]bool = [_]bool{false} ** 8;
+        var covered_count: u32 = 0;
+        for (impl.methods) |other| {
+            if (other.trait_name == null) continue;
+            if (!std.mem.eql(u8, other.name, m.name)) continue;
+            for (conflicts[0..conflict_count], 0..) |ct, ci| {
+                if (!covered[ci] and std.mem.eql(u8, ct, other.trait_name.?)) {
+                    covered[ci] = true;
+                    covered_count += 1;
+                }
+            }
+        }
+        if (covered_count >= conflict_count) {
+            // All conflicting traits are covered by qualified
+            // methods — this is a resolver, not a vtable method.
+            return self.trait_binding_buf[0..0];
+        }
+
         std.debug.print(
-            "error: ambiguous trait binding for method '{s}' on type '{s}' — multiple `with`-listed traits declare it. Add a parenthesised disambiguator, e.g. `with T1 ({s}), T2`\n",
+            "error: ambiguous trait binding for method '{s}' on type '{s}' — multiple `with`-listed traits declare it. Add a dot-qualifier, e.g. `Trait1.{s}`, or write a resolving method alongside qualified ones.\n",
             .{ m.name, impl.target_type, m.name },
         );
         std.process.exit(1);

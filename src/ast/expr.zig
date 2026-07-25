@@ -115,6 +115,18 @@ pub const Expr = union(enum) {
     /// `params` and `null` return_type are accepted (primitives
     /// like `|| { print("hi"); return 0; }`).
     closure: ClosureExpr,
+    /// `expr?` — postfix try/unwrap operator. On a `Result<T,E>`, extracts
+    /// the `Ok(T)` value or early-returns the `Err(E)` from the enclosing
+    /// function. On an `Option<T>`, extracts the `Some(T)` value or
+    /// early-returns `None`. Emits a labeled block + switch at codegen time.
+    /// Built by `Parser.parsePostfix` when a `?` token follows an expression.
+    try_op: TryOp,
+    /// `expr catch HANDLER` — error-handling expression. Evaluates `expr`;
+    /// if it is `Ok(T)`, yields the `T` value; if it is `Err(E)`, evaluates
+    /// `handler` (an expression serving as the default value) or, when
+    /// `err_binding` is set (`catch |err| handler`), binds the error to
+    /// `err` and evaluates `handler`. Built by `Parser.parseCatchExpr`.
+    catch_expr: CatchExpr,
 
     pub const BinaryExpr = struct {
         /// Operator tag. Stored as an enum so codegen can switch on the
@@ -464,6 +476,25 @@ pub const Expr = union(enum) {
         params: []const MethodParam,
         return_type: ?[]const u8,
         body: []const Stmt,
+    };
+
+    /// Backing struct for `Expr.try_op` — `expr?` postfix try operator.
+    /// `expr` is `*Expr` for the same cycle-breaking reason as
+    /// `BinaryExpr.lhs` — the Expr union's size would explode if every
+    /// variant carried a value-typed Expr child.
+    pub const TryOp = struct {
+        expr: *Expr,
+    };
+
+    /// Backing struct for `Expr.catch_expr` — `expr catch HANDLER` or
+    /// `expr catch |err| HANDLER`. `expr` is the expression being
+    /// caught; `handler` is the fallback expression (always present).
+    /// `err_binding` is non-null when the user wrote `catch |err| ...`
+    /// so codegen can inject the binding preamble.
+    pub const CatchExpr = struct {
+        expr: *Expr,
+        handler: *Expr,
+        err_binding: ?[]const u8 = null,
     };
 };
 

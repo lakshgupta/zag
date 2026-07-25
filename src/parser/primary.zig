@@ -507,7 +507,8 @@ pub fn parsePostfix(self: *Parser) Expr {
                 }
             }
         }
-        // The postfix chain interleaves two shapes:
+        // The postfix chain interleaves three shapes:
+        //   - `?` (postfix try/unwrap) → `.try_op`
         //   - `[start..end]` (or single-index or no-bound variants) → `.index` / `.slice`
         //   - `.name` (no parens) → `.member_access` | `.name(args...)` → `.method_call`
         // Both shapes are checked in this single `while` so chains like
@@ -515,6 +516,15 @@ pub fn parsePostfix(self: *Parser) Expr {
         // naturally — each iteration of the loop consumes one postfix
         // token and re-emits `lhs` with the wrapping applied.
         while (true) {
+            // Postfix `?` (try/unwrap operator): `expr?` unwraps
+            // Result<T,E> or Option<T>, early-returning on error/None.
+            if (self.peek().tag == .question) {
+                const target_buf = self.arena.alloc(Expr, 1);
+                target_buf[0] = lhs;
+                lhs = .{ .try_op = .{ .expr = &target_buf[0] } };
+                self.advance();
+                continue;
+            }
             if (self.peek().tag == .lbracket) {
                 self.advance(); // consume [
                 // Three valid shapes and one error follow the opening `[`:

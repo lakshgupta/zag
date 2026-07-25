@@ -1,0 +1,51 @@
+# Resolving method — diamond resolution at the call site
+# (docs/17 §"Resolving methods").
+# When two traits share a method name, write a bare (unqualified)
+# body alongside the dot-qualified ones. The bare body is the
+# "resolver" — it dispatches to the preferred trait with zero
+# overhead. The qualified bodies register on their respective
+# vtable slots.
+#
+# Here `draw` is declared by both Drawable and Clickable.
+# `btn.draw()` calls the resolver, which delegates to
+# `self.Drawable.draw()` at zero cost (the compiler inlines it).
+
+trait Drawable {
+    fun draw(self: *Self);
+}
+
+trait Clickable {
+    fun draw(self: *Self);
+}
+
+struct Button {
+    label: str,
+}
+
+impl Button with Drawable, Clickable {
+    # Resolver: bare `draw` → calls Drawable's draw by default.
+    pub fun draw(self: *Button) { self.Drawable.draw(); }
+
+    pub fun Drawable.draw(self: *Button) {
+        print("drew: ");
+        print(self.label);
+        print("\n");
+    }
+
+    pub fun Clickable.draw(self: *Button) {
+        print("clicked: ");
+        print(self.label);
+        print("\n");
+    }
+}
+
+fun main() {
+    let btn: Button = Button { label: "ok" };
+    # Calls the resolver, which routes to Drawable.draw.
+    btn.draw();
+    # Vtable dispatch through the fat pointer still works.
+    let d: Drawable = btn as Drawable;
+    d.draw();
+    let c: Clickable = btn as Clickable;
+    c.draw();
+}

@@ -379,7 +379,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             self.write(b.name);
             if (b.type_name) |t| {
                 self.write(": ");
-                self.write(zagTypeToZig(t));
+                self.writeType(t);
             }
             self.write(" = blk: {\n");
             for (stmts) |s| {
@@ -424,7 +424,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         // infer from the initializer (which still produces a `const`/`var`).
         if (b.type_name) |t| {
             self.write(": ");
-            self.write(zagTypeToZig(t));
+            self.writeType(t);
         }
         self.write(" = ");
         // Backed-enum typed-bind unwrap (gap #5): when the let-

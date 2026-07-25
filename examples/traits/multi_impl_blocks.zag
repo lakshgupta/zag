@@ -1,0 +1,44 @@
+# Multiple impl blocks on the same type (docs/17 §"Multiple Traits").
+# Impl blocks accumulate — each block can list a subset of the
+# type's traits. This keeps individual blocks short and separates
+# concerns. The compiler collects all methods across blocks and
+# emits one vtable registration per (trait, type) pair.
+#
+# Here Button implements Drawable and Clickable across two
+# separate blocks. Each block owns its trait's methods.
+
+trait Drawable {
+    fun draw(self: *Self);
+}
+
+trait Clickable {
+    fun click(self: *Self);
+}
+
+struct Button {
+    label: str,
+}
+
+impl Button with Drawable {
+    pub fun draw(self: *Button) {
+        print("draw: ");
+        print(self.label);
+        print("\n");
+    }
+}
+
+impl Button with Clickable {
+    pub fun click(self: *Button) {
+        print("click: ");
+        print(self.label);
+        print("\n");
+    }
+}
+
+fun main() {
+    let btn: Button = Button { label: "ok" };
+    let d: Drawable = btn as Drawable;
+    d.draw();
+    let c: Clickable = btn as Clickable;
+    c.click();
+}

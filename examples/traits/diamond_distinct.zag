@@ -1,12 +1,8 @@
 # Diamond disambiguation — distinct methods per trait
-# (docs/17 §"Diamond Disambiguation"). When the diamond has each
-# trait owning a DIFFERENT method, list each under its owning trait
-# in the parens. The bodies can diverge freely — Display's `print`
-# HTML-escapes, Show's `render` prints raw. No shared body, no
-# ambiguity.
-#
-# Equivalent to lopsided, but symmetric: both methods are owned
-# explicitly rather than leaving one slot unfulfilled.
+# (docs/17 §"Dot-qualified methods"). When the diamond has each
+# trait owning a DIFFERENT method, qualify each body with
+# `Trait.method`. The bodies can diverge freely — Display's
+# `print` formats one way, Show's `render` another.
 
 trait Display {
     fun print(self: *Self);
@@ -20,14 +16,15 @@ struct Button {
     label: str,
 }
 
-impl Button with Display (print), Show (render) {
-    pub fun print(self: *Button) {
-        print("<span>");
+impl Button with Display, Show {
+    pub fun Display.print(self: *Button) {
+        print("[display] ");
         print(self.label);
-        print("</span>\n");
+        print("\n");
     }
 
-    pub fun render(self: *Button) {
+    pub fun Show.render(self: *Button) {
+        print("[show] ");
         print(self.label);
         print("\n");
     }
@@ -36,7 +33,7 @@ impl Button with Display (print), Show (render) {
 fun main() {
     let btn: Button = Button { label: "ok" };
     let d: Display = btn as Display;
-    d.print<Button>();      # HTML-escaped
+    d.print();
     let s: Show = btn as Show;
-    s.render<Button>();    # raw
+    s.render();
 }

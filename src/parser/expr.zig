@@ -26,6 +26,7 @@ pub fn collectCastType(self: *Parser) []const u8 {
         // the space branch — so `*raw u8` was emitted as `* raw u8`,
         // breaking the `cast.type_text == "*raw u8"` test.
         var prev_was_ptr = false;
+        var generic_depth: usize = 0;
         while (!self.eof()) {
             const tok = self.peek();
             // Slice type prefix `[]` — consume the bracket pair as a single
@@ -141,10 +142,24 @@ pub fn collectCastType(self: *Parser) []const u8 {
                 continue;
             }
             const is_term: bool = switch (tok.tag) {
-                .newline, .comma, .rparen, .rbracket, .rbrace, .colon, .equals, .plus_eq, .minus_eq, .slash_eq, .percent_eq, .amp_eq, .pipe_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .plus, .minus, .slash, .percent, .amp, .pipe, .caret, .tilde, .bang, .lt_lt, .gt_gt, .lt, .gt, .lt_eq, .gt_eq, .eq_eq, .bang_eq, .amp_amp, .pipe_pipe, .range, .ellipsis, .arrow, .doc_comment, .eof => true,
+                .newline, .comma, .rparen, .rbracket, .rbrace, .colon, .equals, .plus_eq, .minus_eq, .slash_eq, .percent_eq, .amp_eq, .pipe_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .plus, .minus, .slash, .percent, .amp, .pipe, .caret, .tilde, .bang, .lt_lt, .gt_gt, .lt_eq, .gt_eq, .eq_eq, .bang_eq, .amp_amp, .pipe_pipe, .range, .ellipsis, .arrow, .doc_comment, .eof => true,
                 else => false,
             };
-            if (is_term) break;
+            if (is_term) {
+                if (generic_depth == 0) break;
+                // Inside generic angle brackets: consume comma as
+                // part of type text, but break on other terminators.
+                if (tok.tag == .comma) {
+                    if (len + 1 <= buf.len) {
+                        buf[len] = ',';
+                        len += 1;
+                    }
+                    prev_was_ptr = false;
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             // Treat `.star` as the pointer marker (concatenated, no space)
             // and identifiers as the type name proper.
             // `.const_kw` joins the identifier-equivalent dispatch so multi-token
@@ -178,6 +193,33 @@ pub fn collectCastType(self: *Parser) []const u8 {
                 }
                 prev_was_ptr = true;
                 self.advance();
+            } else if (tok.tag == .lt) {
+                // Generic open bracket `<` — part of type text for
+                // `Result<T, E>` / `Option<T>` and user generics.
+                // Mark prev_was_ptr so the next type param glues on
+                // without a space (`Result<i32` not `Result< i32`).
+                if (len + 1 <= buf.len) {
+                    buf[len] = '<';
+                    len += 1;
+                }
+                generic_depth += 1;
+                prev_was_ptr = true;
+                self.advance();
+            } else if (tok.tag == .gt) {
+                // Generic close bracket `>` — part of type text for
+                // `Result<T, E>` / `Option<T>` and user generics.
+                if (generic_depth > 0) {
+                    if (len + 1 <= buf.len) {
+                        buf[len] = '>';
+                        len += 1;
+                    }
+                    generic_depth -= 1;
+                } else {
+                    // Lone `>` outside generics — treat as terminator.
+                    break;
+                }
+                prev_was_ptr = true;
+                self.advance();
             } else {
                 break;
             }
@@ -198,7 +240,7 @@ pub fn collectCastType(self: *Parser) []const u8 {
 
 pub fn isExprStart(tag: TokenTag) bool {
         return switch (tag) {
-            .integer_literal, .float_literal, .string_literal, .byte_string_literal, .char_literal, .true_kw, .false_kw, .null_kw, .undefined_kw, .identifier, .print, .lparen, .lbracket, .minus, .amp, .plus, .tilde, .bang, .star, .new, .free, .if_kw, .match_kw => true,
+            .integer_literal, .float_literal, .string_literal, .byte_string_literal, .char_literal, .true_kw, .false_kw, .null_kw, .undefined_kw, .identifier, .print, .lparen, .lbracket, .minus, .amp, .plus, .tilde, .bang, .star, .new, .free, .if_kw, .match_kw, .catch_kw => true,
             else => false,
         };
     }
@@ -315,32 +357,50 @@ pub fn parseComparison(self: *Parser) Expr {
 
 
 pub fn parseExpr(self: *Parser) Expr {
-        switch (self.peek().tag) {
-            .if_kw => return self.parseIfExpr(),
-            .match_kw => {
+        // Catch expressions (`expr catch HANDLER` or
+        // `expr catch |err| HANDLER`) have the lowest precedence.
+        // We parse the leading expression first, then check for `catch`.
+        const lhs: Expr = switch (self.peek().tag) {
+            .if_kw => self.parseIfExpr(),
+            .match_kw => blk: {
                 const m = self.parseMatchExpr();
-                // Wrap in Expr.match_expr so codegen sees the same node shape
-                // regardless of whether the call site is statement-position
-                // or expression-position. Statement-position call sites
-                // (i.e. `parseStmt`'s `.match_kw` arm) build the same
-                // match_expr and route the codegen via this exact node.
-                return .{ .match_expr = m };
+                break :blk @as(Expr, .{ .match_expr = m });
             },
-            // Closure expressions (docs/15 §"Closures") start with the
-            // leading `.pipe` token of the param-bracketed `|x| body`
-            // shape. Dispatched here at the top of parseExpr so the rest
-            // of the precedence ladder sees the closure as a single
-            // operand and `let f = |x| x + 1;` parses as a single
-            // Closure-typed RHS rather than something bitwise-OR-shaped.
-            // This route mirrors the `.if_kw` arm above and avoids
-            // touching `parsePrimary` directly (where the anchor
-            // surface is large). The `.pipe_pipe` (logical-or) and
-            // `.pipe_eq` (compound-assign) tokens remain binary
-            // operators handled by the binary parse-layers; only the
-            // bare `.pipe` is the closure sentinel.
-            .pipe => return self.parseClosureExpr(),
-            else => return self.parseRange(),
+            .pipe => self.parseClosureExpr(),
+            else => self.parseRange(),
+        };
+        if (self.peek().tag == .catch_kw) {
+            return self.parseCatchExpr(lhs);
         }
+        return lhs;
+    }
+
+
+pub fn parseCatchExpr(self: *Parser, lhs: Expr) Expr {
+        // `lhs catch HANDLER` or `lhs catch |err| HANDLER`.
+        // Already verified that peek() is `.catch_kw`.
+        if (lhs == .try_op) {
+            // OK: `expr? catch ...`
+        }
+        self.advance(); // consume `catch`
+        var err_binding: ?[]const u8 = null;
+        // Check for the `|err|` binding form.
+        if (self.peek().tag == .pipe) {
+            self.advance(); // consume `|`
+            const binding = self.expectIdent();
+            err_binding = binding;
+            self.expect(.pipe); // consume `|`
+        }
+        const handler = self.parseExpr();
+        const lhs_buf = self.arena.alloc(Expr, 1);
+        lhs_buf[0] = lhs;
+        const handler_buf = self.arena.alloc(Expr, 1);
+        handler_buf[0] = handler;
+        return .{ .catch_expr = .{
+            .expr = &lhs_buf[0],
+            .handler = &handler_buf[0],
+            .err_binding = err_binding,
+        } };
     }
 
 

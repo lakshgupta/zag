@@ -76,6 +76,8 @@ pub     fn readIdent(self: *Lexer, start_loc: ast.Loc) void {
         .match_kw
     else if (std.mem.eql(u8, text, "break"))
         .break_kw
+    else if (std.mem.eql(u8, text, "catch"))
+        .catch_kw
     else if (std.mem.eql(u8, text, "continue"))
         .continue_kw
     else if (std.mem.eql(u8, text, "true"))

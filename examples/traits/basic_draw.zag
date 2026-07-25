@@ -4,7 +4,7 @@
 #   2. struct decl with field
 #   3. impl block providing the trait-method
 #   4. cast arm: `btn as Drawable` emitting the fat-pointer container
-#   5. dispatch arm: `d.draw<Button>()` calling through the vtable
+#   5. dispatch arm: `d.draw()` calling through the vtable
 
 trait Drawable {
     fun draw(self: *Self);
@@ -25,5 +25,5 @@ impl Button {
 fun main() {
     let btn: Button = Button { label: "click me" };
     let d = btn as Drawable;
-    d.draw<Button>();
+    d.draw();
 }

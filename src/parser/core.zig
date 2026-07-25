@@ -719,6 +719,7 @@ pub const Parser = struct {
     pub const parseBitOr = @import("expr.zig").parseBitOr;
     pub const parseBitXor = @import("expr.zig").parseBitXor;
     pub const parseCast = @import("expr.zig").parseCast;
+    pub const parseCatchExpr = @import("expr.zig").parseCatchExpr;
     pub const parseComparison = @import("expr.zig").parseComparison;
     pub const parseExpr = @import("expr.zig").parseExpr;
     pub const parseIfExpr = @import("expr.zig").parseIfExpr;

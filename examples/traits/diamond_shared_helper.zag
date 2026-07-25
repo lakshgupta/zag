@@ -1,8 +1,9 @@
 # Diamond disambiguation — shared body with a private helper
-# (docs/17 §"Diamond Disambiguation"). When the per-trait bodies
-# differ in style but share work, factor the shared work into a
-# top-level helper. The parens still disambiguate which vtable each
-# body registers on; the helper is just a regular module-scope fn.
+# (docs/17 §"Dot-qualified methods"). When two traits share a
+# method name, qualify each body with `Trait.method` and factor
+# shared work into a module-scope helper. The helper is a regular
+# fn, not a trait method — no vtable entry. Each qualified body
+# calls the helper and registers on its trait's vtable.
 
 trait Display {
     fun print(self: *Self);
@@ -17,15 +18,18 @@ struct Button {
 }
 
 # Shared helper: formats the button once; both trait bodies call it.
-fun button_format(self: *Button) -> str {
+fn button_format(self: *Button) -> str {
     return self.label;
 }
 
-impl Button with Display (print), Show (print) {
-    # Single source body calling the helper. Registers on BOTH
-    # vtables via the two renamed free fns Button_Display_print and
-    # Button_Show_print — both referencing the same code.
-    pub fun print(self: *Button) {
+impl Button with Display, Show {
+    pub fun Display.print(self: *Button) {
+        print("display: ");
+        print(button_format(self));
+        print("\n");
+    }
+    pub fun Show.print(self: *Button) {
+        print("show: ");
         print(button_format(self));
         print("\n");
     }
@@ -34,7 +38,7 @@ impl Button with Display (print), Show (print) {
 fun main() {
     let btn: Button = Button { label: "ok" };
     let d: Display = btn as Display;
-    d.print<Button>();
+    d.print();
     let s: Show = btn as Show;
-    s.print<Button>();
+    s.print();
 }

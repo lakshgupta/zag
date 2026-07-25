@@ -610,15 +610,14 @@ pub fn parseTraitMethodDecl(self: *Parser) ast.TraitMethodDecl {
             const rt = self.collectCastType();
             return_type = if (rt.len == 0) null else rt;
         }
-        // Phase 1+2 minimum subset: REQUIRED-only methods (no default
-        // bodies). The docs/17 `fun NAME(...) { body }` form is a
-        // default-method surface, deferred to Phase 3+. Parsing the
-        // optional `{ body }` here would silently accept a default
-        // method that codegen then has no path for, so we reject any
-        // trailing `{` post-signature as `expected '}' or newline`.
+        // Body: when present, the method is a default (has a body in the
+        // trait declaration). When absent (a semicolon or newline follows),
+        // the method is required — every impl block must supply a body.
+        var body: ?[]const ast.Stmt = null;
         if (self.peek().tag == .lbrace) {
-            std.debug.print("error:{d}:{d}: trait method '{s}' is REQUIRED-only in v1 minimum subset; default-method bodies are deferred (omit the {{ body }})\n", .{ start_loc.line, start_loc.col, name });
-            std.process.exit(1);
+            self.advance();
+            body = self.parseStmtList();
+            self.expect(.rbrace);
         }
         const params = self.arena.alloc(ast.MethodParam, param_count);
         if (param_count > 0) @memcpy(params, params_buf[0..param_count]);
@@ -626,7 +625,7 @@ pub fn parseTraitMethodDecl(self: *Parser) ast.TraitMethodDecl {
             .name = name,
             .params = params,
             .return_type = return_type,
-            .body = null,
+            .body = body,
             .loc = start_loc,
         };
     }

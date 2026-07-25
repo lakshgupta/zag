@@ -1,9 +1,9 @@
-## Error handling with Result, Option, and ?
+## Error handling with Result, Option, ?, and catch
 ##
 ## Run: zag run result.zag
 ##
 ## v1→v2 taxonomy note: this file uses the stdlib types `Result<T, E>` and
-## `Option<T>` via their unqualified ctors `Ok(...)` / `Err(...)` /
+## `Option<T>` via their unqualified ctors `Ok(...)` / `Err(...>` /
 ## `Some(...)` / `None`. It does NOT declare these types itself — the
 ## declarations live in the stdlib. In the v2 taxonomy (docs/14-unions,
 ## docs/18-error-handling) those declarations read:
@@ -29,8 +29,19 @@ fun maybe_get(index: i32) -> Option<i32> {
     return Some(index * 10);
 }
 
+## ? try-operator: propagates errors to the enclosing Result-returning function
+fun try_propagate() -> Result<i32, str> {
+    let half = divide(10, 2)?;
+    return Ok(half * 2);
+}
+
+## catch expression: provides a fallback value on error
+fun safe_divide(a: i32, b: i32) -> i32 {
+    return divide(a, b) catch 0;
+}
+
 fun main() {
-    # Result handling
+    # Result handling with match
     match divide(10, 2) {
         Ok(val) => print("10 / 2 = {val}\n"),
         Err(msg) => print("error: {msg}\n"),
@@ -41,9 +52,19 @@ fun main() {
         Err(msg) => print("error: {msg}\n"),
     }
 
-    # Option handling
+    # Option handling with match
     match maybe_get(1) {
         Some(val) => print("maybe_get(1) = {val}\n"),
         None      => print("maybe_get(1) = none\n"),
     }
+
+    # ? propagates in Result-returning context
+    match try_propagate() {
+        Ok(val) => print("try_propagate = {val}\n"),
+        Err(msg) => print("try_propagate failed: {msg}\n"),
+    }
+
+    # catch provides a fallback value on error
+    print("safe_divide(10, 0) = {safe_divide(10, 0)}\n");
+    print("safe_divide(10, 2) = {safe_divide(10, 2)}\n");
 }

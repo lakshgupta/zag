@@ -149,7 +149,7 @@ const Codegen = core.Codegen;
             self.rewriteReceiverType(zagTypeToZig(p.type_text), impl_type_params);
         }
         self.write(") ");
-        if (m.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
+        if (m.return_type) |rt| self.writeType(rt) else self.write("void");
         self.write(" {\n");
         // Reset per-function counters (matching `genMethod`/`genFun`).
         self.destructure_counter = 0;
@@ -261,7 +261,7 @@ const Codegen = core.Codegen;
                     self.write("    ");
                     self.write(nf.name);
                     self.write(": ");
-                    self.write(zagTypeToZig(nf.type_text));
+                    self.writeType(nf.type_text);
                     self.write(",\n");
                 },
                 .embed => |ef| {
@@ -283,6 +283,88 @@ const Codegen = core.Codegen;
                     self.write(ef.type_name);
                     self.write(" = .{}, // embedded (promote fields+methods via dot deref) \n");
                 },
+            }
+        }
+        // Embedding promotion: for each embed field, emit forwarding
+        // getter methods that flatten the embedded type's fields and
+        // methods into the outer struct's namespace. `btn.pos()` and
+        // `btn.click()` resolve directly — no `btn.Widget.` prefix
+        // needed. Only runs on the non-generic path (generic structs
+        // use thunk form which can't host nested methods).
+        if (!is_generic) {
+            for (sd.fields) |f| {
+                if (f.kind != .embed) continue;
+                const embed_type = f.kind.embed.type_name;
+                // Forward named fields of the embedded struct as
+                // getter methods.
+                for (self.prog.structs) |esd| {
+                    if (!std.mem.eql(u8, esd.name, embed_type)) continue;
+                    for (esd.fields) |ef| {
+                        if (ef.kind != .named) continue;
+                        const fn_field = ef.kind.named;
+                        self.write("    pub fn ");
+                        self.write(fn_field.name);
+                        self.write("(self: *const ");
+                        self.write(sd.name);
+                        self.write(") ");
+                        self.writeType(fn_field.type_text);
+                        self.write(" {\n");
+                        self.write("        return self.");
+                        self.write(embed_type);
+                        self.write(".");
+                        self.write(fn_field.name);
+                        self.write(";\n");
+                        self.write("    }\n");
+                    }
+                    break;
+                }
+                // Forward non-trait methods from impl blocks on the
+                // embedded type.
+                for (self.prog.impls) |impl| {
+                    if (!std.mem.eql(u8, impl.target_type, embed_type)) continue;
+                    for (impl.methods) |m4| {
+                        if (m4.trait_name != null) continue;
+                        self.write("    pub fn ");
+                        self.write(m4.name);
+                        self.write("(");
+                        // Rewrite the first param (self) to the outer type
+                        for (m4.params, 0..) |p4, pi| {
+                            if (pi > 0) self.write(", ");
+                            self.write(p4.name);
+                            self.write(": ");
+                            if (p4.is_self) {
+                                self.write("*");
+                                self.write(sd.name);
+                            } else {
+                                self.writeType(p4.type_text);
+                            }
+                        }
+                        self.write(") ");
+                        if (m4.return_type) |rt| self.writeType(rt) else self.write("void");
+                        self.write(" {\n");
+                        if (m4.return_type != null) {
+                            self.write("        return ");
+                        } else {
+                            self.write("        ");
+                        }
+                        self.write("self.");
+                        self.write(embed_type);
+                        self.write(".");
+                        self.write(m4.name);
+                        self.write("(");
+                        for (m4.params, 0..) |p5, pj| {
+                            if (pj > 0) self.write(", ");
+                            if (pj == 0 and p5.is_self) {
+                                self.write("&self.");
+                                self.write(embed_type);
+                            } else {
+                                self.write(p5.name);
+                            }
+                        }
+                        self.write(");\n");
+                        self.write("    }\n");
+                    }
+                }
             }
         }
         // Nest matching impl methods inside the struct definition. The
@@ -370,7 +452,7 @@ const Codegen = core.Codegen;
             self.rewriteReceiverType(zagTypeToZig(p.type_text), impl_type_params);
         }
         self.write(") ");
-        if (m.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
+        if (m.return_type) |rt| self.writeType(rt) else self.write("void");
         self.write(" {\n");
         // Trait-bounds guards (docs/16 §3) — see genFun's comment.
         self.genBoundsGuards(impl_type_params);
@@ -483,7 +565,7 @@ const Codegen = core.Codegen;
                 // const-param site. Wrap through `zagTypeToZig` so
                 // `fun foo(comptime N: str)` round-trips to `comptime
                 // N: []const u8` (docs/07 transparent-alias contract).
-                self.write(zagTypeToZig(tp.type_text.?));
+                self.writeType(tp.type_text.?);
             } else {
                 self.write("type");
             }
@@ -598,29 +680,12 @@ const Codegen = core.Codegen;
     }
 
     pub     fn rewriteSelfToT(self: *Codegen, text: []const u8) void {
-        // Docs/17 §"Self": `Self` refers to the implementing type. In
-        // trait method param + return types, `Self` is rewritten to the
-        // dispatch shim's generic `T` so a trait declared on multiple
-        // types shares one shim signature. Substring scan-and-replace
-        // is sufficient because `Self` always sits at the END of a
-        // type expression (it IS the type name, never a prefix) — the
-        // alternatives (`*Self`, `*const Self`, `[]Self`, `?Self`)
-        // are captured verbatim by `collectCastType` so the slice
-        // contains `Self` as a sub-token right before any trim point.
-        // Edge: `SelfIsLol` would collide, but no such identifier
-        // exists in zag's v1 surface and would conflict with type-name
-        // resolution if it did.
-        //
-        // After the Self→T substitution, the rewritten slice is fed
-        // through `zagTypeToZig` so trait-side type emits also honour
-        // the docs/07 transparent-alias contract (`str` becomes
-        // `[]const u8`). Chaining `.Self→T` THEN `.alias` works for
-        // all realistic shapes because no zag alias name contains
-        // `Self` AND no `Self` keyword passes through the alias
-        // table (which only matches the WHOLE text, not substrings).
-        // A local scratch buffer holds the intermediate result so
-        // `zagTypeToZig`'s value-return form can be composed with the
-        // stream-style Self→T scan-and-replace.
+        // Docs/17 §"Self": `Self` refers to the implementing type.
+        // In trait VTable function-pointer types and dispatch shims,
+        // `Self` is rewritten to `anyopaque` — the vtable function
+        // signatures use `*anyopaque` throughout so the dispatch
+        // shim can forward any concrete type through the vtable
+        // without a comptime type parameter.
         var scratch_buf: [256]u8 = undefined;
         var scratch_len: usize = 0;
         var i: usize = 0;
@@ -640,13 +705,14 @@ const Codegen = core.Codegen;
                 @memcpy(scratch_buf[scratch_len..][0..pre.len], pre);
                 scratch_len += pre.len;
             }
-            if (scratch_len + 1 <= scratch_buf.len) {
-                scratch_buf[scratch_len] = 'T';
-                scratch_len += 1;
+            const replacement = "anyopaque";
+            if (scratch_len + replacement.len <= scratch_buf.len) {
+                @memcpy(scratch_buf[scratch_len..][0..replacement.len], replacement);
+                scratch_len += replacement.len;
             }
             i = abs + "Self".len;
         }
-        self.write(zagTypeToZig(scratch_buf[0..scratch_len]));
+        self.writeType(scratch_buf[0..scratch_len]);
     }
 
     pub     fn genTraitDecl(self: *Codegen, td: ast.TraitDecl) void {
@@ -658,8 +724,7 @@ const Codegen = core.Codegen;
         // Docs/17 §"Definition": `trait NAME { fun draw(self: *Self); ... }`
         // compiles to a zig fat-pointer container holding (data ptr,
         // vtable ptr), an inner VTable struct of function pointers keyed
-        // by method name, and a per-method dispatch shim that re-enters
-        // via T. The shape follows the user-confirmed ABI:
+        // by method name, and a per-method dispatch shim:
         //
         //   pub const NAME = struct {
         //       pub const VTable = struct {
@@ -668,20 +733,17 @@ const Codegen = core.Codegen;
         //       };
         //       ptr: *anyopaque,
         //       vtable: *const VTable,
-        //       pub fn m1(self: NAME, comptime T: type, ...) RET1 {
-        //           _ = T;
-        //           return self.vtable.m1(self.ptr, ...);
+        //       pub fn m1(self: NAME) RET1 {
+        //           return self.vtable.m1(self.ptr);
         //       }
         //       ...
         //   };
         //
-        // The `_ = T;` line is REQUIRED because zig 0.16 rejects unused
-        // comptime parameters as a compile error. The shim's body never
-        // touches T (the dispatch is purely runtime through the vtable),
-        // but the user-facing ABI carries it as a placeholder for the
-        // Phase 3 trait-bounds wiring (`where T: SomeBound`). Without
-        // `_ = T;` every trait dispatch shim errors out as
-        // `unused parameter: comptime T`.
+        // Vtable dispatch is purely runtime — the function pointer
+        // is looked up via `self.vtable` and the data pointer is
+        // `self.ptr` (`*anyopaque`). No comptime type parameter is
+        // needed; the concrete type is determined at cast time (when
+        // `btn as Drawable` constructs the fat pointer).
         //
         // The receiver parameter (`self: *Self`) is always the FIRST
         // param in a trait method signature per the docs/17 §"Definition"
@@ -690,14 +752,32 @@ const Codegen = core.Codegen;
         // and to `self: NAME` (the trait container type) at the dispatch
         // shim signature. Subsequent params (additional user-declared args)
         // round-trip through `rewriteSelfToT` so any `*Self`-typed arg
-        // within them converts to `*T` for the shim's per-call monomorph.
+        // converts to `*anyopaque` — the vtable function-pointer type
+        // uses `*anyopaque` for all Self-derived parameters.
         self.write("pub const ");
         self.write(td.name);
         self.write(" = struct {\n");
         self.write("    pub const VTable = struct {\n");
-        for (td.methods) |m| {
+        for (td.methods, 0..) |m, mi| {
+            // VTable field name: suffixed for overloaded methods.
+            var sfn_buf: [128]u8 = undefined;
+            const vtable_name = blk: {
+                var dup_idx: usize = 0;
+                var total: usize = 0;
+                for (td.methods) |tm| {
+                    if (std.mem.eql(u8, tm.name, m.name)) {
+                        if (total < mi) dup_idx += 1;
+                        total += 1;
+                    }
+                }
+                if (total <= 1) break :blk m.name;
+                @memcpy(sfn_buf[0..m.name.len], m.name);
+                const sfx = std.fmt.bufPrint(sfn_buf[m.name.len + 1 .. sfn_buf.len], "{d}", .{dup_idx}) catch "0";
+                sfn_buf[m.name.len] = '_';
+                break :blk sfn_buf[0 .. m.name.len + 1 + sfx.len];
+            };
             self.write("        ");
-            self.write(m.name);
+            self.write(vtable_name);
             self.write(": *const fn (ptr: *anyopaque");
             // Additional params (skip the always-first `self` receiver).
             for (m.params[1..]) |p| {
@@ -716,15 +796,28 @@ const Codegen = core.Codegen;
         self.write("    vtable: *const VTable,\n");
         // Per-method dispatch shim. Each shim is a thin wrapper that
         // forwards to the trait-defined vtable slot; the extra comptime
-        // T arg keeps the user-facing ABI claims of Phase 1 intact even
-        // though zig's strict unused-parameter rule forces the `_ = T;`
-        // discard inside the shim body.
-        for (td.methods) |m| {
+        // the dispatch shim uses the correct vtable field.
+        for (td.methods, 0..) |m, mi| {
+            var sfn_buf: [128]u8 = undefined;
+            const vtable_name = blk: {
+                var dup_idx: usize = 0;
+                var total: usize = 0;
+                for (td.methods) |tm| {
+                    if (std.mem.eql(u8, tm.name, m.name)) {
+                        if (total < mi) dup_idx += 1;
+                        total += 1;
+                    }
+                }
+                if (total <= 1) break :blk m.name;
+                @memcpy(sfn_buf[0..m.name.len], m.name);
+                const sfx = std.fmt.bufPrint(sfn_buf[m.name.len + 1 .. sfn_buf.len], "{d}", .{dup_idx}) catch "0";
+                sfn_buf[m.name.len] = '_';
+                break :blk sfn_buf[0 .. m.name.len + 1 + sfx.len];
+            };
             self.write("    pub fn ");
             self.write(m.name);
             self.write("(self: ");
             self.write(td.name);
-            self.write(", comptime T: type");
             for (m.params[1..]) |p| {
                 self.write(", ");
                 self.write(p.name);
@@ -734,9 +827,8 @@ const Codegen = core.Codegen;
             self.write(") ");
             if (m.return_type) |rt| self.rewriteSelfToT(rt) else self.write("void");
             self.write(" {\n");
-            self.write("        _ = T;\n");
             self.write("        return self.vtable.");
-            self.write(m.name);
+            self.write(vtable_name);
             self.write("(self.ptr");
             for (m.params[1..]) |p| {
                 self.write(", ");
@@ -748,7 +840,7 @@ const Codegen = core.Codegen;
         self.write("};\n\n");
     }
 
-    pub     fn genTraitRegistration(self: *Codegen, trait_name: []const u8, target_type: []const u8, methods: []const ast.MethodDecl) void {
+    pub     fn genTraitRegistration(self: *Codegen, trait_name: []const u8, target_type: []const u8, methods: []const ast.MethodDecl, method_field_names: []const []const u8, default_methods: []const []const u8, default_field_names: []const []const u8) void {
         // Docs/17 §"Implementing" — emit a per-(trait, target_type)
         // vtable instantiation so a future `x.draw()` call site (Phase 3
         // — fat-pointer cast encoding) dispatches through THIS
@@ -778,15 +870,24 @@ const Codegen = core.Codegen;
         self.write(": ");
         self.write(trait_name);
         self.write(".VTable = .{\n");
-        for (methods) |m| {
+        for (methods, method_field_names) |m, fn_| {
             self.write("    .");
-            self.write(m.name);
+            self.write(fn_);
             self.write(" = @ptrCast(&");
             self.write(target_type);
             self.write("_");
             self.write(trait_name);
             self.write("_");
             self.write(m.name);
+            self.write("),\n");
+        }
+        for (default_methods, default_field_names) |_, dfn| {
+            self.write("    .");
+            self.write(dfn);
+            self.write(" = @ptrCast(&");
+            self.write(trait_name);
+            self.write("__");
+            self.write(dfn);
             self.write("),\n");
         }
         self.write("};\n\n");
@@ -976,7 +1077,7 @@ const Codegen = core.Codegen;
                         if (fi > 0) self.write(", ");
                         self.write(f.name);
                         self.write(": ");
-                        self.write(zagTypeToZig(f.type_text));
+                        self.writeType(f.type_text);
                     }
                     self.write(" }");
                 } else if (v.payload_type) |pt| {
@@ -1004,7 +1105,7 @@ const Codegen = core.Codegen;
                     };
                     if (comma_count == 0) {
                         self.write(": ");
-                        self.write(zagTypeToZig(pt));
+                        self.writeType(pt);
                     } else {
                         self.write(": struct { ");
                         const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
@@ -1024,7 +1125,7 @@ const Codegen = core.Codegen;
                                 if (idx > 0) self.write(", ");
                                 self.write(letters[idx]);
                                 self.write(": ");
-                                self.write(zagTypeToZig(pt[a..b]));
+                                self.writeType(pt[a..b]);
                                 idx += 1;
                                 seg_start = i + 1;
                             }
@@ -1199,7 +1300,7 @@ const Codegen = core.Codegen;
             if (p.is_var) self.write("__zag_local_");
             self.write(p.name);
             self.write(": ");
-            self.write(zagTypeToZig(p.type_text));
+            self.writeType(p.type_text);
         }
         self.write(") ");
         // zig 0.16 main-signature migration: wrap the return
@@ -1231,8 +1332,8 @@ const Codegen = core.Codegen;
         if (is_main) {
             const already_err_union = if (fun.return_type) |rt| rt.len > 0 and rt[0] == '!' else false;
             if (!already_err_union) self.write("!");
-            if (fun.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
-        } else if (fun.return_type) |rt| self.write(zagTypeToZig(rt)) else self.write("void");
+            if (fun.return_type) |rt| self.writeType(rt) else self.write("void");
+        } else if (fun.return_type) |rt| self.writeType(rt) else self.write("void");
         self.write(" {\n");
         // Trait-bounds guards (docs/16 §3): emit
         // `if (!@hasDecl(T, "method")) @compileError(...)` BEFORE

@@ -39,6 +39,6 @@ fun main() {
     let btn: Button = Button { label: "ok" };
     let d: Drawable = btn as Drawable;
     let c: Clickable = btn as Clickable;
-    d.draw<Button>();
-    c.click<Button>();
+    d.draw();
+    c.click();
 }

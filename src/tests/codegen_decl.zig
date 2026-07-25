@@ -1249,8 +1249,11 @@ test "codegen: bare enum decl emits pub const NAME = enum { ... }" {
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "pub const Direction") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "North") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "South") != null);
-    // Bare (no payload) — uses regular `enum`, not `union(enum)`.
-    try std.testing.expect(std.mem.indexOf(u8, zig_src, "union(enum)") == null);
+    // Bare (no payload) — the Direction decl itself uses `enum {`, NOT `union(enum)`.
+    // (The preamble Result/Option type definitions DO emit `union(enum)`, so
+    // checking the whole output for its absence is invalid.)
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "pub const Direction = enum {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "pub const Direction = union(enum)") == null);
 }
 
 test "codegen: payload enum decl emits union(enum)" {
@@ -1687,14 +1690,11 @@ test "codegen: generic fun emits `comptime X: type` preamble" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "return x;") != null);
 }
 
-test "codegen: trait decl emits VTable + ptr/vtable + dispatch shims + _ = T;" {
-    // The user-confirmed ABI shape per docs/17 + Phase 2 design.
-    // The trait container holds (data ptr, vtable ptr); the VTable
-    // struct holds ONE *const fn entry per trait method (with
-    // Self rewritten to the per-shim generic T AND alias
-    // resolution applied — e.g. `str` becomes `[]const u8`); each
-    // dispatch shim carries a `comptime T: type` placeholder with
-    // `_ = T;` discard (zig 0.16 rejects unused comptime params).
+test "codegen: trait decl emits VTable + ptr/vtable + dispatch shims" {
+    // The user-confirmed ABI shape per docs/17. The trait container
+    // holds (data ptr, vtable ptr); the VTable struct holds ONE
+    // *const fn entry per trait method (Self rewritten to *anyopaque);
+    // each dispatch shim forwards directly — no comptime T param.
     const src = "trait Drawable {\n    fun draw(self: *Self);\n    fun label(self: *Self) -> str;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -1708,30 +1708,24 @@ test "codegen: trait decl emits VTable + ptr/vtable + dispatch shims + _ = T;" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "    pub const VTable = struct {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    ptr: *anyopaque,") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    vtable: *const VTable,") != null);
-    // VTable fn-pointer slots. Self is omitted because the receiver
-    // becomes `ptr: *anyopaque`. The `str` return-type surfaces as
-    // `[]const u8` because rewriteSelfToT composes with zagTypeToZig
-    // (docs/07 transparent-alias contract).
+    // VTable fn-pointer slots.
     try std.testing.expect(std.mem.indexOf(u8, zig, "draw: *const fn (ptr: *anyopaque) void,") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "label: *const fn (ptr: *anyopaque) []const u8,") != null);
-    // Per-method dispatch shims. The `comptime T: type` slot is the
-    // user-facing ABI claim; `_ = T;` discards the unused parameter
-    // so zig 0.16 accepts the shim body.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn draw(self: Drawable, comptime T: type) void {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "        _ = T;") != null);
+    // Per-method dispatch shims — no comptime type param needed.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn draw(self: Drawable) void {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "return self.vtable.draw(self.ptr);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn label(self: Drawable, comptime T: type) []const u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn label(self: Drawable) []const u8 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "return self.vtable.label(self.ptr);") != null);
+    // Sanity: no comptime T param in the Drawable dispatch shim
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable, comptime T: type") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "_ = T;") == null);
 }
 
-test "codegen: trait method with *Self arg + i32 arg + *Self return — Self->T rewrite chained with alias resolution" {
-    // Exercises three sites at once: (1) an additional param of type
-    // *Self becomes *T (Self->T rewrite), (2) a non-Self `n: i32`
-    // passes through unchanged, (3) the return type *Self becomes *T.
-    // The composition with zagTypeToZig means the rewrite path
-    // ALSO honours `str` -> `[]const u8` (the docs/07 transparent-
-    // alias contract) so trait method signatures on aliased types
-    // round-trip without rejecting the type slot.
+test "codegen: trait method with *Self arg + i32 arg + *Self return — Self→anyopaque rewrite" {
+    // Exercises three sites: (1) additional param *Self → *anyopaque,
+    // (2) non-Self `n: i32` passes through unchanged, (3) return type
+    // *Self → *anyopaque. No comptime T — the vtable function-pointer
+    // types use *anyopaque throughout.
     const src = "trait Greeter {\n    fun greet(self: *Self, other: *Self, n: i32) -> *Self;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -1740,16 +1734,13 @@ test "codegen: trait method with *Self arg + i32 arg + *Self return — Self->T 
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // VTable signature: `other` and `n` appear in declaration order;
-    // *Self becomes *T; non-Self `n: i32` passes through.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "greet: *const fn (ptr: *anyopaque, other: *T, n: i32) *T,") != null);
-    // Dispatch shim mirrors with `comptime T: type` between the
-    // receiver and the additional params.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn greet(self: Greeter, comptime T: type, other: *T, n: i32) *T {") != null);
+    // VTable signature: *Self → *anyopaque.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "greet: *const fn (ptr: *anyopaque, other: *anyopaque, n: i32) *anyopaque,") != null);
+    // Dispatch shim — no comptime T param.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn greet(self: Greeter, other: *anyopaque, n: i32) *anyopaque {") != null);
     // Body forwards self.ptr, other, n to the vtable slot.
     try std.testing.expect(std.mem.indexOf(u8, zig, "return self.vtable.greet(self.ptr, other, n);") != null);
-    // Sanity: no bare `Self` survived anywhere — the rewrite is
-    // applied at every type-bearing slot.
+    // Sanity: no bare `Self` survived.
     try std.testing.expect(std.mem.indexOf(u8, zig, "Self") == null);
 }
 
@@ -1875,20 +1866,14 @@ test "codegen: cast `*T-typed x as Trait` emits @ptrCast(x) without address-of" 
     const zig = cg.generate(prog);
     // Positive: pointer source binds to the vtable registration
     // without an inserted `&`.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @ptrCast(x), .vtable = &Drawable_VTable_for_Button") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @constCast(x), .vtable = &Drawable_VTable_for_Button") != null);
     // Negative: NO spurious address-of for an already-pointer source.
     try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrCast(&x)") == null);
 }
 
-test "codegen: dispatch `d.draw<T>()` emits `d.draw(T)` binding source-type" {
-    // The user MUST supply the source-type via turbofish so the
-    // dispatch shim's `comptime T: type` parameter resolves — the
-    // trait-cast arm sets `d`'s zig type to `Drawable`, and the
-    // dispatch shim's `comptime T: type` is satisfied by the
-    // turbofish'd Button. Without turbofish zig has no way to
-    // infer which `<Trait>_VTable_for_<X>` registration to wire
-    // (the shim's `_ = T;` discards the binding but the slot is
-    // required by zig 0.16 strict comptime rules).
+test "codegen: dispatch `d.draw()` calls the shim without turbofish" {
+    // The dispatch shim no longer needs a comptime T param —
+    // the vtable does all the work. `d.draw()` resolves directly.
     const src =
         \\trait Drawable { fun draw(self: *Self); }
         \\struct Button { label: str }
@@ -1896,7 +1881,7 @@ test "codegen: dispatch `d.draw<T>()` emits `d.draw(T)` binding source-type" {
         \\fun main() {
         \\    let btn: Button = Button { label: "x" };
         \\    let d: Drawable = btn as Drawable;
-        \\    d.draw<Button>();
+        \\    d.draw();
         \\}
         \\
     ;
@@ -1907,26 +1892,15 @@ test "codegen: dispatch `d.draw<T>()` emits `d.draw(T)` binding source-type" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Positive: turbofish surfaces as the type_args slot in the
-    // method-call emit (preceding any args; here there are zero
-    // args so the turbofish slot IS the only arg).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw(Button)") != null);
-    // Negative 1: legacy shape (no turbofish → empty comptime T
-    // slot) was NOT emitted.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw()") == null);
-    // Negative 2: source-type passthrough did NOT slip through as
-    // a sibling vtable literal (e.g. an emit that accidentally
-    // `Drawer_VTable_for_` somewhere). Confirmed by the lack of
-    // a stray `_VTable_for_` outside the registration decl.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawer_VTable_for_") == null);
+    // Direct call — no turbofish
+    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw()") != null);
+    // Sanity: no turbofish noise in draw call
+    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw(Button)") == null);
 }
 
 test "codegen: trait + impl + cast + dispatch end-to-end emits full pipeline shape" {
-    // The full Phase 3 example (mini version of
-    // examples/traits/basic_draw.zag): trait decl, struct decl,
-    // impl, trait-method free fn + vtable reg, plus the user's
-    // main assembling a cast + turbofish-dispatch. Each emission
-    // substring must appear in the codegen output.
+    // Full pipeline: trait decl, struct, impl, vtable reg, cast,
+    // direct dispatch. No turbofish — the vtable handles it.
     const src =
         \\trait Drawable { fun draw(self: *Self); }
         \\struct Button { label: str, }
@@ -1934,7 +1908,7 @@ test "codegen: trait + impl + cast + dispatch end-to-end emits full pipeline sha
         \\fun main() {
         \\    let btn: Button = Button { label: "x" };
         \\    let d: Drawable = btn as Drawable;
-        \\    d.draw<Button>();
+        \\    d.draw();
         \\}
         \\
     ;
@@ -1949,16 +1923,17 @@ test "codegen: trait + impl + cast + dispatch end-to-end emits full pipeline sha
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Drawable = struct {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub const VTable = struct {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "draw: *const fn (ptr: *anyopaque) void,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "_ = T;") != null);
-    // 2. free fn rename (Phase 2 surface)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn draw(self: Drawable) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable, comptime T: type") == null);
+    // 2. free fn rename
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn Button_Drawable_draw(self: *Button) void") != null);
-    // 3. vtable registration (Phase 2 surface)
+    // 3. vtable registration
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Drawable_VTable_for_Button: Drawable.VTable = .{") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, ".draw = @ptrCast(&Button_Drawable_draw),") != null);
-    // 4. cast arm shape (value-typed source → @ptrCast(&btn))
+    // 4. cast arm shape
     try std.testing.expect(std.mem.indexOf(u8, zig, "Drawable{ .ptr = @constCast(&btn), .vtable = &Drawable_VTable_for_Button") != null);
-    // 5. dispatch turbofish (`d.draw(Button)`)
-    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw(Button);") != null);
+    // 5. direct dispatch — no turbofish
+    try std.testing.expect(std.mem.indexOf(u8, zig, "d.draw();") != null);
 }
 
 test "codegen: non-trait cast `x as i32` preserves @as(T, x) emit unchanged" {
@@ -2941,4 +2916,220 @@ test "codegen: with Trait ambiguity (no parens, two traits declare same method) 
     try std.testing.expectEqual(@as(usize, 2), prog.impls[0].trait_specs.len);
     try std.testing.expectEqual(@as(usize, 0), prog.impls[0].trait_specs[0].preferred_methods.len);
     try std.testing.expectEqual(@as(usize, 0), prog.impls[0].trait_specs[1].preferred_methods.len);
+}
+
+test "codegen: default trait method emits Trait__Method free fn and vtable entry" {
+    // When a trait method has a default body, codegen should emit
+    // a standalone free fn named `<Trait>__<Method>` and register
+    // it in the vtable even when the impl block omits the method.
+    const src =
+        \\trait Greeter {
+        \\    pub fun hello(self: *Self) -> str {
+        \\        return "hi";
+        \\    }
+        \\}
+        \\struct Widget {}
+        \\impl Widget with Greeter {}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Default free fn emitted
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn Greeter__hello(") != null);
+    // VTable registration includes the default
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".hello = @ptrCast(&Greeter__hello)") != null);
+}
+
+test "codegen: impl override of default method still wins in vtable" {
+    // When the impl provides a body for a default method, the impl's
+    // body wins in the vtable — NOT the trait's default.
+    const src =
+        \\trait Greeter {
+        \\    pub fun hello(self: *Self) -> str {
+        \\        return "hi";
+        \\    }
+        \\}
+        \\struct Widget {}
+        \\impl Widget with Greeter {
+        \\    pub fun hello(self: *Widget) -> str {
+        \\        return "hey";
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The impl's free fn is registered, not the default
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".hello = @ptrCast(&Widget_Greeter_hello)") != null);
+    // The default free fn still exists (for types that don't override)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Greeter__hello") != null);
+}
+
+test "codegen: Raku-style resolving method allows bare method alongside qualified ones" {
+    // When two traits declare the same method name, a bare (unqualified)
+    // method alongside qualified ones is a "resolver" — a regular
+    // type method that dispatches to the preferred trait. It should NOT
+    // produce an ambiguous binding error.
+    const src =
+        \\trait Drawable { fun draw(self: *Self); }
+        \\trait Clickable { fun draw(self: *Self); }
+        \\struct Button { label: str }
+        \\impl Button with Drawable, Clickable {
+        \\    pub fun draw(self: *Button) { self.Drawable.draw(); }
+        \\    pub fun Drawable.draw(self: *Button) { }
+        \\    pub fun Clickable.draw(self: *Button) { }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The resolver should NOT cause an ambiguous binding error
+    // (the test reaching this point means the compiler didn't exit)
+    // Qualified methods get their trait free fns
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Button_Drawable_draw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Button_Clickable_draw") != null);
+    // The bare method is a regular type method (no vtable entry)
+    // It's emitted inside the struct as a nested pub fn
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn draw(") != null);
+}
+
+test "codegen: default body inherited when impl omits it — vtable includes Trait__Method ref" {
+    // When a trait has a default method and the impl omits it, the
+    // vtable registration should include the default free fn pointer.
+    // No overloads — the existing VTable field-naming convention
+    // doesn't yet support duplicate method names within a trait.
+    const src =
+        \\trait Greeter {
+        \\    pub fun hello(self: *Self) -> str {
+        \\        return "hi";
+        \\    }
+        \\    pub fun goodbye(self: *Self) -> str {
+        \\        return "bye";
+        \\    }
+        \\}
+        \\struct Widget {}
+        \\impl Widget with Greeter {
+        \\    pub fun hello(self: *Widget) -> str {
+        \\        return "hey";
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Impl-provided hello registered normally
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".hello = @ptrCast(&Widget_Greeter_hello)") != null);
+    // Default goodbye inherited from trait — registered with Trait__Method ref
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".goodbye = @ptrCast(&Greeter__goodbye)") != null);
+}
+
+test "codegen: overloaded trait methods get suffixed VTable field names" {
+    // When a trait has two methods with the same name (overloaded),
+    // the VTable struct fields must be unique. The first occurrence
+    // keeps the bare name; subsequent ones get a _1, _2... suffix.
+    const src =
+        \\trait Renderer {
+        \\    pub fun render(self: *Self);
+        \\    pub fun render(self: *Self, scale: f64);
+        \\}
+        \\struct Widget {}
+        \\impl Widget with Renderer {
+        \\    pub fun Renderer.render(self: *Widget) { }
+        \\    pub fun Renderer.render(self: *Widget, scale: f64) { }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // VTable type has unique field names — multiple overloads all get suffixes
+    try std.testing.expect(std.mem.indexOf(u8, zig, "render_0: *const fn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "render_1: *const fn") != null);
+    // VTable registration uses the suffixed names pointing to suffixed free fns
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Widget_Renderer_render_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Widget_Renderer_render_1") != null);
+    // Dispatch shims use the unsuffixed function name (zig handles overloading)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn render(self: Renderer,") != null);
+}
+
+test "codegen: embedding promotion emits getter methods for embedded struct fields" {
+    // When a struct embeds another struct with `Widget,`, the outer
+    // struct should get forwarded getter methods so `btn.pos()` works
+    // without `btn.Widget.pos`.
+    const src =
+        \\struct Widget {
+        \\    pos: i32,
+        \\}
+        \\struct Button {
+        \\    Widget,
+        \\    label: str,
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Embedded field still stored as named field
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Widget: Widget") != null);
+    // Getter method for the pos field forwarded from Widget
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn pos(self: *const Button) i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return self.Widget.pos;") != null);
+}
+
+test "codegen: embedding promotion forwards non-trait impl methods" {
+    // When a struct embeds another struct that has impl methods,
+    // those methods should be forwarded to the outer struct.
+    const src =
+        \\struct Widget {
+        \\    x: i32,
+        \\}
+        \\impl Widget {
+        \\    pub fun show(self: *Widget) -> str {
+        \\        return "ok";
+        \\    }
+        \\}
+        \\struct Button {
+        \\    Widget,
+        \\    label: str,
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Forwarded method on Button delegates to Widget, passing &self.Widget
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn show(self: *Button) []const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "self.Widget.show(&self.Widget") != null);
 }

@@ -1,0 +1,41 @@
+# Overloaded trait methods (docs/17 §"Overloaded trait methods").
+# A single trait can declare multiple methods with the same name
+# but different parameter types. The compiler matches impl bodies
+# to trait slots by signature — no extra disambiguation syntax
+# needed.
+#
+# Here Renderer declares two render methods: one zero-arg, one
+# with a scale parameter. The impl provides both, qualified with
+# Trait.method. The compiler distinguishes them by signature.
+
+trait Renderer {
+    pub fun render(self: *Self);
+    pub fun render(self: *Self, scale: f64);
+}
+
+struct Button {
+    label: str,
+}
+
+impl Button with Renderer {
+    pub fun Renderer.render(self: *Button) {
+        print("button: ");
+        print(self.label);
+        print("\n");
+    }
+
+    pub fun Renderer.render(self: *Button, scale: f64) {
+        print("button (");
+        print(scale);
+        print("): ");
+        print(self.label);
+        print("\n");
+    }
+}
+
+fun main() {
+    let btn: Button = Button { label: "ok" };
+    let r: Renderer = btn as Renderer;
+    r.render();
+    r.render(2.0);
+}

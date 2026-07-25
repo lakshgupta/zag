@@ -1,19 +1,17 @@
-# Ambiguous diamond — compile error (docs/17 §"Diamond Disambiguation").
-# When two listed traits share a method name AND no parenthesised
-# disambiguator picks one, the zag compiler surfaces a compile error
-# with the disambiguator hint rather than silently picking the first
-# match.
+# Ambiguous diamond — compile error (docs/17 §"Dot-qualified methods").
+# When two listed traits share a method name and the impl block
+# provides a bare (unqualified) body with no qualified
+# counterparts, the zag compiler surfaces a compile error with a
+# hint to add dot-qualifiers.
 #
-# This file is NOT expected to compile. Run it with `zag check
-# examples/traits/ambiguous_diamond.zag` and you should see:
-#
+# This file is NOT expected to compile. The error will say:
 #   error: ambiguous trait binding for method 'print' on type 'Button'
-#   — multiple `with`-listed traits declare it. Add a parenthesised
-#   disambiguator, e.g. `with T1 (print), T2`
+#   — multiple `with`-listed traits declare it. Add a
+#   dot-qualifier, e.g. `Trait1.print`, or write a resolving
+#   method alongside qualified ones.
 #
-# Fix by adding parens to one (lopsided) or both (shared) traits —
-# see diamond_lopsided.zag and diamond_shared.zag for the two valid
-# resolutions.
+# Fix by adding dot-qualified methods — see diamond_lopsided.zag
+# and diamond_shared.zag for the valid resolutions.
 
 trait Display {
     fun print(self: *Self);
@@ -27,8 +25,9 @@ struct Button {
     label: str,
 }
 
-# Ambiguous: both Display and Show declare `print`; no parens
-# disambiguate. The zag compile-error fires at codegen time.
+# Ambiguous: both Display and Show declare `print`; no qualified
+# methods disambiguate. The zag compile-error fires at codegen
+# time.
 impl Button with Display, Show {
     pub fun print(self: *Button) {
         print(self.label);

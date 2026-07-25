@@ -2,26 +2,13 @@
 
 A trait declares shared behavior. Use a trait when a Type must be usable wherever the trait is expected — function parameter, list element, or generic bound.
 
-**One canonical syntax.** Name the type and one or more traits at the `impl` block header. Each trait optionally lists method names in parens — the diamond disambiguator that binds a method body to that trait's vtable:
-
-```
-impl Type with Trait1 (m1, m2), Trait2, Trait3 (m3) {
-    pub fun m1(self: *Type, ...) { ... }     # binds to Trait1's vtable
-    pub fun m2(self: *Type, ...) { ... }     # binds to Trait1's vtable
-    pub fun m3(self: *Type, ...) { ... }     # binds to Trait3's vtable
-    pub fun regular(self: *Type, ...) { ... }# no trait (regular type method)
-}
-```
-
 **Memory.** Traits are fat pointers (data pointer + vtable pointer). 16 bytes on 64-bit. Vtable dispatch is one indirect call.
-
-> **Status.** This chapter is the design spec — the canonical `impl Type with Trait (m) { ... }` form is the single target surface. The parser does NOT yet recognise the `with` clause; rollout is staged in § Implementation Plan. Until that lands, the rest of the language (the trait declarations, the `obj as Trait` cast, the vtable dispatch) behaves as described here.
 
 This chapter uses one running example (`Button` + `Drawable`) and progressively extends it.
 
 ## Definition
 
-A trait declares method signatures. Methods without a body are REQUIRED — the impl block must supply one. Methods with a body are DEFAULTS — the impl block may inherit or override them:
+A trait declares method signatures. Methods without a body are **required** — every impl block must supply one. Methods with a body are **defaults** — the impl block may inherit or override them:
 
 ```
 trait Drawable {
@@ -32,89 +19,99 @@ trait Drawable {
 }
 ```
 
-Trait methods have a **fixed signature per trait** — overloading is not supported on trait methods (regular type methods can overload; see § 29). This keeps the diamond a pure name collision, resolved by the `(method)` disambiguator with no signature-level lookup.
+Trait methods have a **fixed signature per trait.** Overloading within a single trait works — two methods with the same name but different parameter types are distinct:
+
+```
+trait Renderer {
+    pub fun render(self: *Self);
+    pub fun render(self: *Self, scale: f64);
+}
+```
 
 ## Implementing
 
-The canonical form names the type and one or more traits at the block header. A method with a unique name across the listed traits dispatches automatically:
+Name the type and one or more traits at the `impl` block header. A method whose name is unique across the listed traits dispatches automatically:
 
 ```
 impl Button with Drawable {
     pub fun draw(self: *Button) {
         print("Button: ", self.label);
     }
-    # Drawable.name is inherited as the default — no need to write
-    # it unless you want different behavior.
+    # Drawable.name is inherited from the default — no body needed.
 }
 ```
 
-Required methods (no body in the trait) MUST appear in the impl block — missing one is a compile error. Default methods (with a body in the trait) are optional — omit them to inherit the default, supply them to override.
+Required methods MUST appear in the impl block. Default methods are optional — omit them to inherit the default, supply them to override.
 
-## Multiple Traits in One Block
+### Dot-qualified methods
 
-Comma-separate the trait names in the header. When a method name is unique to one of the listed traits, the compiler binds the body to that trait's vtable automatically:
+When a method name is not unique (e.g. two traits declare `draw`), qualify it with `Trait.method`:
 
 ```
 impl Button with Drawable, Clickable {
-    pub fun draw(self: *Button)  { ... }   # unique to Drawable
-    pub fun click(self: *Button) { ... }   # unique to Clickable
+    pub fun Drawable.draw(self: *Button)  { ... }    # → Drawable's vtable
+    pub fun Clickable.draw(self: *Button) { ... }    # → Clickable's vtable
 }
 ```
 
-A method whose name appears in no listed trait is a regular type method — no vtable entry. It is callable as `btn.log()` but not through `btn as SomeTrait`.
+The compiler registers each body on the named trait's vtable. Unqualified methods that are unique across the `with` list still bind automatically — the qualifier is only required for disambiguation.
 
-## Diamond Disambiguation
+### Overloaded trait methods
 
-When the same method name appears in more than one listed trait (the diamond shape), the parenthesised `(method, ...)` list on a trait name owns the body. The impl block only needs to provide a body if the owning trait doesn't define a default.
-
-**Lopsided — one trait owns `print`:**
+When a trait has multiple methods with the same name, the compiler matches by signature — no extra syntax:
 
 ```
-impl Button with Drawable (print), Show {
-    pub fun print(self: *Button) { ... }      # Drawable is the source of truth for print;
-                                              # Show's `print` slot stays unfulfilled
+impl Button with Renderer {
+    pub fun Renderer.render(self: *Button) { ... }             # → render()
+    pub fun Renderer.render(self: *Button, scale: f64) { ... } # → render(f64)
 }
 ```
 
-Drawable owns `print`. Show's `print` slot is unfulfilled — a second `impl` block may complete it.
+### Resolving methods
 
-**Shared — both traits register the same body:**
+When two traits share a method name, you can write an unqualified body alongside the qualified ones. The unqualified method resolves the ambiguity at the call site:
 
 ```
-impl Button with Drawable (print), Show (print) {
-    pub fun print(self: *Button) { ... }      # one body, two vtable entries
+impl Button with Drawable, Clickable {
+    pub fun draw(self: *Button) { self.Drawable.draw(); }      # resolver
+    pub fun Drawable.draw(self: *Button)  { ... }              # vtable
+    pub fun Clickable.draw(self: *Button) { ... }              # vtable
 }
 ```
 
-Both traits own `print`. The single body registers on both vtables (compiler emits two free fns).
+`btn.draw()` calls the resolver, which delegates to the preferred trait. The resolver is a regular type method — it has no vtable entry — and compiles to a direct call with zero overhead.
 
-**Distinct — each trait owns a different method:**
+### Default methods + qualifiers
 
-```
-impl Button with Display (print), Show (render) {
-    pub fun print(self: *Button)  { ... }     # Display owns print
-    pub fun render(self: *Button) { ... }     # Show owns render
-}
-```
-
-**Shared work across both bodies** — factor into a private helper; the parens still disambiguate which trait each body registers on:
+When one overload has a default and another is required, qualify the required one and inherit the default:
 
 ```
-fun button_format(self: *Button) -> str { /* shared work */ }
-
-impl Button with Display (print), Show (print) {
-    pub fun print(self: *Button) {
-        print(button_format(self));
+trait Drawable {
+    pub fun draw(self: *Self);              # required
+    pub fun draw(self: *Self, x: f64) {     # default
+        self.draw();
     }
 }
+
+impl Button with Drawable {
+    pub fun Drawable.draw(self: *Button) { ... }    # → required
+    # draw(self, x: f64) inherited from the trait default — no body needed
+}
 ```
 
-Rules:
+## Multiple Traits in One Block
 
-- One or more comma-separated `Trait (methods)?` clauses in the `with` header.
-- A parenthesised method name binds the matching body to that trait's vtable.
-- A method with no parens dispatches by uniqueness across the block's traits; ambiguous → compile error with a hint to add the parens.
-- The compiler emits one `Type_Trait_method` free fn per (Type, Trait) registration and threads each body into the matching vtable slot.
+Comma-separate the trait names in the `with` header:
+
+```
+impl Button with Drawable, Clickable, Hoverable {
+    pub fun draw(self: *Button)  { ... }   # unique to Drawable — automatic
+    pub fun click(self: *Button) { ... }   # unique to Clickable — automatic
+    pub fun reset(self: *Button) { ... }   # not in any trait — regular method
+}
+```
+
+Multiple `impl` blocks on the same type accumulate — each block can list a subset of traits.
 
 ## Using Traits
 
@@ -122,14 +119,12 @@ A trait value is a fat pointer. Calling a method on it goes through the vtable. 
 
 ```
 fun render(d: Drawable) {
-    d.draw();                  # indirection through Drawable's vtable
+    d.draw();                  # vtable dispatch
 }
 
 let btn: Button = Button { label: "click me" };
 render(btn as Drawable);      # constructs the fat pointer
 ```
-
-The `Drawable` parameter accepts any value whose Type implements `Drawable`. The vtable lookup picks the right `draw` body per Type.
 
 ## Default Methods
 
@@ -156,12 +151,11 @@ impl Console with Logger {
 }
 
 # FileLogger overrides ONE default while leaving the other inherited:
-impl FileLogger with Logger (warn) {
+impl FileLogger with Logger {
     pub fun log(self: *FileLogger, msg: str) {
         self.file.write(msg);
     }
-
-    pub fun warn(self: *FileLogger, msg: str) {    # override default
+    pub fun Logger.warn(self: *FileLogger, msg: str) {    # override default
         self.file.write("WARN [" ++ self.level ++ "]: " ++ msg);
     }
     # Logger.error is inherited from the trait default
@@ -190,9 +184,9 @@ fun render_any(items: []Drawable) {
 }
 ```
 
-Prefer generic bounds `<T: A + B>` over chain-cast (`x as A as B`) when possible — the bound resolves both vtables at compile time, the chain-cast falls back to runtime.
+Prefer generic bounds `<T: Drawable + Serializable>` over chain-cast (`x as A as B`) when possible — the bound resolves both vtables at compile time, the chain-cast falls back to runtime.
 
-**Multi-trait vtable overhead.** A fat pointer stores exactly one vtable pointer. Casting `obj as Drawable` constructs that pointer; casting the result `as Serializable` requires a runtime resolve against `obj`'s underlying Type's Serializable vtable slot. The fix is generic bounds (`<T: Drawable + Serializable>`), which compile to direct calls with both vtables inlined at monomorphization time.
+A fat pointer stores exactly one vtable pointer. Casting `obj as Drawable` constructs that pointer; casting the result `as Serializable` requires a runtime resolve against the underlying Type's Serializable vtable slot. The fix is generic bounds, which compile to direct calls with both vtables inlined at monomorphization time.
 
 ## Async Trait Methods
 
@@ -223,35 +217,28 @@ struct Button {
     label: str,
 }
 
-# `btn.click()` resolves through the Widget slot — no vtable.
-# `btn.pos` reads through the Widget slot — no vtable.
+# btn.click() resolves through the Widget slot — no vtable.
+# btn.pos reads through the Widget slot — no vtable.
 ```
 
 Use embedding for monomorphized field/method reuse when the Type is known at the call site. Use trait impl when you need fat-pointer dispatch (`obj as Trait`) or generic bounds (`<T: Trait>`). Both stack on the same Type.
 
-## Trait Rules
+## Reference
 
-| Surface                              | Mapping                                                                                                          |
-|--------------------------------------|------------------------------------------------------------------------------------------------------------------|
-| Trait declaration                    | `trait NAME { pub fun m1(self: *Self); pub fun m2(...) -> T { ... } }`                                           |
-| Trait impl                           | `impl TYPE with T1 (m1, m2)?, T2 (m3)? { pub fun m1(...) { ... } ... }`                                          |
-| Required trait method                | No body in the trait — MUST appear in the impl block; missing is a compile error                                 |
-| Default trait method                 | Has a body in the trait — optional in the impl block; same-named body overrides                                  |
-| Multiple traits on one Type          | Comma-separated `Trait (methods)?` clauses in the `with` header (or across multiple `impl` blocks)              |
-| Diamond (same method name, 2 traits) | Parenthesised name on the owning trait: `with T1(m), T2(m)` registers the body on the listed traits' vtables    |
-| Overloaded trait methods             | Not supported — trait methods have a fixed signature per trait (see § 29)                                        |
-| Fat pointer construction             | `obj as Trait`                                                                                                  |
-| Dynamic dispatch                     | `trait_value.method(...)` — one indirect call through the vtable                                                |
-| Structural composition (no vtable)   | Bare `EmbedType,` row in struct body — promotes fields and methods at compile time                             |
-| Async                                | `async fun` on impl-block method; caller awaits                                                                 |
-| Associated types                     | Not in v1                                                                                                        |
-
-## Implementation Plan
-
-The canonical form lands through a staged sequence of per-file commits. Each step is small, backward-compatible, and individually shippable; the "Status" callout above tracks the unblocked surface as each commit lands.
-
-1. **Lexer (`src/lexer/token.zig`).** Add `with_kw` TokenTag + `with` keyword to the lexer keyword table. No source-code semantic change yet — just lex recognition.
-2. **AST (`src/ast/decl.zig` + `src/ast.zig`).** Add `pub const TraitSpec = struct { name: []const u8, preferred_methods: []const []const u8 = &[_][]const u8{} }`. Add `trait_specs : []const TraitSpec = &[_]TraitSpec{}` field to `ImplBlock`. Re-export `TraitSpec` from `src/ast.zig` alongside the existing decl-side types.
-3. **Parser (`src/parser/decl.zig` `parseImplBlock`).** After consuming the target_type ident and before the `{`, optionally consume `with` + one-or-more comma-separated `IDENT (method_list)?` specs, terminated by `{`. Empty `with` clause falls back to the regular non-trait `impl Type { ... }` path.
-4. **Codegen (`src/codegen/decl.zig` `genTraitRegistration`).** Per-method dispatch rule: (a) any block-level `TraitSpec.preferred_methods` contains `method.name` → bind to that spec's name; (b) `trait_specs` non-empty AND exactly one listed trait declares the method → bind to that trait; (c) `trait_specs` empty → emit as a regular type method (no vtable entry); (d) else compile error with the diamond-disambiguator hint.
-5. **Tests (`src/tests/codegen_decl.zig` + `src/tests/parser_decl.zig`).** Add fixture cases covering the dispatch paths: preferred_methods single-trait lopsided case, shared-body case, trait-uniqueness inference, ambiguity compile-error.
+| Surface | Syntax |
+|---|---|
+| Trait declaration | `trait NAME { pub fun m(self: *Self, ...) -> RET { ... } }` |
+| Required method | No body in the trait — MUST appear in the impl block |
+| Default method | Body in the trait — optional in the impl block; same-named body overrides |
+| Single trait impl | `impl TYPE with TRAIT { ... }` |
+| Multiple traits | Comma-separated: `impl TYPE with T1, T2 { ... }` |
+| Multiple impl blocks | Accumulate — each block lists a subset of the type's traits |
+| Dot-qualified method | `fun Trait.method(self: *TYPE, ...)` — binds to that trait's vtable slot |
+| Unqualified method | `fun method(...)` — binds by uniqueness; error if ambiguous |
+| Resolving method | Bare `fun method(...)` alongside qualified methods — resolves diamond at call site |
+| Fat pointer construction | `obj as Trait` |
+| Dynamic dispatch | `trait_value.method(...)` — one indirect call through the vtable |
+| Overloaded trait methods | Different signatures = distinct slots; matched by signature at impl time |
+| Structural embedding | Bare `EmbedType,` row in struct body — promotes fields and methods at compile time |
+| Async impl methods | `async fun` on impl-block method; caller awaits |
+| Associated types | Not in v1 |
