@@ -692,6 +692,40 @@ pub const MapEntry = struct {
             \\    return if (val) |v| .{ .Ok = v } else |err| .{ .Err = @errorName(err) };
             \\}
             \\
+            \\// __zag_Writer — byte sink for formatted output.
+            \\// Wraps a file descriptor.  Used by `import std.fmt`.
+            \\const __zag_Writer = struct {
+            \\    fd: i32,
+            \\
+            \\    pub fn stdOut() @This() { return .{ .fd = std.posix.STDOUT_FILENO }; }
+            \\    pub fn stdErr() @This() { return .{ .fd = std.posix.STDERR_FILENO }; }
+            \\
+            \\    pub fn writeAll(self: *const @This(), bytes: []const u8) void {
+            \\        var pos: usize = 0;
+            \\        while (pos < bytes.len) {
+            \\            const n = std.os.linux.write(self.fd, bytes.ptr + pos, bytes.len - pos);
+            \\            if (n <= 0) return;
+            \\            pos += @intCast(n);
+            \\        }
+            \\    }
+            \\
+            \\    pub fn print(self: *const @This(), comptime fmt: []const u8, args: anytype) void {
+            \\        var buf: [4096]u8 = undefined;
+            \\        const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+            \\        self.writeAll(s);
+            \\    }
+            \\};
+            \\
+            \\// __zag_format_val — format any value to a stack-allocated string.
+            \\const __zag_format_buf: [4096]u8 = undefined;
+            \\var __zag_format_buf_idx: usize = 0;
+            \\fn __zag_format_val(value: anytype) []const u8 {
+            \\    const idx = __zag_format_buf_idx;
+            \\    const buf = __zag_format_buf[idx..][0..4096];
+            \\    __zag_format_buf_idx = (idx + 4096) % (__zag_format_buf.len);
+            \\    return std.fmt.bufPrint(buf, "{any}", .{value}) catch "(fmt overflow)";
+            \\}
+            \\
         );
 
         // Module imports (docs/manual/22-modules.md §Imports): walk

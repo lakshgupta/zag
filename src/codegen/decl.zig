@@ -609,6 +609,7 @@ const Codegen = core.Codegen;
         // alias to a single emit location.
         if (std.mem.eql(u8, text, "str")) return "[]const u8";
         if (std.mem.eql(u8, text, "String")) return "__zag_String";
+        if (std.mem.eql(u8, text, "Writer")) return "__zag_Writer";
         // v1.5 raw pointer shapes (docs/09 §\"Raw Pointers\"): zag's
         //     *raw T        — raw pointer to T       →  zig   [*]T
         //     ?*raw T       — optional raw pointer   →  zig   ?[*]T

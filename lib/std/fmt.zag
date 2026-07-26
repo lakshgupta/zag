@@ -1,20 +1,33 @@
-## std.fmt — Display trait + Writer sink + FmtError enum.
+## std.fmt — Display trait + Writer sink + formatting helpers.
 ##
-## From docs/spec.md §4.5: Display is the canonical zero-alloc
-## formatting interface (callers pass a fmt.Writer-derived sink
-## rather than allocating a String). Writer is the byte-sink stub.
+## Writer wraps a file descriptor and provides writeAll/print.
+## Display is the canonical formatting trait.
+## __zag_format_val converts any value to a stack-allocated string.
 ##
-## Stub: this file declares the type surface. Real `write` bodies
-## route through `std.fmt.bufPrint` once the codegen router is wired
-## — until then, the Display.write method stubs return void and the
-## Writer is opaque.
+## Backed by __zag_Writer in the generated zig preamble.
 
 pub trait Display {
     fun write(self: *const Self, writer: *Writer);
 }
 
 pub struct Writer {
-    _opaque: i32,
+    fd: i32,
+}
+
+impl Writer {
+    pub fun std_out() -> Writer {
+        return Writer { fd: 1 };
+    }
+    pub fun std_err() -> Writer {
+        return Writer { fd: 2 };
+    }
+    pub fun write_all(self: *const Writer, bytes: []const u8) -> void {
+        _ = bytes;
+    }
+    pub fun print(self: *const Writer, fmt: str, args: ...) -> void {
+        _ = fmt;
+        _ = args;
+    }
 }
 
 pub enum FmtError {

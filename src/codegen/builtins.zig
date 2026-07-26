@@ -261,11 +261,25 @@ pub const BuiltinDispatch = enum {
     /// `string_with_capacity` — `String.with_capacity(n)` → `__zag_String.withCapacity(alloc, n)`.
     string_with_capacity,
 
+    /// `writer_std_out` — `Writer.std_out()` → `__zag_Writer.stdOut()`.
+    writer_std_out,
+    /// `writer_std_err` — `Writer.std_err()` → `__zag_Writer.stdErr()`.
+    writer_std_err,
+
     /// Returns the zig name for a known zag String method.
     pub fn stringMethodZigName(zag_name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, zag_name, "as_str")) return "asStr";
         if (std.mem.eql(u8, zag_name, "push_str")) return "pushStr";
         if (std.mem.eql(u8, zag_name, "with_capacity")) return "withCapacity";
+        return null;
+    }
+
+    /// Returns the zig name for a known Writer method.
+    pub fn writerMethodZigName(zag_name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, zag_name, "write_all")) return "writeAll";
+        if (std.mem.eql(u8, zag_name, "print")) return "print";
+        if (std.mem.eql(u8, zag_name, "std_out")) return "stdOut";
+        if (std.mem.eql(u8, zag_name, "std_err")) return "stdErr";
         return null;
     }
 };
@@ -393,6 +407,9 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "panic", .arity = 1, .receiver = null, .dispatch = .builtin_panic },
     // String type static method — receiver = "String" for dispatch
     .{ .name = "with_capacity", .arity = 1, .receiver = "String", .dispatch = .string_with_capacity },
+    // Writer type static methods
+    .{ .name = "std_out", .arity = 0, .receiver = "Writer", .dispatch = .writer_std_out },
+    .{ .name = "std_err", .arity = 0, .receiver = "Writer", .dispatch = .writer_std_err },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that
