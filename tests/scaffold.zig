@@ -80,7 +80,7 @@ fn parseStub(_name: []const u8, src: []const u8) !ast.Program {
 // ---------------------------------------------------------------
 test "scaffold: std.mod parses with 6 selective-import decls" {
     const prog = try parseStub("std.mod", build_options.stub_mod);
-    try std.testing.expectEqual(@as(usize, 6), prog.imports.len);
+    try std.testing.expectEqual(@as(usize, 13), prog.imports.len);
     // Each line is `pub import std.X.{A, B, …}` so is_pub=true on
     // every entry and selectors.len >= 2.
     const expected_paths = [_][]const u8{
@@ -90,6 +90,13 @@ test "scaffold: std.mod parses with 6 selective-import decls" {
         "std.time",
         "std.atomic",
         "std.bench",
+        "std.argv",
+        "std.env",
+        "std.fs",
+        "std.fs",
+        "std.fs",
+        "std.process",
+        "std.process",
     };
     var i: usize = 0;
     while (i < prog.imports.len) : (i += 1) {
@@ -115,12 +122,7 @@ test "scaffold: std.mod parses with 6 selective-import decls" {
             }
         }
         try std.testing.expectEqualStrings(expected_paths[i], path_buf[0..len]);
-        // The last line of mod.zag (`pub import std.bench.{Counters}`)
-        // has exactly 1 selector; every other line has 2+ (the smallest
-        // is the `{Duration, Timer}` line with 2). Use `>= 1` so the
-        // generic check passes; the per-line alias assertion below
-        // (and per-stub tests for the resolved modules) cover the
-        // exact-shape pin.
+        // Each line has at least 1 selector
         try std.testing.expect(imp.selectors.len >= 1);
     }
     // Pin the alias on the second line (`Display as StringDisplay`)
@@ -143,8 +145,10 @@ test "scaffold: std.string parses with String struct + impl methods" {
     const prog = try parseStub("std.string", build_options.stub_string);
     try std.testing.expectEqual(@as(usize, 1), prog.structs.len);
     try std.testing.expectEqualStrings("String", prog.structs[0].name);
-    try std.testing.expectEqual(@as(usize, 1), prog.structs[0].fields.len);
-    try std.testing.expectEqualStrings("_opaque", prog.structs[0].fields[0].kind.named.name);
+    try std.testing.expectEqual(@as(usize, 3), prog.structs[0].fields.len);
+    try std.testing.expectEqualStrings("ptr", prog.structs[0].fields[0].kind.named.name);
+    try std.testing.expectEqualStrings("len", prog.structs[0].fields[1].kind.named.name);
+    try std.testing.expectEqualStrings("cap", prog.structs[0].fields[2].kind.named.name);
 
     try std.testing.expectEqual(@as(usize, 1), prog.impls.len);
     try std.testing.expectEqualStrings("String", prog.impls[0].target_type);

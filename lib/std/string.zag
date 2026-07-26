@@ -1,7 +1,7 @@
 ## std.string — heap-allocated mutable UTF-8 string.
 ##
 ## Backed by `__zag_String` in the generated zig preamble.
-## Layout { data: []u8, cap: usize }.  len is data.len.
+## Layout { ptr: [*]u8, len: usize, cap: usize }.
 ##
 ## Methods route through the codegen router:
 ##   String.with_capacity(n)  → __zag_String.withCapacity(alloc, n)
@@ -9,6 +9,17 @@
 ##   s.push_str("hello")      → s.pushStr("hello")
 
 pub struct String {
-    data: []u8,
+    ptr: *u8,
+    len: usize,
     cap: usize,
+}
+
+## Stub impl for parse-only tests (real methods route through codegen router).
+impl String {
+    pub fun with_capacity(self: *String, cap: usize) -> String {
+        return String { ptr: null, len: 0, cap: 0 };
+    }
+    pub fun as_str(self: *String) -> []const u8 {
+        return "";
+    }
 }

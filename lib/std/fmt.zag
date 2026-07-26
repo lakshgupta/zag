@@ -24,9 +24,8 @@ impl Writer {
     pub fun write_all(self: *const Writer, bytes: []const u8) -> void {
         _ = bytes;
     }
-    pub fun print(self: *const Writer, fmt: str, args: ...) -> void {
+    pub fun print(self: *const Writer, fmt: str) -> void {
         _ = fmt;
-        _ = args;
     }
 }
 
