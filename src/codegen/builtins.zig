@@ -266,6 +266,9 @@ pub const BuiltinDispatch = enum {
     /// `writer_std_err` — `Writer.std_err()` → `__zag_Writer.stdErr()`.
     writer_std_err,
 
+    /// `time_now` — `now()` → `std.time.nanoTimestamp()` (i64 nanos since monotonic epoch).
+    time_now,
+
     /// Returns the zig name for a known zag String method.
     pub fn stringMethodZigName(zag_name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, zag_name, "as_str")) return "asStr";
@@ -410,6 +413,8 @@ pub const builtin_table = [_]BuiltinRoute{
     // Writer type static methods
     .{ .name = "std_out", .arity = 0, .receiver = "Writer", .dispatch = .writer_std_out },
     .{ .name = "std_err", .arity = 0, .receiver = "Writer", .dispatch = .writer_std_err },
+    // Time builtin
+    .{ .name = "now", .arity = 0, .receiver = null, .dispatch = .time_now },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that

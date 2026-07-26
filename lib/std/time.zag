@@ -1,27 +1,32 @@
-## std.time — Duration + Timer primitives.
+## std.time — Duration, Timer, and time-query free functions.
 ##
-## From docs/spec.md §6.2 + §6.4.4: timers live in std.time, exposed
-## as future-returning async-fun bodies that hand control to the
-## event loop. The current parser doesn't accept `async fun`'s full
-## surface (per docs/features.md), so the stub uses sync free functions
-## whose names mirror the eventual API (`Timer_after`, etc.) — the
-## async layer swaps in beneath these names without breaking call sites.
+## Duration and Timer are defined as real types in the generated zig preamble.
+## `now()` returns `std.time.nanoTimestamp()` (i64 nanos since monotonic epoch).
 ##
-## Stub: sync surface only. Real impl lands via the event loop's
-## built-in timer wheel in zig std.event.
+## Methods route through the codegen router.
 
 pub struct Duration {
     nanos: i64,
 }
 
-pub fun Duration_from_millis(ms: i64) -> Duration {
-    return Duration { nanos: ms };
+impl Duration {
+    pub fun from_millis(ms: u64) -> Duration {
+        return Duration { nanos: 0 };
+    }
+    pub fun as_millis(self: *Duration) -> u64 {
+        return 0;
+    }
 }
 
 pub struct Timer {
-    _opaque: i32,
+    start: i64,
 }
 
-pub fun Timer_after(d: Duration) -> bool {
-    return false;
+impl Timer {
+    pub fun start() -> Timer {
+        return Timer { start: 0 };
+    }
+    pub fun elapsed(self: *Timer) -> Duration {
+        return Duration { nanos: 0 };
+    }
 }

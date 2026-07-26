@@ -1605,5 +1605,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .writer_std_err => {
                 self.write("__zag_Writer.stdErr()");
             },
+            .time_now => {
+                // zig 0.16: use raw clock_gettime for monotonic nanos.
+                self.write("(blk: { var __ts: std.posix.timespec = undefined; _ = std.os.linux.clock_gettime(std.os.linux.clockid_t.MONOTONIC, &__ts); break :blk @as(i64, @intCast(__ts.sec)) * 1_000_000_000 + @as(i64, @intCast(__ts.nsec)); })");
+            },
         }
     }
