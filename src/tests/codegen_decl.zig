@@ -2241,7 +2241,7 @@ test "codegen: readFileAlloc emits Threaded.init + readFileAlloc shim" {
     // undeclared read_file(...) form or a std.fs.cwd()
     // legacy form (the latter was retired in zig 0.16 -
     // std.fs.zig is a 21-line deprecation stub now).
-    const src = "fun f() {\n    let d: []u8 = read_file(\"examples/basics/hello.zag\");\n}\n";
+    const src = "fun f() {\n    let d: []u8 = read_file(\"examples/basics/hello.zag\")?;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2256,10 +2256,11 @@ test "codegen: readFileAlloc emits Threaded.init + readFileAlloc shim" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Dir.cwd().readFileAlloc") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, ".unlimited") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator") != null);
-    // Result capture via blk
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __fs_0") != null);
-    // Error collapse
-    try std.testing.expect(std.mem.indexOf(u8, zig, "catch &[_]u8{}") != null);
+    // Result capture via labeled block (label is __blk_N)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_0") != null);
+    // Error bridge wraps zig errors into Result
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_err_to_result") != null);
 }
 
 test "codegen: fs_counter increments across multiple read_file calls" {
@@ -2273,7 +2274,7 @@ test "codegen: fs_counter increments across multiple read_file calls" {
     // unchanged). Mirrors the explicit annotations on
     // let home (Phase 1 test 1) and let a: ?str
     // (Phase 1 test 2).
-    const src = "fun f() {\n    let a: []u8 = read_file(\"foo\");\n    let b: []u8 = read_file(\"bar\");\n}\n";
+    const src = "fun f() {\n    let a: []u8 = read_file(\"foo\")?;\n    let b: []u8 = read_file(\"bar\")?;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2295,7 +2296,7 @@ test "codegen: read_file routes through builtin_table (no verbatim fallback)" {
     // A regression that bypasses builtins.lookup(...) would
     // leave the verbatim form intact and zig would reject
     // with "use of undeclared identifier 'read_file'".
-    const src = "fun f() {\n    let d: []u8 = read_file(\"examples/basics/hello.zag\");\n}\n";
+    const src = "fun f() {\n    let d: []u8 = read_file(\"examples/basics/hello.zag\")?;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();

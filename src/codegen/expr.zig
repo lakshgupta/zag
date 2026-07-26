@@ -980,9 +980,17 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // `Option<T>` (has Some/None). The early-return wraps
                 // the error/none value in the appropriate constructor
                 // so the enclosing function's return type matches.
-                self.write("(blk: { const __try = ");
+                var lbl_buf: [16]u8 = undefined;
+                const tl = self.nextBlkLabel(&lbl_buf);
+                self.write("(");
+                self.write(tl);
+                self.write(": { const __try = ");
                 self.genExpr(t.expr.*);
-                self.write("; if (@hasField(@TypeOf(__try), \"Ok\")) { switch (__try) { .Ok => |__v| break :blk __v, .Err => |__e| return @as(@TypeOf(__try), .{ .Err = __e }), }; } else { switch (__try) { .Some => |__v| break :blk __v, .None => return @as(@TypeOf(__try), .{ .None = {} }), }; } })");
+                self.write("; if (@hasField(@TypeOf(__try), \"Ok\")) { switch (__try) { .Ok => |__v| break :");
+                self.write(tl);
+                self.write(" __v, .Err => |__e| return @as(@TypeOf(__try), .{ .Err = __e }), } } else { switch (__try) { .Some => |__v| break :");
+                self.write(tl);
+                self.write(" __v, .None => return @as(@TypeOf(__try), .{ .None = {} }), } } })");
             },
             .catch_expr => |c| {
                 // `expr catch HANDLER` or `expr catch |err| HANDLER` —
@@ -991,15 +999,27 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // set (the `|err|` form), the Err value is bound before
                 // evaluating the handler. For the None case (Option<T>),
                 // the binding is unused but the handler expression runs.
-                self.write("(blk: { const __cgt = ");
+                var cl_lbl_buf: [16]u8 = undefined;
+                const cl = self.nextBlkLabel(&cl_lbl_buf);
+                self.write("(");
+                self.write(cl);
+                self.write(": { const __cgt = ");
                 self.genExpr(c.expr.*);
-                self.write("; if (@hasField(@TypeOf(__cgt), \"Ok\")) { switch (__cgt) { .Ok => |__v| break :blk __v, .Err => |");
+                self.write("; if (@hasField(@TypeOf(__cgt), \"Ok\")) { switch (__cgt) { .Ok => |__v| break :");
+                self.write(cl);
+                self.write(" __v, .Err => |");
                 if (c.err_binding) |eb| { self.write(eb); } else { self.write("_"); }
-                self.write("| break :blk ");
+                self.write("| break :");
+                self.write(cl);
+                self.write(" ");
                 self.genExpr(c.handler.*);
-                self.write(", }; } else { switch (__cgt) { .Some => |__v| break :blk __v, .None => break :blk ");
+                self.write(", } } else { switch (__cgt) { .Some => |__v| break :");
+                self.write(cl);
+                self.write(" __v, .None => break :");
+                self.write(cl);
+                self.write(" ");
                 self.genExpr(c.handler.*);
-                self.write(", }; } })");
+                self.write(", } } })");
             },
             .binary => |b| {
                 // zig 0.16 string-comparison shim. The bare `(lhs == rhs)`
@@ -1298,11 +1318,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // The init is infallible (any CpuCountError is stored
                 // on `t.cpu_count_error`, NOT raised); no `catch` is
                 // needed.
-                self.write("blk: { var __io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); defer __io_threaded.deinit(); const ");
+                var label_buf: [16]u8 = undefined;
+                const lbl = self.nextBlkLabel(&label_buf);
+                self.write(lbl);
+                self.write(": { var __io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); defer __io_threaded.deinit(); const ");
                 self.write(name);
-                self.write(": []u8 = std.Io.Dir.cwd().readFileAlloc(__io_threaded.io(), ");
+                self.write(" = __zag_err_to_result([]u8, std.Io.Dir.cwd().readFileAlloc(__io_threaded.io(), ");
                 self.genExpr(args[0]);
-                self.write(", std.heap.page_allocator, .unlimited) catch &[_]u8{}; break :blk ");
+                self.write(", std.heap.page_allocator, .unlimited)); break :");
+                self.write(lbl);
+                self.write(" ");
                 self.write(name);
                 self.write("; }");
             },

@@ -571,8 +571,8 @@ test "codegen: ? postfix try-operator unwraps Result with label-block" {
     const zig = cg.generate(prog);
     // The ? emits a blk label with @hasField discriminator
     try std.testing.expect(std.mem.indexOf(u8, zig, "@hasField(@TypeOf(__try), \"Ok\")") != null);
-    // On Ok, break with unwrapped value
-    try std.testing.expect(std.mem.indexOf(u8, zig, ".Ok => |__v| break :blk __v") != null);
+    // On Ok, break with unwrapped value (label is __blk_N)
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".Ok => |__v| break :__blk_") != null);
     // On Err, return the error
     try std.testing.expect(std.mem.indexOf(u8, zig, ".Err => |__e| return") != null);
 }
@@ -595,10 +595,10 @@ test "codegen: catch expression emits fallback with @hasField discriminator" {
     const zig = cg.generate(prog);
     // catch emits @hasField discriminator
     try std.testing.expect(std.mem.indexOf(u8, zig, "@hasField(@TypeOf(__cgt), \"Ok\")") != null);
-    // On Ok, break with unwrapped value
-    try std.testing.expect(std.mem.indexOf(u8, zig, ".Ok => |__v| break :blk __v") != null);
-    // On Err, break with the handler value (fallback)
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk 0") != null);
+    // On Ok, break with unwrapped value (label is __blk_N)
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".Ok => |__v| break :__blk_") != null);
+    // On Err, break with the handler value (fallback) — label is __blk_N
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_") != null);
 }
 
 test "codegen: catch with error binding emits err variable in handler" {
@@ -661,7 +661,7 @@ test "codegen: catch with block handler emits break :blk for handler body" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // catch with block handler: the handler should contain a labeled blk
-    try std.testing.expect(std.mem.indexOf(u8, zig, ".Err => |msg| break :blk (blk: {") != null);
+    // catch with block handler: the handler should contain a labeled block
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".Err => |msg| break :__blk_") != null);
 }
 

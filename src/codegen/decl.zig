@@ -155,6 +155,7 @@ const Codegen = core.Codegen;
         self.destructure_counter = 0;
         self.alloc_counter = 0;
         self.match_counter = 0;
+        self.blk_counter = 0;
         self.current_symbol = m.name;
         // Phase 1 codegen-router: env_counter reset mirrors the argv
         // counter pattern so sibling `__env_<N>` temps (one per
@@ -466,6 +467,7 @@ const Codegen = core.Codegen;
         self.destructure_counter = 0;
         self.alloc_counter = 0;
         self.match_counter = 0;
+        self.blk_counter = 0;
         self.current_symbol = m.name;
         // Phase 1 codegen-router: env_counter reset mirrors the argv
         // counter pattern above so nested methods get a clean
@@ -1249,6 +1251,7 @@ const Codegen = core.Codegen;
         // no-redeclaration rule is satisfied; sibling `pub fn`s reset
         // their own counters to start fresh at `_0`.
         self.match_counter = 0;
+        self.blk_counter = 0;
         // Phase 1 codegen-router: env_counter reset (mirrors the
         // match_counter reset above) so sibling getEnv calls within
         // the same
@@ -1463,6 +1466,7 @@ const Codegen = core.Codegen;
         self.current_symbol = fun.name;
         self.alloc_counter = 0;
         self.match_counter = 0;
+        self.blk_counter = 0;
         self.fs_counter = 0;
 
         // Doc comment on the test block

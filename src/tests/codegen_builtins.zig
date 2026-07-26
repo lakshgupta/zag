@@ -149,19 +149,10 @@ test "codegen: alloc_counter increments across multiple new exprs" {
 }
 
 test "codegen: free of []u8 ident emits page_allocator.free (slice overload)" {
-    // Phase 2.1 closure: `let s: []u8 = read_file("path"); defer free s;`
-    // must surface as `defer std.heap.page_allocator.free(s);` instead of
-    // `destroy(s)`. The discriminator consults `type_info_buf` (populated
-    // by collectTypedBindings at fn entry); the leading `[]` in the source
-    // type annotation routes the free site to the slice overload.
-    //
-    // The RHS uses `read_file(...)` because (a) it's the canonical
-    // Phase 2 surface this Phase 2.1 widening was designed for, and
-    // (b) its emit shape (`blk: { ... break :blk __fs_<N>; }`) keeps the
-    // free-discriminator's substring assertions stable.
+    // read_file now returns Result([]u8, str).  Use `?` to unwrap.
     const src =
         \\fun f() {
-        \\    let s: []u8 = read_file("path");
+        \\    let s: []u8 = read_file("path")?;
         \\    defer free s;
         \\}
         \\;

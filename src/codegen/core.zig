@@ -141,6 +141,10 @@ pub const Codegen = struct {
     /// bare indented `(blk: { ... });` statement (the value-discarding
     /// form zig accepts at any other position).
     fn_returns_value: bool,
+    /// Per-function counter for labeled blocks (`blk: { ... }`).
+    /// Reset to 0 by genFun/genMethod so each fn body has unique
+    /// `__blk_0`, `__blk_1`, ... labels (zig rejects duplicate labels).
+    blk_counter: u32 = 0,
     /// Tracked trait-decl names (Phase 3 trait-cast, docs/17 §"Using
     /// Traits"): populated at `generate()` entry from `prog.traits`
     /// so the `.cast` arm in `genExpr` can detect `x as Trait` forms
@@ -343,6 +347,7 @@ pub const MapEntry = struct {
     pub const writeType = @import("core.zig").writeType;
     pub const writeInt = @import("core.zig").writeInt;
     pub const recordLoc = @import("core.zig").recordLoc;
+    pub const nextBlkLabel = @import("core.zig").nextBlkLabel;
     pub const buildMapText = @import("core.zig").buildMapText;
     pub const getMapText = @import("core.zig").getMapText;
 };
@@ -360,6 +365,7 @@ pub const MapEntry = struct {
             .type_info_count = 0,
             .alloc_counter = 0,
             .match_counter = 0,
+            .blk_counter = 0,
             // Phase 1 env-result counter starts at 0; each
             // `getEnv` builtin emit steps it and emits a fresh
             // `__env_<N>` scratch used to bridge
@@ -464,6 +470,14 @@ pub const MapEntry = struct {
         var buf: [12]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
         self.write(s);
+    }
+
+    /// Allocate a unique labeled-block label name for the current function.
+    /// Writes the label into `buf` and returns the slice.
+    pub fn nextBlkLabel(self: *Codegen, buf: []u8) []const u8 {
+        const id = self.blk_counter;
+        self.blk_counter += 1;
+        return std.fmt.bufPrint(buf, "__blk_{d}", .{id}) catch "__blk_0";
     }
 
     /// Write a u32 integer into a caller-provided buffer. Returns the number
@@ -669,6 +683,13 @@ pub const MapEntry = struct {
             \\            };
             \\        }
             \\    };
+            \\}
+            \\
+            \\// __zag_err_to_result — bridge from zig error unions to zag's Result.
+            \\// Wraps `anyerror!T` into `Result(T, []const u8)` so standard-library
+            \\// functions that return zig errors can be used with zag's `?` operator.
+            \\fn __zag_err_to_result(comptime T: type, val: anyerror!T) Result(T, []const u8) {
+            \\    return if (val) |v| .{ .Ok = v } else |err| .{ .Err = @errorName(err) };
             \\}
             \\
         );
