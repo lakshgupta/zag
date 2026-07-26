@@ -606,6 +606,12 @@ pub const MapEntry = struct {
             // because it's assigned at runtime from init.io.
             \\var __zag_io: std.Io = undefined;
             \\
+            \\// Zag panic routing — zig safety checks (OOB, overflow, etc.) use
+            \\// zig's default panic handler which prints a full stack trace with
+            \\// file:line info.  Explicit `panic(msg)` calls in zag source use
+            \\// __zag_panic_at below for zag-source file:line:col locations.
+            \\pub const panic = std.debug.FullPanic(std.debug.defaultPanic);
+            \\
             \\// Zag panic helper — prints a panic message with zag source location.
             \\// Called by `panic(msg)` builtin. Writes to stderr and calls @trap().
             \\fn __zag_panic_at(msg: []const u8, file: []const u8, line: u32, col: u32) noreturn {
@@ -649,6 +655,46 @@ pub const MapEntry = struct {
             \\
             \\    pub fn deinit(self: *@This()) void {
             \\        std.heap.page_allocator.free(self.ptr[0..self.cap]);
+            \\    }
+            \\
+            \\    pub fn pushCh(self: *@This(), ch: u8) void {
+            \\        const needed = self.len + 1;
+            \\        if (needed > self.cap) {
+            \\            var new_cap = self.cap;
+            \\            if (new_cap == 0) new_cap = 16;
+            \\            while (new_cap < needed) new_cap *= 2;
+            \\            self.ptr = (std.heap.page_allocator.realloc(self.ptr[0..self.cap], new_cap) catch
+            \\                @panic("String: realloc failed")).ptr;
+            \\            self.cap = new_cap;
+            \\        }
+            \\        self.ptr[self.len] = ch;
+            \\        self.len = needed;
+            \\    }
+            \\
+            \\    pub fn popCh(self: *@This()) ?u8 {
+            \\        if (self.len == 0) return null;
+            \\        self.len -= 1;
+            \\        return self.ptr[self.len];
+            \\    }
+            \\
+            \\    pub fn clear(self: *@This()) void {
+            \\        self.len = 0;
+            \\    }
+            \\
+            \\    pub fn insertCh(self: *@This(), pos: usize, ch: u8) void {
+            \\        if (pos > self.len) @panic("String.insertCh: position out of bounds");
+            \\        const needed = self.len + 1;
+            \\        if (needed > self.cap) {
+            \\            var new_cap = self.cap;
+            \\            if (new_cap == 0) new_cap = 16;
+            \\            while (new_cap < needed) new_cap *= 2;
+            \\            self.ptr = (std.heap.page_allocator.realloc(self.ptr[0..self.cap], new_cap) catch
+            \\                @panic("String: realloc failed")).ptr;
+            \\            self.cap = new_cap;
+            \\        }
+            \\        std.mem.copyBackwards(u8, self.ptr[pos+1..needed], self.ptr[pos..self.len]);
+            \\        self.ptr[pos] = ch;
+            \\        self.len = needed;
             \\    }
             \\};
             \\

@@ -274,6 +274,10 @@ pub const BuiltinDispatch = enum {
         if (std.mem.eql(u8, zag_name, "as_str")) return "asStr";
         if (std.mem.eql(u8, zag_name, "push_str")) return "pushStr";
         if (std.mem.eql(u8, zag_name, "with_capacity")) return "withCapacity";
+        if (std.mem.eql(u8, zag_name, "push_ch")) return "pushCh";
+        if (std.mem.eql(u8, zag_name, "pop_ch")) return "popCh";
+        if (std.mem.eql(u8, zag_name, "clear")) return "clear";
+        if (std.mem.eql(u8, zag_name, "insert_ch")) return "insertCh";
         return null;
     }
 

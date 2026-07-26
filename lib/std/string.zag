@@ -22,4 +22,18 @@ impl String {
     pub fun as_str(self: *String) -> []const u8 {
         return "";
     }
+    pub fun push_str(self: *String, s: []const u8) -> void {
+        _ = s;
+    }
+    pub fun push_ch(self: *String, ch: u8) -> void {
+        _ = ch;
+    }
+    pub fun pop_ch(self: *String) -> Option<u8> {
+        return Option.None;
+    }
+    pub fun clear(self: *String) -> void {}
+    pub fun insert_ch(self: *String, pos: usize, ch: u8) -> void {
+        _ = pos;
+        _ = ch;
+    }
 }

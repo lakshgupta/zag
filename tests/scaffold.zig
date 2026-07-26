@@ -152,10 +152,12 @@ test "scaffold: std.string parses with String struct + impl methods" {
 
     try std.testing.expectEqual(@as(usize, 1), prog.impls.len);
     try std.testing.expectEqualStrings("String", prog.impls[0].target_type);
-    // with_capacity + as_str
-    try std.testing.expectEqual(@as(usize, 2), prog.impls[0].methods.len);
+    // with_capacity, as_str, push_str, push_ch, pop_ch, clear, insert_ch
+    try std.testing.expectEqual(@as(usize, 7), prog.impls[0].methods.len);
     try std.testing.expectEqualStrings("with_capacity", prog.impls[0].methods[0].name);
     try std.testing.expectEqualStrings("as_str", prog.impls[0].methods[1].name);
+    try std.testing.expectEqualStrings("push_str", prog.impls[0].methods[2].name);
+    try std.testing.expectEqualStrings("push_ch", prog.impls[0].methods[3].name);
 }
 
 // ---------------------------------------------------------------
