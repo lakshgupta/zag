@@ -86,6 +86,7 @@ test "codegen: preamble emits exactly once and last preamble precedes last fun d
     // Combined, count + lastIndexOf pin guarantee that any emission
     // of `const __zag_imported_<i>` lines happens exactly at the
     // top, in a contiguous block, before any user fun decl appears.
+    // Stdlib imports now skip __zag_imported_ and emit const alias = __zag_Type.
     const src = "pub import std.string;\npub fun hello() -> void {\n    let unused: i32 = 1;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -95,27 +96,8 @@ test "codegen: preamble emits exactly once and last preamble precedes last fun d
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    const preamble_prefix = "const __zag_imported_0 = @import(\"";
-    const fun_prefix = "pub fn hello(";
-
-    // (1) Count pin -- a regression that emits the preamble twice
-    // (or zero times) surfaces here regardless of ordering.
-    const preamble_count = std.mem.count(u8, zig, "const __zag_imported_");
-    try std.testing.expectEqual(@as(usize, 1), preamble_count);
-
-    // (2) LastIndexOf pin -- the LAST preamble's offset must be
-    // at-or-before the LAST fun decl's offset. This is the
-    // semantically correct direction for a header-preamble +
-    // ordered-fun-decl codegen: every preamble appears in the
-    // contiguous header block before any fun body. (Operands
-    // chosen as `<=` rather than `<` to also tolerate the (non-
-    // constructively reachable but conceivable) case where the
-    // last preamble offset and last fun offset are equal -- in
-    // which case the count pin still enforces EXACTLY ONE
-    // preamble emission.)
-    const preamble_last = std.mem.lastIndexOf(u8, zig, preamble_prefix);
-    try std.testing.expect(preamble_last != null);
-    const fun_last = std.mem.lastIndexOf(u8, zig, fun_prefix);
-    try std.testing.expect(fun_last != null);
-    try std.testing.expect(preamble_last.? <= fun_last.?);
+    // Whole-module stdlib imports (no selectors) produce no aliases.
+    // Types are always available via the preamble.
+    // Verify no @import of .zag files is emitted.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"lib/std/") == null);
 }

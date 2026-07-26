@@ -350,6 +350,7 @@ pub const MapEntry = struct {
     pub const nextBlkLabel = @import("core.zig").nextBlkLabel;
     pub const buildMapText = @import("core.zig").buildMapText;
     pub const getMapText = @import("core.zig").getMapText;
+    pub const stdlibPreambleName = @import("core.zig").stdlibPreambleName;
 };
 
 // ============================================================
@@ -811,6 +812,25 @@ pub const MapEntry = struct {
                 const imp = prog.imports[import_i];
                 const dotted = parser.Parser.joinDottedPath(&import_scratch, imp.path_nodes);
                 if (parser.Parser.resolveStdImport(dotted)) |resolved_path| {
+                    // Stdlib imports: the types are defined in the generated
+                    // preamble (e.g. __zag_String, __zag_Writer), so skip the
+                    // @import of the .zag source file (zig can't import .zag).
+                    // Emit selector aliases directly to preamble types.
+                    if (std.mem.startsWith(u8, resolved_path, "lib/std/")) {
+                        for (imp.selectors) |sel| {
+                            const preamble_name = stdlibPreambleName(sel.name);
+                            if (preamble_name.len > 0) {
+                                const user_name = sel.alias orelse sel.name;
+                                self.write("const ");
+                                self.write(user_name);
+                                self.write(" = ");
+                                self.write(preamble_name);
+                                self.write(";\n");
+                            }
+                        }
+                        continue;
+                    }
+                    // Non-stdlib imports: emit @import of the resolved path.
                     self.write("const __zag_imported_");
                     var idx_buf: [16]u8 = undefined;
                     const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{import_i}) catch "X";
@@ -1589,3 +1609,20 @@ pub const MapEntry = struct {
         if (match_count == 1) return first_match;
         return null;
     }
+
+/// Map a stdlib type name to its preamble equivalent.
+/// Returns "" if the type is not available in the preamble.
+fn stdlibPreambleName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "String")) return "__zag_String";
+    if (std.mem.eql(u8, name, "Writer")) return "__zag_Writer";
+    if (std.mem.eql(u8, name, "Display")) return "";
+    if (std.mem.eql(u8, name, "Error")) return "";
+    if (std.mem.eql(u8, name, "Context")) return "";
+    if (std.mem.eql(u8, name, "ErrorExt")) return "";
+    if (std.mem.eql(u8, name, "Duration")) return "";
+    if (std.mem.eql(u8, name, "Timer")) return "";
+    if (std.mem.eql(u8, name, "FmtError")) return "";
+    if (std.mem.eql(u8, name, "Ordering")) return "";
+    if (std.mem.eql(u8, name, "Counters")) return "";
+    return "";
+}

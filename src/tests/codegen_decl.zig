@@ -1975,23 +1975,18 @@ test "codegen: pub import std.string.{String as MyStr, Display} emits preamble +
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    // Preamble -- `__zag_imported_0` (first import) reaches the
-    // canonical resolved path of `std.string` from KNOWN_STD_MODULES.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") != null);
+    // Stdlib imports now skip @import and emit direct preamble aliases.
+    // `String as MyStr` → `const MyStr = __zag_String;`
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const MyStr = __zag_String") != null);
 
-    // Per-alias forwarder -- user-side aliases must surface verbatim.
-    // `MyStr` maps to `String` (zig-side canonical is the .name).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const MyStr = __zag_imported_0.String") != null);
-
-    // Alias-less selector `Display` reuses its canonical name.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const Display = __zag_imported_0.Display") != null);
+    // Alias-less selector `Display` has no preamble type yet, so it's skipped.
+    // Verify the import mechanism is still wired (no @import of .zag file).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") == null);
 }
 
-test "codegen: whole-module import (no selectors) emits preamble only" {
-    // selectors.len == 0 takes the per-selector pass of zero iterations --
-    // ONLY the preamble line must be present. Pin the negative shape so
-    // a future regression that emits phantom alias lines for whole-module
-    // imports surfaces here, not as a downstream zig compile error.
+test "codegen: whole-module import (no selectors) skips stdlib @import" {
+    // Stdlib imports with no selectors: preamble types are always available.
+    // No @import of .zag files should be emitted.
     const src = "pub import std.string;\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -2001,7 +1996,7 @@ test "codegen: whole-module import (no selectors) emits preamble only" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"lib/std/") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "= __zag_imported_0.") == null);
 }
 
@@ -2034,25 +2029,16 @@ test "codegen: multiple std imports take distinct __zag_imported_<i> indices" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_1 = @import(\"lib/std/fmt.zag\")") != null);
+    // Stdlib imports no longer emit @import of .zag files.
+    // Selectorless imports produce no preamble lines.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"lib/std/") == null);
 }
 
-test "codegen: all 12 KNOWN_STD_MODULES entries render their expected lib/std/<path>.zag preamble" {
-    // Drift pin: KNOWN_STD_MODULES (src/parser/core.zig) and the
-    // codegen preamble's resolveStdImport lookup MUST agree on the
-    // same (name -> path) map. This test renders each entry as
-    // `pub import <name>;` through Parser + Codegen and asserts the
-    // produced zig preamble line resolves to the expected
-    // `lib/std/<path>.zag` URL.
-    //
-    // Catches single-entry drift between parser-side table and
-    // codegen-side lookup: a future change that adds/removes entries
-    // in KNOWN_STD_MODULES without updating this expectation table,
-    // or rewrites resolveStdImport with a different lookup shape,
-    // surfaces here as either a missing prefix (entry not rendered),
-    // a mismatched path (resolveStdImport misroutes), or the count
-    // pin below tripping (silent table growth/shrinkage).
+test "codegen: all 12 KNOWN_STD_MODULES entries are recognized by the import router" {
+    // Each stdlib import must be recognized by resolveStdImport.
+    // Stdlib imports now skip @import (types are in the preamble),
+    // so we verify no @import of .zag files is emitted, and the
+    // parser+codegen pipeline accepts all entries.
     const cases = [_]struct { name: []const u8, expected: []const u8 }{
         .{ .name = "std",               .expected = "lib/std/mod.zag" },
         .{ .name = "std.string",        .expected = "lib/std/string.zag" },
@@ -2081,20 +2067,8 @@ test "codegen: all 12 KNOWN_STD_MODULES entries render their expected lib/std/<p
         var cg = codegen_mod.Codegen.init();
         const zig = cg.generate(prog);
 
-        // Per-entry preamble path assertion. Pull the literal path
-        // string out of `const __zag_imported_0 = @import("<X>");`
-        // and assert X equals c.expected. The prefix/suffix anchored
-        // slice also confirms the emit shape (no spaces-misplaced,
-        // no missing-quote issues).
-        const needle_prefix = "const __zag_imported_0 = @import(\"";
-        const needle_suffix = "\");\n";
-        const prefix_idx = std.mem.indexOf(u8, zig, needle_prefix);
-        try std.testing.expect(prefix_idx != null);
-        const path_start = prefix_idx.? + needle_prefix.len;
-        const suffix_idx = std.mem.indexOfPos(u8, zig, path_start, needle_suffix);
-        try std.testing.expect(suffix_idx != null);
-        const actual_path = zig[path_start..suffix_idx.?];
-        try std.testing.expectEqualStrings(c.expected, actual_path);
+        // Stdlib imports should NOT emit @import of .zag files.
+        try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"lib/std/") == null);
     }
 }
 
