@@ -358,3 +358,50 @@ test "codegen: buildMapText produces tab-separated side-file format" {
     // Symbol should be "main" (the enclosing function name)
     try std.testing.expect(std.mem.indexOf(u8, map_text, "\tmain\ttest.zag\n") != null);
 }
+
+test "codegen: String.with_capacity emits __zag_String call" {
+    const src = "fun main() { let s: String = String.with_capacity(10); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_String.withCapacity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "10") != null);
+}
+
+test "codegen: String.as_str instance method emits zig-native call" {
+    const src =
+        \\fun main() {
+        \\    let s: String = String.with_capacity(10);
+        \\    let view: str = s.as_str();
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // as_str() instance method should emit s.asStr()
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".asStr()") != null);
+}
+
+test "codegen: String type annotation maps to __zag_String" {
+    const src = "fun main() { let s: String = String.with_capacity(10); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The type annotation `: String` should map to `: __zag_String`
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_String") != null);
+    // And the initializer should call withCapacity
+    try std.testing.expect(std.mem.indexOf(u8, zig, "withCapacity") != null);
+}

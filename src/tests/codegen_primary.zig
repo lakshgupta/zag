@@ -192,8 +192,12 @@ test "codegen: stack-allocated array with type annotation emits zig [N]T" {
     const zig = cg.generate(prog);
     // Stack allocation — no heap, no alloc()
     try std.testing.expect(std.mem.indexOf(u8, zig, "[8]u8 = [8]u8{ 0, 1, 2, 3, 4, 5, 6, 7 }") != null);
-    // No page_allocator references — this is pure stack
-    try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator") == null);
+    // No page_allocator references — this is pure stack.
+    // The preamble __zag_String uses page_allocator; check only user code.
+    {
+        const code_start = std.mem.indexOf(u8, zig, "pub fn main") orelse zig.len;
+        try std.testing.expect(std.mem.indexOf(u8, zig[code_start..], "page_allocator") == null);
+    }
 }
 
 test "codegen: stack-allocated fill array emits [1]T{val}**N on stack" {
@@ -212,6 +216,9 @@ test "codegen: stack-allocated fill array emits [1]T{val}**N on stack" {
     const zig = cg.generate(prog);
     // Fill array on stack — [1]u8{ 0 } ** 4096
     try std.testing.expect(std.mem.indexOf(u8, zig, "[1]u8{ 0 } ** 4096") != null);
-    // No heap alloc
-    try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator") == null);
+    // No heap alloc in user code (preamble uses page_allocator for __zag_String)
+    {
+        const code_start = std.mem.indexOf(u8, zig, "pub fn main") orelse zig.len;
+        try std.testing.expect(std.mem.indexOf(u8, zig[code_start..], "page_allocator") == null);
+    }
 }

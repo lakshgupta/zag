@@ -257,6 +257,17 @@ pub const BuiltinDispatch = enum {
     /// `builtin_panic` — emit zig's `@panic(msg)` which prints a stack
     /// trace in debug mode and aborts the program. arity = 1: `panic(msg)`.
     builtin_panic,
+
+    /// `string_with_capacity` — `String.with_capacity(n)` → `__zag_String.withCapacity(alloc, n)`.
+    string_with_capacity,
+
+    /// Returns the zig name for a known zag String method.
+    pub fn stringMethodZigName(zag_name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, zag_name, "as_str")) return "asStr";
+        if (std.mem.eql(u8, zag_name, "push_str")) return "pushStr";
+        if (std.mem.eql(u8, zag_name, "with_capacity")) return "withCapacity";
+        return null;
+    }
 };
 
 /// One row in the router table. The match shape is name + arity --
@@ -380,6 +391,8 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "assert", .arity = 2, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "type_name", .arity = 1, .receiver = null, .dispatch = .builtin_type_name },
     .{ .name = "panic", .arity = 1, .receiver = null, .dispatch = .builtin_panic },
+    // String type static method — receiver = "String" for dispatch
+    .{ .name = "with_capacity", .arity = 1, .receiver = "String", .dispatch = .string_with_capacity },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that

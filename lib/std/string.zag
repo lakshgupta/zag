@@ -1,23 +1,14 @@
 ## std.string — heap-allocated mutable UTF-8 string.
 ##
-## Layout (from docs/spec.md §3.3): { ptr: *u8, len: usize, cap: usize }.
-## Stub: the canonical `String` type, surface-only. The real methods
-## (push, push_str, with_capacity, as_str, as_writer, with_writer)
-## route through zig std.String once the codegen router is wired —
-## until then, this stub exposes only `with_capacity` and `as_str`.
+## Backed by `__zag_String` in the generated zig preamble.
+## Layout { data: []u8, cap: usize }.  len is data.len.
 ##
-## A `_opaque: i32` field stands in for the real `{ptr, len, cap}`
-## layout so struct-literal sites (`new String("hello")`) type-check.
+## Methods route through the codegen router:
+##   String.with_capacity(n)  → __zag_String.withCapacity(alloc, n)
+##   s.as_str()               → s.asStr()
+##   s.push_str("hello")      → s.pushStr("hello")
 
 pub struct String {
-    _opaque: i32,
-}
-
-impl String {
-    pub fun with_capacity(self: *String, cap: usize) -> String {
-        return String { _opaque: 0 };
-    }
-    pub fun as_str(self: *String) -> []const u8 {
-        return "";
-    }
+    data: []u8,
+    cap: usize,
 }

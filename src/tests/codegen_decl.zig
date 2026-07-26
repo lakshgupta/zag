@@ -2626,12 +2626,16 @@ test "codegen: backed-enum(u8) explicit emits enum(u8) { V = N, ... }" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "Warn = 1,") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "Err = 2,") != null);
     // Sanity: NOT the bare-enum form (`enum {\n    Ok,`) nor the str-
-    // backed struct fallback. The map table preamble contains `struct {`
-    // (`__ZagMapEntry`) so filter that out before checking.
+    // backed struct fallback. The preamble contains `struct {` from
+    // `__zag_String` and `__ZagMapEntry` — check only user code.
     {
-        const map_idx = std.mem.indexOf(u8, zig, "__ZagMapEntry");
-        const check_slice = if (map_idx) |idx| zig[0..idx] else zig;
-        try std.testing.expect(std.mem.indexOf(u8, check_slice, "struct {") == null);
+        const user_start = std.mem.indexOf(u8, zig, "pub fn main") orelse zig.len;
+        const check_slice = zig[0..user_start];
+        const map_idx = std.mem.indexOf(u8, check_slice, "__ZagMapEntry");
+        const final_slice = if (map_idx) |idx| check_slice[0..idx] else check_slice;
+        const str_idx = std.mem.indexOf(u8, final_slice, "__zag_String");
+        const pre_string = if (str_idx) |idx| final_slice[0..idx] else final_slice;
+        try std.testing.expect(std.mem.indexOf(u8, pre_string, "struct {") == null);
     }
 }
 

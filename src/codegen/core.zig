@@ -603,6 +603,41 @@ pub const MapEntry = struct {
             \\    @trap();
             \\}
             \\
+            \\// __zag_String — heap-allocated mutable UTF-8 string.
+            \\// Layout: { ptr: [*]u8, len: usize, cap: usize }.
+            \\// Used by `import std.string` and the `String` type in zag.
+            \\const __zag_String = struct {
+            \\    ptr: [*]u8,
+            \\    len: usize,
+            \\    cap: usize,
+            \\
+            \\    pub fn withCapacity(alloc: std.mem.Allocator, capacity: usize) @This() {
+            \\        const buf = alloc.alloc(u8, capacity) catch @panic("String: out of memory");
+            \\        return .{ .ptr = buf.ptr, .len = 0, .cap = capacity };
+            \\    }
+            \\
+            \\    pub fn asStr(self: *const @This()) []const u8 {
+            \\        return self.ptr[0..self.len];
+            \\    }
+            \\
+            \\    pub fn pushStr(self: *@This(), s: []const u8) void {
+            \\        const needed = self.len + s.len;
+            \\        if (needed > self.cap) {
+            \\            var new_cap = self.cap;
+            \\            while (new_cap < needed) new_cap *= 2;
+            \\            self.ptr = (std.heap.page_allocator.realloc(self.ptr[0..self.cap], new_cap) catch
+            \\                @panic("String: realloc failed")).ptr;
+            \\            self.cap = new_cap;
+            \\        }
+            \\        @memcpy(self.ptr[self.len..][0..s.len], s);
+            \\        self.len = needed;
+            \\    }
+            \\
+            \\    pub fn deinit(self: *@This()) void {
+            \\        std.heap.page_allocator.free(self.ptr[0..self.cap]);
+            \\    }
+            \\};
+            \\
             // Result<T,E> and Option<T> — error-handling fundamental types
             // (docs/manual/18-error-handling.md). Defined as generic zig
             // union(enum) types so the `?` try/unwrap operator and `catch`

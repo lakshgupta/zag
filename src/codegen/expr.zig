@@ -882,6 +882,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         return;
                     }
                 }
+                // Intercept String instance methods — emit zig-native calls.
+                // `s.as_str()` → `s.asStr()`, `s.push_str(x)` → `s.pushStr(x)`.
+                if (builtins.BuiltinDispatch.stringMethodZigName(mc.name)) |zig_name| {
+                    self.genExpr(mc.target.*);
+                    self.write(".");
+                    self.write(zig_name);
+                    self.write("(");
+                    for (mc.args, 0..) |a, i| {
+                        if (i > 0) self.write(", ");
+                        self.genExpr(a);
+                    }
+                    self.write(")");
+                    return;
+                }
                 // `target.name(args...)` — emit verbatim because zig
                 // supports both the value-receiver form (e.g. `v.length()`
                 // where v: Vec3) and the type-static constructor form
@@ -1533,6 +1547,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.writeInt(loc.line);
                 self.write(", ");
                 self.writeInt(loc.col);
+                self.write(")");
+            },
+            .string_with_capacity => {
+                self.write("__zag_String.withCapacity(std.heap.page_allocator, ");
+                self.genExpr(args[0]);
                 self.write(")");
             },
         }
