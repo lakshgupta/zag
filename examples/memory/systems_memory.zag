@@ -1,0 +1,33 @@
+## Systems memory management — stack vs heap (docs/19 §"Memory Model")
+##
+## Stack allocation is the default: structs, fixed arrays, and
+## primitives live on the stack and are freed at scope exit — zero
+## allocation overhead. Heap allocation is explicit via `new` and
+## `alloc`. Use `defer` and `errdefer` for deterministic cleanup.
+##
+## Run: zag run systems_memory.zag
+
+fun main() {
+    # ── Stack allocation (zero overhead) ─────────────────────────
+    # Fixed array on stack — no heap, no allocator, just LEA/RSP
+    let buf: [8]u8 = [8]u8 { 0, 1, 2, 3, 4, 5, 6, 7 };
+    print("stack buffer byte 0: {buf[0]}\n");
+    print("stack buffer byte 4: {buf[4]}\n");
+    print("sizeof([8]u8) = {size_of([8]u8)}\n");
+
+    # Zero-filled stack buffer — use fill syntax for large arrays
+    let zero_buf: [4096]u8 = [4096]u8 { 0 ... };
+    print("zeroed stack buffer (4096 bytes)\n");
+
+    # ── Heap allocation (explicit) ────────────────────────────────
+    let heap_buf: []u8 = alloc(64);
+    defer free(heap_buf);
+    print("heap buffer (64 bytes): size_of(*u8) = {size_of(*u8)}, align_of(f64) = {align_of(f64)}\n");
+
+    # Single heap value
+    let p: *i32 = new i32(42);
+    defer free(p);
+    print("heap value: {p}\n");
+
+    print("done — defers run in reverse order\n");
+}

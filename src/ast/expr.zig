@@ -127,6 +127,12 @@ pub const Expr = union(enum) {
     /// `err_binding` is set (`catch |err| handler`), binds the error to
     /// `err` and evaluates `handler`. Built by `Parser.parseCatchExpr`.
     catch_expr: CatchExpr,
+    /// `{ stmt; stmt; expr }` — block expression. Evaluates to the
+    /// value of the last expression in the block. Built by
+    /// `Parser.parsePrimary` when `.lbrace` is encountered in an
+    /// expression position. Codegen emits a zig labeled block with
+    /// `break :blk` for the final value.
+    block_expr: []const Stmt,
 
     pub const BinaryExpr = struct {
         /// Operator tag. Stored as an enum so codegen can switch on the

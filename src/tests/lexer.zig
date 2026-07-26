@@ -286,8 +286,8 @@ test "lexer: const is a keyword" {
     try std.testing.expectEqualStrings("x", tokens[1].text);
 }
 
-test "lexer: errdefer_kw, unsafe_kw, as_kw are keywords" {
-    const src = "errdefer unsafe as";
+test "lexer: errdefer_kw, unsafe_kw, as_kw, extern_kw are keywords" {
+    const src = "errdefer unsafe as extern";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     try std.testing.expectEqual(lexer_mod.TokenTag.errdefer_kw, tokens[0].tag);
@@ -296,6 +296,8 @@ test "lexer: errdefer_kw, unsafe_kw, as_kw are keywords" {
     try std.testing.expectEqualStrings("unsafe", tokens[1].text);
     try std.testing.expectEqual(lexer_mod.TokenTag.as_kw, tokens[2].tag);
     try std.testing.expectEqualStrings("as", tokens[2].text);
+    try std.testing.expectEqual(lexer_mod.TokenTag.extern_kw, tokens[3].tag);
+    try std.testing.expectEqualStrings("extern", tokens[3].text);
 }
 
 test "lexer: control-flow keywords (if/else/while/for/in/match/break/continue)" {

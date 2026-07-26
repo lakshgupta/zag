@@ -234,6 +234,7 @@ pub const VariantFieldsEntry = struct {
     pub const genBuiltinCall = @import("expr.zig").genBuiltinCall;
     pub const genFreeMethod = @import("decl.zig").genFreeMethod;
     pub const genFun = @import("decl.zig").genFun;
+    pub const genExternDecl = @import("decl.zig").genExternDecl;
     pub const genMatchExpr = @import("stmt.zig").genMatchExpr;
     pub const genMethod = @import("decl.zig").genMethod;
     pub const genPrintCall = @import("primary.zig").genPrintCall;
@@ -965,6 +966,10 @@ pub const VariantFieldsEntry = struct {
                 default_buf[0..default_count],
                 default_field_buf[0..default_count],
             );
+        }
+
+        for (prog.externs) |ext| {
+            self.genExternDecl(ext);
         }
 
         for (prog.functions) |fun| {

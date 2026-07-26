@@ -1112,3 +1112,33 @@ test "parser: impl without `with` clause leaves trait_specs empty" {
     try std.testing.expect(prog.impls.len == 1);
     try std.testing.expectEqual(@as(usize, 0), prog.impls[0].trait_specs.len);
 }
+
+test "parser: extern fun declaration populates Program.externs" {
+    const src = "extern fun open(path: *raw u8, flags: i32) -> i32;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expectEqual(@as(usize, 1), prog.externs.len);
+    try std.testing.expectEqualStrings("open", prog.externs[0].name);
+    try std.testing.expectEqual(@as(usize, 2), prog.externs[0].params.len);
+    try std.testing.expectEqualStrings("path", prog.externs[0].params[0].name);
+    try std.testing.expectEqualStrings("*raw u8", prog.externs[0].params[0].type_text);
+    try std.testing.expectEqualStrings("flags", prog.externs[0].params[1].name);
+    try std.testing.expectEqualStrings("i32", prog.externs[0].params[1].type_text);
+    try std.testing.expect(prog.externs[0].return_type != null);
+    try std.testing.expectEqualStrings("i32", prog.externs[0].return_type.?);
+    try std.testing.expect(!prog.externs[0].is_variadic);
+}
+
+test "parser: extern variadic fun captures is_variadic flag" {
+    const src = "extern fun printf(fmt: *raw u8, ...) -> i32;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expectEqual(@as(usize, 1), prog.externs.len);
+    try std.testing.expect(prog.externs[0].is_variadic);
+}

@@ -912,6 +912,31 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
                 self.write(")");
             },
+            .block_expr => |body| {
+                // `{ stmts... }` — block expression. Emit a labeled
+                // zig block that executes all statements and yields
+                // the value of the final expression via `break :blk`.
+                self.write("(blk: {\n");
+                for (body, 0..) |s, i| {
+                    if (i == body.len - 1 and s == .return_stmt) {
+                        const rs = s.return_stmt;
+                        if (rs.value) |v| {
+                            self.write("        break :blk ");
+                            self.genExpr(v);
+                            self.write(";\n");
+                        } else {
+                            self.genStmt(s, false);
+                        }
+                    } else if (i == body.len - 1 and s == .expr_stmt) {
+                        self.write("        break :blk ");
+                        self.genExpr(s.expr_stmt);
+                        self.write(";\n");
+                    } else {
+                        self.genStmt(s, false);
+                    }
+                }
+                self.write("    })");
+            },
             .try_op => |t| {
                 // `expr?` — postfix try/unwrap. Emit a labeled block +
                 // compile-time `@hasField` discriminators so the same
@@ -1368,6 +1393,37 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("(std.os.linux.exit(@as(u8, @intCast(");
                 self.genExpr(args[0]);
                 self.write("))))");
+            },
+            .builtin_alloc => {
+                // `alloc(N)` — heap-allocate N bytes via page_allocator.
+                // Returns []u8 (heap-allocated byte slice). The caller
+                // MUST free with `free(buf)` (already routed through
+                // the slice-overload arm of free_expr).
+                self.write("(std.heap.page_allocator.alloc(u8, ");
+                self.genExpr(args[0]);
+                self.write(") catch @panic(\"OOM\"))");
+            },
+            .builtin_size_of => {
+                self.write("@sizeOf(");
+                self.genExpr(args[0]);
+                self.write(")");
+            },
+            .builtin_align_of => {
+                self.write("@alignOf(");
+                self.genExpr(args[0]);
+                self.write(")");
+            },
+            .builtin_volatile_store => {
+                self.write("@volatileStore(");
+                self.genExpr(args[0]);
+                self.write(", ");
+                self.genExpr(args[1]);
+                self.write(")");
+            },
+            .builtin_volatile_load => {
+                self.write("@volatileLoad(");
+                self.genExpr(args[0]);
+                self.write(")");
             },
         }
     }

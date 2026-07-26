@@ -20,6 +20,9 @@ const TraitDecl = decl.TraitDecl;
 // chain as the other decl-side types; default-empty preserves the
 // non-import source-shape compat (no pre-imports code existed).
 const ImportDecl = decl.ImportDecl;
+// FFI (docs/24). ExternDecl carries `extern fun` declarations so
+// parser can parse them at top-level and codegen can emit them.
+const ExternDecl = decl.ExternDecl;
 
 // ============================================================
 // top.zig — top-level types from src/ast.zig
@@ -78,6 +81,10 @@ pub const Program = struct {
     /// later parser pass). Codegen walks `imports` at generate() entry
     /// to emit one `@import("...")`-style pre-bind per resolved entry.
     imports: []const ImportDecl = &[_]ImportDecl{},
+    /// Top-level `extern fun` declarations (docs/24 §"extern fun").
+    /// Codegen emits `extern fn` for each entry before any function
+    /// bodies so zig's linker can resolve FFI symbols.
+    externs: []const ExternDecl = &[_]ExternDecl{},
 };
 
 pub const Arena = struct {

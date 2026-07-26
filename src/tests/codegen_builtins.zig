@@ -241,3 +241,41 @@ test "codegen: free of call expr falls back to page_allocator.destroy (non-ident
     // the call's argument emission entirely).
     try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator.free(42)") == null);
 }
+
+test "codegen: alloc(N) emits page_allocator.alloc(u8, N) with OOM catch" {
+    const src = "fun main() { let buf: []u8 = alloc(1024); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Emits page_allocator.alloc with OOM panic
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.alloc(u8, 1024)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@panic(\"OOM\")") != null);
+}
+
+test "codegen: size_of(T) emits @sizeOf(T)" {
+    const src = "fun main() { let s: usize = size_of(i32); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@sizeOf(i32)") != null);
+}
+
+test "codegen: align_of(T) emits @alignOf(T)" {
+    const src = "fun main() { let a: usize = align_of(f64); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@alignOf(f64)") != null);
+}

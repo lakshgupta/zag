@@ -1073,3 +1073,60 @@ pub fn parseImportDecl(self: *Parser, is_pub: bool) ast.ImportDecl {
         };
     }
 
+
+pub fn parseExternDecl(self: *Parser) ast.ExternDecl {
+        const start_loc = self.peek().loc;
+        self.expect(.extern_kw);
+        self.expect(.fun);
+        const name = self.expectIdent();
+        self.expect(.lparen);
+        var params_buf: [16]ast.MethodParam = undefined;
+        var param_count: usize = 0;
+        var is_variadic = false;
+        if (self.peek().tag != .rparen) {
+            while (true) {
+                if (self.peek().tag == .ellipsis) {
+                    is_variadic = true;
+                    self.advance();
+                    break;
+                }
+                const pname = self.expectIdent();
+                self.expect(.colon);
+                const ptype = self.collectCastType();
+                if (ptype.len == 0) {
+                    std.debug.print("error:{d}:{d}: extern fun param '{s}' requires a type\n", .{ self.peek().loc.line, self.peek().loc.col, pname });
+                    std.process.exit(1);
+                }
+                if (param_count < params_buf.len) {
+                    params_buf[param_count] = .{
+                        .name = pname,
+                        .type_text = ptype,
+                        .is_self = false,
+                    };
+                    param_count += 1;
+                }
+                if (self.peek().tag == .comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(.rparen);
+        var return_type: ?[]const u8 = null;
+        if (self.peek().tag == .arrow) {
+            self.advance();
+            const rt = self.collectCastType();
+            return_type = if (rt.len == 0) null else rt;
+        }
+        const params = self.arena.alloc(ast.MethodParam, param_count);
+        if (param_count > 0) @memcpy(params, params_buf[0..param_count]);
+        return .{
+            .name = name,
+            .params = params,
+            .return_type = return_type,
+            .is_variadic = is_variadic,
+            .loc = start_loc,
+        };
+    }
+

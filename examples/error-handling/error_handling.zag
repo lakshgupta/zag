@@ -1,0 +1,61 @@
+# Error handling with Result, Option, ?, catch, and block handlers
+# (docs/18 §"Error Handling").
+
+fun divide(a: i32, b: i32) -> Result<i32, str> {
+    if b == 0 {
+        return Err("division by zero");
+    }
+    return Ok(a / b);
+}
+
+fun maybe_get(index: i32) -> Option<i32> {
+    if index < 0 or index >= 3 {
+        return None;
+    }
+    return Some(index * 10);
+}
+
+# ? propagates errors to the enclosing Result-returning function
+fun chain_divide(a: i32, b: i32) -> Result<i32, str> {
+    let half: i32 = divide(a, 2)?;
+    let result: i32 = divide(half, b)?;
+    return Ok(result);
+}
+
+# catch with a block handler — error bound + multi-statement body
+fun safe_divide(a: i32, b: i32) -> i32 {
+    return divide(a, b) catch |err| {
+        print("caught error: {err}\n");
+        0
+    };
+}
+
+fun main() {
+    # Result handling with match
+    match divide(10, 2) {
+        Ok(val) => print("10 / 2 = {val}\n"),
+        Err(msg) => print("error: {msg}\n"),
+    }
+
+    match divide(10, 0) {
+        Ok(val) => print("10 / 0 = {val}\n"),
+        Err(msg) => print("error: {msg}\n"),
+    }
+
+    # Option handling with match
+    match maybe_get(1) {
+        Some(val) => print("maybe_get(1) = {val}\n"),
+        None     => print("maybe_get(1) = none\n"),
+    }
+
+    # ? propagation
+    match chain_divide(20, 2) {
+        Ok(val) => print("chain_divide(20, 2) = {val}\n"),
+        Err(msg) => print("chain_divide failed: {msg}\n"),
+    }
+
+    # catch with block handler — error message printed, fallback returned
+    let a: i32 = safe_divide(10, 0);
+    let b: i32 = safe_divide(10, 2);
+    print("safe_divide: {a}, {b}\n");
+}

@@ -240,7 +240,7 @@ pub fn collectCastType(self: *Parser) []const u8 {
 
 pub fn isExprStart(tag: TokenTag) bool {
         return switch (tag) {
-            .integer_literal, .float_literal, .string_literal, .byte_string_literal, .char_literal, .true_kw, .false_kw, .null_kw, .undefined_kw, .identifier, .print, .lparen, .lbracket, .minus, .amp, .plus, .tilde, .bang, .star, .new, .free, .if_kw, .match_kw, .catch_kw => true,
+            .integer_literal, .float_literal, .string_literal, .byte_string_literal, .char_literal, .true_kw, .false_kw, .null_kw, .undefined_kw, .identifier, .print, .lparen, .lbracket, .lbrace, .minus, .amp, .plus, .tilde, .bang, .star, .new, .free, .if_kw, .match_kw, .catch_kw => true,
             else => false,
         };
     }

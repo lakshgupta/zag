@@ -98,6 +98,8 @@ pub const TypeParam = ast_decl.TypeParam;
 // `Program.imports` via the top.zig aggregator.
 pub const ImportSelector = ast_decl.ImportSelector;
 pub const ImportDecl = ast_decl.ImportDecl;
+// FFI (docs/24). ExternDecl carries `extern fun` declarations.
+pub const ExternDecl = ast_decl.ExternDecl;
 
 // Template-literal types (extracted from Expr union body, now top-level).
 pub const TemplateLitExpr = ast_template.TemplateLitExpr;

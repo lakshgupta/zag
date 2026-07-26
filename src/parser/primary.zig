@@ -1049,6 +1049,14 @@ pub fn parsePrimary(self: *Parser) Expr {
                 self.advance();
                 return .{ .undefined_lit = {} };
             },
+            .lbrace => {
+                self.advance();
+                const body = self.parseStmtList();
+                self.expect(.rbrace);
+                // Return raw block expression — codegen wraps in a
+                // labeled block to produce the final value.
+                return .{ .block_expr = body };
+            },
             .star => {
                 // Note: `*x` (deref) is NOT routed here. After the unary
                 // refactor, parseUnary handles all four prefix operators

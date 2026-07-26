@@ -607,19 +607,44 @@ const Codegen = core.Codegen;
         // v1.5 raw pointer shapes (docs/09 §\"Raw Pointers\"): zag's
         //     *raw T        — raw pointer to T       →  zig   [*]T
         //     ?*raw T       — optional raw pointer   →  zig   ?[*]T
-        // zig has no `*raw` keyword; the canonical equivalent for
-        // `*raw T` is the many-pointer `[*]T`. Without this rewrite,
-        // `let p: *raw u8 = &buf;` round-trips as `let p: *raw u8 =
-        // &buf;` and zig rejects with `expected '=', found 'an
-        // identifier'` (the column-28 marker points at `u8`, parsing
-        // `?*raw` as `? + * + raw` because `*` and `raw` aren't a
-        // single token). Bare `*raw u8` also fails identically via
-        // the bare-pointer row, so both rows are listed. The Phase 3
-        // docs/09 widening will replace these case-locked entries
-        // with a substring rewriter that handles any `*raw <tail>`
-        // / `?*raw <tail>` form (today's tests only pin `u8`).
-        if (std.mem.eql(u8, text, "*raw u8")) return "[*]u8";
-        if (std.mem.eql(u8, text, "?*raw u8")) return "?[*]u8";
+        // General `*raw T` → `[*]T` rewrite (zig 0.16 uses `[*]` for
+        // many-pointers, not `*raw`). Also handles `c_void` → `anyopaque`
+        // for FFI compatibility.
+        if (std.mem.indexOf(u8, text, "*raw ")) |idx| {
+            const inner = text[idx + "*raw ".len ..];
+            var scratch: [256]u8 = undefined;
+            var slen: usize = 0;
+            @memcpy(scratch[slen..][0..idx], text[0..idx]);
+            slen += idx;
+            @memcpy(scratch[slen..][0..3], "[*]");
+            slen += 3;
+            if (std.mem.eql(u8, inner, "c_void")) {
+                @memcpy(scratch[slen..][0..9], "anyopaque");
+                slen += 9;
+            } else {
+                @memcpy(scratch[slen..][0..inner.len], inner);
+                slen += inner.len;
+            }
+            return scratch[0..slen];
+        }
+        if (std.mem.indexOf(u8, text, "?*raw ")) |idx| {
+            const inner = text[idx + "?*raw ".len ..];
+            var scratch: [256]u8 = undefined;
+            var slen: usize = 0;
+            @memcpy(scratch[slen..][0..idx], text[0..idx]);
+            slen += idx;
+            @memcpy(scratch[slen..][0..4], "?[*]");
+            slen += 4;
+            if (std.mem.eql(u8, inner, "c_void")) {
+                @memcpy(scratch[slen..][0..9], "anyopaque");
+                slen += 9;
+            } else {
+                @memcpy(scratch[slen..][0..inner.len], inner);
+                slen += inner.len;
+            }
+            return scratch[0..slen];
+        }
+        if (std.mem.eql(u8, text, "c_void")) return "anyopaque";
         // Phase 3 (CLI migration) followup: extend the alias table to
         // cover the array-shaped forms `[]str` and `[N]str` so a
         // `let args: [3]str = ...;` binding or a `[3]str { a, b, c }`
@@ -1398,4 +1423,26 @@ const Codegen = core.Codegen;
         }
 
         self.write("}\n\n");
+    }
+
+    /// Emit a zig `extern fn` declaration for a zag `extern fun`
+    /// (docs/24 §"extern fun"). The function is declared with C
+    /// calling convention (default for `extern` in zig).
+    pub     fn genExternDecl(self: *Codegen, ext: ast.ExternDecl) void {
+        self.write("pub extern fn ");
+        self.write(ext.name);
+        self.write("(");
+        for (ext.params, 0..) |p, i| {
+            if (i > 0) self.write(", ");
+            self.write(p.name);
+            self.write(": ");
+            self.writeType(p.type_text);
+        }
+        if (ext.is_variadic) {
+            if (ext.params.len > 0) self.write(", ");
+            self.write("...");
+        }
+        self.write(") ");
+        if (ext.return_type) |rt| self.writeType(rt) else self.write("void");
+        self.write(";\n\n");
     }

@@ -53,6 +53,8 @@ pub fn parse(self: *Parser) ast.Program {
         var trait_count: usize = 0;
         var imports_buf: [256]ast.ImportDecl = undefined;
         var import_count: usize = 0;
+        var externs_buf: [256]ast.ExternDecl = undefined;
+        var extern_count: usize = 0;
 
         while (!self.eof()) {
             if (self.peek().tag == .newline) {
@@ -224,6 +226,11 @@ pub fn parse(self: *Parser) ast.Program {
                 import_count += 1;
                 continue;
             }
+            if (lead == .extern_kw) {
+                externs_buf[extern_count] = self.parseExternDecl();
+                extern_count += 1;
+                continue;
+            }
             functions_buf[fun_count] = self.parseFunDecl();
             functions_buf[fun_count].doc = doc;
             fun_count += 1;
@@ -241,7 +248,9 @@ pub fn parse(self: *Parser) ast.Program {
         @memcpy(traits, traits_buf[0..trait_count]);
         const imports = self.arena.alloc(ast.ImportDecl, import_count);
         @memcpy(imports, imports_buf[0..import_count]);
-        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits, .imports = imports };
+        const externs = self.arena.alloc(ast.ExternDecl, extern_count);
+        @memcpy(externs, externs_buf[0..extern_count]);
+        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits, .imports = imports, .externs = externs };
     }
 
 
@@ -563,6 +572,9 @@ pub const Parser = struct {
     // reaches the function registered in decl.zig without pulling the
     // decl.zig file's internals into a separate `@import` site.
     pub const parseImportDecl = @import("decl.zig").parseImportDecl;
+    // FFI (docs/24). parseExternDecl parses `extern fun NAME(...) -> RET;`
+    // declarations at the top level.
+    pub const parseExternDecl = @import("decl.zig").parseExternDecl;
     // Module imports (docs/manual/22-modules.md §Imports).
     // `joinDottedPath` is defined as a file-scope Parser struct
     // member further down in this same file (sibling to

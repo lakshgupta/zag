@@ -175,3 +175,43 @@ test "codegen: named_tuple_lit emits .{ .name = expr, ... }" {
     // deliberately use bare `let NAME = ...` shape so this stays bare.)
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const p = .{ .x = 10, .y = 20 };") != null);
 }
+
+test "codegen: stack-allocated array with type annotation emits zig [N]T" {
+    // let buf: [8]u8 = [8]u8{ ... } — stack-allocated fixed array.
+    const src =
+        \\fun f() {
+        \\    let buf: [8]u8 = [8]u8 { 0, 1, 2, 3, 4, 5, 6, 7 };
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Stack allocation — no heap, no alloc()
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[8]u8 = [8]u8{ 0, 1, 2, 3, 4, 5, 6, 7 }") != null);
+    // No page_allocator references — this is pure stack
+    try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator") == null);
+}
+
+test "codegen: stack-allocated fill array emits [1]T{val}**N on stack" {
+    // let buf: [4096]u8 = [4096]u8 { 0 ... } — zero-filled stack buffer.
+    const src =
+        \\fun f() {
+        \\    let buf: [4096]u8 = [4096]u8 { 0 ... };
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Fill array on stack — [1]u8{ 0 } ** 4096
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[1]u8{ 0 } ** 4096") != null);
+    // No heap alloc
+    try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator") == null);
+}

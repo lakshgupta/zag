@@ -3133,3 +3133,44 @@ test "codegen: embedding promotion forwards non-trait impl methods" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn show(self: *Button) []const u8") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "self.Widget.show(&self.Widget") != null);
 }
+
+test "codegen: extern fun emits pub extern fn declaration" {
+    const src = "extern fun open(path: *raw u8, flags: i32) -> i32;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // *raw u8 → [*]u8 rewrite
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub extern fn open(path: [*]u8, flags: i32) i32;") != null);
+    // No bare `*raw` in the output
+    try std.testing.expect(std.mem.indexOf(u8, zig, "*raw") == null);
+}
+
+test "codegen: extern fun with c_void rewrites to anyopaque" {
+    const src = "extern fun free(ptr: *raw c_void);\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // *raw c_void → [*]anyopaque
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub extern fn free(ptr: [*]anyopaque) void;") != null);
+}
+
+test "codegen: extern variadic fun emits ... in signature" {
+    const src = "extern fun printf(fmt: *raw u8, ...) -> i32;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Variadic signature
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub extern fn printf(fmt: [*]u8, ...) i32;") != null);
+}

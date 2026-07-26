@@ -36,6 +36,8 @@ pub     fn readIdent(self: *Lexer, start_loc: ast.Loc) void {
         .errdefer_kw
     else if (std.mem.eql(u8, text, "unsafe"))
         .unsafe_kw
+    else if (std.mem.eql(u8, text, "extern"))
+        .extern_kw
     else if (std.mem.eql(u8, text, "as"))
         .as_kw
     else if (std.mem.eql(u8, text, "struct"))

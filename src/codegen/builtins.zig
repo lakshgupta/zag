@@ -182,6 +182,32 @@ pub const BuiltinDispatch = enum {
     /// `exit(rc)` call instead of zig-side `std.process.exit`.
     /// docblock mirrored in the table row below.
     process_exit,
+
+    /// `builtin_alloc` — emit a per-call blk wrapper that calls
+    /// `std.heap.page_allocator.alloc(u8, N) catch @panic("OOM")`
+    /// and returns `[]u8` (heap-allocated byte slice, docs/19 §1).
+    /// The user MUST free with `free(buf)` when done. arity = 1:
+    /// only the `alloc(N)` one-arg form routes.
+    builtin_alloc,
+
+    /// `builtin_size_of` — emit zig's `@sizeOf(T)` for compile-time
+    /// type-size reflection. The single argument must be a type ident;
+    /// codegen emits the type verbatim. No per-call counter needed.
+    builtin_size_of,
+
+    /// `builtin_align_of` — emit zig's `@alignOf(T)` for compile-time
+    /// type-alignment reflection. Same shape as size_of.
+    builtin_align_of,
+
+    /// `builtin_volatile_store` — emit zig's `@volatileStore(p, v)`.
+    /// For MMIO and embedded systems where stores must not be
+    /// optimized away. arity = 2: `volatile_store(ptr, value)`.
+    builtin_volatile_store,
+
+    /// `builtin_volatile_load` — emit zig's `@volatileLoad(p)`.
+    /// For MMIO reads that must not be cached or reordered.
+    /// arity = 1: `volatile_load(ptr)`.
+    builtin_volatile_load,
 };
 
 /// One row in the router table. The match shape is name + arity --
@@ -287,6 +313,11 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "mkdir", .arity = 1, .receiver = null, .dispatch = .fs_mkdir },
     .{ .name = "exec", .arity = 1, .receiver = null, .dispatch = .process_exec },
     .{ .name = "exit", .arity = 1, .receiver = null, .dispatch = .process_exit },
+    .{ .name = "alloc", .arity = 1, .receiver = null, .dispatch = .builtin_alloc },
+    .{ .name = "size_of", .arity = 1, .receiver = null, .dispatch = .builtin_size_of },
+    .{ .name = "align_of", .arity = 1, .receiver = null, .dispatch = .builtin_align_of },
+    .{ .name = "volatile_store", .arity = 2, .receiver = null, .dispatch = .builtin_volatile_store },
+    .{ .name = "volatile_load", .arity = 1, .receiver = null, .dispatch = .builtin_volatile_load },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that

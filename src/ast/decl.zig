@@ -434,3 +434,17 @@ pub const ImportDecl = struct {
     loc: Loc,
 };
 
+/// One top-level `extern fun` declaration (docs/24 §"extern fun").
+/// `extern fun open(path: *raw u8, flags: i32) -> i32;` declares a C ABI
+/// function with no body. Codegen emits `extern fn` in zig output.
+pub const ExternDecl = struct {
+    name: []const u8,
+    params: []const MethodParam,
+    return_type: ?[]const u8,
+    /// True when the C function is variadic (`...` trailing parameter).
+    /// The ellipsis is consumed from the parser — codegen appends
+    /// `...` to the zig extern fn signature when true.
+    is_variadic: bool = false,
+    loc: Loc,
+};
+

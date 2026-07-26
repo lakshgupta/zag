@@ -65,6 +65,10 @@ pub const TokenTag = enum {
     /// in multiple listed traits). Phase: lands as part of the canonical
     /// `impl Type with Trait (m) { ... }` form rollout.
     with_kw,
+    /// `extern` keyword — declares C ABI functions and structs
+    /// (`extern fun open(path: *raw u8, flags: i32) -> i32;`,
+    /// `extern struct OpaqueHandle;` — docs/24 §"extern fun").
+    extern_kw,
     /// `pub` keyword — visibility modifier on top-level decls and
     /// methods. Spec framing reserves privacy enforcement to a followup;
     /// current parser accepts-and-ignores it (the keyword is preserved

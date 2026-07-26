@@ -1,0 +1,27 @@
+## Memory allocation: stack vs heap, alloc, new, free, defer
+## (docs/19 §"Memory Model").
+##
+## `alloc(N)` allocates a heap buffer ([]u8). `free(buf)` deallocates it.
+## `new T(value)` allocates a single heap value (*T). `free(p)` deallocates.
+## `defer` runs at scope exit — stack-like LIFO order.
+##
+## Run: zag run stack_heap.zag
+
+fun main() {
+    # Heap buffer via alloc
+    let buf: []u8 = alloc(10);
+    defer free(buf);
+    print("buffer allocated (10 bytes)\n");
+
+    # Heap value via new
+    let p: *i32 = new i32(42);
+    defer free(p);
+    print("value allocated: {p}\n");
+
+    # Multiple defers run in reverse order (LIFO)
+    defer free(buf);
+    defer free(p);
+    defer print("defer: cleaned up multiple allocs\n");
+
+    print("--- scope exit cleanup ---\n");
+}

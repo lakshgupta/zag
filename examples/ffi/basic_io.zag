@@ -1,0 +1,14 @@
+# FFI: C ABI function declarations (docs/24 §"extern fun").
+# Declare C library functions and call them from zag.
+# This example demonstrates file I/O via libc's open/read/write/close.
+
+extern fun open(path: *raw u8, flags: i32, mode: i32) -> i32;
+extern fun read(fd: i32, buf: *raw u8, count: usize) -> isize;
+extern fun write(fd: i32, buf: *raw u8, count: usize) -> isize;
+extern fun close(fd: i32) -> i32;
+
+# Write a message to stdout (fd 1) via the write syscall.
+fun main() {
+    let msg = "hello from FFI\n";
+    let n: i32 = write(1, msg as *raw u8, msg.len as usize) as i32;
+}
