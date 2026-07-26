@@ -1,0 +1,17 @@
+## defer — LIFO cleanup at scope exit (docs/20 §"defer")
+##
+## `defer` runs when the current scope exits, in reverse
+## declaration order. Use for resource cleanup.
+##
+## Run: zag run defer_basic.zag
+
+fun main() {
+    let p: *i32 = new i32(42);
+    defer free(p);                     # runs LAST
+
+    let buf: []u8 = alloc(16);
+    defer free(buf);                   # runs FIRST (LIFO)
+
+    print("defer: p={p}, buf allocated\n");
+    print("defer: exiting scope — cleanups run in reverse\n");
+}

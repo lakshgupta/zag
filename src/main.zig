@@ -136,7 +136,7 @@ pub fn main() !void {
         } else if (try project_mod.detectProject("")) |cfg| {
             resolveZigPath(cfg);
             if (zig_install_path.len == 0) return needZig();
-            try projectCmd(cmd, cfg, &.{}, false);
+            try projectCmd(cmd, cfg, &.{}, false, false);
         } else {
             std.debug.print("error: missing file argument\n\n", .{});
             usage();
@@ -162,14 +162,18 @@ fn cmdRun(args: []const []const u8) !void {
     // Extract extra args (after --)
     const extra_args = if (sep_idx < args.len) args[sep_idx + 1 ..] else &.{};
 
+    // Check for --release flag before --
+    var release_flag = false;
+    for (args[2..sep_idx]) |a| {
+        if (std.mem.eql(u8, a, "--release")) release_flag = true;
+    }
+
     // Determine mode: file specified before -- or after?
-    // First non-flag arg after cmd is the file path (if any)
     const zag_file = blk: {
         if (args.len >= 3 and sep_idx >= 3 and hasZagExt(args[2])) {
             break :blk args[2];
         }
         if (sep_idx < args.len and args.len >= 3) {
-            // Check if there's a file arg between cmd and --
             for (args[2..sep_idx], 2..) |a, i| {
                 if (hasZagExt(a)) break :blk args[i];
             }
@@ -184,7 +188,7 @@ fn cmdRun(args: []const []const u8) !void {
     } else if (try project_mod.detectProject("")) |cfg| {
         resolveZigPath(cfg);
         if (zig_install_path.len == 0) return needZig();
-        try projectCmd("run", cfg, extra_args, false);
+        try projectCmd("run", cfg, extra_args, false, release_flag);
     } else {
         std.debug.print("error: missing file argument. Provide a .zag file or run from a project directory.\n\n", .{});
         usage();
@@ -193,10 +197,11 @@ fn cmdRun(args: []const []const u8) !void {
 }
 
 fn cmdBuild(args: []const []const u8) !void {
-    // Parse -o / --output and -g / --generate
+    // Parse -o / --output, -g / --generate, --release
     var output_path: ?[]const u8 = null;
     var file_arg: ?[]const u8 = null;
     var generate_flag = false;
+    var release_flag = false;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -211,6 +216,8 @@ fn cmdBuild(args: []const []const u8) !void {
             }
         } else if (std.mem.eql(u8, a, "-g") or std.mem.eql(u8, a, "--generate")) {
             generate_flag = true;
+        } else if (std.mem.eql(u8, a, "--release")) {
+            release_flag = true;
         } else if (hasZagExt(a)) {
             file_arg = a;
         }
@@ -224,7 +231,7 @@ fn cmdBuild(args: []const []const u8) !void {
     } else if (try project_mod.detectProject("")) |cfg| {
         resolveZigPath(cfg);
         if (zig_install_path.len == 0) return needZig();
-        try projectCmd("build", cfg, &.{}, generate_flag);
+        try projectCmd("build", cfg, &.{}, generate_flag, release_flag);
     } else {
         std.debug.print("error: missing file argument. Provide a .zag file or run from a project directory.\n\n", .{});
         usage();
@@ -268,7 +275,7 @@ fn cmdGenerate(args: []const []const u8) !void {
     std.process.exit(1);
 }
 
-fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8, generate: bool) !void {
+fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8, generate: bool, release: bool) !void {
 
     // Ensure build/gen/ and build/bin/ exist
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
@@ -318,7 +325,10 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     // Use zig build system with the generated build.zig
     const build_step: []const u8 = if (std.mem.eql(u8, mode, "run")) "run" else "build";
 
-    const build_code = try runCommand(null, &.{ zig_install_path, "build", build_step, "--build-file", "build/gen/build.zig" });
+    const build_code = if (release)
+        try runCommand(null, &.{ zig_install_path, "build", build_step, "--build-file", "build/gen/build.zig", "-Doptimize=ReleaseFast" })
+    else
+        try runCommand(null, &.{ zig_install_path, "build", build_step, "--build-file", "build/gen/build.zig" });
     if (build_code != 0) {
         std.debug.print("error: zig build failed (exit {d})\n", .{build_code});
         std.process.exit(build_code);
@@ -499,17 +509,18 @@ fn needZig() noreturn {
 
 fn usage() void {
     std.debug.print("Usage:\n", .{});
-    std.debug.print("  zag run [<file.zag>] [-- <args>]   Compile and run (file or project)\n", .{});
+    std.debug.print("  zag run [<file.zag>] [--release] [-- <args>]   Compile and run\n", .{});
     std.debug.print("  zag check [<file.zag>]             Type-check a file or project\n", .{});
-    std.debug.print("  zag build [<file.zag>] [-o <path>] Compile to binary\n", .{});
+    std.debug.print("  zag build [<file.zag>] [--release] [-o <path>] Compile to binary\n", .{});
     std.debug.print("  zag generate [-o <dir>]            Transpile to zig project\n", .{});
     std.debug.print("  zag test [<file.zag>]              Run tests in a file or project\n", .{});
     std.debug.print("  zag init [<dir>]                   Create a new Zag project\n", .{});
     std.debug.print("  zag version                        Print version information\n", .{});
     std.debug.print("  zag help                           Show this help message\n", .{});
-    std.debug.print("\nOptions:\n", .{});
-    std.debug.print("  -g, --generate    Also emit .zig output in build/gen/\n", .{});
-    std.debug.print("  -o, --output      Output path (binary for build, dir for generate)\n", .{});
+    std.debug.print("\nFlags:\n", .{});
+    std.debug.print("  --release          Optimize build (passes -Doptimize=ReleaseFast to zig)\n", .{});
+    std.debug.print("  -g, --generate     Also emit .zig output in build/gen/\n", .{});
+    std.debug.print("  -o, --output       Output path (binary for build, dir for generate)\n", .{});
 }
 
 fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extra_args: []const []const u8) !void {

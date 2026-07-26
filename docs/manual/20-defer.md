@@ -10,7 +10,7 @@ fun read_file(path: str) -> Result<[]u8, Error> {
     defer close(fd);            # runs AFTER the next defer
 
     let buf = alloc(1024);
-    defer free(buf as *raw c_void);  # runs FIRST
+    defer free(buf);              # runs FIRST
 
     return Ok(buf);
 }
@@ -44,7 +44,7 @@ fun read_into(path: str) -> Result<[]u8, Error> {
     defer close(fd);            # always runs
 
     let buf = alloc(1024);
-    errdefer free(buf as *raw c_void);  # only runs if read fails
+    errdefer free(buf);           # only runs if read fails
 
     let n = read(fd, buf)?;     # if this fails, buf is freed
     return Ok(buf[0..n]);       # if this succeeds, buf is NOT freed

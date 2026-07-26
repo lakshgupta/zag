@@ -1,0 +1,41 @@
+## Multiple resources with defer/errdefer (docs/20 §"Multiple Resources")
+##
+## Each allocation gets its own defer or errdefer guard.
+## Guards run in reverse order — the last-allocated is
+## cleaned up first. On the success path, errdefers don't
+## run at all.
+##
+## Run: zag run multiple_resources.zag
+
+fun maybe_fail(step: i32) -> Result<i32, str> {
+    if step > 5 {
+        return Err("step too big");
+    }
+    return Ok(step * 10);
+}
+
+fun build() -> Result<i32, str> {
+    let a: *i32 = new i32(1);
+    errdefer free(a);
+
+    let b: *i32 = new i32(2);
+    errdefer free(b);
+
+    let c: *i32 = new i32(3);
+    errdefer free(c);
+
+    let v: i32 = maybe_fail(a + b + c)?;
+
+    # Success: manual free all three
+    free(a);
+    free(b);
+    free(c);
+    return Ok(v);
+}
+
+fun main() {
+    match build() {
+        Ok(v) => print("build ok: {v}\n"),
+        Err(e) => print("build failed: {e}\n"),
+    }
+}
