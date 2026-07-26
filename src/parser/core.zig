@@ -312,7 +312,7 @@ pub fn expect(self: *Parser, tag: TokenTag) void {
 
 
 pub fn isLiteralInit(self: *Parser, expr: Expr) bool {
-        return switch (expr) {
+        return switch (expr.payload) {
             // NOTE: `.single_tuple_lit` (Phase 1 single-element tuple) and
             // `.named_tuple_lit` (Phase 1 named-field tuple) intentionally
             // read as "literal init" here even though their runtime type is

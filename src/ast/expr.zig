@@ -14,11 +14,15 @@ const MethodParam = decl.MethodParam;
 const stmt = @import("stmt.zig");
 const Stmt = stmt.Stmt;
 
+// TOP: Loc for expression source locations.
+const top = @import("top.zig");
+const Loc = top.Loc;
+
 // ============================================================
 // expr.zig — top-level types from src/ast.zig
 // ============================================================
 
-pub const Expr = union(enum) {
+pub const ExprPayload = union(enum) {
     string_lit: []const u8,
     int_lit: []const u8,
     float_lit: []const u8,
@@ -507,6 +511,38 @@ pub const Expr = union(enum) {
         handler: *Expr,
         err_binding: ?[]const u8 = null,
     };
+};
+
+pub const Expr = struct {
+    payload: ExprPayload,
+    loc: Loc,
+
+    pub const BinaryExpr = ExprPayload.BinaryExpr;
+    pub const BinaryOp = ExprPayload.BinaryOp;
+    pub const UnaryExpr = ExprPayload.UnaryExpr;
+    pub const UnaryOp = ExprPayload.UnaryOp;
+    pub const IndexExpr = ExprPayload.IndexExpr;
+    pub const MemberAccessExpr = ExprPayload.MemberAccessExpr;
+    pub const MethodCallExpr = ExprPayload.MethodCallExpr;
+    pub const RangeExpr = ExprPayload.RangeExpr;
+    pub const SliceExpr = ExprPayload.SliceExpr;
+    pub const ArrayLitExpr = ExprPayload.ArrayLitExpr;
+    pub const TemplateLitExpr = ExprPayload.TemplateLitExpr;
+    pub const TemplatePart = ExprPayload.TemplatePart;
+    pub const CallExpr = ExprPayload.CallExpr;
+    pub const NewExpr = ExprPayload.NewExpr;
+    pub const FreeExpr = ExprPayload.FreeExpr;
+    pub const DerefExpr = ExprPayload.DerefExpr;
+    pub const CastExpr = ExprPayload.CastExpr;
+    pub const IfExpr = ExprPayload.IfExpr;
+    pub const MatchExpr = ExprPayload.MatchExpr;
+    pub const StructLitExpr = ExprPayload.StructLitExpr;
+    pub const FieldInit = ExprPayload.FieldInit;
+    pub const EnumVariantCtor = ExprPayload.EnumVariantCtor;
+    pub const NamedTupleLit = ExprPayload.NamedTupleLit;
+    pub const ClosureExpr = ExprPayload.ClosureExpr;
+    pub const TryOp = ExprPayload.TryOp;
+    pub const CatchExpr = ExprPayload.CatchExpr;
 };
 
 /// One arm of a `match` expression: a `Pattern`, an optional `if`-guard,

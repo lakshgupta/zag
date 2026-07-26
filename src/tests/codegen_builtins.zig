@@ -279,3 +279,82 @@ test "codegen: align_of(T) emits @alignOf(T)" {
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@alignOf(f64)") != null);
 }
+
+test "codegen: panic(msg) emits __zag_panic_at" {
+    const src = "fun main() { panic(\"boom\"); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    cg.source_path = "test.zag";
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_panic_at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "test.zag") != null);
+}
+
+test "codegen: sourcemap emitted when expression has location" {
+    const src = "fun main() { let x: i32 = 42; }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    cg.source_path = "src/test.zag";
+    const zig = cg.generate(prog);
+    // The map table should contain entries with the source path
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__ZagMapEntry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_map") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "src/test.zag") != null);
+}
+
+test "codegen: sourcemap tracks expression-level lines" {
+    const src =
+        \\fun main() {
+        \\    let x: i32 = 1 + 2;
+        \\    let y: i32 = 3 * 4;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    cg.source_path = "test.zag";
+    const zig = cg.generate(prog);
+    // Both let bindings should have map entries
+    try std.testing.expect(std.mem.indexOf(u8, zig, "test.zag") != null);
+    // The map should reference lines 2 and 3 (1-based)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "zag_line = 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "zag_line = 3") != null);
+}
+
+test "codegen: buildMapText produces tab-separated side-file format" {
+    const src =
+        \\fun main() {
+        \\    let x: i32 = 42;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    cg.source_path = "test.zag";
+    _ = cg.generate(prog);
+    cg.buildMapText();
+    const map_text = cg.getMapText();
+    try std.testing.expect(map_text.len > 0);
+    // Tab-separated format: zig_line\tzag_line\tzag_col\tsymbol\tfile\n
+    try std.testing.expect(std.mem.indexOf(u8, map_text, "\ttest.zag\n") != null);
+    // Should contain a row with zag_line = 2 (the let binding is on line 2)
+    try std.testing.expect(std.mem.indexOf(u8, map_text, "\t2\t") != null);
+    // Symbol should be "main" (the enclosing function name)
+    try std.testing.expect(std.mem.indexOf(u8, map_text, "\tmain\ttest.zag\n") != null);
+}

@@ -25,10 +25,10 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 // ============================================================
 
     pub     fn collectTypedBindings(self: *Codegen, stmt: ast.Stmt) void {
-        const b: ast.Stmt.BindingStmt = switch (stmt) {
-            .let => stmt.let,
-            .var_binding => stmt.var_binding,
-            .const_binding => stmt.const_binding,
+        const b: ast.Stmt.BindingStmt = switch (stmt.payload) {
+            .let => stmt.payload.let,
+            .var_binding => stmt.payload.var_binding,
+            .const_binding => stmt.payload.const_binding,
             else => return,
         };
         if (b.pattern != null) return;
@@ -40,7 +40,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         // `b.type_name` arm keeps recording (a const-block binding can
         // carry an explicit `: T` annotation independent of `init`).
         if (b.init) |init_val| {
-            if (init_val == .closure) {
+            if (init_val.payload == .closure) {
                 self.type_info_buf[self.type_info_count] = .{
                     .name = b.name,
                     .type_name = "",
@@ -93,7 +93,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     }
 
     pub     fn genStmt(self: *Codegen, stmt: ast.Stmt, is_tail_pos: bool) void {
-        switch (stmt) {
+        if (stmt.loc.line > 0) self.recordLoc(stmt.loc, "");
+        switch (stmt.payload) {
             // All three binding kinds funnel through `genBinding`, which
             // decides between the simple single-binding path (no `pattern`
             // set) and the destructuring path (one temp binding + per-leaf
@@ -223,11 +224,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // become inclusive; static and dynamic ends both work
                 // because `end + 1` is a valid zig binary expression.
                 self.write("    for (");
-                if (fs.iter == .range) {
-                    self.genExpr(fs.iter.range.start.*);
+                if (fs.iter.payload == .range) {
+                    self.genExpr(fs.iter.payload.range.start.*);
                     self.write("..");
-                    self.genExpr(fs.iter.range.end.*);
-                    if (fs.iter.range.inclusive) self.write(" + 1");
+                    self.genExpr(fs.iter.payload.range.end.*);
+                    if (fs.iter.payload.range.inclusive) self.write(" + 1");
                 } else {
                     self.genExpr(fs.iter);
                 }
@@ -413,13 +414,13 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             }
             self.write(" = blk: {\n");
             for (stmts) |s| {
-                if (s == .return_stmt) {
+                if (s.payload == .return_stmt) {
                     // `return EXPR;` → `break :blk EXPR;` so zig's
                     // labeled-block semantics carries the bind's RHS
                     // value out. Bare `return;` (no value) is rejected
                     // at parse time so this arm always has a value.
                     self.write("        break :blk ");
-                    if (s.return_stmt.value) |v| {
+                    if (s.payload.return_stmt.value) |v| {
                         self.genExpr(v);
                     }
                     self.write(";\n");
@@ -477,8 +478,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         // zig sees the enum-typed binding site as-is.
         var backed_wrap: ?[]const u8 = null;
         if (b.type_name) |tn| {
-            if (init_expr == .enum_variant_ctor) {
-                const evc = init_expr.enum_variant_ctor;
+            if (init_expr.payload == .enum_variant_ctor) {
+                const evc = init_expr.payload.enum_variant_ctor;
                 // `enum_name` is `?[]const u8` because the
                 // brace-form brace-named-field ctor can be
                 // unqualified (`Variant { x = v }` when only one
@@ -806,7 +807,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // implement equality by default). `lit` is `*Expr` (the
                 // Pattern-variant cycle-breaking pointer) so deref
                 // before walking.
-                switch (lit.*) {
+                switch (lit.*.payload) {
                     .string_lit => |s| {
                         self.write("std.mem.eql(u8, ");
                         self.write(scrut_name);

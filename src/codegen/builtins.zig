@@ -253,6 +253,10 @@ pub const BuiltinDispatch = enum {
     /// `builtin_type_name` — emit zig's `@typeName(T)` for compile-time
     /// type reflection. arity = 1: `type_name(T)`.
     builtin_type_name,
+
+    /// `builtin_panic` — emit zig's `@panic(msg)` which prints a stack
+    /// trace in debug mode and aborts the program. arity = 1: `panic(msg)`.
+    builtin_panic,
 };
 
 /// One row in the router table. The match shape is name + arity --
@@ -375,6 +379,7 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "assert", .arity = 1, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "assert", .arity = 2, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "type_name", .arity = 1, .receiver = null, .dispatch = .builtin_type_name },
+    .{ .name = "panic", .arity = 1, .receiver = null, .dispatch = .builtin_panic },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that

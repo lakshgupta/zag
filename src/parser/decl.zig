@@ -143,6 +143,7 @@ pub fn parseTurbofishArgs(self: *Parser) []const []const u8 {
 
 
 pub fn parseClosureExpr(self: *Parser) Expr {
+        const start_loc = self.peek().loc;
         self.expect(.pipe);
         var params_buf: [16]ast.MethodParam = undefined;
         var param_count: usize = 0;
@@ -165,11 +166,11 @@ pub fn parseClosureExpr(self: *Parser) Expr {
         const body = self.parseBlock();
         const params = self.arena.alloc(ast.MethodParam, param_count);
         if (param_count > 0) @memcpy(params, params_buf[0..param_count]);
-        return .{ .closure = .{
+        return Expr{ .payload = .{ .closure = .{
             .params = params,
             .return_type = return_type,
             .body = body,
-        } };
+        } }, .loc = start_loc };
     }
 
 

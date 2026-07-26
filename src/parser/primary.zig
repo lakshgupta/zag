@@ -12,7 +12,7 @@ const Expr = ast.Expr;
 const Parser = core.Parser;
 
 
-pub fn buildTemplate(self: *Parser, raw: []const u8) Expr {
+pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
         var parts_buf: [32]ast.Expr.TemplatePart = undefined;
         var part_count: usize = 0;
         var i: usize = 0;
@@ -90,7 +90,7 @@ pub fn buildTemplate(self: *Parser, raw: []const u8) Expr {
                 // preserved exactly. `a + b` and `obj.f()` are still
                 // non-functional templates — that's a pre-existing gap
                 // not introduced by this fix.
-                var build_expr: ast.Expr = .{ .ident = expr_text };
+                var build_expr: ast.Expr = Expr{ .payload = .{ .ident = expr_text }, .loc = start_loc };
                 // Scan for the first `(` (top-level; the args segment
                 // is tracked separately with depth-aware comma-split
                 // below, so nested brackets inside `name(...)` don't
@@ -127,9 +127,9 @@ pub fn buildTemplate(self: *Parser, raw: []const u8) Expr {
                                             if (c < '0' or c > '9') is_int = false;
                                         }
                                         if (is_int) {
-                                            args_buf[arg_count] = .{ .int_lit = seg };
+                                            args_buf[arg_count] = Expr{ .payload = .{ .int_lit = seg }, .loc = start_loc };
                                         } else {
-                                            args_buf[arg_count] = .{ .ident = seg };
+                                            args_buf[arg_count] = Expr{ .payload = .{ .ident = seg }, .loc = start_loc };
                                         }
                                         arg_count += 1;
                                     }
@@ -146,7 +146,7 @@ pub fn buildTemplate(self: *Parser, raw: []const u8) Expr {
                         if (arg_count > 0 and name_text.len > 0) {
                             const args_arena = self.arena.alloc(ast.Expr, arg_count);
                             @memcpy(args_arena, args_buf[0..arg_count]);
-                            build_expr = .{ .call = .{ .name = name_text, .args = args_arena } };
+                            build_expr = Expr{ .payload = .{ .call = .{ .name = name_text, .args = args_arena } }, .loc = start_loc };
                         }
                     }
                 }
@@ -170,11 +170,12 @@ pub fn buildTemplate(self: *Parser, raw: []const u8) Expr {
 
         const parts = self.arena.alloc(ast.Expr.TemplatePart, part_count);
         @memcpy(parts, parts_buf[0..part_count]);
-        return .{ .template_lit = .{ .parts = parts } };
+        return Expr{ .payload = .{ .template_lit = .{ .parts = parts } }, .loc = start_loc };
     }
 
 
 pub fn parseArrayLit(self: *Parser) Expr {
+        const start_loc = self.peek().loc;
         self.expect(.lbracket);
         // The size literal follows.
         const size_tok = self.peek();
@@ -309,7 +310,7 @@ pub fn parseArrayLit(self: *Parser) Expr {
         self.expect(.rbrace);
         const elements = self.arena.alloc(Expr, element_count);
         @memcpy(elements, elements_buf[0..element_count]);
-        return .{ .array_lit = .{
+        return Expr{ .payload = .{ .array_lit = .{
             .size = size,
             .size_text = size_text,
             .type_name = type_name,
@@ -317,7 +318,7 @@ pub fn parseArrayLit(self: *Parser) Expr {
             .fill = fill,
             .progression = progression,
             .sizes = sizes,
-        } };
+        } }, .loc = start_loc };
     }
 
 
@@ -345,6 +346,7 @@ pub fn skipNewlines(self: *Parser) void {
 
 
 pub fn parseCallExpr(self: *Parser, name: []const u8) Expr {
+        const start_loc = self.peek().loc;
         self.expect(.lparen);
         var args_buf: [32]Expr = undefined;
         var arg_count: usize = 0;
@@ -361,20 +363,22 @@ pub fn parseCallExpr(self: *Parser, name: []const u8) Expr {
         self.expect(.rparen);
         const args = self.arena.alloc(Expr, arg_count);
         @memcpy(args, args_buf[0..arg_count]);
-        return .{ .call = .{ .name = name, .args = args } };
+        return Expr{ .payload = .{ .call = .{ .name = name, .args = args } }, .loc = start_loc };
     }
 
 
 pub fn parseFree(self: *Parser) Expr {
+        const start_loc = self.peek().loc;
         self.expect(.free);
         const target = self.parseExpr();
         const t = self.arena.alloc(Expr, 1);
         t[0] = target;
-        return .{ .free_expr = .{ .target = &t[0] } };
+        return Expr{ .payload = .{ .free_expr = .{ .target = &t[0] } }, .loc = start_loc };
     }
 
 
 pub fn parseNew(self: *Parser) Expr {
+        const start_loc = self.peek().loc;
         self.expect(.new);
         // Custom-allocator sugar form: `new(<allocator>, T(value))`. The
         // leading `(` distinguishes it from the simple `new T(value)`
@@ -393,11 +397,11 @@ pub fn parseNew(self: *Parser) Expr {
             self.expect(.rparen);
             const v = self.arena.alloc(Expr, 1);
             v[0] = value;
-            return .{ .new_expr = .{
+            return Expr{ .payload = .{ .new_expr = .{
                 .type_name = type_name,
                 .value = &v[0],
                 .allocator = allocator,
-            } };
+            } }, .loc = start_loc };
         }
         // Simple form: `new T(value)` — global allocator (zig's
         // `std.heap.page_allocator`) is used at codegen.
@@ -407,12 +411,13 @@ pub fn parseNew(self: *Parser) Expr {
         self.expect(.rparen);
         const v = self.arena.alloc(Expr, 1);
         v[0] = value;
-        return .{ .new_expr = .{ .type_name = type_name, .value = &v[0] } };
+        return Expr{ .payload = .{ .new_expr = .{ .type_name = type_name, .value = &v[0] } }, .loc = start_loc };
     }
 
 
 pub fn parsePostfix(self: *Parser) Expr {
         var lhs = self.parsePrimary();
+        const start_loc = lhs.loc;
         // Generics turbofish (docs/16 §"Turbofish"). Detected AT-IDENT
         // rather than in `parseComparison` because the grammar
         // distinguishes `name<T>(...)` (turbofish call) from
@@ -423,7 +428,7 @@ pub fn parsePostfix(self: *Parser) Expr {
         // is enough to disambiguate without lexer changes. When the
         // shape holds, we collect turbofish args immediately so the
         // existing `.call(...)` recursive path can pick them up.
-        if (lhs == .ident and self.peek().tag == .lt) {
+        if (lhs.payload == .ident and self.peek().tag == .lt) {
             const tps_start = self.pos;
             var depth: u32 = 1;
             var idx: u32 = 1;
@@ -437,7 +442,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                             // matching `.gt` is `.lparen`. If not, fall
                             // back to non-turbofish path (the `a < b` form).
                             if (idx + 1 < self.tokens.len - tps_start and self.tokens[tps_start + idx + 1].tag == .lparen) {
-                                const name = lhs.ident;
+                                const name = lhs.payload.ident;
                                 // Generics turbofish chain followup (docs/16
                                 // §\"Turbofish\"): the OUTER while-loop above
                                 // walks tokens by INDEX (`self.tokens[tps_start
@@ -492,7 +497,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                                 self.expect(.rparen);
                                 const args_arena = self.arena.alloc(Expr, call_arg_count);
                                 @memcpy(args_arena, call_args_buf[0..call_arg_count]);
-                                lhs = .{ .call = .{ .name = name, .args = args_arena, .type_args = tps_args } };
+                                lhs = Expr{ .payload = .{ .call = .{ .name = name, .args = args_arena, .type_args = tps_args } }, .loc = start_loc };
                                 // Continue the postfix chain so things like
                                 // `max<i32>(3,5)[0]` or `max<i32>(3,5).field`
                                 // continue parsing. The fragment below is
@@ -521,7 +526,7 @@ pub fn parsePostfix(self: *Parser) Expr {
             if (self.peek().tag == .question) {
                 const target_buf = self.arena.alloc(Expr, 1);
                 target_buf[0] = lhs;
-                lhs = .{ .try_op = .{ .expr = &target_buf[0] } };
+                lhs = Expr{ .payload = .{ .try_op = .{ .expr = &target_buf[0] } }, .loc = start_loc };
                 self.advance();
                 continue;
             }
@@ -564,7 +569,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                         target_buf[0] = lhs;
                         const idx_buf = self.arena.alloc(Expr, 1);
                         idx_buf[0] = start_expr;
-                        lhs = .{ .index = .{ .target = &target_buf[0], .index = &idx_buf[0] } };
+                        lhs = Expr{ .payload = .{ .index = .{ .target = &target_buf[0], .index = &idx_buf[0] } }, .loc = start_loc };
                         continue;
                     }
                 }
@@ -579,7 +584,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                 self.expect(.rbracket);
                 const target_buf = self.arena.alloc(Expr, 1);
                 target_buf[0] = lhs;
-                lhs = .{ .slice = .{ .target = &target_buf[0], .start = start_opt, .end = end_opt, .inclusive = inclusive } };
+                lhs = Expr{ .payload = .{ .slice = .{ .target = &target_buf[0], .start = start_opt, .end = end_opt, .inclusive = inclusive } }, .loc = start_loc };
                 continue;
             }
             // `.` postfix chain — `.name` (no parens) → `.member_access`,
@@ -611,7 +616,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                     @memcpy(args, args_buf[0..arg_count]);
                     const target_buf = self.arena.alloc(Expr, 1);
                     target_buf[0] = lhs;
-                    lhs = .{ .method_call = .{ .target = &target_buf[0], .name = name, .args = args } };
+                    lhs = Expr{ .payload = .{ .method_call = .{ .target = &target_buf[0], .name = name, .args = args } }, .loc = start_loc };
                 } else if (self.peek().tag == .lt) {
                     // Method-call turbofish (Phase 3 trait dispatch,
                     // docs/17 §"Using Traits"). The `.lt` token after
@@ -670,7 +675,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                         @memcpy(ta_args, args_buf[0..arg_count]);
                         const ta_target_buf = self.arena.alloc(Expr, 1);
                         ta_target_buf[0] = lhs;
-                        lhs = .{ .method_call = .{ .target = &ta_target_buf[0], .name = name, .args = ta_args, .type_args = mc_type_args } };
+                        lhs = Expr{ .payload = .{ .method_call = .{ .target = &ta_target_buf[0], .name = name, .args = ta_args, .type_args = mc_type_args } }, .loc = start_loc };
                     } else {
                         // Fall-through: `.name <` is a property access
                         // followed by a binary operator — NOT a
@@ -690,7 +695,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                         // structure that pre-dates this fix.
                         const target_buf = self.arena.alloc(Expr, 1);
                         target_buf[0] = lhs;
-                        lhs = .{ .member_access = .{ .target = &target_buf[0], .name = name } };
+                        lhs = Expr{ .payload = .{ .member_access = .{ .target = &target_buf[0], .name = name } }, .loc = start_loc };
                     }
                 } else {
                     // Property-access form: `.name` (no parens). Codegen
@@ -699,7 +704,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                     // access syntax so no special conversion is needed.
                     const target_buf = self.arena.alloc(Expr, 1);
                     target_buf[0] = lhs;
-                    lhs = .{ .member_access = .{ .target = &target_buf[0], .name = name } };
+                    lhs = Expr{ .payload = .{ .member_access = .{ .target = &target_buf[0], .name = name } }, .loc = start_loc };
                 }
                 continue;
             }
@@ -914,11 +919,11 @@ pub fn parsePrimary(self: *Parser) Expr {
                         self.expect(.rparen);
                         const args = self.arena.alloc(Expr, arg_count);
                         @memcpy(args, args_buf[0..arg_count]);
-                        return .{ .enum_variant_ctor = .{
+                        return Expr{ .payload = .{ .enum_variant_ctor = .{
                             .enum_name = name,
                             .variant_name = variant_name,
                             .args = args,
-                        } };
+                        } }, .loc = tok.loc };
                     }
                     // No-args form: `Direction.North` — the variant
                     // ctor with no payload. Peek after the variant name
@@ -931,11 +936,11 @@ pub fn parsePrimary(self: *Parser) Expr {
                     // surface (the same forwarding strategy as the
                     // with-args branch).
                     const args = self.arena.alloc(Expr, 0);
-                    return .{ .enum_variant_ctor = .{
+                    return Expr{ .payload = .{ .enum_variant_ctor = .{
                         .enum_name = name,
                         .variant_name = variant_name,
                         .args = args,
-                    } };
+                    } }, .loc = tok.loc };
                 }
                 if (self.peek().tag == .lparen) {
                     return self.parseCallExpr(name);
@@ -996,7 +1001,7 @@ pub fn parsePrimary(self: *Parser) Expr {
                     //      parser's structural disambiguation.
                     return self.parseStructLit(name);
                 } else {
-                    return .{ .ident = name };
+                    return Expr{ .payload = .{ .ident = name }, .loc = tok.loc };
                 }
             },
             .string_literal => {
@@ -1013,37 +1018,37 @@ pub fn parsePrimary(self: *Parser) Expr {
                 // `looksLikeTemplateLiteral`'s docblock for the full
                 // rationale and edge cases.
                 if (looksLikeTemplateLiteral(tok.text)) {
-                    return self.buildTemplate(tok.text);
+                    return self.buildTemplate(tok.text, tok.loc);
                 }
-                return .{ .string_lit = tok.text };
+                return Expr{ .payload = .{ .string_lit = tok.text }, .loc = tok.loc };
             },
             .byte_string_literal => {
                 self.advance();
-                return .{ .byte_string_lit = tok.text };
+                return Expr{ .payload = .{ .byte_string_lit = tok.text }, .loc = tok.loc };
             },
             .char_literal => {
                 self.advance();
-                return .{ .char_lit = tok.text };
+                return Expr{ .payload = .{ .char_lit = tok.text }, .loc = tok.loc };
             },
             .integer_literal => {
                 self.advance();
-                return .{ .int_lit = tok.text };
+                return Expr{ .payload = .{ .int_lit = tok.text }, .loc = tok.loc };
             },
             .float_literal => {
                 self.advance();
-                return .{ .float_lit = tok.text };
+                return Expr{ .payload = .{ .float_lit = tok.text }, .loc = tok.loc };
             },
             .true_kw => {
                 self.advance();
-                return .{ .bool_lit = true };
+                return Expr{ .payload = .{ .bool_lit = true }, .loc = tok.loc };
             },
             .false_kw => {
                 self.advance();
-                return .{ .bool_lit = false };
+                return Expr{ .payload = .{ .bool_lit = false }, .loc = tok.loc };
             },
             .null_kw => {
                 self.advance();
-                return .{ .null_lit = {} };
+                return Expr{ .payload = .{ .null_lit = {} }, .loc = tok.loc };
             },
             .const_kw => {
                 // `const { stmts; return expr; }` — compile-time block
@@ -1051,11 +1056,11 @@ pub fn parsePrimary(self: *Parser) Expr {
                 self.expect(.lbrace);
                 const body = self.parseStmtList();
                 self.expect(.rbrace);
-                return .{ .const_block = body };
+                return Expr{ .payload = .{ .const_block = body }, .loc = tok.loc };
             },
             .undefined_kw => {
                 self.advance();
-                return .{ .undefined_lit = {} };
+                return Expr{ .payload = .{ .undefined_lit = {} }, .loc = tok.loc };
             },
             .lbrace => {
                 self.advance();
@@ -1063,7 +1068,7 @@ pub fn parsePrimary(self: *Parser) Expr {
                 self.expect(.rbrace);
                 // Return raw block expression — codegen wraps in a
                 // labeled block to produce the final value.
-                return .{ .block_expr = body };
+                return Expr{ .payload = .{ .block_expr = body }, .loc = tok.loc };
             },
             .star => {
                 // Note: `*x` (deref) is NOT routed here. After the unary
@@ -1078,7 +1083,7 @@ pub fn parsePrimary(self: *Parser) Expr {
                 const target = self.parsePrimary();
                 const t = self.arena.alloc(Expr, 1);
                 t[0] = target;
-                return .{ .deref = .{ .target_ptr = &t[0] } };
+                return Expr{ .payload = .{ .deref = .{ .target_ptr = &t[0] } }, .loc = tok.loc };
             },
             .lparen => {
                 self.advance();
@@ -1086,7 +1091,7 @@ pub fn parsePrimary(self: *Parser) Expr {
                 if (self.peek().tag == .rparen) {
                     self.advance();
                     const elements = self.arena.alloc(Expr, 0);
-                    return .{ .tuple_lit = elements };
+                    return Expr{ .payload = .{ .tuple_lit = elements }, .loc = tok.loc };
                 }
                 // Lookahead: named tuple `(name: expr, ...)`. Two-token
                 // discriminator: identifier followed by COLON. Distinct
@@ -1117,7 +1122,7 @@ pub fn parsePrimary(self: *Parser) Expr {
                     @memcpy(names_alloc, names_buf[0..named_count]);
                     const elements_alloc = self.arena.alloc(Expr, named_count);
                     @memcpy(elements_alloc, named_elems_buf[0..named_count]);
-                    return .{ .named_tuple_lit = .{ .names = names_alloc, .elements = elements_alloc } };
+                    return Expr{ .payload = .{ .named_tuple_lit = .{ .names = names_alloc, .elements = elements_alloc } }, .loc = tok.loc };
                 }
                 // Parse first expression — delegate via the top of the
                 // precedence ladder so `(1 + 2)` is parsed as a full
@@ -1145,7 +1150,7 @@ pub fn parsePrimary(self: *Parser) Expr {
                         self.advance();
                         const single = self.arena.alloc(Expr, 1);
                         single[0] = elements_buf[0];
-                        return .{ .single_tuple_lit = &single[0] };
+                        return Expr{ .payload = .{ .single_tuple_lit = &single[0] }, .loc = tok.loc };
                     }
                     elements_buf[element_count] = self.parseExpr();
                     element_count += 1;
@@ -1157,20 +1162,21 @@ pub fn parsePrimary(self: *Parser) Expr {
                     self.expect(.rparen);
                     const elements = self.arena.alloc(Expr, element_count);
                     @memcpy(elements, elements_buf[0..element_count]);
-                    return .{ .tuple_lit = elements };
+                    return Expr{ .payload = .{ .tuple_lit = elements }, .loc = tok.loc };
                 }
                 self.expect(.rparen);
                 return elements_buf[0];
             },
             else => {
                 self.advance();
-                return .{ .ident = tok.text };
+                return Expr{ .payload = .{ .ident = tok.text }, .loc = tok.loc };
             },
         }
     }
 
 
 pub fn parseStructLit(self: *Parser, type_name: []const u8) Expr {
+        const start_loc = self.peek().loc;
         self.expect(.lbrace);
         var inits_buf: [16]ast.Expr.FieldInit = undefined;
         var init_count: usize = 0;
@@ -1194,7 +1200,7 @@ pub fn parseStructLit(self: *Parser, type_name: []const u8) Expr {
         self.expect(.rbrace);
         const inits = self.arena.alloc(ast.Expr.FieldInit, init_count);
         @memcpy(inits, inits_buf[0..init_count]);
-        return .{ .struct_lit = .{ .type_name = type_name, .inits = inits } };
+        return Expr{ .payload = .{ .struct_lit = .{ .type_name = type_name, .inits = inits } }, .loc = start_loc };
     }
 
 
@@ -1221,6 +1227,7 @@ pub fn parseStructLit(self: *Parser, type_name: []const u8) Expr {
 /// but builds the variant-ctor AST node instead of struct-lit's. The
 /// 16-slot cap matches parseStructLit's `inits_buf` for symmetry.
 pub fn parseEnumVariantCtorBrace(self: *Parser, variant_name: []const u8) Expr {
+    const start_loc = self.peek().loc;
     // BLOCKING #1 fix (gap #2 closure): reject EMPTY brace `Variant {}` on a
     // brace-named-field variant because codegen iterates `fields` and reads
     // from args by positional index — an empty args list would segfault.
@@ -1254,10 +1261,10 @@ pub fn parseEnumVariantCtorBrace(self: *Parser, variant_name: []const u8) Expr {
     self.expect(.rbrace);
     const args = self.arena.alloc(Expr, arg_count);
     @memcpy(args, args_buf[0..arg_count]);
-    return .{ .enum_variant_ctor = .{
+    return Expr{ .payload = .{ .enum_variant_ctor = .{
         .enum_name = null,
         .variant_name = variant_name,
         .args = args,
-    } };
+    } }, .loc = start_loc };
 }
 

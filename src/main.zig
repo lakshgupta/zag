@@ -149,6 +149,9 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "build")) {
         return try cmdBuild(args);
     }
+    if (std.mem.eql(u8, cmd, "debug")) {
+        return try cmdDebug(args);
+    }
     if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "test")) {
         if (args.len >= 3 and hasZagExt(args[2])) {
             resolveZigPath(null);
@@ -260,6 +263,94 @@ fn cmdBuild(args: []const []const u8) !void {
     }
 }
 
+fn cmdDebug(args: []const []const u8) !void {
+    // Parse: zag debug [<binary.zag>] [-- <args>]
+    var file_arg: ?[]const u8 = null;
+    var extra_args: []const []const u8 = &.{};
+
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--")) {
+            extra_args = if (i + 1 < args.len) args[i + 1 ..] else &.{};
+            break;
+        } else if (hasZagExt(a)) {
+            file_arg = a;
+        }
+    }
+
+    // Binary to debug — default to project's build/bin/<name>
+    var binary_path: [512]u8 = undefined;
+    var bin: []const u8 = "zig-out/bin/main";
+
+    if (file_arg) |file| {
+        // File mode: compile the .zag file, debug the binary
+        resolveZigPath(null);
+        if (zig_install_path.len == 0) return needZig();
+        const out = file[0..file.len - ".zag".len];
+        try leafProcess("build", file, out, &.{});
+        bin = out;
+    } else if (try project_mod.detectProject("")) |cfg| {
+        resolveZigPath(cfg);
+        if (zig_install_path.len == 0) return needZig();
+        // Write map files and build
+        try projectCmd("build", cfg, &.{}, false, false);
+        bin = try std.fmt.bufPrint(&binary_path, "zig-out/bin/{s}", .{cfg.name});
+    }
+
+    // Write gdbinit file
+    try writeGdbInit();
+
+    // Patch DWARF debug info so gdb shows .zag sources
+    _ = remapDwarfElf(bin);
+
+    // Launch gdb
+    var gdb_args: [10][]const u8 = undefined;
+    gdb_args[0] = "gdb";
+    gdb_args[1] = "-q";
+    gdb_args[2] = "-x";
+    gdb_args[3] = "build/gen/gdbinit";
+    gdb_args[4] = "-ex";
+    gdb_args[5] = "run";
+    gdb_args[6] = "--args";
+    gdb_args[7] = bin;
+    var arg_count: usize = 8;
+    // Append extra args after binary
+    var extra_idx: usize = 0;
+    while (extra_idx < extra_args.len and arg_count < gdb_args.len) : (extra_idx += 1) {
+        gdb_args[arg_count] = extra_args[extra_idx];
+        arg_count += 1;
+    }
+
+    const code = runCommand(null, gdb_args[0..arg_count]) catch {
+        std.debug.print("error: could not launch gdb. Is gdb installed?\n", .{});
+        std.debug.print("  hint: install gdb or use 'zag build' and debug manually:\n", .{});
+        std.debug.print("    gdb -x build/gen/gdbinit {s}\n", .{bin});
+        std.process.exit(1);
+    };
+    std.process.exit(code);
+}
+
+fn writeGdbInit() !void {
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
+    // Find the tools directory relative to the project root
+    const gdbinit =
+        \\# Zag gdb init — maps zig source locations to zag source
+        \\python
+        \\import sys, os
+        \\sys.path.insert(0, os.path.join(os.getcwd(), 'tools'))
+        \\import zag_gdb
+        \\zag_gdb.load_map_files(os.path.join(os.getcwd(), 'build/gen'))
+        \\try:
+        \\    gdb.frame_filters["zag_decorate"] = zag_gdb.zag_frame_decorator
+        \\except: pass
+        \\end
+        \\set pagination off
+        \\echo [zag] gdb with .zag source mapping ready\n
+    ;
+    try writeFile("build/gen/gdbinit", gdbinit);
+}
+
 fn cmdGenerate(args: []const []const u8) !void {
     var output_dir: []const u8 = "build/gen";
     var i: usize = 2;
@@ -282,12 +373,13 @@ fn cmdGenerate(args: []const []const u8) !void {
     // File mode: transpile single file
     if (args.len >= 3 and hasZagExt(args[2])) {
         const source = try readFile(args[2]);
-        const zig_src = try transpile(source);
+        const result = try transpile(args[2], source);
         // Use output dir as file path
         const out_path = if (std.mem.eql(u8, output_dir, "build/gen")) "build/gen/main.zig" else output_dir;
         _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
         _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
-        try writeFile(out_path, zig_src);
+        try writeFile(out_path, result.zig);
+        if (result.map.len > 0) try writeMapFile(out_path, result.map);
         std.debug.print("generated {s}\n", .{out_path});
         return;
     }
@@ -321,7 +413,7 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
             std.debug.print("error: could not read {s}\n", .{mod.path});
             std.process.exit(1);
         };
-        const zig_src = transpile(source) catch |e| {
+        const result = transpile(mod.path, source) catch |e| {
             std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
             std.process.exit(1);
         };
@@ -333,7 +425,8 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
         else
             std.fmt.bufPrint(&out_buf, "build/gen/{s}.zig", .{mod.module_name}) catch "build/gen/module.zig";
 
-        try writeFile(out_path, zig_src);
+        try writeFile(out_path, result.zig);
+        if (result.map.len > 0) try writeMapFile(out_path, result.map);
     }
 
     // Generate build.zig for the project
@@ -445,7 +538,7 @@ fn generateProjectFiles() !void {
             std.debug.print("error: could not read {s}\n", .{mod.path});
             std.process.exit(1);
         };
-        const zig_src = transpile(source) catch |e| {
+        const result = transpile(mod.path, source) catch |e| {
             std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
             std.process.exit(1);
         };
@@ -456,7 +549,8 @@ fn generateProjectFiles() !void {
         else
             std.fmt.bufPrint(&out_buf, "build/gen/{s}.zig", .{mod.module_name}) catch "build/gen/module.zig";
 
-        try writeFile(out_path, zig_src);
+        try writeFile(out_path, result.zig);
+        if (result.map.len > 0) try writeMapFile(out_path, result.map);
     }
 
     try generateBuildZig(modules, "main");
@@ -542,6 +636,7 @@ fn usage() void {
     std.debug.print("  zag run [<file.zag>] [--release] [-- <args>]   Compile and run\n", .{});
     std.debug.print("  zag check [<file.zag>]             Type-check a file or project\n", .{});
     std.debug.print("  zag build [<file.zag>] [--release] [-o <path>] Compile to binary\n", .{});
+    std.debug.print("  zag debug [<file.zag>]             Build and debug with gdb\n", .{});
     std.debug.print("  zag generate [-o <dir>]            Transpile to zig project\n", .{});
     std.debug.print("  zag test [<file.zag>]              Run tests in a file or project\n", .{});
     std.debug.print("  zag init [<dir>]                   Create a new Zag project\n", .{});
@@ -566,12 +661,12 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
     const f_bin = std.fmt.bufPrint(&path_leaf_bin, "/tmp/zag_leaf_{d}_bin", .{pid_num}) catch "/tmp/zag_leaf_bin";
 
     const source = try readFile(src);
-    const zig_src = try transpile(source);
-    try writeFile(f_zig, zig_src);
+    const result = try transpile(src, source);
+    try writeFile(f_zig, result.zig);
 
     if (std.mem.eql(u8, flag, "test")) {
-        const has_test_block = std.mem.indexOf(u8, zig_src, "test \"") != null;
-        const has_main = std.mem.indexOf(u8, zig_src, "pub fn main(") != null;
+        const has_test_block = std.mem.indexOf(u8, result.zig, "test \"") != null;
+        const has_main = std.mem.indexOf(u8, result.zig, "pub fn main(") != null;
         if (has_test_block) {
             const test_code = try runCommand(null, &.{ zig_install_path, "test", f_zig });
             std.process.exit(test_code);
@@ -745,6 +840,132 @@ fn writeFile(path: []const u8, content: []const u8) !void {
     }
 }
 
+fn writeMapFile(zig_path: []const u8, map_content: []const u8) !void {
+    // map path: replace ".zig" suffix with ".zag.map"
+    var buf: [512]u8 = undefined;
+    var map_path = zig_path;
+    if (std.mem.endsWith(u8, zig_path, ".zig")) {
+        const base = zig_path[0 .. zig_path.len - 4];
+        map_path = std.fmt.bufPrint(&buf, "{s}.zag.map", .{base}) catch zig_path;
+    } else {
+        map_path = std.fmt.bufPrint(&buf, "{s}.zag.map", .{zig_path}) catch zig_path;
+    }
+    try writeFile(map_path, map_content);
+}
+
+/// Patch DWARF debug info in a compiled ELF binary so debuggers
+/// reference .zag source files instead of build/gen/*.zig.
+fn remapDwarfElf(binary_path: []const u8) void {
+    // Collect zig→zag mappings from .zag.map files
+    var zig_paths: [32][256]u8 = undefined;
+    var zag_paths: [32][256]u8 = undefined;
+    var mapping_count: usize = 0;
+
+    // Load map entries
+    {
+        const map_dir = "build/gen";
+        const map_dir_fd = posix.openat(posix.AT.FDCWD, map_dir, .{ .ACCMODE = .RDONLY }, 0) catch return;
+        defer _ = std.os.linux.close(map_dir_fd);
+
+        var ptr: usize = 0;
+        while (true) : (ptr += 1) {
+            var d: std.os.linux.dirent64 = undefined;
+            const nread = std.os.linux.getdents64(map_dir_fd, @ptrCast(&d), @sizeOf(std.os.linux.dirent64));
+            if (nread <= 0) break;
+            const name_ptr: [*:0]const u8 = @ptrCast(&d.name);
+            const name_len = std.mem.indexOfScalar(u8, std.mem.span(name_ptr), 0) orelse 0;
+            const entry_name = std.mem.span(name_ptr)[0..name_len];
+            if (!std.mem.endsWith(u8, entry_name, ".zag.map")) {
+                if (d.off == 0) break;
+                ptr = @intCast(d.off);
+                continue;
+            }
+            if (mapping_count >= zig_paths.len) break;
+
+            const zig_base = entry_name[0..entry_name.len - 8];
+            _ = std.fmt.bufPrint(&zig_paths[mapping_count], "build/gen/{s}", .{zig_base}) catch continue;
+
+            const zag_path = readFirstMapEntry(map_dir, entry_name) catch continue;
+            if (zag_path.len > 0) {
+                @memcpy(zag_paths[mapping_count][0..zag_path.len], zag_path);
+                zag_paths[mapping_count][zag_path.len] = 0;
+                mapping_count += 1;
+            }
+
+            if (d.off == 0) break;
+            ptr = @intCast(d.off);
+        }
+    }
+
+    if (mapping_count == 0) return;
+
+    // Read binary
+    const bin_fd = posix.openat(posix.AT.FDCWD, binary_path, .{ .ACCMODE = .RDWR }, 0) catch return;
+    defer _ = std.os.linux.close(bin_fd);
+
+    // Get file size via lseek
+    const end_pos = std.os.linux.lseek(bin_fd, 0, std.os.linux.SEEK.END);
+    if (end_pos < 0) return;
+    const file_size: usize = @intCast(end_pos);
+    _ = std.os.linux.lseek(bin_fd, 0, std.os.linux.SEEK.SET);
+    if (file_size > 64 * 1024 * 1024) return;
+
+    const data = std.heap.page_allocator.alloc(u8, file_size) catch return;
+    defer std.heap.page_allocator.free(data);
+    const bytes_read = std.os.linux.read(bin_fd, data.ptr, file_size);
+    if (bytes_read < 0) return;
+    if (@as(usize, @intCast(bytes_read)) != file_size) return;
+
+    if (data.len < 4 or !std.mem.eql(u8, data[0..4], "\x7fELF")) return;
+
+    var patched: usize = 0;
+    for (0..mapping_count) |i| {
+        const zig_path: []const u8 = zig_paths[i][0..(std.mem.indexOfScalar(u8, &zig_paths[i], 0) orelse 256)];
+        const zag_path: []const u8 = zag_paths[i][0..(std.mem.indexOfScalar(u8, &zag_paths[i], 0) orelse 256)];
+        if (zag_path.len > zig_path.len or zag_path.len == 0) continue;
+
+        var search_pos: usize = 0;
+        while (std.mem.indexOfPos(u8, data, search_pos, zig_path)) |found| {
+            @memset(data[found .. found + zig_path.len], 0);
+            @memcpy(data[found .. found + zag_path.len], zag_path);
+            patched += 1;
+            search_pos = found + zig_path.len;
+        }
+    }
+
+    if (patched > 0) {
+        _ = std.os.linux.lseek(bin_fd, 0, std.os.linux.SEEK.SET);
+        _ = std.os.linux.write(bin_fd, data.ptr, data.len);
+        _ = std.os.linux.ftruncate(bin_fd, @intCast(data.len));
+    }
+}
+
+/// Read the first line of a .zag.map file and return the source file path
+/// (the 5th tab-separated field).
+fn readFirstMapEntry(map_dir: []const u8, entry_name: []const u8) ![]const u8 {
+    var path_buf: [512]u8 = undefined;
+    const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ map_dir, entry_name }) catch return error.InvalidPath;
+    const fd = posix.openat(posix.AT.FDCWD, full_path, .{ .ACCMODE = .RDONLY }, 0) catch return error.OpenFailed;
+    defer _ = std.os.linux.close(fd);
+
+    var buf: [4096]u8 = undefined;
+    const n = std.os.linux.read(fd, &buf, buf.len);
+    if (n <= 0) return "";
+    const content = buf[0..@intCast(n)];
+    // Find first newline
+    const line_end = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
+    const line = content[0..line_end];
+    // Tab-separated: zig_line\tzag_line\tzag_col\tsymbol\tfile
+    var parts: [5][]const u8 = undefined;
+    var pi: usize = 0;
+    var it = std.mem.splitScalar(u8, line, '\t');
+    while (it.next()) |p| {
+        if (pi < 5) { parts[pi] = p; pi += 1; }
+    }
+    if (pi >= 5) return parts[4];
+    return "";
+}
+
 var cmdline_buf: [4096]u8 = undefined;
 var cmdline_args: [64][]const u8 = undefined;
 
@@ -766,7 +987,12 @@ fn parseArgs() ![][]const u8 {
     return cmdline_args[0..count];
 }
 
-fn transpile(source: []const u8) ![]const u8 {
+const TranspileResult = struct {
+    zig: []const u8,
+    map: []const u8,
+};
+
+fn transpile(path: []const u8, source: []const u8) !TranspileResult {
     var l = lexer_mod.Lexer.init(source);
     const tokens = l.tokenize();
 
@@ -775,5 +1001,8 @@ fn transpile(source: []const u8) ![]const u8 {
     const prog = p.parse();
 
     var cg = codegen_mod.Codegen.init();
-    return cg.generate(prog);
+    cg.source_path = path;
+    const zig = cg.generate(prog);
+    cg.buildMapText();
+    return .{ .zig = zig, .map = cg.getMapText() };
 }

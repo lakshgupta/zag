@@ -9,6 +9,10 @@ const expr = @import("expr.zig");
 const Expr = expr.Expr;
 const Pattern = expr.Pattern;
 
+// TOP: Loc for statement source locations.
+const top = @import("top.zig");
+const Loc = top.Loc;
+
 // ============================================================
 // stmt.zig — top-level types from src/ast.zig
 // ============================================================
@@ -62,99 +66,9 @@ pub const RestBinding = struct {
     before_count: u32,
 };
 
-pub const Stmt = union(enum) {
-    /// `let` binding. The keyword tag is on the envelope, the kind on the
-    /// payload (see `BindingKind`): one `BindingStmt` struct is reused for
-    /// `let`, `var`, and `const` so adding a future kind (e.g. `mut`,
-    /// `implicit`) only requires a new `BindingKind` member + a new dispatch
-    /// arm in the parser, not a fresh struct definition.
-    let: BindingStmt,
-    /// `var` binding. The tag is named `.var_binding` rather than `.var`
-    /// because Zig's tagged-union tag literals cannot reuse `var` (it's a
-    /// reserved keyword in Zig 0.16). The lexer accepts `var` as the
-    /// `var_kw` TokenTag and the parser constructs `.var_binding = …` here.
-    var_binding: BindingStmt,
-    /// `const` binding. Mirrors the shape of the other two exactly. The tag
-    /// is named `.const_binding` (not `.const`) for the same Zig-keyword
-    /// reason as `.var_binding`. Zag's `const` is a *compile-time* binding by
-    /// convention; codegen emits a Zig `const NAME: T = expr;`, which is
-    /// itself evaluated at compile time.
-    const_binding: BindingStmt,
-    assign: AssignStmt,
-    /// `arr[i] = x` indexed-write statement. Distinct from `.assign` because
-    /// the target path includes a runtime-computed index; codegen emits
-    /// `target[index] = value;` directly. The `value` field is value-typed
-    /// (Expr) since it is the leaf of the assignment, while `target` and
-    /// `index` are pointer-typed to avoid arena allocations for what are
-    /// typically other Expr nodes (ident, call, etc.).
-    index_assign: IndexAssignStmt,
-    defer_stmt: DeferStmt,
-    errdefer_stmt: ErrDeferStmt,
-    unsafe_block: []const Stmt,
-    expr_stmt: Expr,
-    /// `if cond { stmts... }` statement form (NOT the expression form —
-    /// that's `Expr.if_expr`). Statement form lets each branch contain a
-    /// list of statements; otherwise the user must build tagged-union
-    /// expr by hand. Else-chain is unified via the recursive
-    /// `IfStmt.else_kind` union (`.none` / `.block` / `.if_chain`).
-    if_stmt: IfStmt,
-    /// `while cond { stmts... }` plain form. `while let` is deferred to a
-    /// followup commit because it requires enum-variant patterns or at
-    /// least a more permissive `if let` pattern surface than the
-    /// ident-and-discard-only carve-out this commit ships.
-    while_stmt: WhileStmt,
-    /// `for pat in iter { stmts... }` form. Pattern is simplified to the
-    /// one-element subset (just ident or discard) for this commit — tuple
-    /// destructuring like `for (k, v) in …` needs a tuple-pattern parser
-    /// path that's structurally identical to the existing
-    /// `BindingPattern.tuple` walker; defer to followup.
-    for_stmt: ForStmt,
-    /// `match scrutinee { arms... }` expression-as-statement. The match
-    /// node itself lives at `Expr.match_expr` so codegen emits the
-    /// labeled if-else ladder uniformly; this slot is just a passthrough
-    /// wrapper for statement-position contexts. Codegen delegates to
-    /// `Expr.match_expr`'s codegen path. The type qualifier `Expr.`
-    /// here is required because `MatchExpr` is nested inside `Expr`
-    /// (mirrors `IndexAssignStmt` being nested inside `Stmt`).
-    match_stmt: Expr.MatchExpr,
-    /// `break;` — exit the innermost enclosing loop. Statement-only per
-    /// the user-confirmed shape (no `break val;` value form). Codegen
-    /// emits `break;` verbatim targeting zig's default innermost loop —
-    /// no explicit loop labels needed.
-    break_stmt: void,
-    /// `continue;` — skip to next iteration of the innermost enclosing
-    /// loop. Codegen emits `continue;` verbatim.
-    continue_stmt: void,
-    /// `return expr;` (or bare `return;`). The function signature
-    /// (`fun foo(...) -> T`) isn't yet parsed in this compiler revision
-    /// so codegen unconditionally emits `return expr;` and zig's
-    /// downstream type checker validates the type against the inferred
-    /// `pub fn main() !void` body return shape. If `value` is `null`,
-    /// codegen emits `return;` (no value).
-    return_stmt: ReturnStmt,
-    /// `name.field = expr` field-write statement. Distinct from
-    /// `.assign` because the RHS is a field on an aggregate rather
-    /// than a bare-name rebind. The 3-token lookahead at parseStmt's
-    /// identifier arm dispatches into this variant when the pattern
-    /// `identifier . identifier =` is detected. `target` is `*Expr`
-    /// so non-identifier receivers (e.g. `getBox().field = …`) parse
-    /// cleanly via parsePostfix; `value` is value-typed Expr because
-    /// it's the leaf of the assignment.
-    field_assign: FieldAssignStmt,
-    /// `*p = expr` dereference-write statement. Distinct from
-    /// `.assign` because the LHS is a deref of a bare-named pointer
-    /// rather than a rebind. The 3-token lookahead at parseStmt's
-    /// `.star` arm dispatches into this variant when the pattern
-    /// `star identifier equals` is detected. The parser restricts the
-    /// LHS to a bare identifier (no complex deref-trees like
-    /// `*obj.field` or `*arr[i]` for this slot; users wanting those
-    /// forms should extract a local first). Codegen emits
-    /// `name.* = value;` -- zig 0.16's postfix deref-and-write form,
-    /// semantically equivalent to the source-side `*p = x`.
-    deref_assign: DerefAssignStmt,
-
+pub const Stmt = struct {
     /// Backing struct for all three binding kinds (`let`, `var`, `const`).
-    /// The kind is carried *by the union tag* on `Stmt`, not duplicated here
+    /// The kind is carried *by the union tag* on `Payload`, not duplicated here
     /// in a payload-level field — Zig's tagged union already gives us
     /// exhaustive payload access (`stmt.let.init`, `stmt.var_binding.name`),
     /// so storing `kind` here would just be redundant and risk drift. The
@@ -305,5 +219,101 @@ pub const Stmt = union(enum) {
         name: []const u8,
         value: Expr,
     };
+
+    /// The statement payload — all possible statement kinds.
+    pub const Payload = union(enum) {
+        /// `let` binding. The keyword tag is on the envelope, the kind on the
+        /// payload (see `BindingKind`): one `BindingStmt` struct is reused for
+        /// `let`, `var`, and `const` so adding a future kind (e.g. `mut`,
+        /// `implicit`) only requires a new `BindingKind` member + a new dispatch
+        /// arm in the parser, not a fresh struct definition.
+        let: BindingStmt,
+        /// `var` binding. The tag is named `.var_binding` rather than `.var`
+        /// because Zig's tagged-union tag literals cannot reuse `var` (it's a
+        /// reserved keyword in Zig 0.16). The lexer accepts `var` as the
+        /// `var_kw` TokenTag and the parser constructs `.var_binding = …` here.
+        var_binding: BindingStmt,
+        /// `const` binding. Mirrors the shape of the other two exactly. The tag
+        /// is named `.const_binding` (not `.const`) for the same Zig-keyword
+        /// reason as `.var_binding`. Zag's `const` is a *compile-time* binding by
+        /// convention; codegen emits a Zig `const NAME: T = expr;`, which is
+        /// itself evaluated at compile time.
+        const_binding: BindingStmt,
+        assign: AssignStmt,
+        /// `arr[i] = x` indexed-write statement. Distinct from `.assign` because
+        /// the target path includes a runtime-computed index; codegen emits
+        /// `target[index] = value;` directly. The `value` field is value-typed
+        /// (Expr) since it is the leaf of the assignment, while `target` and
+        /// `index` are pointer-typed to avoid arena allocations for what are
+        /// typically other Expr nodes (ident, call, etc.).
+        index_assign: IndexAssignStmt,
+        defer_stmt: DeferStmt,
+        errdefer_stmt: ErrDeferStmt,
+        unsafe_block: []const Stmt,
+        expr_stmt: Expr,
+        /// `if cond { stmts... }` statement form (NOT the expression form —
+        /// that's `Expr.if_expr`). Statement form lets each branch contain a
+        /// list of statements; otherwise the user must build tagged-union
+        /// expr by hand. Else-chain is unified via the recursive
+        /// `IfStmt.else_kind` union (`.none` / `.block` / `.if_chain`).
+        if_stmt: IfStmt,
+        /// `while cond { stmts... }` plain form. `while let` is deferred to a
+        /// followup commit because it requires enum-variant patterns or at
+        /// least a more permissive `if let` pattern surface than the
+        /// ident-and-discard-only carve-out this commit ships.
+        while_stmt: WhileStmt,
+        /// `for pat in iter { stmts... }` form. Pattern is simplified to the
+        /// one-element subset (just ident or discard) for this commit — tuple
+        /// destructuring like `for (k, v) in …` needs a tuple-pattern parser
+        /// path that's structurally identical to the existing
+        /// `BindingPattern.tuple` walker; defer to followup.
+        for_stmt: ForStmt,
+        /// `match scrutinee { arms... }` expression-as-statement. The match
+        /// node itself lives at `Expr.match_expr` so codegen emits the
+        /// labeled if-else ladder uniformly; this slot is just a passthrough
+        /// wrapper for statement-position contexts. Codegen delegates to
+        /// `Expr.match_expr`'s codegen path. The type qualifier `Expr.`
+        /// here is required because `MatchExpr` is nested inside `Expr`
+        /// (mirrors `IndexAssignStmt` being nested inside `Stmt`).
+        match_stmt: Expr.MatchExpr,
+        /// `break;` — exit the innermost enclosing loop. Statement-only per
+        /// the user-confirmed shape (no `break val;` value form). Codegen
+        /// emits `break;` verbatim targeting zig's default innermost loop —
+        /// no explicit loop labels needed.
+        break_stmt: void,
+        /// `continue;` — skip to next iteration of the innermost enclosing
+        /// loop. Codegen emits `continue;` verbatim.
+        continue_stmt: void,
+        /// `return expr;` (or bare `return;`). The function signature
+        /// (`fun foo(...) -> T`) isn't yet parsed in this compiler revision
+        /// so codegen unconditionally emits `return expr;` and zig's
+        /// downstream type checker validates the type against the inferred
+        /// `pub fn main() !void` body return shape. If `value` is `null`,
+        /// codegen emits `return;` (no value).
+        return_stmt: ReturnStmt,
+        /// `name.field = expr` field-write statement. Distinct from
+        /// `.assign` because the RHS is a field on an aggregate rather
+        /// than a bare-name rebind. The 3-token lookahead at parseStmt's
+        /// identifier arm dispatches into this variant when the pattern
+        /// `identifier . identifier =` is detected. `target` is `*Expr`
+        /// so non-identifier receivers (e.g. `getBox().field = …`) parse
+        /// cleanly via parsePostfix; `value` is value-typed Expr because
+        /// it's the leaf of the assignment.
+        field_assign: FieldAssignStmt,
+        /// `*p = expr` dereference-write statement. Distinct from
+        /// `.assign` because the LHS is a deref of a bare-named pointer
+        /// rather than a rebind. The 3-token lookahead at parseStmt's
+        /// `.star` arm dispatches into this variant when the pattern
+        /// `star identifier equals` is detected. The parser restricts the
+        /// LHS to a bare identifier (no complex deref-trees like
+        /// `*obj.field` or `*arr[i]` for this slot; users wanting those
+        /// forms should extract a local first). Codegen emits
+        /// `name.* = value;` -- zig 0.16's postfix deref-and-write form,
+        /// semantically equivalent to the source-side `*p = x`.
+        deref_assign: DerefAssignStmt,
+    };
+
+    payload: Payload,
+    loc: Loc,
 };
 

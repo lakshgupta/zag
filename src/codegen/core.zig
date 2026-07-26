@@ -56,6 +56,9 @@ pub const Codegen = struct {
     ///   - any future emit pass that needs to look up an enclosing
     ///     type for a nested emit site.
     prog: *const ast.Program,
+    /// Source file path of the zig module being generated
+    /// (e.g. "src/main.zag"). Set by the caller before `generate()`.
+    source_path: []const u8 = "",
     /// Per-function counter for destructuring temps. Reset to 0 by `genFun`
     /// so each `pub fn` body has its own `__destruct_0`, `__destruct_1`,
     /// ... sequence. Multiple destructurings in the same body produce
@@ -203,6 +206,22 @@ pub const Codegen = struct {
     /// am I receiving" lookup cost-free (no map scan).
     current_receiver_struct_name: ?[]const u8 = null,
 
+    /// Source location map: zig output line → zag source location.
+    /// Populated during codegen as expressions/statements are emitted.
+    /// Bounded at 16384 entries — one per emitted AST node per module.
+    map_entries: [16384]MapEntry = undefined,
+    map_count: u32 = 0,
+    /// Current line number in the generated zig output (1-based).
+    /// Incremented by write() on each newline.
+    current_zig_line: u32 = 1,
+    /// Current function/method name being generated. Set by genFun/genMethod
+    /// before emitting the body; used by recordLoc() for the map symbol column.
+    current_symbol: []const u8 = "",
+    /// Serialized map text (tab-separated format for .zag.map side-file).
+    /// Populated by buildMapText() after generate() completes map recording.
+    map_text_buf: [131072]u8 = undefined,
+    map_text_len: u32 = 0,
+
 /// One entry in `Codegen.variant_fields_buf` (gap #2 fix). Carries
 /// the (enum_name, variant_name) key + the user's actual field names
 /// (`[]const ast.VariantField` mirror the EnumVariant.fields slice
@@ -214,6 +233,19 @@ pub const VariantFieldsEntry = struct {
     enum_name: []const u8,
     variant_name: []const u8,
     fields: []const ast.VariantField,
+};
+
+/// One entry in the zig→zag source location map.
+/// `zig_line` is the line number in the generated zig output.
+/// `zag_line`/`zag_col` are the source location in the .zag file.
+/// `file` is the source path (e.g. "src/main.zag").
+/// `symbol` is the enclosing function/method name.
+pub const MapEntry = struct {
+    zig_line: u32,
+    zag_line: u32,
+    zag_col: u32,
+    file: []const u8,
+    symbol: []const u8,
 };
 
 
@@ -309,6 +341,10 @@ pub const VariantFieldsEntry = struct {
     // stable across that future registration.
     pub const write = @import("core.zig").write;
     pub const writeType = @import("core.zig").writeType;
+    pub const writeInt = @import("core.zig").writeInt;
+    pub const recordLoc = @import("core.zig").recordLoc;
+    pub const buildMapText = @import("core.zig").buildMapText;
+    pub const getMapText = @import("core.zig").getMapText;
 };
 
 // ============================================================
@@ -373,7 +409,26 @@ pub const VariantFieldsEntry = struct {
 
     pub     fn write(self: *Codegen, s: []const u8) void {
         @memcpy(self.out_buf[self.out_len .. self.out_len + s.len], s);
+        for (s) |c| {
+            if (c == '\n') self.current_zig_line += 1;
+        }
         self.out_len += s.len;
+    }
+
+    /// Record a source location mapping at the current generated zig line.
+    /// Called before emitting an expression or statement with a known zag source location.
+    pub fn recordLoc(self: *Codegen, loc: ast.Loc, symbol: []const u8) void {
+        const sym = if (symbol.len > 0) symbol else self.current_symbol;
+        if (self.map_count < self.map_entries.len) {
+            self.map_entries[self.map_count] = .{
+                .zig_line = self.current_zig_line,
+                .zag_line = loc.line,
+                .zag_col = loc.col,
+                .file = self.source_path,
+                .symbol = sym,
+            };
+            self.map_count += 1;
+        }
     }
 
     /// Writes a type text to out_buf, applying (1) transparent-alias expansion
@@ -402,6 +457,51 @@ pub const VariantFieldsEntry = struct {
             len += 1;
         }
         self.write(buf[0..len]);
+    }
+
+    /// Write a u32 integer to the output buffer as decimal text.
+    pub fn writeInt(self: *Codegen, val: u32) void {
+        var buf: [12]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
+        self.write(s);
+    }
+
+    /// Write a u32 integer into a caller-provided buffer. Returns the number
+    /// of bytes written.
+    fn writeIntToBuf(buf: []u8, val: u32) usize {
+        var tmp: [12]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch "0";
+        @memcpy(buf[0..s.len], s);
+        return s.len;
+    }
+
+    /// Build the tab-separated map text in `map_text_buf`. Must be called
+    /// AFTER `generate()` has recorded all entries. Each line:
+    ///   zig_line\tzag_line\tzag_col\tsymbol\tsource_file\n
+    pub fn buildMapText(self: *Codegen) void {
+        if (self.map_count == 0) return;
+        var pos: usize = 0;
+        const buf: []u8 = &self.map_text_buf;
+        for (self.map_entries[0..self.map_count]) |entry| {
+            pos += writeIntToBuf(buf[pos..], entry.zig_line);
+            buf[pos] = '\t'; pos += 1;
+            pos += writeIntToBuf(buf[pos..], entry.zag_line);
+            buf[pos] = '\t'; pos += 1;
+            pos += writeIntToBuf(buf[pos..], entry.zag_col);
+            buf[pos] = '\t'; pos += 1;
+            @memcpy(buf[pos..pos + entry.symbol.len], entry.symbol);
+            pos += entry.symbol.len;
+            buf[pos] = '\t'; pos += 1;
+            @memcpy(buf[pos..pos + entry.file.len], entry.file);
+            pos += entry.file.len;
+            buf[pos] = '\n'; pos += 1;
+        }
+        self.map_text_len = @intCast(pos);
+    }
+
+    /// Returns the serialized map text (tab-separated). Empty if no map entries.
+    pub fn getMapText(self: *Codegen) []const u8 {
+        return self.map_text_buf[0..self.map_text_len];
     }
 
     pub fn generate(self: *Codegen, prog: ast.Program) []const u8 {
@@ -491,6 +591,17 @@ pub const VariantFieldsEntry = struct {
             // without a per-call io parameter. The `var` is needed
             // because it's assigned at runtime from init.io.
             \\var __zag_io: std.Io = undefined;
+            \\
+            \\// Zag panic helper — prints a panic message with zag source location.
+            \\// Called by `panic(msg)` builtin. Writes to stderr and calls @trap().
+            \\fn __zag_panic_at(msg: []const u8, file: []const u8, line: u32, col: u32) noreturn {
+            \\    const stderr_writer = &std.debug.lockStderr(&.{}).file_writer.interface;
+            \\    stderr_writer.print("panic: {s}\n", .{msg}) catch {};
+            \\    if (@import("builtin").mode == .Debug) {
+            \\        stderr_writer.print("  at {s}:{d}:{d}\n", .{ file, line, col }) catch {};
+            \\    }
+            \\    @trap();
+            \\}
             \\
             // Result<T,E> and Option<T> — error-handling fundamental types
             // (docs/manual/18-error-handling.md). Defined as generic zig
@@ -980,6 +1091,44 @@ pub const VariantFieldsEntry = struct {
 
         for (prog.functions) |fun| {
             self.genFun(fun);
+        }
+
+        // Emit the zig→zag source location map table.
+        // Only included in debug builds (stripped by @compileIf in release).
+        if (self.map_count > 0) {
+            self.write(
+                \\
+                \\const __ZagMapEntry = struct {
+                \\    zig_line: u32,
+                \\    zag_line: u32,
+                \\    zag_col: u32,
+                \\    file: []const u8,
+                \\    symbol: []const u8,
+                \\};
+                \\const __zag_map = if (@import("builtin").mode == .Debug)
+                \\    [_]__ZagMapEntry{
+                \\
+            );
+            for (self.map_entries[0..self.map_count]) |entry| {
+                self.write("        .{ .zig_line = ");
+                self.writeInt(entry.zig_line);
+                self.write(", .zag_line = ");
+                self.writeInt(entry.zag_line);
+                self.write(", .zag_col = ");
+                self.writeInt(entry.zag_col);
+                self.write(", .file = \"");
+                self.write(entry.file);
+                self.write("\", .symbol = \"");
+                self.write(entry.symbol);
+                self.write("\" },\n");
+            }
+            self.write(
+                \\    }
+                \\else
+                \\    [_]__ZagMapEntry{}
+                \\;
+                \\
+            );
         }
 
         return self.out_buf[0..self.out_len];

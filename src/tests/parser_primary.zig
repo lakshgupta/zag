@@ -22,8 +22,8 @@ test "parser: bool literal" {
     const prog = p.parse();
     try std.testing.expectEqual(@as(usize, 1), prog.functions.len);
     const body = prog.functions[0].body;
-    try std.testing.expect(body.len > 0 and body[0] == .let);
-    try std.testing.expect(body[1] == .let);
+    try std.testing.expect(body.len > 0 and body[0].payload == .let);
+    try std.testing.expect(body[1].payload == .let);
 }
 
 test "parser: string with braces becomes template_lit" {
@@ -33,12 +33,12 @@ test "parser: string with braces becomes template_lit" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .template_lit);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .template_lit);
     // 3 parts: "hello, " literal, name ident, "" trailing literal
-    try std.testing.expectEqual(@as(usize, 3), init.template_lit.parts.len);
-    try std.testing.expectEqualStrings("hello, ", init.template_lit.parts[0].literal.?);
-    try std.testing.expectEqualStrings("name", init.template_lit.parts[1].expr.?.ident);
+    try std.testing.expectEqual(@as(usize, 3), init.payload.template_lit.parts.len);
+    try std.testing.expectEqualStrings("hello, ", init.payload.template_lit.parts[0].literal.?);
+    try std.testing.expectEqualStrings("name", init.payload.template_lit.parts[1].expr.?.payload.ident);
 }
 
 test "parser: plain string stays string_lit" {
@@ -48,8 +48,8 @@ test "parser: plain string stays string_lit" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .string_lit);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .string_lit);
 }
 
 test "parser: identifier operands" {
@@ -59,11 +59,11 @@ test "parser: identifier operands" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .binary);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.mul, init.binary.op);
-    try std.testing.expectEqualStrings("x", init.binary.lhs.*.ident);
-    try std.testing.expectEqualStrings("y", init.binary.rhs.*.ident);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.mul, init.payload.binary.op);
+    try std.testing.expectEqualStrings("x", init.payload.binary.lhs.*.payload.ident);
+    try std.testing.expectEqualStrings("y", init.payload.binary.rhs.*.payload.ident);
 }
 
 test "parser: identifier expr without `=` stays `.expr_stmt`" {
@@ -77,9 +77,9 @@ test "parser: identifier expr without `=` stays `.expr_stmt`" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .expr_stmt);
-    try std.testing.expect(stmt.expr_stmt == .ident);
-    try std.testing.expectEqualStrings("y", stmt.expr_stmt.ident);
+    try std.testing.expect(stmt.payload == .expr_stmt);
+    try std.testing.expect(stmt.payload.expr_stmt.payload == .ident);
+    try std.testing.expectEqualStrings("y", stmt.payload.expr_stmt.payload.ident);
 }
 
 test "parser: format spec preserved on interpolation" {
@@ -93,19 +93,19 @@ test "parser: format spec preserved on interpolation" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const print_stmt = prog.functions[0].body[0];
-    const arg = print_stmt.expr_stmt.call.args[0];
-    try std.testing.expect(arg == .template_lit);
+    const arg = print_stmt.payload.expr_stmt.payload.call.args[0];
+    try std.testing.expect(arg.payload == .template_lit);
     // source "{PI:.5}" has no leading text, so buildTemplate emits:
     //   parts[0] = { expr = ident "PI",  spec = ".5" }   (interpolation)
     //   parts[1] = { literal = "" }                       (trailing literal)
-    try std.testing.expectEqual(@as(usize, 2), arg.template_lit.parts.len);
-    try std.testing.expect(arg.template_lit.parts[0].literal == null);
-    try std.testing.expect(arg.template_lit.parts[0].expr != null);
-    try std.testing.expectEqualStrings("PI", arg.template_lit.parts[0].expr.?.ident);
-    try std.testing.expect(arg.template_lit.parts[0].spec != null);
-    try std.testing.expectEqualStrings(".5", arg.template_lit.parts[0].spec.?);
-    try std.testing.expect(arg.template_lit.parts[1].literal != null);
-    try std.testing.expectEqualStrings("", arg.template_lit.parts[1].literal.?);
+    try std.testing.expectEqual(@as(usize, 2), arg.payload.template_lit.parts.len);
+    try std.testing.expect(arg.payload.template_lit.parts[0].literal == null);
+    try std.testing.expect(arg.payload.template_lit.parts[0].expr != null);
+    try std.testing.expectEqualStrings("PI", arg.payload.template_lit.parts[0].expr.?.payload.ident);
+    try std.testing.expect(arg.payload.template_lit.parts[0].spec != null);
+    try std.testing.expectEqualStrings(".5", arg.payload.template_lit.parts[0].spec.?);
+    try std.testing.expect(arg.payload.template_lit.parts[1].literal != null);
+    try std.testing.expectEqualStrings("", arg.payload.template_lit.parts[1].literal.?);
 }
 
 test "parser: plain interpolation has null spec" {
@@ -118,12 +118,12 @@ test "parser: plain interpolation has null spec" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const print_stmt = prog.functions[0].body[1];
-    const arg = print_stmt.expr_stmt.call.args[0];
-    try std.testing.expect(arg == .template_lit);
+    const arg = print_stmt.payload.expr_stmt.payload.call.args[0];
+    try std.testing.expect(arg.payload == .template_lit);
     // The single interpolation part has `spec == null`.
-    for (arg.template_lit.parts) |part| {
+    for (arg.payload.template_lit.parts) |part| {
         if (part.expr) |expr| {
-            try std.testing.expectEqualStrings("name", expr.ident);
+            try std.testing.expectEqualStrings("name", expr.payload.ident);
             try std.testing.expect(part.spec == null);
         }
     }
@@ -153,14 +153,14 @@ test "parser: float precision {pi:.5} gate accepts dot inside braces" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const print_stmt = prog.functions[0].body[1];
-    const arg = print_stmt.expr_stmt.call.args[0];
-    try std.testing.expect(arg == .template_lit);
-    try std.testing.expectEqual(@as(usize, 2), arg.template_lit.parts.len);
-    try std.testing.expect(arg.template_lit.parts[0].literal == null);
-    try std.testing.expect(arg.template_lit.parts[0].expr != null);
-    try std.testing.expectEqualStrings("pi", arg.template_lit.parts[0].expr.?.ident);
-    try std.testing.expect(arg.template_lit.parts[0].spec != null);
-    try std.testing.expectEqualStrings(".5", arg.template_lit.parts[0].spec.?);
+    const arg = print_stmt.payload.expr_stmt.payload.call.args[0];
+    try std.testing.expect(arg.payload == .template_lit);
+    try std.testing.expectEqual(@as(usize, 2), arg.payload.template_lit.parts.len);
+    try std.testing.expect(arg.payload.template_lit.parts[0].literal == null);
+    try std.testing.expect(arg.payload.template_lit.parts[0].expr != null);
+    try std.testing.expectEqualStrings("pi", arg.payload.template_lit.parts[0].expr.?.payload.ident);
+    try std.testing.expect(arg.payload.template_lit.parts[0].spec != null);
+    try std.testing.expectEqualStrings(".5", arg.payload.template_lit.parts[0].spec.?);
 }
 
 test "parser: binary `&` still bitwise AND (not addr)" {
@@ -174,7 +174,7 @@ test "parser: binary `&` still bitwise AND (not addr)" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .binary);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.bitand, init.binary.op);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.bitand, init.payload.binary.op);
 }

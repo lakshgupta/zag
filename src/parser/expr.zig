@@ -251,7 +251,7 @@ pub fn makeBinary(self: *Parser, op: ast.Expr.BinaryOp, lhs: Expr, rhs: Expr) Ex
         lhs_buf[0] = lhs;
         const rhs_buf = self.arena.alloc(Expr, 1);
         rhs_buf[0] = rhs;
-        return .{ .binary = .{ .op = op, .lhs = &lhs_buf[0], .rhs = &rhs_buf[0] } };
+        return Expr{ .payload = .{ .binary = .{ .op = op, .lhs = &lhs_buf[0], .rhs = &rhs_buf[0] } }, .loc = lhs.loc };
     }
 
 
@@ -260,7 +260,7 @@ pub fn makeRange(self: *Parser, lhs: Expr, rhs: Expr, inclusive: bool) Expr {
         lb[0] = lhs;
         const rb = self.arena.alloc(Expr, 1);
         rb[0] = rhs;
-        return .{ .range = .{ .start = &lb[0], .end = &rb[0], .inclusive = inclusive } };
+        return Expr{ .payload = .{ .range = .{ .start = &lb[0], .end = &rb[0], .inclusive = inclusive } }, .loc = lhs.loc };
     }
 
 
@@ -314,6 +314,7 @@ pub fn parseBitXor(self: *Parser) Expr {
 
 
 pub fn parseCast(self: *Parser) Expr {
+        const start_loc = self.peek().loc;
         const lhs = self.parsePostfix();
         if (self.peek().tag != .as_kw) return lhs;
         const binding_loc = self.peek().loc;
@@ -325,7 +326,7 @@ pub fn parseCast(self: *Parser) Expr {
         }
         const buf = self.arena.alloc(Expr, 1);
         buf[0] = lhs;
-        return .{ .cast = .{ .expr = &buf[0], .type_text = type_text } };
+        return Expr{ .payload = .{ .cast = .{ .expr = &buf[0], .type_text = type_text } }, .loc = start_loc };
     }
 
 
@@ -357,6 +358,7 @@ pub fn parseComparison(self: *Parser) Expr {
 
 
 pub fn parseExpr(self: *Parser) Expr {
+        const start_loc = self.peek().loc;
         // Catch expressions (`expr catch HANDLER` or
         // `expr catch |err| HANDLER`) have the lowest precedence.
         // We parse the leading expression first, then check for `catch`.
@@ -364,7 +366,7 @@ pub fn parseExpr(self: *Parser) Expr {
             .if_kw => self.parseIfExpr(),
             .match_kw => blk: {
                 const m = self.parseMatchExpr();
-                break :blk @as(Expr, .{ .match_expr = m });
+                break :blk Expr{ .payload = .{ .match_expr = m }, .loc = start_loc };
             },
             .pipe => self.parseClosureExpr(),
             else => self.parseRange(),
@@ -379,7 +381,7 @@ pub fn parseExpr(self: *Parser) Expr {
 pub fn parseCatchExpr(self: *Parser, lhs: Expr) Expr {
         // `lhs catch HANDLER` or `lhs catch |err| HANDLER`.
         // Already verified that peek() is `.catch_kw`.
-        if (lhs == .try_op) {
+        if (lhs.payload == .try_op) {
             // OK: `expr? catch ...`
         }
         self.advance(); // consume `catch`
@@ -396,15 +398,16 @@ pub fn parseCatchExpr(self: *Parser, lhs: Expr) Expr {
         lhs_buf[0] = lhs;
         const handler_buf = self.arena.alloc(Expr, 1);
         handler_buf[0] = handler;
-        return .{ .catch_expr = .{
+        return Expr{ .payload = .{ .catch_expr = .{
             .expr = &lhs_buf[0],
             .handler = &handler_buf[0],
             .err_binding = err_binding,
-        } };
+        } }, .loc = lhs.loc };
     }
 
 
 pub fn parseIfExpr(self: *Parser) Expr {
+        const start_loc = self.peek().loc;
         self.expect(.if_kw);
         // Suppress struct-literal parsing in if-expression's cond. The
         // expression-form `let x = if Foo { 1 } else { 2 }` is an
@@ -437,11 +440,11 @@ pub fn parseIfExpr(self: *Parser) Expr {
         const else_buf = self.arena.alloc(Expr, 1);
         else_buf[0] = self.parseExpr();
         self.expect(.rbrace);
-        return .{ .if_expr = .{
+        return Expr{ .payload = .{ .if_expr = .{
             .cond = &cond_buf[0],
             .then_expr = &then_buf[0],
             .else_expr = &else_buf[0],
-        } };
+        } }, .loc = start_loc };
     }
 
 
@@ -546,6 +549,7 @@ pub fn parseShift(self: *Parser) Expr {
 
 
 pub fn parseUnary(self: *Parser) Expr {
+        const start_loc = self.peek().loc;
         const op: ast.Expr.UnaryOp = switch (self.peek().tag) {
             .minus => .neg,
             .tilde => .bnot,
@@ -558,7 +562,7 @@ pub fn parseUnary(self: *Parser) Expr {
         const operand = self.parseUnary();
         const buf = self.arena.alloc(Expr, 1);
         buf[0] = operand;
-        return .{ .unary = .{ .op = op, .operand = &buf[0] } };
+        return Expr{ .payload = .{ .unary = .{ .op = op, .operand = &buf[0] } }, .loc = start_loc };
     }
 
 

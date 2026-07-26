@@ -24,15 +24,15 @@ test "parser: tuple destructuring" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .let);
-    try std.testing.expect(stmt.let.pattern != null);
-    try std.testing.expect(stmt.let.pattern.? == .tuple);
-    try std.testing.expectEqual(@as(usize, 2), stmt.let.pattern.?.tuple.len);
-    try std.testing.expectEqualStrings("x", stmt.let.pattern.?.tuple[0].name);
-    try std.testing.expectEqualStrings("y", stmt.let.pattern.?.tuple[1].name);
-    try std.testing.expectEqualStrings("", stmt.let.name);
-    try std.testing.expect(stmt.let.type_name == null);
-    try std.testing.expect(stmt.let.init.? == .tuple_lit);
+    try std.testing.expect(stmt.payload == .let);
+    try std.testing.expect(stmt.payload.let.pattern != null);
+    try std.testing.expect(stmt.payload.let.pattern.? == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), stmt.payload.let.pattern.?.tuple.len);
+    try std.testing.expectEqualStrings("x", stmt.payload.let.pattern.?.tuple[0].name);
+    try std.testing.expectEqualStrings("y", stmt.payload.let.pattern.?.tuple[1].name);
+    try std.testing.expectEqualStrings("", stmt.payload.let.name);
+    try std.testing.expect(stmt.payload.let.type_name == null);
+    try std.testing.expect(stmt.payload.let.init.?.payload == .tuple_lit);
 }
 
 test "parser: array destructuring" {
@@ -45,15 +45,15 @@ test "parser: array destructuring" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .let);
-    try std.testing.expect(stmt.let.pattern != null);
-    try std.testing.expect(stmt.let.pattern.? == .array);
-    try std.testing.expectEqual(@as(usize, 3), stmt.let.pattern.?.array.len);
-    try std.testing.expectEqualStrings("a", stmt.let.pattern.?.array[0].name);
-    try std.testing.expectEqualStrings("b", stmt.let.pattern.?.array[1].name);
-    try std.testing.expectEqualStrings("c", stmt.let.pattern.?.array[2].name);
-    try std.testing.expect(stmt.let.init.? == .ident);
-    try std.testing.expectEqualStrings("arr", stmt.let.init.?.ident);
+    try std.testing.expect(stmt.payload == .let);
+    try std.testing.expect(stmt.payload.let.pattern != null);
+    try std.testing.expect(stmt.payload.let.pattern.? == .array);
+    try std.testing.expectEqual(@as(usize, 3), stmt.payload.let.pattern.?.array.len);
+    try std.testing.expectEqualStrings("a", stmt.payload.let.pattern.?.array[0].name);
+    try std.testing.expectEqualStrings("b", stmt.payload.let.pattern.?.array[1].name);
+    try std.testing.expectEqualStrings("c", stmt.payload.let.pattern.?.array[2].name);
+    try std.testing.expect(stmt.payload.let.init.?.payload == .ident);
+    try std.testing.expectEqualStrings("arr", stmt.payload.let.init.?.payload.ident);
 }
 
 test "parser: destructuring with wildcard discard" {
@@ -66,11 +66,11 @@ test "parser: destructuring with wildcard discard" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt.let.pattern.? == .tuple);
-    try std.testing.expectEqual(@as(usize, 3), stmt.let.pattern.?.tuple.len);
-    try std.testing.expect(stmt.let.pattern.?.tuple[0] == .discard);
-    try std.testing.expectEqualStrings("y", stmt.let.pattern.?.tuple[1].name);
-    try std.testing.expect(stmt.let.pattern.?.tuple[2] == .discard);
+    try std.testing.expect(stmt.payload.let.pattern.? == .tuple);
+    try std.testing.expectEqual(@as(usize, 3), stmt.payload.let.pattern.?.tuple.len);
+    try std.testing.expect(stmt.payload.let.pattern.?.tuple[0] == .discard);
+    try std.testing.expectEqualStrings("y", stmt.payload.let.pattern.?.tuple[1].name);
+    try std.testing.expect(stmt.payload.let.pattern.?.tuple[2] == .discard);
 }
 
 test "parser: top-level wildcard" {
@@ -86,10 +86,10 @@ test "parser: top-level wildcard" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .let);
-    try std.testing.expect(stmt.let.pattern != null);
-    try std.testing.expect(stmt.let.pattern.? == .discard);
-    try std.testing.expect(stmt.let.init.? == .int_lit);
+    try std.testing.expect(stmt.payload == .let);
+    try std.testing.expect(stmt.payload.let.pattern != null);
+    try std.testing.expect(stmt.payload.let.pattern.? == .discard);
+    try std.testing.expect(stmt.payload.let.init.?.payload == .int_lit);
 }
 
 test "parser: nested destructuring" {
@@ -102,12 +102,12 @@ test "parser: nested destructuring" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt.let.pattern.? == .tuple);
-    try std.testing.expectEqual(@as(usize, 2), stmt.let.pattern.?.tuple.len);
-    try std.testing.expectEqualStrings("a", stmt.let.pattern.?.tuple[0].name);
-    try std.testing.expect(stmt.let.pattern.?.tuple[1] == .tuple);
-    try std.testing.expectEqualStrings("b", stmt.let.pattern.?.tuple[1].tuple[0].name);
-    try std.testing.expectEqualStrings("c", stmt.let.pattern.?.tuple[1].tuple[1].name);
+    try std.testing.expect(stmt.payload.let.pattern.? == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), stmt.payload.let.pattern.?.tuple.len);
+    try std.testing.expectEqualStrings("a", stmt.payload.let.pattern.?.tuple[0].name);
+    try std.testing.expect(stmt.payload.let.pattern.?.tuple[1] == .tuple);
+    try std.testing.expectEqualStrings("b", stmt.payload.let.pattern.?.tuple[1].tuple[0].name);
+    try std.testing.expectEqualStrings("c", stmt.payload.let.pattern.?.tuple[1].tuple[1].name);
 }
 
 test "parser: errdefer parses as Stmt.errdefer_stmt" {
@@ -128,11 +128,11 @@ test "parser: errdefer parses as Stmt.errdefer_stmt" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .errdefer_stmt);
-    try std.testing.expect(stmt.errdefer_stmt.expr == .call);
-    try std.testing.expectEqualStrings("print", stmt.errdefer_stmt.expr.call.name);
-    try std.testing.expectEqual(@as(usize, 1), stmt.errdefer_stmt.expr.call.args.len);
-    try std.testing.expectEqualStrings("cleanup\\n", stmt.errdefer_stmt.expr.call.args[0].string_lit);
+    try std.testing.expect(stmt.payload == .errdefer_stmt);
+    try std.testing.expect(stmt.payload.errdefer_stmt.expr.payload == .call);
+    try std.testing.expectEqualStrings("print", stmt.payload.errdefer_stmt.expr.payload.call.name);
+    try std.testing.expectEqual(@as(usize, 1), stmt.payload.errdefer_stmt.expr.payload.call.args.len);
+    try std.testing.expectEqualStrings("cleanup\\n", stmt.payload.errdefer_stmt.expr.payload.call.args[0].payload.string_lit);
 }
 
 test "parser: unsafe { } parses as Stmt.unsafe_block" {
@@ -146,9 +146,9 @@ test "parser: unsafe { } parses as Stmt.unsafe_block" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .unsafe_block);
-    try std.testing.expectEqual(@as(usize, 1), stmt.unsafe_block.len);
-    try std.testing.expect(stmt.unsafe_block[0] == .expr_stmt);
+    try std.testing.expect(stmt.payload == .unsafe_block);
+    try std.testing.expectEqual(@as(usize, 1), stmt.payload.unsafe_block.len);
+    try std.testing.expect(stmt.payload.unsafe_block[0].payload == .expr_stmt);
 }
 
 test "parser: if-stmt parses as Stmt.if_stmt" {
@@ -163,12 +163,12 @@ test "parser: if-stmt parses as Stmt.if_stmt" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .if_stmt);
-    try std.testing.expect(stmt.if_stmt.cond == .binary);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.gt, stmt.if_stmt.cond.binary.op);
-    try std.testing.expectEqual(@as(usize, 1), stmt.if_stmt.then_body.len);
-    try std.testing.expect(stmt.if_stmt.then_body[0] == .expr_stmt);
-    try std.testing.expect(stmt.if_stmt.else_kind == .none);
+    try std.testing.expect(stmt.payload == .if_stmt);
+    try std.testing.expect(stmt.payload.if_stmt.cond.payload == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.gt, stmt.payload.if_stmt.cond.payload.binary.op);
+    try std.testing.expectEqual(@as(usize, 1), stmt.payload.if_stmt.then_body.len);
+    try std.testing.expect(stmt.payload.if_stmt.then_body[0].payload == .expr_stmt);
+    try std.testing.expect(stmt.payload.if_stmt.else_kind == .none);
 }
 
 test "parser: if-stmt with else-if chain walks nested if_kind" {
@@ -183,11 +183,11 @@ test "parser: if-stmt with else-if chain walks nested if_kind" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .if_stmt);
-    try std.testing.expect(stmt.if_stmt.else_kind == .if_chain);
-    const mid = stmt.if_stmt.else_kind.if_chain;
-    try std.testing.expect(mid.cond == .ident);
-    try std.testing.expectEqualStrings("b", mid.cond.ident);
+    try std.testing.expect(stmt.payload == .if_stmt);
+    try std.testing.expect(stmt.payload.if_stmt.else_kind == .if_chain);
+    const mid = stmt.payload.if_stmt.else_kind.if_chain;
+    try std.testing.expect(mid.cond.payload == .ident);
+    try std.testing.expectEqualStrings("b", mid.cond.payload.ident);
     try std.testing.expect(mid.else_kind == .block);
 }
 
@@ -207,13 +207,13 @@ test "parser: if-expression parses as Expr.if_expr (RHS of let)" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .if_expr);
-    try std.testing.expect(init.if_expr.cond.* == .binary);
-    try std.testing.expect(init.if_expr.then_expr.* == .int_lit);
-    try std.testing.expectEqualStrings("1", init.if_expr.then_expr.*.int_lit);
-    try std.testing.expect(init.if_expr.else_expr.* == .int_lit);
-    try std.testing.expectEqualStrings("0", init.if_expr.else_expr.*.int_lit);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .if_expr);
+    try std.testing.expect(init.payload.if_expr.cond.*.payload == .binary);
+    try std.testing.expect(init.payload.if_expr.then_expr.*.payload == .int_lit);
+    try std.testing.expectEqualStrings("1", init.payload.if_expr.then_expr.*.payload.int_lit);
+    try std.testing.expect(init.payload.if_expr.else_expr.*.payload == .int_lit);
+    try std.testing.expectEqualStrings("0", init.payload.if_expr.else_expr.*.payload.int_lit);
 }
 
 test "parser: while-stmt parses as Stmt.while_stmt" {
@@ -232,10 +232,10 @@ test "parser: while-stmt parses as Stmt.while_stmt" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .while_stmt);
-    try std.testing.expect(stmt.while_stmt.cond == .binary);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.lt, stmt.while_stmt.cond.binary.op);
-    try std.testing.expectEqual(@as(usize, 1), stmt.while_stmt.body.len);
+    try std.testing.expect(stmt.payload == .while_stmt);
+    try std.testing.expect(stmt.payload.while_stmt.cond.payload == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.lt, stmt.payload.while_stmt.cond.payload.binary.op);
+    try std.testing.expectEqual(@as(usize, 1), stmt.payload.while_stmt.body.len);
 }
 
 test "parser: for-range parses as Stmt.for_stmt with RangeExpr iter" {
@@ -257,13 +257,13 @@ test "parser: for-range parses as Stmt.for_stmt with RangeExpr iter" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .for_stmt);
-    try std.testing.expect(stmt.for_stmt.iter == .range);
-    try std.testing.expectEqualStrings("0", stmt.for_stmt.iter.range.start.*.int_lit);
-    try std.testing.expectEqualStrings("10", stmt.for_stmt.iter.range.end.*.int_lit);
-    try std.testing.expect(!stmt.for_stmt.iter.range.inclusive);
-    try std.testing.expect(stmt.for_stmt.pattern == .ident);
-    try std.testing.expectEqualStrings("i", stmt.for_stmt.pattern.ident);
+    try std.testing.expect(stmt.payload == .for_stmt);
+    try std.testing.expect(stmt.payload.for_stmt.iter.payload == .range);
+    try std.testing.expectEqualStrings("0", stmt.payload.for_stmt.iter.payload.range.start.*.payload.int_lit);
+    try std.testing.expectEqualStrings("10", stmt.payload.for_stmt.iter.payload.range.end.*.payload.int_lit);
+    try std.testing.expect(!stmt.payload.for_stmt.iter.payload.range.inclusive);
+    try std.testing.expect(stmt.payload.for_stmt.pattern == .ident);
+    try std.testing.expectEqualStrings("i", stmt.payload.for_stmt.pattern.ident);
 }
 
 test "parser: for-incl range sets inclusive flag" {
@@ -283,8 +283,8 @@ test "parser: for-incl range sets inclusive flag" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .for_stmt);
-    try std.testing.expect(stmt.for_stmt.iter.range.inclusive);
+    try std.testing.expect(stmt.payload == .for_stmt);
+    try std.testing.expect(stmt.payload.for_stmt.iter.payload.range.inclusive);
 }
 
 test "parser: for-iter non-range parses with the user expression as iter" {
@@ -305,9 +305,9 @@ test "parser: for-iter non-range parses with the user expression as iter" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .for_stmt);
-    try std.testing.expect(stmt.for_stmt.iter == .call);
-    try std.testing.expectEqualStrings("items", stmt.for_stmt.iter.call.name);
+    try std.testing.expect(stmt.payload == .for_stmt);
+    try std.testing.expect(stmt.payload.for_stmt.iter.payload == .call);
+    try std.testing.expectEqualStrings("items", stmt.payload.for_stmt.iter.payload.call.name);
 }
 
 test "parser: match-stmt with literal arms parses as Stmt.match_stmt" {
@@ -330,21 +330,21 @@ test "parser: match-stmt with literal arms parses as Stmt.match_stmt" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .match_stmt);
-    try std.testing.expect(stmt.match_stmt.scrutinee.* == .ident);
-    try std.testing.expectEqualStrings("n", stmt.match_stmt.scrutinee.*.ident);
-    try std.testing.expectEqual(@as(usize, 3), stmt.match_stmt.arms.len);
+    try std.testing.expect(stmt.payload == .match_stmt);
+    try std.testing.expect(stmt.payload.match_stmt.scrutinee.*.payload == .ident);
+    try std.testing.expectEqualStrings("n", stmt.payload.match_stmt.scrutinee.*.payload.ident);
+    try std.testing.expectEqual(@as(usize, 3), stmt.payload.match_stmt.arms.len);
 
-    try std.testing.expect(stmt.match_stmt.arms[0].pat == .literal);
-    try std.testing.expectEqualStrings("1", stmt.match_stmt.arms[0].pat.literal.*.int_lit);
-    try std.testing.expect(stmt.match_stmt.arms[0].guard == null);
-    try std.testing.expectEqualStrings("one", stmt.match_stmt.arms[0].expr.*.string_lit);
+    try std.testing.expect(stmt.payload.match_stmt.arms[0].pat == .literal);
+    try std.testing.expectEqualStrings("1", stmt.payload.match_stmt.arms[0].pat.literal.*.payload.int_lit);
+    try std.testing.expect(stmt.payload.match_stmt.arms[0].guard == null);
+    try std.testing.expectEqualStrings("one", stmt.payload.match_stmt.arms[0].expr.*.payload.string_lit);
 
-    try std.testing.expect(stmt.match_stmt.arms[1].pat == .literal);
-    try std.testing.expectEqualStrings("2", stmt.match_stmt.arms[1].pat.literal.*.int_lit);
+    try std.testing.expect(stmt.payload.match_stmt.arms[1].pat == .literal);
+    try std.testing.expectEqualStrings("2", stmt.payload.match_stmt.arms[1].pat.literal.*.payload.int_lit);
 
-    try std.testing.expect(stmt.match_stmt.arms[2].pat == .discard);
-    try std.testing.expectEqualStrings("other", stmt.match_stmt.arms[2].expr.*.string_lit);
+    try std.testing.expect(stmt.payload.match_stmt.arms[2].pat == .discard);
+    try std.testing.expectEqualStrings("other", stmt.payload.match_stmt.arms[2].expr.*.payload.string_lit);
 }
 
 test "parser: match-stmt with range arm and guard" {
@@ -366,11 +366,11 @@ test "parser: match-stmt with range arm and guard" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .match_stmt);
-    try std.testing.expect(stmt.match_stmt.arms[0].pat == .range);
-    try std.testing.expectEqualStrings("0", stmt.match_stmt.arms[0].pat.range.start.*.int_lit);
-    try std.testing.expectEqualStrings("10", stmt.match_stmt.arms[0].pat.range.end.*.int_lit);
-    try std.testing.expect(!stmt.match_stmt.arms[0].pat.range.inclusive);
+    try std.testing.expect(stmt.payload == .match_stmt);
+    try std.testing.expect(stmt.payload.match_stmt.arms[0].pat == .range);
+    try std.testing.expectEqualStrings("0", stmt.payload.match_stmt.arms[0].pat.range.start.*.payload.int_lit);
+    try std.testing.expectEqualStrings("10", stmt.payload.match_stmt.arms[0].pat.range.end.*.payload.int_lit);
+    try std.testing.expect(!stmt.payload.match_stmt.arms[0].pat.range.inclusive);
 }
 
 test "parser: match-stmt with ident-pattern arm binds name" {
@@ -392,10 +392,10 @@ test "parser: match-stmt with ident-pattern arm binds name" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .match_stmt);
-    try std.testing.expect(stmt.match_stmt.arms[0].pat == .ident);
-    try std.testing.expectEqualStrings("x", stmt.match_stmt.arms[0].pat.ident);
-    try std.testing.expect(stmt.match_stmt.arms[0].expr.* == .binary);
+    try std.testing.expect(stmt.payload == .match_stmt);
+    try std.testing.expect(stmt.payload.match_stmt.arms[0].pat == .ident);
+    try std.testing.expectEqualStrings("x", stmt.payload.match_stmt.arms[0].pat.ident);
+    try std.testing.expect(stmt.payload.match_stmt.arms[0].expr.*.payload == .binary);
 }
 
 test "parser: match-expression parses as Expr.match_expr" {
@@ -416,10 +416,10 @@ test "parser: match-expression parses as Expr.match_expr" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .match_expr);
-    try std.testing.expectEqualStrings("n", init.match_expr.scrutinee.*.ident);
-    try std.testing.expectEqual(@as(usize, 2), init.match_expr.arms.len);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .match_expr);
+    try std.testing.expectEqualStrings("n", init.payload.match_expr.scrutinee.*.payload.ident);
+    try std.testing.expectEqual(@as(usize, 2), init.payload.match_expr.arms.len);
 }
 
 test "parser: break-stmt parses as Stmt.break_stmt" {
@@ -439,8 +439,8 @@ test "parser: break-stmt parses as Stmt.break_stmt" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const stmt = prog.functions[0].body[0].while_stmt.body[0];
-    try std.testing.expect(stmt == .break_stmt);
+    const stmt = prog.functions[0].body[0].payload.while_stmt.body[0];
+    try std.testing.expect(stmt.payload == .break_stmt);
 }
 
 test "parser: continue-stmt parses as Stmt.continue_stmt" {
@@ -458,8 +458,8 @@ test "parser: continue-stmt parses as Stmt.continue_stmt" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const stmt = prog.functions[0].body[0].for_stmt.body[0];
-    try std.testing.expect(stmt == .continue_stmt);
+    const stmt = prog.functions[0].body[0].payload.for_stmt.body[0];
+    try std.testing.expect(stmt.payload == .continue_stmt);
 }
 
 test "parser: return-stmt with value parses as Stmt.return_stmt with expr" {
@@ -472,9 +472,9 @@ test "parser: return-stmt with value parses as Stmt.return_stmt with expr" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .return_stmt);
-    try std.testing.expect(stmt.return_stmt.value != null);
-    try std.testing.expectEqualStrings("42", stmt.return_stmt.value.?.int_lit);
+    try std.testing.expect(stmt.payload == .return_stmt);
+    try std.testing.expect(stmt.payload.return_stmt.value != null);
+    try std.testing.expectEqualStrings("42", stmt.payload.return_stmt.value.?.payload.int_lit);
 }
 
 test "parser: bare return parses as Stmt.return_stmt with null value" {
@@ -487,8 +487,8 @@ test "parser: bare return parses as Stmt.return_stmt with null value" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .return_stmt);
-    try std.testing.expect(stmt.return_stmt.value == null);
+    try std.testing.expect(stmt.payload == .return_stmt);
+    try std.testing.expect(stmt.payload.return_stmt.value == null);
 }
 
 test "parser: qualified enum-variant-ctor expression with no args" {
@@ -503,9 +503,9 @@ test "parser: qualified enum-variant-ctor expression with no args" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .enum_variant_ctor);
-    const evc = init.enum_variant_ctor;
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .enum_variant_ctor);
+    const evc = init.payload.enum_variant_ctor;
     try std.testing.expect(std.mem.eql(u8, evc.enum_name.?, "Direction"));
     try std.testing.expect(std.mem.eql(u8, evc.variant_name, "North"));
     try std.testing.expect(evc.args.len == 0);
@@ -523,14 +523,14 @@ test "parser: qualified enum-variant-ctor with payload args" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .enum_variant_ctor);
-    const evc = init.enum_variant_ctor;
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .enum_variant_ctor);
+    const evc = init.payload.enum_variant_ctor;
     try std.testing.expect(std.mem.eql(u8, evc.enum_name.?, "Shape"));
     try std.testing.expect(std.mem.eql(u8, evc.variant_name, "Circle"));
     try std.testing.expect(evc.args.len == 1);
-    try std.testing.expect(evc.args[0] == .float_lit);
-    try std.testing.expect(std.mem.eql(u8, evc.args[0].float_lit, "2.5"));
+    try std.testing.expect(evc.args[0].payload == .float_lit);
+    try std.testing.expect(std.mem.eql(u8, evc.args[0].payload.float_lit, "2.5"));
 }
 
 test "parser: qualified enum-variant pattern in match" {
@@ -547,7 +547,7 @@ test "parser: qualified enum-variant pattern in match" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const arms = prog.functions[0].body[0].match_stmt.arms;
+    const arms = prog.functions[0].body[0].payload.match_stmt.arms;
     try std.testing.expect(arms.len == 2);
     try std.testing.expect(arms[0].pat == .enum_variant);
     const ev = arms[0].pat.enum_variant;
@@ -571,7 +571,7 @@ test "parser: enum-variant pattern with bindings" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const arms = prog.functions[0].body[0].match_stmt.arms;
+    const arms = prog.functions[0].body[0].payload.match_stmt.arms;
     try std.testing.expect(arms[0].pat == .enum_variant);
     const ev = arms[0].pat.enum_variant;
     try std.testing.expect(ev.bindings != null);
@@ -588,8 +588,8 @@ test "parser: (first, ...rest) produces BindingPattern.rest with before_count" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt.let.pattern.? == .tuple);
-    const tuple_pat = stmt.let.pattern.?.tuple;
+    try std.testing.expect(stmt.payload.let.pattern.? == .tuple);
+    const tuple_pat = stmt.payload.let.pattern.?.tuple;
     try std.testing.expectEqual(@as(usize, 2), tuple_pat.len);
     try std.testing.expectEqualStrings("first", tuple_pat[0].name);
     try std.testing.expect(tuple_pat[1] == .rest);
@@ -605,8 +605,8 @@ test "parser: array [a, ...rest] produces BindingPattern.array with .rest" {
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .let);
-    const pat = stmt.let.pattern.?;
+    try std.testing.expect(stmt.payload == .let);
+    const pat = stmt.payload.let.pattern.?;
     try std.testing.expect(pat == .array);
     const leaves = pat.array;
     try std.testing.expectEqual(@as(usize, 2), leaves.len);
@@ -625,8 +625,8 @@ test "parser: nested (a, (b, ...ir)) produces recursive tuple .pattern with .res
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
     const stmt = prog.functions[0].body[0];
-    try std.testing.expect(stmt == .let);
-    const outer = stmt.let.pattern.?;
+    try std.testing.expect(stmt.payload == .let);
+    const outer = stmt.payload.let.pattern.?;
     try std.testing.expect(outer == .tuple);
     try std.testing.expectEqual(@as(usize, 2), outer.tuple.len);
     try std.testing.expect(outer.tuple[0] == .name);

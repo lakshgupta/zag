@@ -155,6 +155,7 @@ const Codegen = core.Codegen;
         self.destructure_counter = 0;
         self.alloc_counter = 0;
         self.match_counter = 0;
+        self.current_symbol = m.name;
         // Phase 1 codegen-router: env_counter reset mirrors the argv
         // counter pattern so sibling `__env_<N>` temps (one per
         // env_var / getEnv call site) start fresh at `_0` per fn.
@@ -465,6 +466,7 @@ const Codegen = core.Codegen;
         self.destructure_counter = 0;
         self.alloc_counter = 0;
         self.match_counter = 0;
+        self.current_symbol = m.name;
         // Phase 1 codegen-router: env_counter reset mirrors the argv
         // counter pattern above so nested methods get a clean
         // `__env_<N>` sequence starting at `_0`.
@@ -1235,6 +1237,7 @@ const Codegen = core.Codegen;
         // main` would resolve against the most-recent impl's
         // receiver even though there's no `self` in main).
         self.current_receiver_struct_name = null;
+        self.current_symbol = fun.name;
         // Reset the `new`-temp counter at the top of each function so
         // sibling `pub fn` declarations don't reuse the same `__p_<N>`
         // names (zig's redeclaration-error would reject a collision).
@@ -1456,6 +1459,7 @@ const Codegen = core.Codegen;
     pub     fn genTestFun(self: *Codegen, fun: ast.FunDecl) void {
         self.destructure_counter = 0;
         self.type_info_count = 0;
+        self.current_symbol = fun.name;
         self.alloc_counter = 0;
         self.match_counter = 0;
         self.fs_counter = 0;

@@ -2576,14 +2576,14 @@ test "codegen: unqualified brace ctor routes through brace-named-field emit via 
     // through to when isKnownVariant lookup missed).
     try std.testing.expect(prog.functions.len == 1);
     try std.testing.expect(prog.functions[0].body.len == 2);
-    try std.testing.expect(prog.functions[0].body[0] == .let);
-    try std.testing.expect(prog.functions[0].body[0].let.init != null);
-    const init_expr = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init_expr == .enum_variant_ctor);
+    try std.testing.expect(prog.functions[0].body[0].payload == .let);
+    try std.testing.expect(prog.functions[0].body[0].payload.let.init != null);
+    const init_expr = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init_expr.payload == .enum_variant_ctor);
     // LOAD-BEARING: enum_name MUST be null (gap #2 unqualified path).
-    try std.testing.expect(init_expr.enum_variant_ctor.enum_name == null);
-    try std.testing.expect(std.mem.eql(u8, init_expr.enum_variant_ctor.variant_name, "Pair"));
-    try std.testing.expect(init_expr.enum_variant_ctor.args.len == 2);
+    try std.testing.expect(init_expr.payload.enum_variant_ctor.enum_name == null);
+    try std.testing.expect(std.mem.eql(u8, init_expr.payload.enum_variant_ctor.variant_name, "Pair"));
+    try std.testing.expect(init_expr.payload.enum_variant_ctor.args.len == 2);
 
 
     var cg = codegen_mod.Codegen.init();
@@ -2626,9 +2626,13 @@ test "codegen: backed-enum(u8) explicit emits enum(u8) { V = N, ... }" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "Warn = 1,") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "Err = 2,") != null);
     // Sanity: NOT the bare-enum form (`enum {\n    Ok,`) nor the str-
-    // backed struct fallback.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "enum {\n    Ok,") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "struct {") == null);
+    // backed struct fallback. The map table preamble contains `struct {`
+    // (`__ZagMapEntry`) so filter that out before checking.
+    {
+        const map_idx = std.mem.indexOf(u8, zig, "__ZagMapEntry");
+        const check_slice = if (map_idx) |idx| zig[0..idx] else zig;
+        try std.testing.expect(std.mem.indexOf(u8, check_slice, "struct {") == null);
+    }
 }
 
 test "codegen: backed-enum(str) falls back to struct { pub const V = \"...\" }" {

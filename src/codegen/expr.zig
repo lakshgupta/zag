@@ -35,7 +35,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 // ============================================================
 
     pub     fn genExpr(self: *Codegen, expr: ast.Expr) void {
-        switch (expr) {
+        if (expr.loc.line > 0) self.recordLoc(expr.loc, "");
+        switch (expr.payload) {
             .string_lit => |s| {
                 self.write("\"");
                 self.write(s);
@@ -205,7 +206,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     // genBuiltinCall case simultaneously or zig will
                     // hard-error at compile time (the switch is
                     // exhaustiveness-checked).
-                    self.genBuiltinCall(dispatch, c.args);
+                    self.genBuiltinCall(dispatch, c.args, expr.loc);
                 } else {
                     // Generics (docs/16 §"Turbofish"):
                     // `name<type_args...>(regular_args...)` emits
@@ -307,8 +308,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // only — more complex sources like `get_btn().as Trait`
                 // would require a type-inferer to identify the
                 // source; deferred to a Phase 4 widening.
-                if (self.isTrackedTrait(c.type_text) and c.expr.* == .ident) {
-                    const source_ident = c.expr.*.ident;
+                if (self.isTrackedTrait(c.type_text) and c.expr.payload == .ident) {
+                    const source_ident = c.expr.payload.ident;
                     if (self.getSourceTypeName(source_ident)) |source_type| {
                         // Strip leading `*` markers and the `const`
                         // qualifier from the source-type so the
@@ -407,8 +408,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // widen to `.binary` / `.call` operands once the
                 // expression-type-resolution infrastructure lands.
                 const target_zig = zagTypeToZig(c.type_text);
-                if (core.isFloatTypeName(target_zig) and c.expr.* == .ident) {
-                    const op_ident = c.expr.*.ident;
+                if (core.isFloatTypeName(target_zig) and c.expr.payload == .ident) {
+                    const op_ident = c.expr.payload.ident;
                     if (self.getSourceTypeName(op_ident)) |source_type| {
                         if (core.isFloatTypeName(source_type)) {
                             // Single-arg form: zig infers target from
@@ -463,8 +464,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // than a named fn + extra stack frame on every free site).
                 const use_slice_free = blk: {
                     const t = f.target.*;
-                    if (t != .ident) break :blk false;
-                    const tn = self.getSourceTypeName(t.ident) orelse break :blk false;
+                    if (t.payload != .ident) break :blk false;
+                    const tn = self.getSourceTypeName(t.payload.ident) orelse break :blk false;
                     // Slice-shaped: leading `[]` covers `[]u8`, `[]const
                     // u8`, `[]T`, and any future `[]<qualifier> T` shape.
                     if (tn.len >= 2 and tn[0] == '[' and tn[1] == ']') break :blk true;
@@ -875,9 +876,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // fall through to a sentinel -- it writes to self.out_buf
                 // inline -- and skipping it preserves the existing
                 // emit shape for non-builtin method calls.
-                if (mc.target.* == .ident) {
-                    if (builtins.lookupWithRecv(mc.target.*.ident, mc.name, mc.args.len)) |dispatch| {
-                        self.genBuiltinCall(dispatch, mc.args);
+                if (mc.target.payload == .ident) {
+                    if (builtins.lookupWithRecv(mc.target.payload.ident, mc.name, mc.args.len)) |dispatch| {
+                        self.genBuiltinCall(dispatch, mc.args, expr.loc);
                         return;
                     }
                 }
@@ -918,8 +919,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // the value of the final expression via `break :blk`.
                 self.write("(blk: {\n");
                 for (body, 0..) |s, i| {
-                    if (i == body.len - 1 and s == .return_stmt) {
-                        const rs = s.return_stmt;
+                    if (i == body.len - 1 and s.payload == .return_stmt) {
+                        const rs = s.payload.return_stmt;
                         if (rs.value) |v| {
                             self.write("        break :blk ");
                             self.genExpr(v);
@@ -927,9 +928,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         } else {
                             self.genStmt(s, false);
                         }
-                    } else if (i == body.len - 1 and s == .expr_stmt) {
+                    } else if (i == body.len - 1 and s.payload == .expr_stmt) {
                         self.write("        break :blk ");
-                        self.genExpr(s.expr_stmt);
+                        self.genExpr(s.payload.expr_stmt);
                         self.write(";\n");
                     } else {
                         self.genStmt(s, false);
@@ -943,8 +944,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // compile time and yields the return value.
                 self.write("(comptime blk: {\n");
                 for (body, 0..) |s, i| {
-                    if (i == body.len - 1 and s == .return_stmt) {
-                        const rs = s.return_stmt;
+                    if (i == body.len - 1 and s.payload == .return_stmt) {
+                        const rs = s.payload.return_stmt;
                         if (rs.value) |v| {
                             self.write("        break :blk ");
                             self.genExpr(v);
@@ -1009,7 +1010,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // between two slice idents bind one to a `str` literal
                 // first (or we add a `slice_eq` builtin in a followup).
                 if (b.op == .eq or b.op == .ne) {
-                    if (b.lhs.* == .string_lit or b.rhs.* == .string_lit) {
+                    if (b.lhs.payload == .string_lit or b.rhs.payload == .string_lit) {
                         if (b.op == .ne) self.write("!");
                         // Phase 3 (CLI migration) followup: the string-
                         // comparison shim is wrapped in an outer `(` / `)`
@@ -1128,7 +1129,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     // even though the stubbed arms were never reached. `@panic`
     // is the runtime-only equivalent that preserves the loud-fail
     // when-reached intent without the compile-time false positive.
-    pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr) void {
+    pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr, loc: ast.Loc) void {
         switch (dispatch) {
             .argv_get => {
                 // zig 0.16 main-signature migration: argv is no
@@ -1521,6 +1522,17 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .builtin_type_name => {
                 self.write("@typeName(");
                 self.genExpr(args[0]);
+                self.write(")");
+            },
+            .builtin_panic => {
+                self.write("__zag_panic_at(");
+                self.genExpr(args[0]);
+                self.write(", \"");
+                self.write(self.source_path);
+                self.write("\", ");
+                self.writeInt(loc.line);
+                self.write(", ");
+                self.writeInt(loc.col);
                 self.write(")");
             },
         }

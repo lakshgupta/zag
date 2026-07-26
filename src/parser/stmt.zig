@@ -121,7 +121,7 @@ pub fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
                 self.expect(.equals);
                 self.advance(); // consume `const_kw`
                 const block_body = self.parseBlock();
-                if (block_body.len == 0 or block_body[block_body.len - 1] != .return_stmt) {
+                if (block_body.len == 0 or block_body[block_body.len - 1].payload != .return_stmt) {
                     std.debug.print("error:{d}:{d}: const block for '{s}' must end with `return EXPR;`\n", .{
                         binding_loc.line,
                         binding_loc.col,
@@ -134,7 +134,7 @@ pub fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
                 // value-less breaks. The parse-by-parse ReturnStmt parser
                 // accepts `return;` (value=null) for void-returning fns,
                 // but const-blocks always need a value.
-                if (block_body[block_body.len - 1].return_stmt.value == null) {
+                if (block_body[block_body.len - 1].payload.return_stmt.value == null) {
                     std.debug.print("error:{d}:{d}: const block for '{s}' `return` must carry a value (const blocks always evaluate to a value)\n", .{
                         binding_loc.line,
                         binding_loc.col,
@@ -171,7 +171,7 @@ pub fn parseBinding(self: *Parser, kind: ast.BindingKind) Stmt.BindingStmt {
             // an explicit `: T` annotation. Mirrors codegen's
             // `collectTypedBindings` (src/codegen/stmt.zig) which
             // seeds `is_closure = true` for closure init literals.
-            if (initializer == .closure) {
+            if (initializer.payload == .closure) {
                 if (self.closure_binding_count < self.closure_bindings.len) {
                     self.closure_bindings[self.closure_binding_count] = pattern.name;
                     self.closure_binding_count += 1;
@@ -356,6 +356,7 @@ pub fn parseBlock(self: *Parser) []const Stmt {
 
 
 pub fn parseCompoundAssign(self: *Parser, op: ast.Expr.BinaryOp) Stmt.AssignStmt {
+        const name_loc = self.peek().loc;
         const name = self.expectIdent();
         // Consume the OP_EQ token -- parseStmt's lookahead verified the
         // specific tag, but `advance` walks past whatever OP_EQ associate
@@ -365,7 +366,7 @@ pub fn parseCompoundAssign(self: *Parser, op: ast.Expr.BinaryOp) Stmt.AssignStmt
         // Desugar `x OP= rhs` → `x = x OP rhs`. The ident Expr("x") and the
         // `rhs` get lifted into arena-allocated slots via makeBinary so
         // their addresses match the BinaryExpr's pointer convention.
-        const bin_expr = self.makeBinary(op, .{ .ident = name }, rhs);
+        const bin_expr = self.makeBinary(op, Expr{ .payload = .{ .ident = name }, .loc = name_loc }, rhs);
         return .{ .name = name, .value = bin_expr };
     }
 
@@ -385,9 +386,10 @@ pub fn parseErrDefer(self: *Parser) Stmt.ErrDeferStmt {
 
 
 pub fn parseFieldAssign(self: *Parser) Stmt.FieldAssignStmt {
+        const target_loc = self.peek().loc;
         const target_name = self.expectIdent();
         const target = self.arena.alloc(Expr, 1);
-        target[0] = .{ .ident = target_name };
+        target[0] = Expr{ .payload = .{ .ident = target_name }, .loc = target_loc };
         self.expect(.dot);
         const field_name = self.expectIdent();
         self.expect(.equals);
@@ -591,8 +593,9 @@ pub fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
     }
 
 
-pub fn parsePattern(self: *Parser) ast.Pattern {
+    pub fn parsePattern(self: *Parser) ast.Pattern {
         const tok = self.peek();
+        const start_loc = tok.loc;
         switch (tok.tag) {
             .integer_literal => {
                 // Range detection: if literal is followed by .. or ...,
@@ -606,42 +609,43 @@ pub fn parsePattern(self: *Parser) ast.Pattern {
                     const sep = self.tokens[self.pos + 1].tag;
                     const inclusive = sep == .ellipsis;
                     const end_text = self.tokens[self.pos + 2].text;
+                    const end_loc = self.tokens[self.pos + 2].loc;
                     self.advance(); // start
                     self.advance(); // .. or ...
                     self.advance(); // end
                     const start_buf = self.arena.alloc(Expr, 1);
-                    start_buf[0] = .{ .int_lit = start_text };
+                    start_buf[0] = Expr{ .payload = .{ .int_lit = start_text }, .loc = start_loc };
                     const end_buf = self.arena.alloc(Expr, 1);
-                    end_buf[0] = .{ .int_lit = end_text };
+                    end_buf[0] = Expr{ .payload = .{ .int_lit = end_text }, .loc = end_loc };
                     return .{ .range = .{ .start = &start_buf[0], .end = &end_buf[0], .inclusive = inclusive } };
                 }
                 self.advance();
                 const lit_buf = self.arena.alloc(Expr, 1);
-                lit_buf[0] = .{ .int_lit = tok.text };
+                lit_buf[0] = Expr{ .payload = .{ .int_lit = tok.text }, .loc = start_loc };
                 return .{ .literal = &lit_buf[0] };
             },
             .string_literal => {
                 self.advance();
                 const lit_buf = self.arena.alloc(Expr, 1);
-                lit_buf[0] = .{ .string_lit = tok.text };
+                lit_buf[0] = Expr{ .payload = .{ .string_lit = tok.text }, .loc = start_loc };
                 return .{ .literal = &lit_buf[0] };
             },
             .true_kw => {
                 self.advance();
                 const lit_buf = self.arena.alloc(Expr, 1);
-                lit_buf[0] = .{ .bool_lit = true };
+                lit_buf[0] = Expr{ .payload = .{ .bool_lit = true }, .loc = start_loc };
                 return .{ .literal = &lit_buf[0] };
             },
             .false_kw => {
                 self.advance();
                 const lit_buf = self.arena.alloc(Expr, 1);
-                lit_buf[0] = .{ .bool_lit = false };
+                lit_buf[0] = Expr{ .payload = .{ .bool_lit = false }, .loc = start_loc };
                 return .{ .literal = &lit_buf[0] };
             },
             .char_literal => {
                 self.advance();
                 const lit_buf = self.arena.alloc(Expr, 1);
-                lit_buf[0] = .{ .char_lit = tok.text };
+                lit_buf[0] = Expr{ .payload = .{ .char_lit = tok.text }, .loc = start_loc };
                 return .{ .literal = &lit_buf[0] };
             },
             .identifier => {
@@ -861,9 +865,9 @@ pub fn parseStmt(self: *Parser) Stmt {
             // not see the union tag -- it just parses the common shape and
             // returns a BindingStmt; the structural duplication that
             // motivated the refactor lives here at exactly three lines.
-            .let => return .{ .let = self.parseBinding(.let) },
-            .var_kw => return .{ .var_binding = self.parseBinding(.var_binding) },
-            .const_kw => return .{ .const_binding = self.parseBinding(.const_binding) },
+            .let => return Stmt{ .payload = .{ .let = self.parseBinding(.let) }, .loc = tok.loc },
+            .var_kw => return Stmt{ .payload = .{ .var_binding = self.parseBinding(.var_binding) }, .loc = tok.loc },
+            .const_kw => return Stmt{ .payload = .{ .const_binding = self.parseBinding(.const_binding) }, .loc = tok.loc },
             .identifier => {
                 // Multi-form lookahead. statement-leading identifier can be:
                 //   - `name = expr;`           → bare assign (.assign)
@@ -878,13 +882,13 @@ pub fn parseStmt(self: *Parser) Stmt {
                 if (self.pos + 1 < self.tokens.len) {
                     const next = self.tokens[self.pos + 1].tag;
                     if (next == .equals) {
-                        return .{ .assign = self.parseAssign() };
+                        return Stmt{ .payload = .{ .assign = self.parseAssign() }, .loc = tok.loc };
                     }
                     if (compoundOpForTag(next)) |op| {
-                        return .{ .assign = self.parseCompoundAssign(op) };
+                        return Stmt{ .payload = .{ .assign = self.parseCompoundAssign(op) }, .loc = tok.loc };
                     }
                     if (next == .lbracket) {
-                        return .{ .index_assign = self.parseIndexAssign() };
+                        return Stmt{ .payload = .{ .index_assign = self.parseIndexAssign() }, .loc = tok.loc };
                     }
                     // 3-token lookahead for `name . ident =` field-write.
                     // Pattern: ident (current) . dot (next) . ident (n+2) . equals (n+3).
@@ -898,27 +902,27 @@ pub fn parseStmt(self: *Parser) Stmt {
                         self.pos + 3 < self.tokens.len and
                         self.tokens[self.pos + 3].tag == .equals)
                     {
-                        return .{ .field_assign = self.parseFieldAssign() };
+                        return Stmt{ .payload = .{ .field_assign = self.parseFieldAssign() }, .loc = tok.loc };
                     }
                 }
-                return .{ .expr_stmt = self.parseExpr() };
+                return Stmt{ .payload = .{ .expr_stmt = self.parseExpr() }, .loc = tok.loc };
             },
-            .defer_kw => return .{ .defer_stmt = self.parseDefer() },
-            .errdefer_kw => return .{ .errdefer_stmt = self.parseErrDefer() },
-            .unsafe_kw => return .{ .unsafe_block = self.parseUnsafeBlock() },
-            .if_kw => return .{ .if_stmt = self.parseIfBranch() },
-            .while_kw => return .{ .while_stmt = self.parseWhileStmt() },
-            .for_kw => return .{ .for_stmt = self.parseForStmt() },
-            .match_kw => return .{ .match_stmt = self.parseMatchExpr() },
+            .defer_kw => return Stmt{ .payload = .{ .defer_stmt = self.parseDefer() }, .loc = tok.loc },
+            .errdefer_kw => return Stmt{ .payload = .{ .errdefer_stmt = self.parseErrDefer() }, .loc = tok.loc },
+            .unsafe_kw => return Stmt{ .payload = .{ .unsafe_block = self.parseUnsafeBlock() }, .loc = tok.loc },
+            .if_kw => return Stmt{ .payload = .{ .if_stmt = self.parseIfBranch() }, .loc = tok.loc },
+            .while_kw => return Stmt{ .payload = .{ .while_stmt = self.parseWhileStmt() }, .loc = tok.loc },
+            .for_kw => return Stmt{ .payload = .{ .for_stmt = self.parseForStmt() }, .loc = tok.loc },
+            .match_kw => return Stmt{ .payload = .{ .match_stmt = self.parseMatchExpr() }, .loc = tok.loc },
             .break_kw => {
                 self.advance();
-                return .{ .break_stmt = {} };
+                return Stmt{ .payload = .{ .break_stmt = {} }, .loc = tok.loc };
             },
             .continue_kw => {
                 self.advance();
-                return .{ .continue_stmt = {} };
+                return Stmt{ .payload = .{ .continue_stmt = {} }, .loc = tok.loc };
             },
-            .return_kw => return .{ .return_stmt = self.parseReturnStmt() },
+            .return_kw => return Stmt{ .payload = .{ .return_stmt = self.parseReturnStmt() }, .loc = tok.loc },
             .star => {
                 // `*p = value;` dereference-write (zag's mirror of zig
                 // 0.16's `p.* = value;` postfix-deref-write form). 3-token
@@ -953,11 +957,11 @@ pub fn parseStmt(self: *Parser) Stmt {
                     const name = self.expectIdent();
                     self.expect(.equals);
                     const value = self.parseExpr();
-                    return .{ .deref_assign = .{ .name = name, .value = value } };
+                    return Stmt{ .payload = .{ .deref_assign = .{ .name = name, .value = value } }, .loc = tok.loc };
                 }
-                return .{ .expr_stmt = self.parseExpr() };
+                return Stmt{ .payload = .{ .expr_stmt = self.parseExpr() }, .loc = tok.loc };
             },
-            else => return .{ .expr_stmt = self.parseExpr() },
+            else => return Stmt{ .payload = .{ .expr_stmt = self.parseExpr() }, .loc = tok.loc },
         }
     }
 

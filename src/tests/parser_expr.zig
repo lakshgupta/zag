@@ -20,11 +20,11 @@ test "parser: simple binary add" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .binary);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.add, init.binary.op);
-    try std.testing.expect(init.binary.lhs.* == .int_lit);
-    try std.testing.expect(init.binary.rhs.* == .int_lit);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.add, init.payload.binary.op);
+    try std.testing.expect(init.payload.binary.lhs.*.payload == .int_lit);
+    try std.testing.expect(init.payload.binary.rhs.*.payload == .int_lit);
 }
 
 test "parser: precedence — mul binds tighter than add" {
@@ -35,12 +35,12 @@ test "parser: precedence — mul binds tighter than add" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .binary);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.add, init.binary.op);
-    try std.testing.expect(init.binary.lhs.* == .int_lit);
-    try std.testing.expect(init.binary.rhs.* == .binary);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.mul, init.binary.rhs.*.binary.op);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.add, init.payload.binary.op);
+    try std.testing.expect(init.payload.binary.lhs.*.payload == .int_lit);
+    try std.testing.expect(init.payload.binary.rhs.*.payload == .binary);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.mul, init.payload.binary.rhs.*.payload.binary.op);
 }
 
 test "parser: precedence — parens override" {
@@ -51,9 +51,9 @@ test "parser: precedence — parens override" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expectEqual(ast.Expr.BinaryOp.mul, init.binary.op);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.add, init.binary.lhs.*.binary.op);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expectEqual(ast.Expr.BinaryOp.mul, init.payload.binary.op);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.add, init.payload.binary.lhs.*.payload.binary.op);
 }
 
 test "parser: left-associative chain" {
@@ -64,10 +64,10 @@ test "parser: left-associative chain" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expectEqual(ast.Expr.BinaryOp.sub, init.binary.op);
-    try std.testing.expectEqual(ast.Expr.BinaryOp.sub, init.binary.lhs.*.binary.op);
-    try std.testing.expect(init.binary.lhs.*.binary.lhs.* == .int_lit);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expectEqual(ast.Expr.BinaryOp.sub, init.payload.binary.op);
+    try std.testing.expectEqual(ast.Expr.BinaryOp.sub, init.payload.binary.lhs.*.payload.binary.op);
+    try std.testing.expect(init.payload.binary.lhs.*.payload.binary.lhs.*.payload == .int_lit);
 }
 
 test "parser: postfix dot chain produces member_access" {
@@ -79,11 +79,11 @@ test "parser: postfix dot chain produces member_access" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const a_init = prog.functions[0].body[1].let.init.?;
-    try std.testing.expect(a_init == .member_access);
-    try std.testing.expectEqualStrings("x", a_init.member_access.name);
-    try std.testing.expect(a_init.member_access.target.* == .ident);
-    try std.testing.expectEqualStrings("v", a_init.member_access.target.*.ident);
+    const a_init = prog.functions[0].body[1].payload.let.init.?;
+    try std.testing.expect(a_init.payload == .member_access);
+    try std.testing.expectEqualStrings("x", a_init.payload.member_access.name);
+    try std.testing.expect(a_init.payload.member_access.target.*.payload == .ident);
+    try std.testing.expectEqualStrings("v", a_init.payload.member_access.target.*.payload.ident);
 }
 
 test "parser: postfix dot chain produces method_call" {
@@ -97,12 +97,12 @@ test "parser: postfix dot chain produces method_call" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .method_call);
-    try std.testing.expectEqualStrings("length", init.method_call.name);
-    try std.testing.expectEqual(@as(usize, 0), init.method_call.args.len);
-    try std.testing.expect(init.method_call.target.* == .ident);
-    try std.testing.expectEqualStrings("v", init.method_call.target.*.ident);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .method_call);
+    try std.testing.expectEqualStrings("length", init.payload.method_call.name);
+    try std.testing.expectEqual(@as(usize, 0), init.payload.method_call.args.len);
+    try std.testing.expect(init.payload.method_call.target.*.payload == .ident);
+    try std.testing.expectEqualStrings("v", init.payload.method_call.target.*.payload.ident);
 }
 
 test "parser: method_call with positional args parses correctly" {
@@ -116,12 +116,12 @@ test "parser: method_call with positional args parses correctly" {
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
     const prog = p.parse();
-    const init = prog.functions[0].body[0].let.init.?;
-    try std.testing.expect(init == .method_call);
-    try std.testing.expectEqualStrings("Vec3", init.method_call.target.*.ident);
-    try std.testing.expectEqualStrings("new", init.method_call.name);
-    try std.testing.expectEqual(@as(usize, 3), init.method_call.args.len);
-    try std.testing.expect(init.method_call.args[0] == .float_lit);
+    const init = prog.functions[0].body[0].payload.let.init.?;
+    try std.testing.expect(init.payload == .method_call);
+    try std.testing.expectEqualStrings("Vec3", init.payload.method_call.target.*.payload.ident);
+    try std.testing.expectEqualStrings("new", init.payload.method_call.name);
+    try std.testing.expectEqual(@as(usize, 3), init.payload.method_call.args.len);
+    try std.testing.expect(init.payload.method_call.args[0].payload == .float_lit);
 }
 
 test "parser: closure expression |x:T|->T{} produces Expr.closure" {
@@ -133,9 +133,9 @@ test "parser: closure expression |x:T|->T{} produces Expr.closure" {
     const prog = p.parse();
     try std.testing.expect(prog.functions.len == 1);
     try std.testing.expect(prog.functions[0].body.len == 1);
-    const let_stmt = prog.functions[0].body[0].let;
-    try std.testing.expect(let_stmt.init.? == .closure);
-    try std.testing.expect(let_stmt.init.?.closure.params.len == 1);
-    try std.testing.expect(std.mem.eql(u8, let_stmt.init.?.closure.params[0].name, "x"));
-    try std.testing.expect(std.mem.eql(u8, let_stmt.init.?.closure.return_type.?, "i32"));
+    const let_stmt = prog.functions[0].body[0].payload.let;
+    try std.testing.expect(let_stmt.init.?.payload == .closure);
+    try std.testing.expect(let_stmt.init.?.payload.closure.params.len == 1);
+    try std.testing.expect(std.mem.eql(u8, let_stmt.init.?.payload.closure.params[0].name, "x"));
+    try std.testing.expect(std.mem.eql(u8, let_stmt.init.?.payload.closure.return_type.?, "i32"));
 }

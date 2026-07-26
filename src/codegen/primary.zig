@@ -26,7 +26,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 // ============================================================
 
     pub     fn inferZigTypeFromExpr(expr: ast.Expr) []const u8 {
-        return switch (expr) {
+        return switch (expr.payload) {
             .int_lit => "i32",
             .float_lit => "f64",
             .bool_lit => "bool",
@@ -144,8 +144,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     pub fn typeAwareFmtSpec(self: *Codegen, expr: ast.Expr) struct { spec: []const u8, is_optional_byte_slice: bool } {
         // .ident arm: existing typed-binding lookup via
         // type_info_buf (gap #6 widening, unchanged behaviour).
-        if (expr == .ident) {
-            const ident_name = expr.ident;
+        if (expr.payload == .ident) {
+            const ident_name = expr.payload.ident;
             var i: u32 = 0;
             while (i < self.type_info_count) : (i += 1) {
                 if (std.mem.eql(u8, self.type_info_buf[i].name, ident_name)) {
@@ -176,12 +176,12 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         // is set (set by genFreeMethod body entry +
         // genStructDecl/genEnumDecl nested-method loops; reset by
         // genFun body entry + end-of-impl-body emit).
-        if (expr == .member_access) {
+        if (expr.payload == .member_access) {
             const recv_name_opt = self.current_receiver_struct_name;
             if (recv_name_opt == null) return .{ .spec = "any", .is_optional_byte_slice = false };
             const recv_name = recv_name_opt.?;
-            const ma = expr.member_access;
-            if (ma.target.* != .ident) return .{ .spec = "any", .is_optional_byte_slice = false };
+            const ma = expr.payload.member_access;
+            if (ma.target.payload != .ident) return .{ .spec = "any", .is_optional_byte_slice = false };
             for (self.prog.structs) |sd| {
                 if (!std.mem.eql(u8, sd.name, recv_name)) continue;
                 for (sd.fields) |f| {
@@ -253,7 +253,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     // the receiver struct type does. This preserves the user-facing
     // freedom to call their receiver pointees whatever they want.
             pub     fn getTopElements(expr: ast.Expr) []const ast.Expr {
-        return switch (expr) {
+        return switch (expr.payload) {
             .tuple_lit => |els| els,
             .single_tuple_lit => |el_ptr| @as([*]const ast.Expr, @ptrCast(el_ptr))[0..1],
             .named_tuple_lit => |nt| nt.elements,
@@ -263,7 +263,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     }
 
     pub     fn exprContainsFloat(expr: ast.Expr) bool {
-        return switch (expr) {
+        return switch (expr.payload) {
             .float_lit => true,
             .binary => |b| exprContainsFloat(b.lhs.*) or exprContainsFloat(b.rhs.*),
             .unary => |u| exprContainsFloat(u.operand.*),
@@ -273,15 +273,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 
     pub     fn needsIntDivShim(self: *Codegen, b: ast.Expr.BinaryExpr) bool {
         if (b.op != .div and b.op != .mod) return false;
-        if (b.rhs.* != .int_lit) return false;
+        if (b.rhs.payload != .int_lit) return false;
         // Both sides comptime_int → zig folds the bare form at compile time.
         // Skip the shim so the user's source round-trips: `1 / 2 === (1 / 2)`.
-        if (b.lhs.* == .int_lit) return false;
+        if (b.lhs.payload == .int_lit) return false;
         // LHS ident annotated with a float type in the per-function map →
         // `@divTrunc` requires integer args so the shim would miscompile.
         // Skip the wrap and emit the bare form; zig infers the operand
         // types from the binding annotations and accepts `f64 / comptime_int`.
-        if (b.lhs.* == .ident and self.isFloatIdentType(b.lhs.*.ident)) return false;
+        if (b.lhs.payload == .ident and self.isFloatIdentType(b.lhs.payload.ident)) return false;
         return !exprContainsFloat(b.lhs.*);
     }
 
@@ -363,7 +363,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             // `std.process.exit(1)`). The user sees
             // `error:codegen: ...` at compile time rather
             // than zig's downstream parse rejection.
-            switch (c.args[0]) {
+            switch (c.args[0].payload) {
                 .string_lit, .byte_string_lit => |str| {
                     self.write("__zag_print(\"");
                     self.write(str);
@@ -394,7 +394,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     // extra args are logically distinct streams.
                     std.debug.print(
                         "error:codegen: multi-arg print first arg must be a literal format string without `{{...}}` placeholders (got '{s}' with {d} extra arg(s)); rephrase as single-arg template interpolation — e.g., `print(\"range: {{x}}, extra={{extra}}\")` combines format + extras into one template, or split into separate print calls if the extras are logically distinct\n",
-                        .{ @tagName(c.args[0]), c.args.len - 1 },
+                        .{ @tagName(c.args[0].payload), c.args.len - 1 },
                     );
                     std.process.exit(1);
                 },
@@ -402,7 +402,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             return;
         }
         const arg = c.args[0];
-        switch (arg) {
+        switch (arg.payload) {
             .string_lit, .byte_string_lit => |str| {
                 self.write("__zag_print(\"");
                 self.write(str);
