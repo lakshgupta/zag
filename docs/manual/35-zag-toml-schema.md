@@ -82,7 +82,8 @@ zig = "/opt/zig-0.16/zig"
 |------|-----------------------------------------|------------------------|
 | 1    | `[toolchain].zig` from project's `zag.toml` | this project        |
 | 2    | `$ZAG_ZIG_PATH` env var                  | machine-wide         |
-| 3    | Embedded payload (`-Dzig_payload=<path>` at `zag`'s build time) | compile-time vendoring |
+| 3    | `/usr/bin/zig`, `/usr/local/bin/zig`     | system auto-detect   |
+| 4    | Embedded payload (`-Dzig_payload=<path>` at `zag`'s build time) | compile-time vendoring |
 
 The tier order means a project that needs a specific zig (for example, a project pinned to zig 0.13 for ABI-compat with vendored libraries) keeps its setting even when your shell exports `$ZAG_ZIG_PATH` to something different — just like Cargo's `[source.crates-io]` overrides `CARGO_REGISTRIES_*` and rustup's `rust-toolchain.toml` overrides `RUSTUP_TOOLCHAIN`.
 

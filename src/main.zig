@@ -23,7 +23,19 @@ const project_mod = @import("project.zig");
 const toolchain = @import("toolchain.zig");
 const build_options = @import("build_options");
 
-var zig_install_path: []const u8 = "";
+var zig_install_buf: [512]u8 = undefined;
+var zig_install_len: usize = 0;
+
+fn setZigPath(path: []const u8) void {
+    if (path.len < zig_install_buf.len) {
+        @memcpy(zig_install_buf[0..path.len], path);
+        zig_install_len = path.len;
+    }
+}
+
+fn zigPath() []const u8 {
+    return zig_install_buf[0..zig_install_len];
+}
 
 /// Materialized location of the embedded zig payload (when the
 /// `zag` binary was built with `-Dzig_payload=<path>`). Captured
@@ -35,6 +47,15 @@ var zig_install_path: []const u8 = "";
 /// with `zig_install_path` empty and the dispatched cmd exits via
 /// `needZig()`.
 var embedded_zig_path: []const u8 = "";
+
+/// Stable buffer for the resolved zig path — `resolveZigPath` copies
+/// the chosen path here so callers get a persistent slice.
+var zig_path_buf: [512]u8 = undefined;
+var zig_path_len: usize = 0;
+var zig_install_path: []const u8 = "";
+fn updateZigPathAlias() void {
+    zig_install_path = zig_path_buf[0..zig_path_len];
+}
 
 pub fn main() !void {
     env_path.readEnviron();
@@ -323,15 +344,26 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     }
 
     // Use zig build system with the generated build.zig
-    const build_step: []const u8 = if (std.mem.eql(u8, mode, "run")) "run" else "build";
-
-    const build_code = if (release)
-        try runCommand(null, &.{ zig_install_path, "build", build_step, "--build-file", "build/gen/build.zig", "-Doptimize=ReleaseFast" })
-    else
-        try runCommand(null, &.{ zig_install_path, "build", build_step, "--build-file", "build/gen/build.zig" });
-    if (build_code != 0) {
-        std.debug.print("error: zig build failed (exit {d})\n", .{build_code});
-        std.process.exit(build_code);
+    // run → `zig build run --build-file ...`
+    // build → `zig build --build-file ...` (default install step)
+    if (std.mem.eql(u8, mode, "run")) {
+        const build_code = if (release)
+            try runCommand(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig", "-Doptimize=ReleaseFast" })
+        else
+            try runCommand(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig" });
+        if (build_code != 0) {
+            std.debug.print("error: zig build failed (exit {d})\n", .{build_code});
+            std.process.exit(build_code);
+        }
+    } else {
+        const build_code = if (release)
+            try runCommand(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig", "-Doptimize=ReleaseFast" })
+        else
+            try runCommand(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig" });
+        if (build_code != 0) {
+            std.debug.print("error: zig build failed (exit {d})\n", .{build_code});
+            std.process.exit(build_code);
+        }
     }
 
     if (std.mem.eql(u8, mode, "check")) {
@@ -427,12 +459,12 @@ fn generateProjectFiles() !void {
 
 /// Resolve the zig compiler binary path that the current
 /// invocation will use, applying the project's `[toolchain].zig`
-/// override at highest priority and falling back through the env
-/// var to the embedded payload in that order. Mirrors
-/// `docs/manual/35-zag-toml-schema.md` §[toolchain]:
-///   1. `[toolchain].zig` from `cfg.zig_path` (project-specific file)
-///   2. `$ZAG_ZIG_PATH` env var                              (machine-wide)
-///   3. `embedded_zig_path` from `-Dzig_payload=...`        (compile-time)
+/// override at highest priority and falling back through env var,
+/// common system paths, and the embedded payload:
+///   1. `[toolchain].zig` from `cfg.zig_path` (project-specific)
+///   2. `$ZAG_ZIG_PATH` env var                    (machine-wide)
+///   3. /usr/bin/zig, /usr/local/bin/zig           (auto-detect)
+///   4. `embedded_zig_path` from `-Dzig_payload=`   (compile-time)
 ///
 /// Called from each cmd-branch that uses zig (cmdRun / cmdBuild /
 /// cmdCheck / cmdTest / leafProcess's `check`-via-file flow) AFTER
@@ -447,31 +479,34 @@ fn generateProjectFiles() !void {
 /// the all-three-empty case (build without `-Dzig_payload` AND no
 /// `$ZAG_ZIG_PATH` AND no `zag.toml` -- typical cross-distro
 /// installs that expect a per-machine zig binary).
+
 fn resolveZigPath(cfg: ?project_mod.ProjectConfig) void {
-    // 1. Project-level override (highest priority). A user-set
-    //    `[toolchain].zig` in the current project's `zag.toml`
-    //    wins regardless of any env-var override -- this matches
-    //    Cargo's `[source.crates-io]` > `CARGO_REGISTRIES_*`
-    //    ordering and rustup's `rust-toolchain.toml` > `RUSTUP_TOOLCHAIN`
-    //    ordering: project-contextual config beats machine-wide env.
+    zig_path_len = 0;
+    // 1. Project-level override.
     if (cfg) |c| {
-        if (c.zig_path) |zp| {
-            zig_install_path = zp;
-            return;
-        }
+        if (c.zig_path) |zp| { zig_path_len = @min(zp.len, zig_path_buf.len); @memcpy(zig_path_buf[0..zig_path_len], zp); updateZigPathAlias(); return; }
     }
     // 2. Machine-wide env override.
-    if (env_path.getenv("ZAG_ZIG_PATH")) |zp| {
-        zig_install_path = zp;
-        return;
+    if (env_path.getenv("ZAG_ZIG_PATH")) |zp| { zig_path_len = @min(zp.len, zig_path_buf.len); @memcpy(zig_path_buf[0..zig_path_len], zp); updateZigPathAlias(); return; }
+    // 3. Auto-detect common paths.
+    const search_paths = [_][]const u8{ "/usr/bin/zig", "/usr/local/bin/zig", "/usr/local/zig/zig" };
+    for (search_paths) |p| {
+        if (posix.openat(posix.AT.FDCWD, p, .{ .ACCMODE = .RDONLY }, 0)) |fd| {
+            _ = std.os.linux.close(fd);
+            zig_path_len = @min(p.len, zig_path_buf.len); @memcpy(zig_path_buf[0..zig_path_len], p); updateZigPathAlias(); return;
+        } else |_| {}
     }
-    // 3. Embedded payload (lowest priority). Populated at startup
-    //    via `toolchain.materializeZigToCache` against
-    //    `build_options.zig_payload` -- only present when the
-    //    compiler binary was built with `-Dzig_payload=<path>`.
+    if (env_path.getenv("HOME")) |home| {
+        var home_buf: [512]u8 = undefined;
+        const home_zig = std.fmt.bufPrint(&home_buf, "{s}/.local/zig/zig", .{home}) catch "";
+        if (posix.openat(posix.AT.FDCWD, home_zig, .{ .ACCMODE = .RDONLY }, 0)) |fd| {
+            _ = std.os.linux.close(fd);
+            zig_path_len = @min(home_zig.len, zig_path_buf.len); @memcpy(zig_path_buf[0..zig_path_len], home_zig); updateZigPathAlias(); return;
+        } else |_| {}
+    }
+    // 4. Embedded payload.
     if (embedded_zig_path.len > 0) {
-        zig_install_path = embedded_zig_path;
-        return;
+        zig_path_len = @min(embedded_zig_path.len, zig_path_buf.len); @memcpy(zig_path_buf[0..zig_path_len], embedded_zig_path); updateZigPathAlias(); return;
     }
 }
 
@@ -485,23 +520,13 @@ fn hasZagExt(name: []const u8) bool {
 }
 
 fn needZig() noreturn {
-    // Tri-clause help line: enumerate the three resolution tiers
-    // the user can configure so the failure path itself is
-    // discoverability for the v2.1 `[toolchain].zig` project-level
-    // override. The priority chain order (toml > env > embedded)
-    // matches the docs/manual/35-zag-toml-schema.md §[toolchain]
-    // description.
-    //
-    // Multi-line literal (zig 0.16 `\\` raw-string syntax) sidesteps
-    // the `++` operator requirements (must be at comptime on
-    // `*const u8` literals) and gives one self-contained
-    // print-and-exit call site.
     std.debug.print(
         \\error: zig compiler not found.
         \\  resolution order (each tier may hold the answer):
         \\    1. project-level: `[toolchain] zig = "..."` in zag.toml
         \\    2. machine-wide:  $ZAG_ZIG_PATH=/path/to/zig
-        \\    3. compiled-in:   build zag with -Dzig_payload=<path>
+        \\    3. auto-detect:    /usr/bin/zig, /usr/local/bin/zig, $HOME/.local/zig/zig
+        \\    4. compiled-in:   build zag with -Dzig_payload=<path>
         \\
     , .{});
     std.process.exit(1);
