@@ -54,13 +54,17 @@ impl Vec3 {
 
 ## Usage
 
+Dunder methods are called directly — automatic desugaring (`a + b` → `a.__add__(b)`) requires a type resolver not yet implemented:
+
 ```
-let c = a + b;           # desugars to Vec3.__add__(a, b)
-let d = a - b;           # desugars to Vec3.__sub__(a, b)
-let e = a * 2.0;         # desugars to Vec3.__mul__(a, 2.0)
-let same = a == b;       # desugars to Vec3.__eq__(a, b)
-let val = v[0];          # desugars to Vec3.__index__(v, 0)
+let c = a.__add__(b);      # Vec2.__add__(a, b)
+let d = a.__sub__(b);      # Vec2.__sub__(a, b)
+let e = a.__mul__(2.0);    # Vec2.__mul__(a, 2.0)
+let same = a.__eq__(b);    # Vec2.__eq__(a, b)
+let val = v.__index__(0);  # Vec2.__index__(v, 0)
 ```
+
+Once the type resolver lands, these will desugar to `a + b`, `a - b`, `a * 2.0`, `a == b`, `v[0]`.
 
 ## Operator Methods Participate in Overload Resolution
 

@@ -3245,3 +3245,43 @@ test "codegen: type_name(T) emits @typeName(T)" {
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@typeName(i32)") != null);
 }
+
+test "codegen: if let Option.Some(val) emits if (opt) |val| capture" {
+    const src =
+        \\fun f() {
+        \\    let opt: Option<i32> = Option.Some(10);
+        \\    if let Option.Some(val) = opt {
+        \\        print("{val}");
+        \\    }
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // if let emits zig's if (expr) |capture|
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (opt) |val| {") != null);
+}
+
+test "codegen: while let Option.Some(val) emits while (expr) |val| capture" {
+    const src =
+        \\fun f() {
+        \\    let opt: Option<i32> = Option.Some(10);
+        \\    while let Option.Some(val) = opt {
+        \\        print("{val}");
+        \\    }
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // while let emits zig's while (expr) |capture|
+    try std.testing.expect(std.mem.indexOf(u8, zig, "while (opt) |val| {") != null);
+}

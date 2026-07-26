@@ -142,45 +142,75 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("    // }\n");
             },
             .if_stmt => |ifs| {
-                // Statement form: `if cond { … } else …` rendered with
-                // zig's `if`/`else` keyword directly. The recursive
-                // `else_kind` union walks the chain so `else if …`, `else`,
-                // and bare (`none`) all render uniformly via `genElseBranch`.
-                //
-                // IMPORTANT: do NOT emit literal `(` / `)` around the
-                // condition. The `.binary` codegen path always wraps its
-                // emission in `(...)` (either `(lhs op rhs)` on the
-                // arithmetic surface or `(std.mem.eql(u8, lhs, rhs))` on
-                // the Phase 3 string-comparison shim) so adding outer
-                // parens would produce `if ((x > 0)) {` (one extra paren
-                // pair) and break substring assertion tests like the
-                // docs/06 pin tests. For an identifier cond (`if cond { … }`)
-                // no outer paren is needed; the form `if cond {` is
-                // exactly what zig accepts.
-                self.write("    if ");
-                self.genExpr(ifs.cond);
-                self.write(" {\n");
-                for (ifs.then_body) |s| self.genStmt(s, false);
-                self.write("    }");
-                self.genElseBranch(ifs.else_kind);
-                self.write("\n");
+                if (ifs.is_if_let) {
+                    self.write("    if (");
+                    self.genExpr(ifs.cond);
+                    self.write(") |");
+                    // Write the capture name from the pattern
+                    const pat = ifs.if_let_pat;
+                    if (pat == .enum_variant) {
+                        const ev = pat.enum_variant;
+                        if (ev.bindings) |binds| {
+                            if (binds.len > 0 and binds[0] != null) {
+                                self.write(binds[0].?);
+                            } else {
+                                self.write("_");
+                            }
+                        } else {
+                            self.write("_");
+                        }
+                    } else if (pat == .ident) {
+                        self.write(pat.ident);
+                    } else {
+                        self.write("_");
+                    }
+                    self.write("| {\n");
+                    for (ifs.then_body) |s| self.genStmt(s, false);
+                    self.write("    }");
+                    self.genElseBranch(ifs.else_kind);
+                    self.write("\n");
+                } else {
+                    self.write("    if ");
+                    self.genExpr(ifs.cond);
+                    self.write(" {\n");
+                    for (ifs.then_body) |s| self.genStmt(s, false);
+                    self.write("    }");
+                    self.genElseBranch(ifs.else_kind);
+                    self.write("\n");
+                }
             },
             .while_stmt => |ws| {
-                // Plain `while cond { … }` mirrors zig directly. Cond
-                // and body are both standard zig, so no shim is needed.
-                //
-                // Same outer-paren caveat as `.if_stmt` above: genExpr
-                // always wraps `.binary` in `(...)` (either
-                // `(lhs op rhs)` on arithmetic or `(std.mem.eql(u8, ...))`
-                // on the Phase 3 string-comparison shim), so emitting
-                // literal `(` / `)` around the cond would produce
-                // `while ((i < 10)) {` (double parens) breaking substring
-                // assertions. Drop the wrappers.
-                self.write("    while ");
-                self.genExpr(ws.cond);
-                self.write(" {\n");
-                for (ws.body) |s| self.genStmt(s, false);
-                self.write("    }\n");
+                if (ws.is_while_let) {
+                    self.write("    while (");
+                    self.genExpr(ws.cond);
+                    self.write(") |");
+                    const pat = ws.while_let_pat;
+                    if (pat == .enum_variant) {
+                        const ev = pat.enum_variant;
+                        if (ev.bindings) |binds| {
+                            if (binds.len > 0 and binds[0] != null) {
+                                self.write(binds[0].?);
+                            } else {
+                                self.write("_");
+                            }
+                        } else {
+                            self.write("_");
+                        }
+                    } else if (pat == .ident) {
+                        self.write(pat.ident);
+                    } else {
+                        self.write("_");
+                    }
+                    self.write("| {\n");
+                    for (ws.body) |s| self.genStmt(s, false);
+                    self.write("    }\n");
+                } else {
+                    self.write("    while ");
+                    self.genExpr(ws.cond);
+                    self.write(" {\n");
+                    for (ws.body) |s| self.genStmt(s, false);
+                    self.write("    }\n");
+                }
             },
             .for_stmt => |fs| {
                 // `for (iter) |pat| { … }`. The iter expression is emitted

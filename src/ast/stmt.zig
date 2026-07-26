@@ -239,6 +239,10 @@ pub const Stmt = union(enum) {
         cond: Expr,
         then_body: []const Stmt,
         else_kind: IfElseKind,
+        /// True when `if let` syntax was used.
+        is_if_let: bool = false,
+        /// Pattern from `if let Pattern = expr`. Only valid when is_if_let.
+        if_let_pat: Pattern = undefined,
 
         pub const IfElseKind = union(enum) {
             none: void,
@@ -254,6 +258,10 @@ pub const Stmt = union(enum) {
     pub const WhileStmt = struct {
         cond: Expr,
         body: []const Stmt,
+        /// True when `while let` syntax was used.
+        is_while_let: bool = false,
+        /// Pattern from `while let Pattern = expr`. Only valid when is_while_let.
+        while_let_pat: Pattern = undefined,
     };
 
     /// `for pat in iter { stmts... }` form. Pattern is the one-element

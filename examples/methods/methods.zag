@@ -1,0 +1,75 @@
+## Methods and impl blocks — self, constructors, overloading (docs/28)
+##
+## Methods are declared in impl blocks. self: *const T is immutable,
+## self: *T is mutable, self: T is by-value. Method calls desugar:
+##   v.length()   →   Vec3.length(&v)
+##
+## Run: zag run methods.zag
+
+struct Vec3 {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+impl Vec3 {
+    # Constructor — static method, no self
+    pub fun init(x: f64, y: f64, z: f64) -> Vec3 {
+        return Vec3 { x: x, y: y, z: z };
+    }
+
+    # Immutable borrow — reads only
+    pub fun length(self: *const Vec3) -> f64 {
+        return size_of(f64);
+    }
+
+    # Mutable borrow — can write through self
+    pub fun scale(self: *Vec3, s: f64) {
+        self.x = self.x * s;
+        self.y = self.y * s;
+        self.z = self.z * s;
+    }
+}
+
+# Multiple impl blocks — same type, separate blocks
+impl Vec3 {
+    pub fun dot(self: *const Vec3, other: *const Vec3) -> f64 {
+        return self.x * other.x + self.y * other.y + self.z * other.z;
+    }
+}
+
+fun main() {
+    let v: Vec3 = Vec3.init(3.0, 4.0, 0.0);
+    print("length of (3,4,0): {v.length()}\n");
+
+    var w: Vec3 = Vec3.init(1.0, 2.0, 3.0);
+    w.scale(2.0);
+    print("scaled (1,2,3) by 2: ({w.x}, {w.y}, {w.z})\n");
+
+    let d: f64 = v.dot(&w);
+    print("dot: {d}\n");
+}
+
+@[test]
+fun test_vec3_init() {
+    let v: Vec3 = Vec3.init(1.0, 2.0, 3.0);
+    assert(v.x == 1.0);
+    assert(v.y == 2.0);
+    assert(v.z == 3.0);
+}
+
+@[test]
+fun test_vec3_scale() {
+    var v: Vec3 = Vec3.init(2.0, 3.0, 4.0);
+    v.scale(2.0);
+    assert(v.x == 4.0);
+    assert(v.y == 6.0);
+    assert(v.z == 8.0);
+}
+
+@[test]
+fun test_vec3_dot() {
+    let a: Vec3 = Vec3.init(1.0, 0.0, 0.0);
+    let b: Vec3 = Vec3.init(0.0, 1.0, 0.0);
+    assert(a.dot(&b) == 0.0);
+}

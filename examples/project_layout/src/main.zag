@@ -1,14 +1,26 @@
-## src/main.zag — binary entry point for cfgtool.
+## Minimal zag project — two files, one command (docs/34)
 ##
-## Stands alone in the fixture: the worked example imports
-## `internal_tls` here, but the current compiler does not yet plumb
-## `path = "..."` deps through the import resolver (that work ships
-## alongside the v0.1 dep CLI). Until then, the fixture's main.zag
-## is intentionally dep-free so `examples/run_all.sh` keeps passing.
+## The smallest possible zag project: zag.toml + src/main.zag.
+## Run from the project root:
+##   zag run        → compile + execute
+##   zag build      → compile only
+##   zag generate   → emit zig to build/gen/
+##   zag test       → run @[test] functions
 ##
-## The metafiles (zag.toml + zag.lock) carry the project-layout
-## story; the .zag source stays trivially runnable.
+## This example is the on-disk fixture matching the docs/34
+## "Quick Start" section.
+
+fun add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
 
 fun main() {
-    print("cfgtool v0.1.0\n");
+    print("hello from zag project\n");
+    print("add(2, 3) = {add(2, 3)}\n");
+}
+
+@[test]
+fun test_add() {
+    assert(add(2, 3) == 5);
+    assert(add(-1, 1) == 0);
 }

@@ -435,6 +435,34 @@ pub fn parseForStmt(self: *Parser) Stmt.ForStmt {
 pub fn parseIfBranch(self: *Parser) Stmt.IfStmt {
         const start_loc = self.peek().loc;
         self.expect(.if_kw);
+        // `if let Pattern = expr { body } else { ... }`
+        // Desugar at codegen: match scrutinee { Pattern => body, _ => {} }
+        if (self.peek().tag == .let) {
+            self.advance(); // consume let
+            const pattern = self.parsePattern();
+            self.expect(.equals);
+            const scrutinee = self.parseExpr();
+            self.expect(.lbrace);
+            const then_body = self.parseStmtList();
+            self.expect(.rbrace);
+            var else_kind: Stmt.IfStmt.IfElseKind = .{ .none = {} };
+            if (self.peek().tag == .else_kw) {
+                self.advance();
+                if (self.peek().tag == .if_kw) {
+                    const inner = self.parseIfBranch();
+                    const boxed = self.arena.alloc(Stmt.IfStmt, 1);
+                    boxed[0] = inner;
+                    else_kind = .{ .if_chain = &boxed[0] };
+                } else {
+                    self.expect(.lbrace);
+                    const else_body = self.parseStmtList();
+                    self.expect(.rbrace);
+                    else_kind = .{ .block = else_body };
+                }
+            }
+            _ = start_loc;
+            return .{ .cond = scrutinee, .then_body = then_body, .else_kind = else_kind, .is_if_let = true, .if_let_pat = pattern };
+        }
         // Suppress struct-literal parsing in if-condition position. The
         // default `allow_struct_lit = true` everywhere; the principled
         // carve-out is the EXACT list of "block-start `{` required" sites
@@ -967,6 +995,20 @@ pub fn parseUnsafeBlock(self: *Parser) []const Stmt {
 
 pub fn parseWhileStmt(self: *Parser) Stmt.WhileStmt {
         self.expect(.while_kw);
+        // `while let Pattern = expr { body }`
+        if (self.peek().tag == .let) {
+            self.advance();
+            const pattern = self.parsePattern();
+            self.expect(.equals);
+            const scrutinee = blk: {
+                const prev = self.allow_struct_lit;
+                defer self.allow_struct_lit = prev;
+                self.allow_struct_lit = false;
+                break :blk self.parseExpr();
+            };
+            const body = self.parseBlock();
+            return .{ .cond = scrutinee, .body = body, .is_while_let = true, .while_let_pat = pattern };
+        }
         // Suppress struct-literal parsing in while-condition position.
         // Mirrors parseIfBranch: the immediately-following `{` must be
         // the while body, not a struct-literal payload. See

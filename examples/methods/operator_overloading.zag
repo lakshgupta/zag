@@ -1,0 +1,85 @@
+## Operator methods — dunder pattern (docs/30)
+##
+## Define methods like __add__, __sub__, __eq__ on custom types.
+## The methods work as regular calls: v.__add__(u), a.__eq__(b).
+## Automatic operator desugaring (a + b → a.__add__(b)) requires
+## a type resolver not yet available — use direct method calls.
+##
+## Run: zag run operator_overloading.zag
+
+struct Vec2 {
+    x: f64,
+    y: f64,
+}
+
+impl Vec2 {
+    pub fun init(x: f64, y: f64) -> Vec2 {
+        return Vec2 { x: x, y: y };
+    }
+
+    pub fun __add__(a: Vec2, b: Vec2) -> Vec2 {
+        return Vec2 { x: a.x + b.x, y: a.y + b.y };
+    }
+
+    pub fun __sub__(a: Vec2, b: Vec2) -> Vec2 {
+        return Vec2 { x: a.x - b.x, y: a.y - b.y };
+    }
+
+    pub fun __mul__(a: Vec2, s: f64) -> Vec2 {
+        return Vec2 { x: a.x * s, y: a.y * s };
+    }
+
+    pub fun __eq__(a: Vec2, b: Vec2) -> bool {
+        return a.x == b.x and a.y == b.y;
+    }
+
+    pub fun __index__(self: *const Vec2, i: usize) -> f64 {
+        return match i {
+            0 => self.x,
+            1 => self.y,
+            _ => 0.0,
+        };
+    }
+}
+
+fun main() {
+    let a: Vec2 = Vec2.init(1.0, 2.0);
+    let b: Vec2 = Vec2.init(3.0, 4.0);
+
+    let c: Vec2 = a.__add__(b);
+    let d: Vec2 = a.__sub__(b);
+    let e: Vec2 = a.__mul__(2.0);
+    let same: bool = a.__eq__(b);
+    let val: f64 = a.__index__(0);
+
+    print("add: ({c.x}, {c.y})\n");
+    print("sub: ({d.x}, {d.y})\n");
+    print("mul: ({e.x}, {e.y})\n");
+    print("eq: {same}\n");
+    print("index(0): {val}\n");
+}
+
+@[test]
+fun test_vec2_add() {
+    let a: Vec2 = Vec2.init(1.0, 2.0);
+    let b: Vec2 = Vec2.init(3.0, 4.0);
+    let c: Vec2 = a.__add__(b);
+    assert(c.x == 4.0);
+    assert(c.y == 6.0);
+}
+
+@[test]
+fun test_vec2_eq() {
+    let a: Vec2 = Vec2.init(1.0, 2.0);
+    let b: Vec2 = Vec2.init(1.0, 2.0);
+    let c: Vec2 = Vec2.init(3.0, 4.0);
+    assert(a.__eq__(b));
+    assert(!a.__eq__(c));
+}
+
+@[test]
+fun test_vec2_index() {
+    let a: Vec2 = Vec2.init(5.0, 7.0);
+    assert(a.__index__(0) == 5.0);
+    assert(a.__index__(1) == 7.0);
+}

@@ -130,7 +130,7 @@ impl Config {
         };
     }
 
-    pub fun new(host: str, port: u16) -> Config {
+    pub fun init(host: str, port: u16) -> Config {
         return Config {
             host: host,
             port: port,

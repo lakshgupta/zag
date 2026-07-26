@@ -1,0 +1,20 @@
+## Building a zag project — workflow reference (docs/31)
+##
+## This example demonstrates a typical zag project lifecycle.
+##
+## Commands (run from the project root):
+##   zag init myproject          create a new project
+##   zag build                   compile (debug, with symbols)
+##   zag build --release         compile (optimized)
+##   zag run                     compile + run
+##   zag run --release           compile + run optimized
+##   zag generate                emit zig to build/gen/
+##   zag test                    run tests (@[test] functions)
+
+fun add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fun main() {
+    print("add(2, 3) = {add(2, 3)}\n");
+}

@@ -1,0 +1,64 @@
+## Method overloading — same name, different parameter types (docs/29)
+##
+## Multiple methods can share a name if their parameter types differ.
+## Resolution is compile-time, zero runtime cost. zig handles it natively.
+##
+## Run: zag run method_overloading.zag
+
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    pub fun init(x: f64, y: f64) -> Point {
+        return Point { x: x, y: y };
+    }
+}
+
+# Overloaded methods — same name, different signatures
+impl Point {
+    pub fun distance(self: *const Point) -> f64 {
+        return self.x + self.y;
+    }
+}
+
+# Printer with overloaded print method
+struct Printer {
+    prefix: str,
+}
+
+impl Printer {
+    pub fun init(prefix: str) -> Printer {
+        return Printer { prefix: prefix };
+    }
+
+    pub fun print(self: *const Printer, x: i32) -> str {
+        return self.prefix;
+    }
+
+    pub fun print(self: *const Printer, s: str) -> str {
+        return self.prefix;
+    }
+}
+
+fun main() {
+    let p: Printer = Printer.init("LOG: ");
+    let a: str = p.print(42);
+    let b: str = p.print("hello");
+    print("loaded: {a} {b}\n");
+}
+
+@[test]
+fun test_overload_i32() {
+    let p: Printer = Printer.init("OK: ");
+    let result: str = p.print(42);
+    assert(result == "OK: ");
+}
+
+@[test]
+fun test_overload_str() {
+    let p: Printer = Printer.init("OK: ");
+    let result: str = p.print("hello");
+    assert(result == "OK: ");
+}

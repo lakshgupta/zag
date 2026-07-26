@@ -1,0 +1,83 @@
+## Pattern matching — match, if let, while let (docs/27)
+##
+## match: exhaustive matching on values, ranges, and enum variants.
+## if let: single-pattern match with optional else.
+## while let: loop while a pattern matches.
+##
+## Run: zag run pattern_matching.zag
+
+# Variant patterns
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+
+# Option with match
+fun describe_opt(opt: Option<i32>) -> str {
+    return match opt {
+        Option.Some(val) => "some",
+        Option.None      => "none",
+    };
+}
+
+# if let — single pattern match
+fun maybe_double(opt: Option<i32>) -> i32 {
+    if let Option.Some(val) = opt {
+        return val * 2;
+    }
+    return 0;
+}
+
+fun main() {
+    let opt: Option<i32> = Option.Some(21);
+    print("describe: {describe_opt(opt)}\n");
+    print("maybe_double: {maybe_double(opt)}\n");
+
+    let none: Option<i32> = Option.None;
+    print("maybe_double none: {maybe_double(none)}\n");
+}
+
+@[test]
+fun test_match_literals() {
+    let x: i32 = 2;
+    let result: str = match x {
+        0    => "zero",
+        1    => "one",
+        2..9 => "digit",
+        _    => "other",
+    };
+    assert(result == "digit");
+}
+
+@[test]
+fun test_match_wildcard() {
+    let x: i32 = 99;
+    let result: str = match x {
+        0 => "zero",
+        _ => "other",
+    };
+    assert(result == "other");
+}
+
+@[test]
+fun test_if_let_some() {
+    let opt: Option<i32> = Option.Some(10);
+    if let Option.Some(val) = opt {
+        assert(val == 10);
+        return;
+    }
+    assert(false);
+}
+
+@[test]
+fun test_if_let_none() {
+    let opt: Option<i32> = Option.None;
+    if let Option.Some(val) = opt {
+        assert(false);
+        return;
+    }
+    # none branch — make sure we get here
+    assert(true);
+}
