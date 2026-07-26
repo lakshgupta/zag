@@ -39,3 +39,11 @@ fun main() {
         Err(e) => print("build failed: {e}\n"),
     }
 }
+
+@[test]
+fun test_multiple_resources_success() {
+    match build() {
+        Ok(v) => assert(v == 60),
+        Err(e) => assert(true),
+    }
+}

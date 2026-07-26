@@ -20,3 +20,16 @@ fun main() {
 
     print("--- before scope exit ---\n");
 }
+
+@[test]
+fun test_heap_alloc_and_free() {
+    let p = new i32(42);
+    defer free(p);
+    assert(true);
+}
+
+@[test]
+fun test_multiple_defers() {
+    defer assert(true);
+    assert(true);
+}

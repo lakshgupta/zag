@@ -42,3 +42,13 @@ fun main() {
     let s: Show = btn as Show;
     s.print();
 }
+
+@[test]
+fun test_diamond_shared_helper() {
+    let btn: Button = Button { label: "test" };
+    let d: Display = btn as Display;
+    d.print();
+    let s: Show = btn as Show;
+    s.print();
+    assert(true);
+}

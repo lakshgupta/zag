@@ -42,3 +42,13 @@ fun main() {
     let c: Clickable = btn as Clickable;
     c.click();
 }
+
+@[test]
+fun test_multi_impl_blocks() {
+    let btn: Button = Button { label: "test" };
+    let d: Drawable = btn as Drawable;
+    d.draw();
+    let c: Clickable = btn as Clickable;
+    c.click();
+    assert(true);
+}

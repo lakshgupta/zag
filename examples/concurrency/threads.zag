@@ -33,3 +33,25 @@ fun main() {
     let val: i32 = load(counter);
     print("counter = {val}\n");
 }
+
+@[test]
+fun test_thread_spawn_join() {
+    let h1 = spawn(worker_hello, ());
+    join(h1);
+    assert(true);
+}
+
+@[test]
+fun test_thread_increment() {
+    let counter: *i32 = new i32(0);
+    defer free(counter);
+
+    let h2 = spawn(worker_increment, (counter));
+    let h3 = spawn(worker_increment, (counter));
+
+    join(h2);
+    join(h3);
+
+    let val: i32 = load(counter);
+    assert(val == 2);
+}

@@ -72,3 +72,10 @@ fun main() {
     let c: Shape = Shape.Circle(2.0);
     print(c);
 }
+
+@[test]
+fun test_enum_direction() {
+    let d: Direction = Direction.North;
+    assert(Direction.opposite(d) == Direction.South);
+    assert(Direction.opposite(Direction.East) == Direction.West);
+}

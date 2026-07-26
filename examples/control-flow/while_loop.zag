@@ -31,3 +31,12 @@ fun main() {
         print("kept {skipped}\n");
     }
 }
+
+@[test]
+fun test_while_loop_count() {
+    var i: i32 = 0;
+    while i < 5 {
+        i = i + 1;
+    }
+    assert(i == 5);
+}

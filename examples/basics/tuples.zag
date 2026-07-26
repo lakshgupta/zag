@@ -64,3 +64,19 @@ fun main() {
     print("{head}\n");
     print("{tail}\n");
 }
+
+@[test]
+fun test_tuple_access() {
+    let point = (x: 10, y: 20);
+    assert(point.x == 10);
+    assert(point.y == 20);
+
+    let pair = (1, 2);
+    let (a, b) = pair;
+    assert(a == 1);
+    assert(b == 2);
+
+    let single = (42,);
+    let (v) = single;
+    assert(v == 42);
+}

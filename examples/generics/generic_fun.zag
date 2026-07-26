@@ -83,3 +83,32 @@ fun main() {
     let pair_label: str = pair<i32, str>(7, "zag");
     print("pair<i32, str>(7, zag) = {pair_label}\n");
 }
+
+@[test]
+fun test_generic_identity() {
+    let val: i32 = identity<i32>(42);
+    assert(val == 42);
+    let s: str = identity<str>("hello");
+    assert(s == "hello");
+}
+
+@[test]
+fun test_generic_max() {
+    let a: i32 = max<i32>(3, 5);
+    assert(a == 5);
+    let b: f64 = max<f64>(1.5, 2.5);
+    assert(b == 2.5);
+}
+
+@[test]
+fun test_generic_fill() {
+    let zeros: [4]i32 = fill<i32, 4>(0);
+    assert(zeros[0] == 0);
+    assert(zeros[3] == 0);
+}
+
+@[test]
+fun test_generic_pair() {
+    let label: str = pair<i32, str>(7, "zag");
+    assert(label == "ok");
+}

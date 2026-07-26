@@ -43,3 +43,12 @@ fun main() {
     }
     print("iterations = {tick}\n");
 }
+
+@[test]
+fun test_for_loop_sum() {
+    var sum: usize = 0;
+    for i in 1..5 {
+        sum = sum + i;
+    }
+    assert(sum == 10);
+}

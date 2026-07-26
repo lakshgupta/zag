@@ -46,3 +46,16 @@ fun main() {
     let s_rest_sum: i32 = s_rest[0] + s_rest[1];
     print("runtime rest: s_first={s_first} sum_s_rest={s_rest_sum}\n");
 }
+
+@[test]
+fun test_rest_binding() {
+    let (head, ...tail) = (1, 2, 3);
+    assert(head == 1);
+    assert(tail[0] == 2);
+    assert(tail[1] == 3);
+
+    let [a, ...rest] = [3]i32 { 7, 8, 9 };
+    assert(a == 7);
+    assert(rest[0] == 8);
+    assert(rest[1] == 9);
+}

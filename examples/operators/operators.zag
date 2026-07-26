@@ -127,3 +127,14 @@ fun main() {
     print("range: half-open start={range_start} end={range_end_v} inclusive={half_open_inc}\n");
     print("range: inclusive start={range_start} end={range_end_v} inclusive={inclusive_inc}\n");
 }
+
+@[test]
+fun test_operators() {
+    let m: i32 = 17 % 5;
+    assert(m == 2);
+    let a: i32 = 0b1100 & 0b1010;
+    assert(a == 8);
+    let arr: [3]i32 = [3]i32 { 10, 20, 30 };
+    assert(arr[0] == 10);
+    assert(arr[2] == 30);
+}

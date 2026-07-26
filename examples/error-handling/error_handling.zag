@@ -59,3 +59,47 @@ fun main() {
     let b: i32 = safe_divide(10, 2);
     print("safe_divide: {a}, {b}\n");
 }
+
+@[test]
+fun test_divide_ok() {
+    match divide(10, 2) {
+        Ok(val) => assert(val == 5),
+        Err(msg) => assert(false),
+    }
+}
+
+@[test]
+fun test_divide_err() {
+    match divide(10, 0) {
+        Ok(val) => assert(false),
+        Err(msg) => assert(msg == "division by zero"),
+    }
+}
+
+@[test]
+fun test_chain_divide() {
+    match chain_divide(20, 2) {
+        Ok(val) => assert(val == 5),
+        Err(msg) => assert(false),
+    }
+}
+
+@[test]
+fun test_safe_divide_block_handler() {
+    let a: i32 = safe_divide(10, 0);
+    assert(a == 0);
+    let b: i32 = safe_divide(10, 2);
+    assert(b == 5);
+}
+
+@[test]
+fun test_option_match() {
+    match maybe_get(1) {
+        Some(val) => assert(val == 10),
+        None => assert(false),
+    }
+    match maybe_get(-1) {
+        Some(val) => assert(false),
+        None => assert(true),
+    }
+}

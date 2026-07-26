@@ -115,3 +115,14 @@ fun main() {
     print("hello, {name}!\n");
     print("two plus three is {2 + 3}\n");
 }
+
+@[test]
+fun test_literals() {
+    let hex: i32 = 0xFF;
+    assert(hex == 255);
+    let fill: [5]i32 = [5]i32 { 0 ... };
+    assert(fill[0] == 0);
+    assert(fill[4] == 0);
+    let explicit: [3]i32 = [3]i32 { 1, 2, 3 };
+    assert(explicit[2] == 3);
+}

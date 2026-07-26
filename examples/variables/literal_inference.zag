@@ -79,3 +79,15 @@ fun main() {
     const LIMIT = 256;
     print("const (literal-init): LIMIT={LIMIT}\n");
 }
+
+@[test]
+fun test_literal_inference() {
+    let n = 42;
+    assert(n == 42);
+    let flag = true;
+    assert(flag);
+    let ch = 'Z';
+    assert(ch == 90);
+    const C = 100;
+    assert(C == 100);
+}

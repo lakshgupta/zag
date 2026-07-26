@@ -30,3 +30,12 @@ fun main() {
     };
     print("{total}\n");
 }
+
+@[test]
+fun test_named_field_match() {
+    let p: Pos = Pair { x: 1.5, y: 2.5 };
+    let total: f64 = match p {
+        Pair { x: w, y: h } => w + h,
+    };
+    assert(total == 4.0);
+}

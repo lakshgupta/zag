@@ -44,3 +44,11 @@ fun main() {
     print(b"hello");
     print("\n");
 }
+
+@[test]
+fun test_string_concat() {
+    let a: []const u8 = "hello";
+    let b: []const u8 = "world";
+    assert(a[0] == 'h');
+    assert(b[0] == 'w');
+}

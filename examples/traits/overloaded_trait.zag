@@ -39,3 +39,12 @@ fun main() {
     r.render();
     r.render(2.0);
 }
+
+@[test]
+fun test_overloaded_trait() {
+    let btn: Button = Button { label: "test" };
+    let r: Renderer = btn as Renderer;
+    r.render();
+    r.render(2.0);
+    assert(true);
+}

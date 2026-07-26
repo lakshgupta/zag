@@ -42,3 +42,11 @@ fun main() {
     };
     print("{val} is {label}\n");
 }
+
+@[test]
+fun test_if_else_expr() {
+    let x: i32 = if 1 == 1 { 10 } else { 20 };
+    assert(x == 10);
+    let y: i32 = if 0 == 1 { 30 } else { 40 };
+    assert(y == 40);
+}

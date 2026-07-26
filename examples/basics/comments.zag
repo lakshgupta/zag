@@ -35,3 +35,9 @@ fun main() {
     print(farewell());
     print("\n");
 }
+
+@[test]
+fun test_basic_assert() {
+    assert(true);
+    assert(1 + 1 == 2);
+}

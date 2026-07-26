@@ -71,3 +71,9 @@ fun main() {
     bump(start);
     print("after:  start = {start} (unchanged — caller isolates)\n");
 }
+
+@[test]
+fun test_basic_functions() {
+    assert(add(3, 4) == 7);
+    assert(add(-1, 1) == 0);
+}

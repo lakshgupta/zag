@@ -48,3 +48,16 @@ fun main() {
     # Button's own methods still work
     btn.click();
 }
+
+@[test]
+fun test_embedding_getter_and_forwarding() {
+    let btn: Button = Button {
+        Widget { x: 5, y: 7 },
+        label: "test",
+    };
+    let x: i32 = btn.x();
+    assert(x == 5);
+    btn.show();
+    btn.click();
+    assert(true);
+}

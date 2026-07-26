@@ -34,3 +34,21 @@ fun main() {
     n = n + 10;
     print("mut destructure: m = {m}, n = {n}\n");
 }
+
+@[test]
+fun test_destructuring() {
+    let pair = (10, 20);
+    let (x, y) = pair;
+    assert(x == 10);
+    assert(y == 20);
+
+    let (a, _, c) = (1, 2, 3);
+    assert(a == 1);
+    assert(c == 3);
+
+    let nested = (5, (6, 7));
+    let (o, (p, q)) = nested;
+    assert(o == 5);
+    assert(p == 6);
+    assert(q == 7);
+}

@@ -31,3 +31,16 @@ fun main() {
     let third: i32 = numbers[2];
     print("numbers[2] = {third}\n");          # 30
 }
+
+@[test]
+fun test_multi_dim() {
+    let m: [2][2]i32 = [2][2]i32 {
+        [2]i32 { 1, 2 },
+        [2]i32 { 3, 4 },
+    };
+    assert(m.len == 2);
+    assert(m[0][0] == 1);
+    assert(m[0][1] == 2);
+    assert(m[1][0] == 3);
+    assert(m[1][1] == 4);
+}

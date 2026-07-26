@@ -32,3 +32,19 @@ fun main() {
         Err(e) => print("error: {e}\n"),
     }
 }
+
+@[test]
+fun test_errdefer_partial_success() {
+    match partial_init(10, 2) {
+        Ok(v) => assert(v == 5),
+        Err(e) => assert(true),
+    }
+}
+
+@[test]
+fun test_errdefer_partial_error() {
+    match partial_init(10, 0) {
+        Ok(v) => assert(true),
+        Err(e) => assert(e == "division by zero"),
+    }
+}

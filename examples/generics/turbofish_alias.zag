@@ -66,3 +66,10 @@ fun main() {
     print(identity<str>("hi"));
     print("\n");
 }
+
+@[test]
+fun test_turbofish_generic() {
+    assert(identity<i32>(42) == 42);
+    assert(identity<str>("zag")[0] == 'z');
+    assert(identity<i32>(-7) + identity<i32>(3) == -4);
+}

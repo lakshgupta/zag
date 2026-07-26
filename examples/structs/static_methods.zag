@@ -39,3 +39,11 @@ fun main() {
     print("p.distance_squared(&q) = {d}\n");
     print("expected d = 25.0\n");
 }
+
+@[test]
+fun test_static_methods() {
+    let p: Point = Point.init(0.0, 0.0);
+    let q: Point = Point.init(3.0, 4.0);
+    let d: f64 = p.distance_squared(&q);
+    assert(d == 25.0);
+}

@@ -130,3 +130,12 @@ fun log(msg: str) -> void {
 ## path because the parser set `m.return_type = null`.
 fun do_nothing() {
 }
+
+@[test]
+fun test_type_aliases() {
+    let auto_i = 42;
+    assert(auto_i == 42);
+    let i: i32 = 65;
+    let f: f64 = i as f64;
+    assert(f == 65.0);
+}

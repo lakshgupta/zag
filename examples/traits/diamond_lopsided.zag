@@ -49,3 +49,13 @@ fun main() {
     let s: Show = btn as Show;
     s.render();
 }
+
+@[test]
+fun test_diamond_lopsided() {
+    let btn: Button = Button { label: "test" };
+    let d: Display = btn as Display;
+    d.print();
+    let s: Show = btn as Show;
+    s.render();
+    assert(true);
+}

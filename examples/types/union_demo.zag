@@ -56,3 +56,11 @@ fun main() {
     print(ClickEvent.is_action(hover));
     print(ClickEvent.is_action(press));
 }
+
+@[test]
+fun test_union_is_action() {
+    let hover: ClickEvent = ClickEvent.Hover;
+    assert(!ClickEvent.is_action(hover));
+    let press: ClickEvent = ClickEvent.Press(42);
+    assert(ClickEvent.is_action(press));
+}

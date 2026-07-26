@@ -95,3 +95,13 @@ fun main() {
     print("range half-open: start={half_start} end={half_end_v} inclusive={half_inc}\n");
     print("range inclusive: start={incl_start} end={incl_end_v} inclusive={incl_inc}\n");
 }
+
+@[test]
+fun test_precedence() {
+    let pre: i32 = 1 + 2 * 3;
+    assert(pre == 7);
+    let paren: i32 = (1 + 2) * 3;
+    assert(paren == 9);
+    let chain: i32 = 10 - 3 - 2;
+    assert(chain == 5);
+}

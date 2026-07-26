@@ -63,3 +63,23 @@ fun main() {
     # Inherited typical — no override in FileLogger.
     fl.error("crash");
 }
+
+@[test]
+fun test_default_methods_inherited() {
+    let c: Console = Console {};
+    let cl: Logger = c as Logger;
+    cl.log("test log");
+    cl.warn("test warn");
+    cl.error("test error");
+    assert(true);
+}
+
+@[test]
+fun test_default_methods_overridden() {
+    let f: FileLogger = FileLogger { file: "test.log", level: "dev" };
+    let fl: Logger = f as Logger;
+    fl.log("test");
+    fl.warn("test warn");
+    fl.error("test error");
+    assert(true);
+}

@@ -23,3 +23,13 @@ fun main() {
 
     print("z = {z}, flag = {flag}, ch = {ch}\n");
 }
+
+@[test]
+fun test_variable_mutation() {
+    var a: i32 = 10;
+    a = a + 5;
+    assert(a == 15);
+    var b: f64 = 2.5;
+    b = b * 4.0;
+    assert(b == 10.0);
+}

@@ -22,3 +22,14 @@ fun main() {
     }
     print("after unsafe block\n");
 }
+
+@[test]
+fun test_unsafe_block() {
+    unsafe {
+        let buf: []u8 = alloc(4);
+        let p: *raw u8 = buf;
+        *p = 'a';
+        free(p as *raw c_void);
+    }
+    assert(true);
+}

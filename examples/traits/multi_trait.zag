@@ -42,3 +42,13 @@ fun main() {
     d.draw();
     c.click();
 }
+
+@[test]
+fun test_multi_trait_cast() {
+    let btn: Button = Button { label: "test" };
+    let d: Drawable = btn as Drawable;
+    let c: Clickable = btn as Clickable;
+    d.draw();
+    c.click();
+    assert(true);
+}

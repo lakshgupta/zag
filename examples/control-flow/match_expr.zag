@@ -42,3 +42,15 @@ fun main() {
     };
     print("safe = {safe}\n");
 }
+
+@[test]
+fun test_match_literal() {
+    let n: i32 = 7;
+    let result: []const u8 = match n {
+        0 => "zero",
+        7 => "lucky",
+        _ => "other",
+    };
+    assert(result[0] == 'l');
+    assert(result[4] == 'y');
+}

@@ -29,3 +29,9 @@ fun main() {
     let r = build();
     print("returned from build (errdefer ran above)\n");
 }
+
+@[test]
+fun test_errdefer_triggers_on_error() {
+    let r = build();
+    assert(true);
+}

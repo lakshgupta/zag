@@ -49,3 +49,14 @@ fun main() {
     let c: Clickable = btn as Clickable;
     c.draw();
 }
+
+@[test]
+fun test_resolving_method() {
+    let btn: Button = Button { label: "test" };
+    btn.draw();
+    let d: Drawable = btn as Drawable;
+    d.draw();
+    let c: Clickable = btn as Clickable;
+    c.draw();
+    assert(true);
+}

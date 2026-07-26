@@ -77,3 +77,13 @@ fun main() {
     let f64_wider: f64 = i32_int as f64;     # i32 → f64 widening
     print("as-cast   i32={i32_int} -> f64={f64_wider}\n");
 }
+
+@[test]
+fun test_primitives() {
+    let i: i32 = 42;
+    assert(i == 42);
+    let u: u8 = 255;
+    assert(u == 255);
+    let b: bool = true;
+    assert(b);
+}

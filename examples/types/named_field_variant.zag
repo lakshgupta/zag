@@ -60,3 +60,12 @@ fun main() {
     let click: Click = Drag { x: 1.5, y: 2.5 };
     print(click);
 }
+
+@[test]
+fun test_named_field_ctor() {
+    let p: Pos = Pair { x: 2.0, y: 3.0 };
+    let sum: f64 = match p {
+        Pair { x: a, y: b } => a + b,
+    };
+    assert(sum == 5.0);
+}

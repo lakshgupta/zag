@@ -57,3 +57,13 @@ fun main() {
     let third: u8 = AutoInfer.Third;
     print(third);
 }
+
+@[test]
+fun test_enum_backed() {
+    let s: u8 = Status.Ok;
+    assert(s == 0);
+    let t: u8 = AutoInfer.First;
+    assert(t == 0);
+    let lvl: str = Level.High;
+    assert(lvl[0] == 'h');
+}

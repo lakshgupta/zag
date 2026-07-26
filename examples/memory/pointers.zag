@@ -149,3 +149,28 @@ fun main() {
         print("q.offset(p) = {n}\n");
     }
 }
+
+@[test]
+fun test_pointer_deref() {
+    var counter: i32 = 0;
+    let p: *i32 = &counter;
+    *p = 7;
+    assert(counter == 7);
+}
+
+@[test]
+fun test_slicing() {
+    let data: [5]i32 = [5]i32 { 10, 20, 30, 40, 50 };
+    let middle: []const i32 = data[1..4];
+    assert(middle[0] == 20);
+    assert(middle[2] == 40);
+}
+
+@[test]
+fun test_nullable_pointer() {
+    let maybe_ptr: ?*i32 = null;
+    assert(maybe_ptr == null);
+    var val: i32 = 99;
+    let ptr: ?*i32 = &val;
+    assert(ptr != null);
+}

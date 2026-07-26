@@ -34,3 +34,11 @@ fun main() {
     let d: Drawable = btn as Drawable;
     d.draw();
 }
+
+@[test]
+fun test_canonical_with_cast() {
+    let btn: Button = Button { label: "test" };
+    let d: Drawable = btn as Drawable;
+    d.draw();
+    assert(true);
+}

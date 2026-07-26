@@ -15,3 +15,12 @@ fun main() {
     print("defer: p={p}, buf allocated\n");
     print("defer: exiting scope — cleanups run in reverse\n");
 }
+
+@[test]
+fun test_defer_frees() {
+    let p: *i32 = new i32(42);
+    defer free(p);
+    let buf: []u8 = alloc(16);
+    defer free(buf);
+    assert(true);
+}

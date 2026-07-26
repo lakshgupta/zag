@@ -68,3 +68,51 @@ fun main() {
     print("safe_divide(10, 0) = {safe_divide(10, 0)}\n");
     print("safe_divide(10, 2) = {safe_divide(10, 2)}\n");
 }
+
+@[test]
+fun test_result_ok() {
+    match divide(10, 2) {
+        Ok(val) => assert(val == 5),
+        Err(msg) => assert(false),
+    }
+}
+
+@[test]
+fun test_result_err() {
+    match divide(10, 0) {
+        Ok(val) => assert(false),
+        Err(msg) => assert(msg == "division by zero"),
+    }
+}
+
+@[test]
+fun test_option_some() {
+    match maybe_get(1) {
+        Some(val) => assert(val == 10),
+        None => assert(false),
+    }
+}
+
+@[test]
+fun test_option_none() {
+    match maybe_get(-1) {
+        Some(val) => assert(false),
+        None => assert(true),
+    }
+}
+
+@[test]
+fun test_try_propagate() {
+    match try_propagate() {
+        Ok(val) => assert(val == 10),
+        Err(msg) => assert(false),
+    }
+}
+
+@[test]
+fun test_catch_fallback() {
+    let result: i32 = safe_divide(10, 0);
+    assert(result == 0);
+    let ok: i32 = safe_divide(10, 2);
+    assert(ok == 5);
+}

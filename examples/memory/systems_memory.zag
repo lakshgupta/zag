@@ -31,3 +31,17 @@ fun main() {
 
     print("done — defers run in reverse order\n");
 }
+
+@[test]
+fun test_stack_array() {
+    let buf: [8]u8 = [8]u8 { 0, 1, 2, 3, 4, 5, 6, 7 };
+    assert(buf[0] == 0);
+    assert(buf[4] == 4);
+}
+
+@[test]
+fun test_heap_alloc_free() {
+    let p: *i32 = new i32(42);
+    defer free(p);
+    assert(true);
+}
