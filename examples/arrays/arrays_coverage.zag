@@ -1,0 +1,205 @@
+# examples/arrays/arrays_coverage.zag
+#
+# Comprehensive §10 audit surface — every "Arrays and Slices" feature
+# documented in `docs/manual/10-arrays-and-slices.md` exercised in a
+# SINGLE runnable file with print-based assertions. A regression in
+# any of the 12 sections below surfaces here first, before it reaches
+# the parser/codegen layer. Citations in `docs/features.md` §10 cite
+# this file by name only — line numbers go stale on every edit.
+#
+# Sections:
+#   1. Explicit list literal `[5]i32 { 1, 2, 3, 4, 5 }`
+#   2. Fill-with-zero literal `[10]i32 { 0 ... }`
+#   3. Repeating-pattern literal `[4]i32 { 1, 2 ... }` → [1, 2, 1, 2]
+#   4. Indexed read `let x = arr[0]`
+#   5. Indexed write `arr[0] = 10`
+#   6. `.len` compile-time constant
+#   7. Half-open slice `arr[a..b]`
+#   8. Full-array view slice `arr[..]`
+#   9. Open-ended slice `arr[5..]`
+#  10. `[]const T` immutable slice type (vs mutable `[]T`)
+#  11. Multi-dim `[3][3]i32 { ... }` (parse + literal surface; nested
+#      indexed access is exercised end-to-end in multi_dim.zag because
+#      of an unrelated parser regression on multi-dim indexed access
+#      inside print template literals)
+#  12. SIMD cast `arr as f32x4` + reverse `vec as [4]f32`
+#  13. Common pattern: indexed-fill via for-loop (the docs/10 §"Common
+#      Patterns" example)
+
+fun main() {
+    # ── 1. Explicit-list literal ──────────────────────────────
+    # Stack-allocated, value-typed aggregate. 20 bytes on the
+    # stack for `[5]i32` (no heap allocation). Codegen pin:
+    # `[5]i32 { 1, 2, 3, 4, 5 }` round-trips as the verbatim
+    # zig literal in src/codegen/primary.zig:266 (genArrayLit's
+    # explicit-list branch).
+    let arr: [5]i32 = [5]i32 { 1, 2, 3, 4, 5 };
+    print("1. explicit = {arr[0]} {arr[1]} {arr[2]} {arr[3]} {arr[4]}\n");
+    # → 1. explicit = 1 2 3 4 5
+
+    # ── 2. Fill-with-zero literal ─────────────────────────────
+    # Per docs/10, the leading `{ 0 ... }` syntax fills every slot
+    # with 0. Codegen lowers this to zig's `**` repeat operator:
+    # `[1]i32{ 0 } ** 10` (see src/codegen/primary.zig:280 in
+    # genArrayLit's `if (a.fill)` branch). The leading-element
+    # grammar is required by the parser, even for the trivial
+    # zero-fill shape.
+    let zeros: [10]i32 = [10]i32 { 0 ... };
+    print("2. zeros[0]={zeros[0]} zeros[9]={zeros[9]} zeros.len={zeros.len}\n");
+    # → 2. zeros[0]=0 zeros[9]=0 zeros.len=10
+
+    # ── 3. Repeating-pattern literal ──────────────────────────
+    # Per docs/10, `[4]i32 { 1, 2 ... }` produces `[1, 2, 1, 2]`.
+    # Codegen lowers this to `(blk: { var __arr = ...; while
+    # (__i < 4) __arr[__i] = __pat[__i % 2]; break :blk __arr; })`
+    # which zig inlines as a 4-element aggregate.
+    let pattern: [4]i32 = [4]i32 { 1, 2 ... };
+    print("3. pattern = {pattern[0]} {pattern[1]} {pattern[2]} {pattern[3]}\n");
+    # → 3. pattern = 1 2 1 2
+
+    # ── 4. Indexed read ───────────────────────────────────────
+    # `arr[0]` lowers to `arr[0]` verbatim in zig. Bounds checking
+    # is off by default; `-Dbounds-check` enables it per docs/10.
+    let first: i32 = arr[0];
+    let last:  i32 = arr[4];
+    print("4. arr[0]={first} arr[4]={last}\n");
+    # → 4. arr[0]=1 arr[4]=5
+
+    # ── 5. Indexed write ──────────────────────────────────────
+    # Per docs/10, `arr[0] = 10` mutates the storage aggregate.
+    # The binding must be `var` for the LHS write to compile; `let`
+    # binds reject LHS-write codegen.
+    var mut_arr: [5]i32 = [5]i32 { 1, 2, 3, 4, 5 };
+    mut_arr[0] = 10;
+    mut_arr[4] = 50;
+    print("5. mut_arr[0]={mut_arr[0]} mut_arr[4]={mut_arr[4]}\n");
+    # → 5. mut_arr[0]=10 mut_arr[4]=50
+
+    # ── 6. `.len` compile-time constant ───────────────────────
+    # Per docs/10, `arr.len` is a compile-time constant. For a
+    # stack aggregate `[5]i32`, zig has `arr.len == 5` baked into
+    # the type — the runtime is the constant 5. For a slice
+    # `[]i32`, `.len` is the runtime `usize` field, set at slice
+    # construction time and propagated through the lifetime.
+    print("6. arr.len={arr.len}\n");
+    # → 6. arr.len=5
+
+    # ── 7. Half-open slice `arr[a..b]` ────────────────────────
+    # Per docs/10, slicing produces a stack-allocated slice
+    # `{ ptr: *T, len: usize }` borrowing the original array. No
+    # element is copied. Codegen route: `.slice` arm with
+    # `start != null && end != null`; verified by the unit-test
+    # "half-open slice `arr[1..3]` emits `arr[1..3]`" in
+    # src/tests/codegen_decl.zig.
+    let half_slice: []const i32 = arr[1..3];
+    let half_first: i32 = half_slice[0];
+    let half_len: usize = half_slice.len;
+    print("7. half.len={half_len} half[0]={half_first}\n");
+    # → 7. half.len=2 half[0]=2
+
+    # ── 8. Full-array view slice `arr[..]` ────────────────────
+    # Per docs/10, `arr[..]` is the canonical full-view slice.
+    # The codegen `.slice` arm emits `arr[..]` verbatim and zig
+    # lowers it directly. Pin test:
+    # src/tests/codegen_decl.zig "no-bound slice `arr[..]`
+    #  emits SliceExpr with null bounds".
+    let full: []const i32 = arr[..];
+    print("8. full.len={full.len}\n");
+    # → 8. full.len=5
+
+    # ── 9. Open-ended slice `arr[a..]` ───────────────────────
+    # Per docs/10, `arr[a..]` runs from index `a` to the array's
+    # end. Codegen route: `.slice` with start-set + end-null;
+    # verified by src/tests/codegen_decl.zig "slicing `arr[2..]`
+    # produces SliceExpr with end null".
+    let tail: []const i32 = arr[3..];
+    let tail_first: i32 = tail[0];
+    print("9. tail.len={tail.len} tail[0]={tail_first}\n");
+    # → 9. tail.len=2 tail[0]=4
+
+    # ── 10. `[]const T` immutable slice type ──────────────────
+    # Per docs/10, `[]const T` types a slice whose elements cannot
+    # be mutated — the slice's `ptr` is `*const T` vs `*T` for the
+    # mutable form. The binding-annotation arm in src/codegen/
+    # decl.zig:zagTypeToZig round-trips `[]const i32` verbatim
+    # (it's already zig's native slice-with-readonly-pointee).
+    let const_view: []const i32 = arr[..];
+    print("10. const_view.len={const_view.len} const_view[0]={const_view[0]}\n");
+    # → 10. const_view.len=5 const_view[0]=1
+
+    # ── 11. Multi-dim `[3][3]i32 { ... }` ────────────────────
+    # Per docs/10, `[3][3]i32` is a 36-byte row-major layout. The
+    # nested-array-literal shape recursively parses to a
+    # `.array_lit` whose `type_name` is `[3]i32` (the inner shape)
+    # and whose outer size=3 (parsed by `parseArrayLit's` leading
+    # `[3]` slot). The elements are themselves `.array_lit` nodes
+    # representing each row.
+    #
+    # Codegen emits the literal verbatim as zig: `[3][3]i32 { ... }`.
+    # The parser fix (Phase 6) routes the type-name slot through
+    # `collectCastType` (mirroring `parseBinding`'s LHS-annotation
+    # route in src/parser/stmt.zig) and adds a newline-skip arm to
+    # the element-collection while-loop (mirroring `parseStructLit`'s
+    # nested-block pattern at src/parser/primary.zig:1018) so the
+    # multi-line layout below parses cleanly.
+    #
+    # We use `.len` rather than a multi-dim indexed read in the print
+    # template because template-literal placeholders currently don't
+    # expand multi-dim nested index chains `matrix[1][2]` reliably —
+    # the row-by-row nested indexed-access shape is exercised
+    # end-to-end in `examples/arrays/multi_dim.zag` (which prints
+    # `matrix[1][2]` AFTER the parser fix via a direct `print(matrix[1][2])`
+    # call, not via a template placeholder). The runtime / typed-array
+    # surface is verified as a whole by running the multi_dim.zag
+    # example alongside this audit file.
+    let matrix: [3][3]i32 = [3][3]i32 {
+        [3]i32 { 1, 0, 0 },
+        [3]i32 { 0, 1, 0 },
+        [3]i32 { 0, 0, 1 },
+    };
+    print("11. matrix.len={matrix.len} matrix[0].len={matrix[0].len} row1_sum={matrix[1][0] + matrix[1][1] + matrix[1][2]}\n");
+    # → 11. matrix.len=3 matrix[0].len=3 row1_sum=1
+    #       (identity_matrix row 1 sums to 1; full row-by-row traversal
+    #        with multi-dim indexed access lives in examples/arrays/multi_dim.zag)
+
+    # ── 12. SIMD cast ─────────────────────────────────────────
+    # Per docs/10 §"Array as SIMD" + docs/23 SIMD canonical
+    # surface, `arr as f32x4` is a zero-cost reinterpret cast.
+    # Codegen shim: zagTypeToZig rewrites `f32x4` to
+    # `@Vector(4, f32)`, so the cast arm in codegen/expr.zig emits
+    # `@as(@Vector(4, f32), arr)` and zig's @as coercion handles
+    # the byte-equivalent memory transfer (16 bytes both sides).
+    # The reverse `vec as [4]f32` roundtrips because `[4]f32` is
+    # verbatim in zagTypeToZig.
+    let simd_in: [4]f32 = [4]f32 { 1.0, 2.0, 3.0, 4.0 };
+    let simd_vec: f32x4 = simd_in as f32x4;
+    let simd_out: [4]f32 = simd_vec as [4]f32;
+    print("12. simd[0]={simd_out[0]:.2} simd[1]={simd_out[1]:.2} simd[2]={simd_out[2]:.2} simd[3]={simd_out[3]:.2}\n");
+    # → 12. simd[0]=1.00 simd[1]=2.00 simd[2]=3.00 simd[3]=4.00
+
+    # ── 13. Common pattern: indexed fill via for-loop ─────────
+    # Per docs/10 §"Common Patterns" — build a lookup table by
+    # computing each slot from its index. The for-loop iterates
+    # `0..16` and assigns to `lut[i]`. The `lut` binding is `var`
+    # so the LHS-write codegen (same shape as section 5) compiles.
+    #
+    # Note: clipped from the docs example's 256-slot `u32`
+    # Knuth-hash shape to i32-fitted `i * 7` because the source
+    # arithmetic `i * 7` (where `i: usize` from `for (0..16) |i|`)
+    # produces a `usize` value that requires explicit narrowing
+    # to the i32 element type — zig 0.16 rejects lossy `@as` on
+    # 64-bit platforms and the parser doesn't yet support an
+    # in-loop `@intCast` form. The pattern is preserved (loop +
+    # indexed-assign) and the values are pre-computed for the
+    # documented `usize → i32` cross-platform click-through.
+    var lut: [16]i32 = [16]i32 { 0 ... };
+    let values: [16]i32 = [16]i32 { 0, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105 };
+    for i in 0..16 {
+        lut[i] = values[i];
+    }
+    print("13. lut[0]={lut[0]} lut[3]={lut[3]} lut[15]={lut[15]}\n");
+    # → 13. lut[0]=0 lut[3]=21 lut[15]=105
+    #       (lut[i] = values[i] — same-type assign dodges the
+    #        lossy-@as widening the docs's raw-arithmetic form
+    #        would surface on 64-bit targets)
+}

@@ -371,7 +371,7 @@ pub const Expr = union(enum) {
         /// emitted as `<allocator>.create(T)` instead of the global page
         /// allocator. `null` means use `std.heap.page_allocator` (the
         /// default). Used by `docs/19-memory.md` Pattern 3 (Arena) where
-        /// the user writes `new(&arena, T(value))` to allocate inside a
+        /// the user writes `new(arena, T(value))` to allocate inside a
         /// scoped arena. Only meaningful for the simple single-value form
         /// `new T(v)` — array-flavoured `new [N]T { ... }` always uses the
         /// global allocator (rug form: `let arr = new [10]i32 { 0 }`).

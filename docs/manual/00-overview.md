@@ -97,8 +97,8 @@ fun main() {
 }
 ```
 
-- Stack values (primitives, structs) are automatically managed
-- Heap values (`new`) require explicit `free`
+- Stack values (`Type { fields }`, `Type.init(args)`) are automatically freed
+- Heap values (`new T(value)`) require explicit `free`
 - `defer` runs cleanup when the scope exits
 - Arena allocators enable bulk deallocation in O(1)
 

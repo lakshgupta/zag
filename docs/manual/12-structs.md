@@ -14,11 +14,19 @@ struct Vec3 {
 
 ## Construction
 
+Struct literals are stack-allocated:
+
 ```
-let v = Vec3 { x: 1.0, y: 2.0, z: 3.0 };
+let v = Vec3 { x: 1.0, y: 2.0, z: 3.0 };    # stack
 ```
 
-**Memory:** Stack-allocated value. No heap allocation.
+For heap allocation, use the `new` keyword:
+
+```
+let v: *Vec3 = new Vec3(Vec3 { x: 1.0, y: 2.0, z: 3.0 });  # heap
+```
+
+**Memory:** Struct literals are stack values. `new T(value)` heap-allocates and returns `*T`.
 
 ## Field Access
 
@@ -97,6 +105,9 @@ v.normalize();              # mutable method
 
 ## Constructor Pattern
 
+`Type.init(args)` is the convention for constructors with logic or defaults.
+Use `Type { fields }` for direct field-by-field construction:
+
 ```
 struct Config {
     host: str,
@@ -113,7 +124,7 @@ impl Config {
         };
     }
 
-    pub fun new(host: str, port: u16) -> Config {
+    pub fun init(host: str, port: u16) -> Config {
         return Config {
             host: host,
             port: port,
@@ -122,9 +133,19 @@ impl Config {
     }
 }
 
-let cfg = Config.default();
-let custom = Config.new("example.com", 443);
+let cfg = Config.default();                 # factory method
+let custom = Config.init("example.com", 443); # constructor
 ```
+
+Three construction forms, three purposes:
+
+| Form | Returns | When |
+|---|---|---|
+| `Type { fields }` | `T` (stack) | Direct field-by-field construction |
+| `Type.init(args)` | `T` (stack) | Constructor with logic, defaults, validation |
+| `new T(value)` | `*T` (heap) | Heap allocation |
+
+`Type.init()` is just a convention — it's a regular static method. The `new` keyword is the ONLY way to heap-allocate.
 
 ## Derive Attributes
 

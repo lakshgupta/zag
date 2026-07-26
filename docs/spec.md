@@ -1125,7 +1125,7 @@ For arena-allocated memory, use `arena.free(ptr)` to free a single allocation or
 **Warning:** `arena.free_all()` does **not** recursively free inner allocations. If the arena holds types with their own heap-allocated buffers (e.g., `String`, `List<T>`, `Map<K,V>`), those inner buffers are **leaked** — only the arena's backing memory is reclaimed. Either call per-element cleanup before `free_all()`, or use arena only for flat types (`i32`, structs containing `*T` that point to the same arena, POD arrays).
 
 ```
-let arena = Arena.new();
+let arena = Arenainit();
 let p = new(arena, i32(42));    # arena allocation
 arena.free(p);                   # ok: arena knows about p
 # free(p);                      # WRONG: free uses global allocator
@@ -1504,7 +1504,7 @@ async fun long_running(token: CancellationToken) {
 }
 
 async fun parent() {
-    let token = CancellationToken.new();
+    let token = CancellationTokeninit();
     task.spawn(long_running(token.child()));  # child token linked to parent
     task.spawn(long_running(token.child()));
 
@@ -1514,7 +1514,7 @@ async fun parent() {
 ```
 
 **API:**
-- `CancellationToken.new()` — root token
+- `CancellationTokeninit()` — root token
 - `token.child()` — derived token; cancelled when parent cancels
 - `token.cancel()` — triggers cancellation for this token and all children
 - `token.cancelled()` — future that completes when cancelled
@@ -1611,7 +1611,7 @@ Returns `Ok(old_value)` on success (old value matched `expected`), `Err(old_valu
 ```
 import std.atomic
 
-var big: AtomicU128 = AtomicU128.new(0);
+var big: AtomicU128 = AtomicU128init(0);
 
 # 128-bit compare-and-swap
 let old = big.compare_exchange(expected, desired, AcqRel, Relaxed);
@@ -1639,7 +1639,7 @@ This avoids the complexity of manual hazard-pointer management while providing l
 ```
 struct ThreadPool { ... }
 
-fun ThreadPool.new(thread_count: usize) -> ThreadPool
+fun ThreadPoolinit(thread_count: usize) -> ThreadPool
 fun ThreadPool.shutdown(self: *ThreadPool)
 
 fun parallel_for<T>(pool: *ThreadPool, items: []T, f: fun(*T) -> void)
@@ -1672,7 +1672,7 @@ This is sufficient for all concurrent patterns: data parallelism (`parallel_for`
 ```
 import std.thread
 
-let pool = thread.ThreadPool.new(8);
+let pool = thread.ThreadPoolinit(8);
 
 var data: []i32 = ...;
 
@@ -1783,7 +1783,7 @@ thread.spawn { x = 1; };   # write
 thread.spawn { let r = x; };  # read — race!
 
 # No data race — atomic operations are well-defined
-var x: AtomicI32 = AtomicI32.new(0);
+var x: AtomicI32 = AtomicI32init(0);
 thread.spawn { x.store(1, Release); };   # atomic write
 thread.spawn { let r = x.load(Acquire); };  # atomic read — OK
 ```
@@ -2371,7 +2371,7 @@ The language has a small core. Everything in this section is standard library.
 
 Packages the bootstrap stdlib must provide:
 
-- `std.mem` — `Allocator`, `global_allocator`, `Arena`, `Rc<T>`, `Arc<T>`, `Cell<T>`, `RefCell<T>`. `Arena` is a bump allocator for scoped lifetimes: `Arena.new()` creates a new arena (initial capacity 0, grows on demand), `Arena.with_capacity(size: usize)` pre-reserves an initial region of the given size (avoids the first few grow calls — useful for game-frame allocators that know the per-frame budget up front, or per-request HTTP arenas), `arena.alloc<T>(value)` allocates a `T` from the arena, `arena.free_all()` resets the arena to empty in O(1) (does not run destructors — meant to be called between frames in a game loop or at the end of a request in an HTTP handler). **Arena leak trap:** `free_all()` does not reclaim inner allocations of types like `String`, `List<T>`, or `Map<K,V>` — see §5.1 for the full warning. `Arena` satisfies the `Allocator` trait, so `new(arena, T(value))` (§5.1) works out of the box. `Rc`/`Arc` use `unsafe` internally for shared ownership; `Cell`/`RefCell` use `unsafe` for interior mutability. Their public APIs are safe
+- `std.mem` — `Allocator`, `global_allocator`, `Arena`, `Rc<T>`, `Arc<T>`, `Cell<T>`, `RefCell<T>`. `Arena` is a bump allocator for scoped lifetimes: `Arenainit()` creates a new arena (initial capacity 0, grows on demand), `Arena.with_capacity(size: usize)` pre-reserves an initial region of the given size (avoids the first few grow calls — useful for game-frame allocators that know the per-frame budget up front, or per-request HTTP arenas), `arena.alloc<T>(value)` allocates a `T` from the arena, `arena.free_all()` resets the arena to empty in O(1) (does not run destructors — meant to be called between frames in a game loop or at the end of a request in an HTTP handler). **Arena leak trap:** `free_all()` does not reclaim inner allocations of types like `String`, `List<T>`, or `Map<K,V>` — see §5.1 for the full warning. `Arena` satisfies the `Allocator` trait, so `new(arena, T(value))` (§5.1) works out of the box. `Rc`/`Arc` use `unsafe` internally for shared ownership; `Cell`/`RefCell` use `unsafe` for interior mutability. Their public APIs are safe
 - `std.collections` — `List<T>`, `Map<K, V>`, `Set<T>`, `Deque<T>`. `List.iter()`, `Set.iter()`, and `Deque.iter()` return `Iterator<T>`; `Map<K, V>.iter()` returns `Iterator<(K, V)>` — this is the contract that enables `for (k, v) in map` destructuring in §7.2
 - `std.thread` — `thread.spawn`, `ThreadPool`, `parallel_for`
 - `std.async` — `Future<T>`, `Task<T>`, `task.spawn`, `task.spawn_blocking`, `task.shield`, `task.detach`, `task.join`, `task.scope`, `CancellationToken`, `TcpListener`, `TcpStream`
@@ -2811,7 +2811,7 @@ struct ListIter<T> {
 }
 
 fun main() {
-    var list = List<i32>.new();
+    var list = List<i32>init();
     list.push_front(1);
     list.push_front(2);
     list.push_back(3);

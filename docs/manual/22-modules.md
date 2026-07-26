@@ -163,7 +163,7 @@ Display::write(greeting, &writer);
 
 ```zag
 import std.atomic
-var counter: std.atomic.AtomicI32 = std.atomic.AtomicI32.new(0);
+var counter: std.atomic.AtomicI32 = std.atomic.AtomicI32.init(0);
 counter.fetch_add(1, std.atomic.Ordering.AcqRel);
 ```
 

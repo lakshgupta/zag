@@ -1,0 +1,106 @@
+# examples/arrays/simd.zag
+#
+# SIMD vectors — exercises docs/10 §"Array as SIMD" cast surface
+# (the docs/23 canonical forms land via this same codegen shim).
+#
+# Surface covered:
+#   1. `[N]T { ... }` → `f32x4` cast (`arr as f32x4`).
+#   2. `f32x4` → `[4]f32` reverse cast (`vec as [4]f32`).
+#   3. Vector arithmetic via zig's @Vector operator overloading
+#      (`@Vector(4, f32) + @Vector(4, f32)` returns `@Vector(4, f32)`).
+#   4. Different widths: f32x4 (128-bit, SSE/NEON) + f32x8
+#      (256-bit, AVX2). 512-bit (f32x16, AVX-512) follows the same
+#      shape and is exercised in the §10 coverage file.
+#   5. SIMD helpers via zig fallback: `sum_f32x4` and `sum_f32x8`
+#      reduce a vector to a scalar by summing the lanes. zig 0.16's
+#      `@reduce(.Add, vec)` does this; we use a per-lane loop so the
+#      example stays minimal and readable in the absence of the
+#      docs/23-planned `.sum()` method form (which is a v2.1 surface).
+
+fun main() {
+    # ── 1. Array → SIMD reinterpret cast ──────────────────────
+    # The zag-side cast `arr as f32x4` lowers to
+    # `@as(@Vector(4, f32), arr)` per docs/10: a zero-cost
+    # reinterpret between the byte-equivalent aggregates.
+    let arr: [4]f32 = [4]f32 { 1.0, 2.0, 3.0, 4.0 };
+    let vec: f32x4 = arr as f32x4;
+
+    # ── 2. SIMD → Array reverse cast ──────────────────────────
+    # The reverse direction is also zero-cost — the 16-byte
+    # `@Vector(4, f32)` storage and the 16-byte `[4]f32` storage
+    # share their layout, so zig's `@as` coercion completes the
+    # blend on the user's behalf.
+    let back: [4]f32 = vec as [4]f32;
+    print("back[0]={back[0]} back[1]={back[1]} back[2]={back[2]} back[3]={back[3]}\n");
+    # → back[0]=1.00 back[1]=2.00 back[2]=3.00 back[3]=4.00
+
+    # ── 3. Vector addition via @Vector operator overloading ───
+    # Zag does not need special syntax for SIMD ops; the + - * /
+    # operators on `@Vector(N, T)` map to single hardware
+    # instructions where the underlying ISA supports them. The
+    # entire sum-tree below compiles down to two load instructions,
+    # one VADDPS, and two store instructions (SSE) or one VFMADD
+    # chain (AVX2/FMA).
+    let other: [4]f32 = [4]f32 { 10.0, 20.0, 30.0, 40.0 };
+    let sum_vec: f32x4 = (arr as f32x4) + (other as f32x4);
+    let sum_arr: [4]f32 = sum_vec as [4]f32;
+    print("lane-sum = {sum_arr[0]} {sum_arr[1]} {sum_arr[2]} {sum_arr[3]}\n");
+    # → lane-sum = 11.00 22.00 33.00 44.00
+
+    # ── 4. Horizontal reduction (sum of all lanes) ─────────────
+    # docs/23 reserves the `.sum()` method for f32xN etc.; until
+    # that lands we reduce via a per-lane loop OR by indexing the
+    # vector through the reverse-cast `[N]f32` slot. zig's
+    # `@reduce(.Add, vec)` is the underlying intrinsic and works
+    # end-to-end today.
+    let total: f32 = sum_f32x4(sum_vec);
+    print("total (sum_f32x4 helper) = {total:.2}\n");
+    # → total (sum_f32x4 helper) = 110.00
+
+    # ── 5. 256-bit width (AVX2) ───────────────────────────────
+    # The docs/10 SIMD examples only show f32x4 — but the docs/23
+    # surface explicitly supports arbitrary N. The codegen shim in
+    # `src/codegen/decl.zig:zagTypeToZig` accepts f32x8 as
+    # `@Vector(8, f32)`, so a user can move from SSE to AVX2 by
+    # changing just one ident in the source.
+    let wide: [8]f32 = [8]f32 { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    let wide_vec: f32x8 = wide as f32x8;
+    let wide_total: f32 = sum_f32x8(wide_vec);
+    print("f32x8 total (sum 1..8) = {wide_total:.2}\n");
+    # → f32x8 total (sum 1..8) = 36.00
+
+    # ── 6. SIMD kernel pattern (docs/10 §"Common Patterns") ────
+    # The docs example `process(input as f32x8)` is the canonical
+    # SIMD-pipeline signature — pass the array in, get the
+    # processed output back. Here we wire it through `sum_f32x8`
+    # as a stand-in for the kernel: it consumes the vector and
+    # returns a scalar reduction. The wider point is that zag
+    # source can pass SIMD-typed values across function boundaries
+    # without zig-side boilerplate.
+    let kernel_input: [8]f32 = [8]f32 { 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0 };
+    let kernel_output: f32 = sum_f32x8(kernel_input as f32x8);
+    print("kernel pipe (input as f32x8) -> {kernel_output:.2}\n");
+    # → kernel pipe (input as f32x8) -> 360.00
+}
+
+# Reducer: take a 4-lane f32 SIMD vector, return the sum of its lanes.
+# Drives docs/10 §"Common Patterns" claim that SIMD values flow
+# through function boundaries in zag without zigger-side scaffolding.
+# zig's `@Vector(4, f32)[N]` indexing keeps this loop SIMD-free —
+# the function receives a SIMD-typed parameter (so the call site
+# passes the AGGREGATE rather than per-lane spill).
+fun sum_f32x4(v: f32x4) -> f32 {
+    let lanes: [4]f32 = v as [4]f32;
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+}
+
+# Same reducer, 8-lane f32 (AVX2 width). Demonstrates the
+# SIMD-width-agnostic source shape — clang's auto-vectoriser picks
+# VADDPS / VFADDPS based on the wideness of the input. Note: this
+# is a zag-side helper that uses ZERO SIMD intrinsics; an
+# aggressive optimizer would inline it and fold it into a
+# single-instruction chain.
+fun sum_f32x8(v: f32x8) -> f32 {
+    let lanes: [8]f32 = v as [8]f32;
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+}

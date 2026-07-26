@@ -2,145 +2,131 @@
 
 Zag has **no garbage collector**. All memory management is explicit.
 
-## Stack vs Heap
+## Construction
 
-| Storage | Types | Lifetime | Deallocation |
-|---------|-------|----------|--------------|
-| Stack | Primitives, structs, arrays, tuples, slices | Scope exit | Automatic |
-| Heap | `new T(...)` | Until `free` | Manual |
+Three forms, three purposes:
 
-## Allocation with `new`
+| Form | Returns | Where | When |
+|---|---|---|---|
+| `Type { fields }` | `T` | Stack | Direct field-by-field construction |
+| `Type.init(args)` | `T` | Stack | Constructor with logic, defaults |
+| `new T(value)` | `*T` | Heap | Explicit heap allocation — must `free` |
 
 ```
-let p = new i32(42);             # heap allocate single value
-let arr = new [10]i32 { 0 ... }; # heap allocate array
-let s = new String("hello");     # heap allocate string
+let v = Vec3 { x: 1.0, y: 2.0, z: 3.0 };       # struct literal — stack
+let cfg = Config.init("localhost", 443);           # constructor — stack
+let arr = [8]u8 { 0, 1, 2, 3, 4, 5, 6, 7 };     # fixed array — stack
+let zero: [4096]u8 = [4096]u8 { 0 ... };          # fill array — stack
+
+let p = new i32(42);                               # heap value — returns *i32
+let buf: []u8 = alloc(1024);                       # heap buffer — returns []u8
 ```
 
-`new` returns an owning `*T`. Must be `free`d.
+**`Type.init()` is a convention, not a keyword.** It's a regular static method. Use it when construction needs logic (validation, defaults, computed fields). Use `Type { fields }` for simple direct construction.
 
-## Deallocation with `free`
+**`new` is the ONLY heap keyword.** It always returns `*T`. Every `new` must be paired with `free`.
+
+## Deallocation
+
+`free` works on both pointers and slices — the compiler infers the right zig deallocator from the binding's type annotation:
 
 ```
 let p = new i32(42);
-defer free(p);            # freed when scope exits
+defer free(p);                     # pointer → page_allocator.destroy(p)
 
-let s = new String("hello");
-defer free(s);
+let buf: []u8 = alloc(1024);
+defer free(buf);                   # slice → page_allocator.free(buf)
 ```
 
-**Memory:** `free` deallocates the heap memory. The pointer becomes invalid.
-
-## Custom Allocators
+`defer` runs at scope exit in LIFO order. `errdefer` runs only on the error path (when `?` propagates):
 
 ```
-let arena = Arena.new();
-let p = new(arena, i32(42));     # arena allocation
-defer arena.free(p);
-
-# Or bulk-free the entire arena:
-arena.free_all();                 # O(1) reset
-```
-
-**Memory:** Arena allocators are bump allocators. `free_all` resets the entire arena in O(1) — ideal for game frames, HTTP requests.
-
-**Warning:** `free_all()` does **not** recursively free inner allocations. Types like `String`, `List<T>`, or `Map<K,V>` contain heap-allocated buffers that are **leaked** by `free_all()`. Either call per-element cleanup before `free_all()`, or use arena only for flat types (`i32`, structs whose `*T` fields point into the same arena, POD arrays). See spec §5.1.
-
-## Ownership Rules
-
-1. Each `new` has a single owner
-2. Assignment moves ownership for non-`Copy` types
-3. `Copy` types duplicate on assignment
-
-```
-let s = new String("hello");
-let t = s;          # s is moved — s is now invalid
-free(t);            # only t is valid
-```
-
-## Ownership Checking
-
-The default `zag check` profile runs `-Downership-check` and `-Dleak-check`:
-
-```
-zag check              # runs ownership + leak checks
-zag check --strict     # all checks + runtime sanitizers
-```
-
-## Common Patterns
-
-### Pattern 1: defer free
-
-```
-fun process() {
-    let buf = alloc(1024);
-    defer free(buf as *raw c_void);
-
-    # use buf...
-}
-```
-
-### Pattern 2: errdefer for partial init
-
-```
-fun build() -> Result<Config, Error> {
+fun build() -> Result<Config, str> {
     let a = compute()?;
-    errdefer free(a);
+    errdefer free(a);              # only runs if `?` propagates
 
     let b = compute()?;
-    # b is returned — errdefer for a does NOT run
     return Ok(Config { a: a, b: b });
 }
 ```
 
-### Pattern 3: Arena for scoped lifetimes
+## Custom Allocators
+
+`new(allocator, T(value))` allocates via a named allocator instead of the global page allocator:
 
 ```
-async fun handle_request(conn: TcpConn) {
-    var arena = Arena.new();
-    defer arena.free_all();      # O(1) cleanup
+let p = new(arena, i32(42));       # arena.create(i32){ .* = 42 }
+```
 
-    let req = new(&arena, Request { ... });
-    let resp = process(req);
-    conn.write(resp);
+The allocator name is emitted verbatim — `arena` must be a variable in scope whose type has a `.create(T)` method (the zig convention).
+
+## Builtins
+
+| Builtin | Emits | Returns |
+|---|---|---|
+| `alloc(N)` | `page_allocator.alloc(u8, N)` | `[]u8` |
+| `size_of(T)` | `@sizeOf(T)` | `usize` (comptime) |
+| `align_of(T)` | `@alignOf(T)` | `usize` (comptime) |
+| `volatile_store(p, v)` | `@volatileStore(p, v)` | `void` |
+| `volatile_load(p)` | `@volatileLoad(p)` | `T` |
+
+## Common Patterns
+
+### Stack buffer
+
+Zero allocation — fixed array on the stack:
+
+```
+fun process() {
+    let buf: [4096]u8 = [4096]u8 { 0 ... };
+    # use buf — freed at scope exit, zero cost
 }
 ```
 
-### Pattern 4: Rc/Arc for shared ownership
+### Heap buffer with deferred free
 
 ```
-import std.mem
-
-let shared = new Arc<Data> { ... };
-let clone = Arc.clone(shared);    # reference count increment
-defer Arc.release(clone);         # reference count decrement
+fun read_and_process(path: str) {
+    let data: []u8 = alloc(1024);
+    defer free(data);
+    # use data — freed at scope exit
+}
 ```
 
-## Safety Tooling
+### Partial init with errdefer
 
-| Check | Flag | Detects |
-|-------|------|---------|
-| Ownership | `-Downership-check` | Double-free, use-after-move |
-| Leak | `-Dleak-check` | Missing `free` calls |
-| Bounds | `-Dbounds-check` | Out-of-bounds access |
-| Ref | `-Dref-check` | Dangling references |
-| Init | `-Dinit-check` | Uninitialized reads |
-| Thread | `-Dthread-safety` | Data races |
+```
+fun build_pair() -> Result<Pair, str> {
+    let a = new i32(10);
+    errdefer free(a);               # freed only if ? propagates
 
-## Unsafe Operations
+    let b = compute()?;
+    return Ok(Pair { a: a, b: b });
+}
+```
+
+### Unsafe raw pointers
 
 ```
 unsafe {
-    let p: *raw i32 = alloc(4) as *raw i32;
-    *p = 42;                          # raw pointer dereference
-    let val = *p;
+    let p: *raw u8 = alloc(4) as *raw u8;
+    *p = 0x41;
+    let val: u8 = *p;
     free(p as *raw c_void);
 }
 ```
 
-Unsafe is required for:
-- Dereferencing `*raw T`
-- Pointer arithmetic
-- Pointer-to-integer casts
-- `transmute`
-- C FFI calls
+Unsafe is required for: `*raw T` dereferences, pointer arithmetic, pointer-to-integer casts, and C FFI calls.
+
+## Stack vs Heap Summary
+
+| Storage | Syntax | Returns | Lifetime |
+|---|---|---|---|
+| Struct literal | `Type { .f = v }` | `T` | Scope exit |
+| Constructor | `Type.init(args)` | `T` | Scope exit |
+| Array literal | `[N]T { vals }` | `[N]T` | Scope exit |
+| Array fill | `[N]T { val ... }` | `[N]T` | Scope exit |
+| Heap value | `new T(value)` | `*T` | Until `free` |
+| Heap buffer | `alloc(N)` | `[]u8` | Until `free` |
+
+**No hidden allocations.** Struct and array literals are on the stack. Only `new` and `alloc` touch the heap.

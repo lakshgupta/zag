@@ -9,12 +9,12 @@ struct Point {
 }
 
 impl Point {
-    # Type-static: called as `Point.new(3.0, 4.0)`.
-    pub fun new(x: f64, y: f64) -> Point {
+    # Constructor: called as `Point.init(3.0, 4.0)`.
+    pub fun init(x: f64, y: f64) -> Point {
         return Point { x: x, y: y };
     }
 
-    # Type-static: called as `Point.default()`.
+    # Factory: called as `Point.default()`.
     pub fun default() -> Point {
         return Point { x: 0.0, y: 0.0 };
     }
@@ -29,7 +29,7 @@ impl Point {
 }
 
 fun main() {
-    let p: Point = Point.new(3.0, 4.0);
+    let p: Point = Point.init(3.0, 4.0);
     let q: Point = Point.default();
 
     print("p = ({p.x}, {p.y})\n");

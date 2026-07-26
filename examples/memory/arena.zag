@@ -8,7 +8,7 @@
 ## Run: zag run arena.zag
 
 fun main() {
-    # Stub arena shim — in a real program this is `Arena.new()` from
+    # Stub arena shim — in a real program this is `Arena.init()` from
     # the std mem module. For this demo we treat it as a generic
     # allocator surface.
     let arena = 0;       # placeholder

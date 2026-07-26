@@ -140,7 +140,7 @@ impl Config {
 }
 
 let cfg = Config.default();
-let custom = Config.new("example.com", 443);
+let custom = Config.init("example.com", 443);
 ```
 
 ## Memory

@@ -103,7 +103,7 @@ async fun long_running(token: CancellationToken) {
 }
 
 async fun parent() {
-    let token = CancellationToken.new();
+    let token = CancellationToken.init();
     task.spawn(long_running(token.child()));
     task.spawn(long_running(token.child()));
 
@@ -151,7 +151,7 @@ Atomic types provide lock-free concurrent access. Each operation maps to a singl
 ```
 import std.atomic
 
-var counter: AtomicI32 = AtomicI32.new(0);
+var counter: AtomicI32 = AtomicI32.init(0);
 
 counter.fetch_add(1, SeqCst);       # atomic increment
 let val = counter.load(Acquire);     # atomic read
@@ -208,7 +208,7 @@ thread.spawn { x = 1; };
 thread.spawn { let r = x; };
 
 # RIGHT — atomic, well-defined
-var x: AtomicI32 = AtomicI32.new(0);
+var x: AtomicI32 = AtomicI32.init(0);
 thread.spawn { x.store(1, Release); };
 thread.spawn { let r = x.load(Acquire); };
 ```
@@ -222,7 +222,7 @@ Thread pool for data-parallel work:
 ```
 import std.thread
 
-let pool = thread.ThreadPool.new(8);
+let pool = thread.ThreadPool.init(8);
 
 # Parallel for-each
 var data: []i32 = ...;
