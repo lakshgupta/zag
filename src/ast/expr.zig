@@ -133,6 +133,11 @@ pub const Expr = union(enum) {
     /// expression position. Codegen emits a zig labeled block with
     /// `break :blk` for the final value.
     block_expr: []const Stmt,
+    /// `const { stmts; return expr; }` — compile-time evaluated block.
+    /// Codegen emits zig `comptime blk: { ... break :blk expr; }`.
+    /// Built by `Parser.parsePrimary` when `.const_kw` is encountered
+    /// in an expression position.
+    const_block: []const Stmt,
 
     pub const BinaryExpr = struct {
         /// Operator tag. Stored as an enum so codegen can switch on the

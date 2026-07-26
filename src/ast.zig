@@ -100,6 +100,8 @@ pub const ImportSelector = ast_decl.ImportSelector;
 pub const ImportDecl = ast_decl.ImportDecl;
 // FFI (docs/24). ExternDecl carries `extern fun` declarations.
 pub const ExternDecl = ast_decl.ExternDecl;
+// Compile-time (docs/26). ConstDecl carries `const NAME = EXPR` declarations.
+pub const ConstDecl = ast_decl.ConstDecl;
 
 // Template-literal types (extracted from Expr union body, now top-level).
 pub const TemplateLitExpr = ast_template.TemplateLitExpr;

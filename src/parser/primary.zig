@@ -1045,6 +1045,14 @@ pub fn parsePrimary(self: *Parser) Expr {
                 self.advance();
                 return .{ .null_lit = {} };
             },
+            .const_kw => {
+                // `const { stmts; return expr; }` — compile-time block
+                self.advance();
+                self.expect(.lbrace);
+                const body = self.parseStmtList();
+                self.expect(.rbrace);
+                return .{ .const_block = body };
+            },
             .undefined_kw => {
                 self.advance();
                 return .{ .undefined_lit = {} };

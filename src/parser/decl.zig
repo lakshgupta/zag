@@ -1074,6 +1074,27 @@ pub fn parseImportDecl(self: *Parser, is_pub: bool) ast.ImportDecl {
     }
 
 
+pub fn parseConstDecl(self: *Parser) ast.ConstDecl {
+        const start_loc = self.peek().loc;
+        self.expect(.const_kw);
+        const name = self.expectIdent();
+        var type_text: ?[]const u8 = null;
+        if (self.peek().tag == .colon) {
+            self.advance();
+            type_text = self.collectCastType();
+        }
+        self.expect(.equals);
+        const init_expr = self.arena.alloc(ast.Expr, 1);
+        init_expr[0] = self.parseExpr();
+        return .{
+            .name = name,
+            .type_text = type_text,
+            .init = &init_expr[0],
+            .loc = start_loc,
+        };
+    }
+
+
 pub fn parseExternDecl(self: *Parser) ast.ExternDecl {
         const start_loc = self.peek().loc;
         self.expect(.extern_kw);

@@ -451,3 +451,12 @@ pub const ExternDecl = struct {
     loc: Loc,
 };
 
+/// One top-level `const NAME: TYPE = EXPR;` declaration (docs/26).
+/// Module-level compile-time constants. Codegen emits zig `const`.
+pub const ConstDecl = struct {
+    name: []const u8,
+    type_text: ?[]const u8,
+    init: *Expr,
+    loc: Loc,
+};
+

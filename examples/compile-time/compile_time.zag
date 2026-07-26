@@ -1,0 +1,50 @@
+## Compile-time execution — const, const blocks, type reflection
+## (docs/26 §"Compile-Time Execution")
+##
+## `const` bindings are compile-time constants embedded in the binary.
+## `const { ... }` blocks evaluate arbitrary code at compile time.
+## `type_name(T)`, `size_of(T)`, `align_of(T)` reflect on types.
+##
+## Run: zag run compile_time.zag
+
+const PI: f64 = 3.141592653589793;
+const MAX_SIZE: usize = 1024;
+
+# Compile-time computed lookup table
+const SQUARES: [16]i32 = const {
+    var t: [16]i32 = undefined;
+    for i in 0..16 {
+        t[i] = i * i;
+    }
+    return t;
+};
+
+fun main() {
+    print("PI = {PI}\n");
+    print("MAX_SIZE = {MAX_SIZE}\n");
+    print("sizeof(i32) = {size_of(i32)}\n");
+    print("alignof(f64) = {align_of(f64)}\n");
+    print("type_name(i32) = {type_name(i32)}\n");
+    print("SQUARES[3] = {SQUARES[3]}\n");  # 9
+    print("SQUARES[15] = {SQUARES[15]}\n"); # 225
+}
+
+@[test]
+fun test_const_bindings() {
+    assert(PI > 3.14);
+    assert(MAX_SIZE == 1024);
+}
+
+@[test]
+fun test_const_table() {
+    assert(SQUARES[0] == 0);
+    assert(SQUARES[3] == 9);
+    assert(SQUARES[15] == 225);
+}
+
+@[test]
+fun test_type_reflection() {
+    assert(size_of(i32) == 4);
+    assert(align_of(f64) == 8);
+    assert(type_name(i32) == "i32");
+}

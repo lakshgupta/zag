@@ -23,6 +23,8 @@ const ImportDecl = decl.ImportDecl;
 // FFI (docs/24). ExternDecl carries `extern fun` declarations so
 // parser can parse them at top-level and codegen can emit them.
 const ExternDecl = decl.ExternDecl;
+// Compile-time (docs/26). ConstDecl carries `const NAME = EXPR` declarations.
+const ConstDecl = decl.ConstDecl;
 
 // ============================================================
 // top.zig — top-level types from src/ast.zig
@@ -85,6 +87,9 @@ pub const Program = struct {
     /// Codegen emits `extern fn` for each entry before any function
     /// bodies so zig's linker can resolve FFI symbols.
     externs: []const ExternDecl = &[_]ExternDecl{},
+    /// Top-level `const` declarations (docs/26). Codegen emits zig
+    /// `const NAME: TYPE = EXPR;` for each entry.
+    consts: []const ConstDecl = &[_]ConstDecl{},
 };
 
 pub const Arena = struct {

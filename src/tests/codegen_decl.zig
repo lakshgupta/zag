@@ -3213,3 +3213,35 @@ test "codegen: assert(false, msg) emits expect with message" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "test \"msg_test\" {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.testing.expect(false)") != null);
 }
+
+test "codegen: const block emits comptime blk with break :blk" {
+    const src =
+        \\const TABLE: [3]i32 = const {
+        \\    var t: [3]i32 = undefined;
+        \\    return t;
+        \\};
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // const block emits comptime labeled block
+    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime blk: {") != null);
+    // Return statement becomes break :blk
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk t") != null);
+}
+
+test "codegen: type_name(T) emits @typeName(T)" {
+    const src = "const NAME = type_name(i32);\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@typeName(i32)") != null);
+}

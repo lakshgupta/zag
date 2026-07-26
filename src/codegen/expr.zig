@@ -937,6 +937,27 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
                 self.write("    })");
             },
+            .const_block => |body| {
+                // `const { stmts; return expr; }` — compile-time block.
+                // Emit zig comptime labeled block that evaluates at
+                // compile time and yields the return value.
+                self.write("(comptime blk: {\n");
+                for (body, 0..) |s, i| {
+                    if (i == body.len - 1 and s == .return_stmt) {
+                        const rs = s.return_stmt;
+                        if (rs.value) |v| {
+                            self.write("        break :blk ");
+                            self.genExpr(v);
+                            self.write(";\n");
+                        } else {
+                            self.genStmt(s, false);
+                        }
+                    } else {
+                        self.genStmt(s, false);
+                    }
+                }
+                self.write("    })");
+            },
             .try_op => |t| {
                 // `expr?` — postfix try/unwrap. Emit a labeled block +
                 // compile-time `@hasField` discriminators so the same
@@ -1495,6 +1516,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     self.write("; _ = ");
                     self.genExpr(args[1]);
                 }
+                self.write(")");
+            },
+            .builtin_type_name => {
+                self.write("@typeName(");
+                self.genExpr(args[0]);
                 self.write(")");
             },
         }

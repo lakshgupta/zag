@@ -55,6 +55,8 @@ pub fn parse(self: *Parser) ast.Program {
         var import_count: usize = 0;
         var externs_buf: [256]ast.ExternDecl = undefined;
         var extern_count: usize = 0;
+        var consts_buf: [256]ast.ConstDecl = undefined;
+        var const_count: usize = 0;
 
         while (!self.eof()) {
             if (self.peek().tag == .newline) {
@@ -240,6 +242,11 @@ pub fn parse(self: *Parser) ast.Program {
                 extern_count += 1;
                 continue;
             }
+            if (lead == .const_kw) {
+                consts_buf[const_count] = self.parseConstDecl();
+                const_count += 1;
+                continue;
+            }
             var fd = self.parseFunDecl();
             fd.is_test = is_test;
             fd.doc = doc;
@@ -261,7 +268,9 @@ pub fn parse(self: *Parser) ast.Program {
         @memcpy(imports, imports_buf[0..import_count]);
         const externs = self.arena.alloc(ast.ExternDecl, extern_count);
         @memcpy(externs, externs_buf[0..extern_count]);
-        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits, .imports = imports, .externs = externs };
+        const consts = self.arena.alloc(ast.ConstDecl, const_count);
+        @memcpy(consts, consts_buf[0..const_count]);
+        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits, .imports = imports, .externs = externs, .consts = consts };
     }
 
 
@@ -586,6 +595,8 @@ pub const Parser = struct {
     // FFI (docs/24). parseExternDecl parses `extern fun NAME(...) -> RET;`
     // declarations at the top level.
     pub const parseExternDecl = @import("decl.zig").parseExternDecl;
+    // Compile-time (docs/26). parseConstDecl parses `const NAME: TYPE = EXPR;`.
+    pub const parseConstDecl = @import("decl.zig").parseConstDecl;
     // Module imports (docs/manual/22-modules.md §Imports).
     // `joinDottedPath` is defined as a file-scope Parser struct
     // member further down in this same file (sibling to

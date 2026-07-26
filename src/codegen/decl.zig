@@ -1474,3 +1474,16 @@ const Codegen = core.Codegen;
 
         self.write("}\n\n");
     }
+
+    /// Emit a zig `const` declaration for a top-level `const` binding.
+    pub     fn genConstDecl(self: *Codegen, cd: ast.ConstDecl) void {
+        self.write("const ");
+        self.write(cd.name);
+        if (cd.type_text) |tt| {
+            self.write(": ");
+            self.writeType(tt);
+        }
+        self.write(" = ");
+        self.genExpr(cd.init.*);
+        self.write(";\n\n");
+    }

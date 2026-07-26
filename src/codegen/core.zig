@@ -235,6 +235,7 @@ pub const VariantFieldsEntry = struct {
     pub const genFreeMethod = @import("decl.zig").genFreeMethod;
     pub const genFun = @import("decl.zig").genFun;
     pub const genTestFun = @import("decl.zig").genTestFun;
+    pub const genConstDecl = @import("decl.zig").genConstDecl;
     pub const genExternDecl = @import("decl.zig").genExternDecl;
     pub const genMatchExpr = @import("stmt.zig").genMatchExpr;
     pub const genMethod = @import("decl.zig").genMethod;
@@ -971,6 +972,10 @@ pub const VariantFieldsEntry = struct {
 
         for (prog.externs) |ext| {
             self.genExternDecl(ext);
+        }
+
+        for (prog.consts) |c| {
+            self.genConstDecl(c);
         }
 
         for (prog.functions) |fun| {
