@@ -297,6 +297,7 @@ fn cmdGenerate(args: []const []const u8) !void {
 }
 
 fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8, generate: bool, release: bool) !void {
+    _ = extra_args;
 
     // Ensure build/gen/ and build/bin/ exist
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
@@ -336,7 +337,7 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     }
 
     // Generate build.zig for the project
-    try generateBuildZig(modules);
+    try generateBuildZig(modules, cfg.name);
 
     if (generate) {
         std.debug.print("generated zig project at build/gen/\n", .{});
@@ -375,31 +376,35 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
         return;
     }
     if (std.mem.eql(u8, mode, "run")) {
-        // Find the binary for run
-        var run_buf: [256]u8 = undefined;
-        const run_bin = std.fmt.bufPrint(&run_buf, "zig-out/bin/{s}", .{cfg.name}) catch unreachable;
-        const run_code = try runCommandWithArgs(run_bin, extra_args);
-        std.process.exit(run_code);
+        // zig build run already executed the binary with extra_args
+        return;
     }
 }
 
 /// Generate a build.zig for the multi-module zag project.
-fn generateBuildZig(modules: []const project_mod.ModuleEntry) !void {
+fn generateBuildZig(modules: []const project_mod.ModuleEntry, project_name: []const u8) !void {
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
 
-    const header = "const std = @import(\"std\");\n\npub fn build(b: *std.Build) !void {\n    const target = b.resolveTargetQuery(.{});\n    const optimize = b.standardOptimizeOption(.{});\n    const exe = b.addExecutable(.{\n        .name = \"main\",\n        .root_source_file = b.path(\"main.zig\"),\n        .target = target,\n        .optimize = optimize,\n    });\n";
-    @memcpy(buf[pos..][0..header.len], header);
-    pos += header.len;
+    const header_prefix = "const std = @import(\"std\");\n\npub fn build(b: *std.Build) !void {\n    const target = b.resolveTargetQuery(.{});\n    const optimize = b.standardOptimizeOption(.{});\n    const exe = b.addExecutable(.{\n        .name = \"";
+    const header_suffix = "\",\n        .root_module = b.createModule(.{\n            .root_source_file = b.path(\"main.zig\"),\n            .target = target,\n            .optimize = optimize,\n        }),\n    });\n";
+
+    // Build header with project name
+    @memcpy(buf[pos..][0..header_prefix.len], header_prefix);
+    pos += header_prefix.len;
+    @memcpy(buf[pos..][0..project_name.len], project_name);
+    pos += project_name.len;
+    @memcpy(buf[pos..][0..header_suffix.len], header_suffix);
+    pos += header_suffix.len;
 
     for (modules) |mod| {
         if (std.mem.eql(u8, mod.module_name, "main")) continue;
 
-        const line1 = "    _ = exe.addModule(\"";
+        const line1 = "    _ = exe.root_module.addImport(\"";
         const line2 = "\", b.createModule(.{ .root_source_file = b.path(\"";
         const line3 = ".zig\") }));\n";
 
-        // Build the line: _ = exe.addModule("modname", b.createModule(.{ .root_source_file = b.path("modname.zig") }));
+        // Build: _ = exe.root_module.addImport("modname", b.createModule(.{ ... }));
         @memcpy(buf[pos..][0..line1.len], line1);
         pos += line1.len;
         @memcpy(buf[pos..][0..mod.module_name.len], mod.module_name);
@@ -412,7 +417,7 @@ fn generateBuildZig(modules: []const project_mod.ModuleEntry) !void {
         pos += line3.len;
     }
 
-    const footer = "    b.installArtifact(exe);\n}\n";
+    const footer = "    b.installArtifact(exe);\n\n    const run_cmd = b.addRunArtifact(exe);\n    if (b.args) |args| run_cmd.addArgs(args);\n    const run_step = b.step(\"run\", \"Run the app\");\n    run_step.dependOn(&run_cmd.step);\n}\n";
     @memcpy(buf[pos..][0..footer.len], footer);
     pos += footer.len;
 
@@ -454,7 +459,7 @@ fn generateProjectFiles() !void {
         try writeFile(out_path, zig_src);
     }
 
-    try generateBuildZig(modules);
+    try generateBuildZig(modules, "main");
 }
 
 /// Resolve the zig compiler binary path that the current
