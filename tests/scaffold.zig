@@ -229,9 +229,10 @@ test "scaffold: std.time parses with Duration, Timer, and 2 free fns" {
 
     try std.testing.expectEqualStrings("Timer", prog.structs[1].name);
 
-    try std.testing.expectEqual(@as(usize, 2), prog.functions.len);
-    try std.testing.expectEqualStrings("Duration_from_millis", prog.functions[0].name);
-    try std.testing.expectEqualStrings("Timer_after", prog.functions[1].name);
+    // Methods are now in impl blocks, not free functions
+    try std.testing.expectEqual(@as(usize, 2), prog.impls.len);
+    try std.testing.expectEqualStrings("Duration", prog.impls[0].target_type);
+    try std.testing.expectEqualStrings("Timer", prog.impls[1].target_type);
 }
 
 // ---------------------------------------------------------------
