@@ -60,33 +60,49 @@ pub const Lexer = struct {
             const ch = self.src[self.pos];
             const start_loc = ast.Loc{ .line = self.line, .col = self.col, .offset = self.pos };
 
-            if (ch == '#') {
-                if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '#') {
-                    self.readDocComment(start_loc);
-                } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '[') {
-                    // `@[ ... ]` attribute (currently only `@[derive(...)]`
-                    // is in the grammar). Skip to the matching `]` so the
-                    // parser never sees `@[` as its own token. The brace
-                    // counting handles nested pairs like `@[derive(Eq)]`.
-                    // The attribute is otherwise ignored (full derive impl
-                    // is deferred per the user-confirmed scope); the parser
-                    // sees nothing where the attribute lived.
-                    self.advance(); // consume #
+            if (ch == '#' or ch == '@') {
+                const is_at = ch == '@';
+                if (is_at and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '[') {
+                    // `@[ ... ]` annotation attribute
+                    self.advance(); // consume @
                     self.advance(); // consume [
                     var depth: u32 = 1;
+                    const attr_start = self.pos;
                     while (self.pos < self.src.len and depth > 0) {
                         if (self.src[self.pos] == '[') depth += 1;
                         if (self.src[self.pos] == ']') depth -= 1;
                         self.pos += 1;
                         self.col += 1;
                     }
-                } else {
-                    while (self.pos < self.src.len and self.src[self.pos] != '\n') {
-                        self.pos += 1;
-                        self.col += 1;
+                    const attr_text = self.src[attr_start .. self.pos - 1];
+                    if (std.mem.eql(u8, attr_text, "test")) {
+                        self.addToken(.{ .tag = .test_annotation, .loc = start_loc, .text = "test" });
                     }
+                    continue;
                 }
-                continue;
+                if (!is_at) {
+                    // ch == '#' — handle ## (doc), #[ (skip), or bare #
+                    if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '#') {
+                        self.readDocComment(start_loc);
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '[') {
+                        self.advance(); // consume #
+                        self.advance(); // consume [
+                        var depth: u32 = 1;
+                        while (self.pos < self.src.len and depth > 0) {
+                            if (self.src[self.pos] == '[') depth += 1;
+                            if (self.src[self.pos] == ']') depth -= 1;
+                            self.pos += 1;
+                            self.col += 1;
+                        }
+                    } else {
+                        while (self.pos < self.src.len and self.src[self.pos] != '\n') {
+                            self.pos += 1;
+                            self.col += 1;
+                        }
+                    }
+                    continue;
+                }
+                // `@` without `[` — treat as regular character, fall through
             }
 
             if (ch == '\n') {

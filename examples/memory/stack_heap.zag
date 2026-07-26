@@ -7,6 +7,20 @@
 ##
 ## Run: zag run stack_heap.zag
 
+@[test]
+fun test_heap_value() {
+    let p: *i32 = new i32(42);
+    defer free(p);
+    assert(p == 42);
+}
+
+@[test]
+fun test_heap_buffer() {
+    let buf: []u8 = alloc(10);
+    defer free(buf);
+    assert(buf.len == 10);
+}
+
 fun main() {
     # Heap buffer via alloc
     let buf: []u8 = alloc(10);

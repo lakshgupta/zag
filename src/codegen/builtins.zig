@@ -245,6 +245,10 @@ pub const BuiltinDispatch = enum {
     /// `builtin_mutex_unlock` — emit `m.unlock()`.
     /// arity = 1: `mutex_unlock(m)`.
     builtin_mutex_unlock,
+
+    /// `builtin_assert` — emit `std.testing.expect(cond) catch unreachable`.
+    /// arity = 1: `assert(cond)`. arity = 2: `assert(cond, "msg")`.
+    builtin_assert,
 };
 
 /// One row in the router table. The match shape is name + arity --
@@ -364,6 +368,8 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "create", .arity = 0, .receiver = null, .dispatch = .builtin_mutex_create },
     .{ .name = "lock", .arity = 1, .receiver = null, .dispatch = .builtin_mutex_lock },
     .{ .name = "unlock", .arity = 1, .receiver = null, .dispatch = .builtin_mutex_unlock },
+    .{ .name = "assert", .arity = 1, .receiver = null, .dispatch = .builtin_assert },
+    .{ .name = "assert", .arity = 2, .receiver = null, .dispatch = .builtin_assert },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that

@@ -3173,3 +3173,43 @@ test "codegen: extern variadic fun emits ... in signature" {
     // Variadic signature
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub extern fn printf(fmt: [*]u8, ...) i32;") != null);
 }
+
+test "codegen: @[test] annotation emits test \"name\" { ... } block" {
+    const src =
+        \\@[test]
+        \\fun my_test() {
+        \\    assert(true);
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Emits test block, not pub fn
+    try std.testing.expect(std.mem.indexOf(u8, zig, "test \"my_test\" {") != null);
+    // Does NOT emit pub fn
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn my_test(") == null);
+    // assert builtin emits std.testing.expect
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.testing.expect(true)") != null);
+}
+
+test "codegen: assert(false, msg) emits expect with message" {
+    const src =
+        \\@[test]
+        \\fun msg_test() {
+        \\    assert(false, "should be true");
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "test \"msg_test\" {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.testing.expect(false)") != null);
+}

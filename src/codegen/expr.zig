@@ -1487,5 +1487,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.genExpr(args[0]);
                 self.write(".unlock())");
             },
+            .builtin_assert => {
+                self.write("(std.testing.expect(");
+                self.genExpr(args[0]);
+                self.write(") catch unreachable");
+                if (args.len >= 2) {
+                    self.write("; _ = ");
+                    self.genExpr(args[1]);
+                }
+                self.write(")");
+            },
         }
     }

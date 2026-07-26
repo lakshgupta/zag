@@ -68,6 +68,13 @@ pub fn parse(self: *Parser) ast.Program {
                 while (self.peek().tag == .newline) self.advance();
             }
             if (self.eof()) break;
+            // Check for `@[test]` annotation before declarations.
+            var is_test = false;
+            if (self.peek().tag == .test_annotation) {
+                is_test = true;
+                self.advance();
+                while (self.peek().tag == .newline) self.advance();
+            }
             // Top-level dispatch: structs and impl blocks live alongside
             // top-level functions. The dispatch is order-independent at
             // codegen time (codegen re-walks and interleaves struct fields
@@ -135,8 +142,10 @@ pub fn parse(self: *Parser) ast.Program {
                             trait_count += 1;
                         },
                         .fun => {
-                            functions_buf[fun_count] = self.parseFunDecl();
-                            functions_buf[fun_count].doc = doc;
+                            var fd = self.parseFunDecl();
+                            fd.is_test = is_test;
+                            fd.doc = doc;
+                            functions_buf[fun_count] = fd;
                             fun_count += 1;
                         },
                         else => unreachable,
@@ -231,8 +240,10 @@ pub fn parse(self: *Parser) ast.Program {
                 extern_count += 1;
                 continue;
             }
-            functions_buf[fun_count] = self.parseFunDecl();
-            functions_buf[fun_count].doc = doc;
+            var fd = self.parseFunDecl();
+            fd.is_test = is_test;
+            fd.doc = doc;
+            functions_buf[fun_count] = fd;
             fun_count += 1;
         }
 

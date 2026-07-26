@@ -346,3 +346,11 @@ test "lexer: union is a keyword" {
     try std.testing.expectEqualStrings("union", tokens[0].text);
 }
 
+test "lexer: @[test] produces test_annotation token" {
+    const src = "@[test]\nfun foo() { }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    try std.testing.expectEqual(lexer_mod.TokenTag.test_annotation, tokens[0].tag);
+    try std.testing.expectEqualStrings("test", tokens[0].text);
+}
+

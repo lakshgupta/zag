@@ -1213,6 +1213,10 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genFun(self: *Codegen, fun: ast.FunDecl) void {
+        if (fun.is_test) {
+            self.genTestFun(fun);
+            return;
+        }
         // Reset destructuring counter at the top of each function so the
         // temp bindings inside this body stay local (avoiding clashes
         // across sibling `pub fn` declarations) and count from `_0`.
@@ -1445,4 +1449,28 @@ const Codegen = core.Codegen;
         self.write(") ");
         if (ext.return_type) |rt| self.writeType(rt) else self.write("void");
         self.write(";\n\n");
+    }
+
+    /// Emit a zig `test "name" { ... }` block for an `@[test]` function.
+    /// Test functions have no parameters — the body runs directly.
+    pub     fn genTestFun(self: *Codegen, fun: ast.FunDecl) void {
+        self.destructure_counter = 0;
+        self.type_info_count = 0;
+        self.alloc_counter = 0;
+        self.match_counter = 0;
+        self.fs_counter = 0;
+
+        // Doc comment on the test block
+        if (fun.doc) |d| self.genDocComment(d);
+
+        self.write("test \"");
+        self.write(fun.name);
+        self.write("\" {\n");
+
+        // Trait-bounds guards (if generics present)
+        self.genBoundsGuards(fun.type_params);
+
+        for (fun.body) |s| self.genStmt(s, false);
+
+        self.write("}\n\n");
     }

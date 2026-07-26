@@ -72,6 +72,9 @@ pub const FunDecl = struct {
     /// for the type-param preamble and `@hasDecl(T, "method")` guards
     /// for each bound.
     type_params: []const TypeParam = &[_]TypeParam{},
+    /// True when `@[test]` annotation precedes the function.
+    /// Codegen emits `test "name" { ... }` instead of `pub fn name(...)`.
+    is_test: bool = false,
 };
 
 /// One field in a struct declaration. Two shapes:

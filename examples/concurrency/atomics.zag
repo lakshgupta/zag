@@ -9,6 +9,19 @@
 
 import std.concurrent.atomic
 
+@[test]
+fun test_atomic_ops() {
+    let ptr: *i32 = new i32(0);
+    defer free(ptr);
+
+    store(ptr, 42);
+    assert(load(ptr) == 42);
+
+    let old: i32 = fetch_add(ptr, 1);
+    assert(old == 42);
+    assert(load(ptr) == 43);
+}
+
 fun main() {
     let ptr: *i32 = new i32(0);
     defer free(ptr);

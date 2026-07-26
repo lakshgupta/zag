@@ -173,6 +173,10 @@ pub const TokenTag = enum {
     /// into `.member_access` (no parens) or `.method_call` (parens); a
     /// second `.` short-circuits into the range/ellipsis arms.
     dot,
+    /// `@[test]` annotation — marks the following function as a test.
+    /// Emitted as a distinct token so the parser can set `is_test`
+    /// on the FunDecl before parsing the function body.
+    test_annotation,
     newline,
     doc_comment,
     eof,

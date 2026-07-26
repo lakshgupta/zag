@@ -234,6 +234,7 @@ pub const VariantFieldsEntry = struct {
     pub const genBuiltinCall = @import("expr.zig").genBuiltinCall;
     pub const genFreeMethod = @import("decl.zig").genFreeMethod;
     pub const genFun = @import("decl.zig").genFun;
+    pub const genTestFun = @import("decl.zig").genTestFun;
     pub const genExternDecl = @import("decl.zig").genExternDecl;
     pub const genMatchExpr = @import("stmt.zig").genMatchExpr;
     pub const genMethod = @import("decl.zig").genMethod;
