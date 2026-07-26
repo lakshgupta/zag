@@ -122,17 +122,17 @@ buf.write("error: {err}");         # format into pre-allocated buffer
 ### 2.5 Attributes
 
 ```
-#[...]  applied to the next declaration
+@[...]  applied to the next declaration
 ```
 
-Standard attributes: `#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`, `#[packed]`, `#[align(N)]`, `#[allow_leak]`, `#[blocking]`, `#[test]`, `#[bench]`, `#[no_mangle]`, `#[export]`, `#[export("name")]`, `#[unused]`, `#[must_use]`, `#[deprecated]`, `#[deprecated("message")]`, `#[derive(Clone)]`, `#[derive(Default)]`, `#[derive(Zero)]`, `#[clone(skip)]`.
+Standard attributes: `@[inline]`, `@[inline(always)]`, `@[inline(never)]`, `@[cold]`, `@[packed]`, `@[align(N)]`, `@[allow_leak]`, `@[blocking]`, `@[test]`, `@[bench]`, `@[no_mangle]`, `@[export]`, `@[export("name")]`, `@[unused]`, `@[must_use]`, `@[deprecated]`, `@[deprecated("message")]`, `@[derive(Clone)]`, `@[derive(Default)]`, `@[derive(Zero)]`, `@[clone(skip)]`.
 
-`#[clone(skip)]` is a field-level attribute used inside a struct that opts into `#[derive(Clone)]`. It marks a field that the synthesized `Clone` impl should **not** copy — the cloned value receives whatever the field's `default()` produces (or `undefined` if the field is non-`Default` and the user has accepted the cost). Use it for owning `*T` fields that need a hand-written `Clone` (deep copy via `T.clone()` or `Rc.clone` / `Arc.clone`) or for fields that should be left in a known-empty state until the user initializes them. The attribute is only valid on struct fields in a `#[derive(Clone)]` block; using it elsewhere is a compile error.
+`@[clone(skip)]` is a field-level attribute used inside a struct that opts into `@[derive(Clone)]`. It marks a field that the synthesized `Clone` impl should **not** copy — the cloned value receives whatever the field's `default()` produces (or `undefined` if the field is non-`Default` and the user has accepted the cost). Use it for owning `*T` fields that need a hand-written `Clone` (deep copy via `T.clone()` or `Rc.clone` / `Arc.clone`) or for fields that should be left in a known-empty state until the user initializes them. The attribute is only valid on struct fields in a `@[derive(Clone)]` block; using it elsewhere is a compile error.
 
 ```
 struct Graph {
     nodes: List<Node>,
-    #[clone(skip)]               # deep-cloned by hand in the impl below
+    @[clone(skip)]               # deep-cloned by hand in the impl below
     adjacency: *Adjacency,
 }
 
@@ -145,21 +145,21 @@ impl Graph {
 }
 ```
 
-In the example, `#[derive(Clone)]` would otherwise attempt a shallow copy of `adjacency` and produce a use-after-free. `#[clone(skip)]` excludes the field from the synthesized `Clone`, and the hand-written `impl Graph { pub fun clone(...) }` provides the deep-copy semantics.
+In the example, `@[derive(Clone)]` would otherwise attempt a shallow copy of `adjacency` and produce a use-after-free. `@[clone(skip)]` excludes the field from the synthesized `Clone`, and the hand-written `impl Graph { pub fun clone(...) }` provides the deep-copy semantics.
 
-**`#[derive(...)]` in v1.** Only `Clone`, `Default`, and `Zero` are derivable in v1. The compiler synthesizes the trait `impl` for the annotated `struct` or `enum` automatically:
+**`@[derive(...)]` in v1.** Only `Clone`, `Default`, and `Zero` are derivable in v1. The compiler synthesizes the trait `impl` for the annotated `struct` or `enum` automatically:
 
 | Attribute | Synthesizes | Notes |
 |---|---|---|
-| `#[derive(Clone)]` | `impl T { fun clone(self: *const T) -> T }` that copies every field | Recursive: each field's type must also be `Clone`. The compiler synthesizes `Clone` for primitives, `[]T`, `String`, `*T` (shallow copy), `Option<T>` (when `T: Clone`), `Result<T,E>` (when `T: Clone`). User `Clone` impls win over the generated one. |
-| `#[derive(Default)]` | `impl T { fun default() -> T }` that zero-initializes the struct or returns the first enum variant | Recursive: each field's type must be `Default`. Primitive types are `Default` with the value `0`, `false`, `'\0'`, or `{}` (for `void`). |
-| `#[derive(Zero)]` | Marker impl `impl T { fun zero() -> T }` that writes all-zero bytes via `std.mem.zero` | The struct must be `Zero`-compatible — every field type must be `Zero` (no embedded slices, `String`, `Option<T>` where `T` is not `Zero`, or other non-`Zero` types). This is a **fast path** for bulk initialization in tight loops (game frames, AI kernels, page-table zeroing). The compiler emits a single `memset` call. |
+| `@[derive(Clone)]` | `impl T { fun clone(self: *const T) -> T }` that copies every field | Recursive: each field's type must also be `Clone`. The compiler synthesizes `Clone` for primitives, `[]T`, `String`, `*T` (shallow copy), `Option<T>` (when `T: Clone`), `Result<T,E>` (when `T: Clone`). User `Clone` impls win over the generated one. |
+| `@[derive(Default)]` | `impl T { fun default() -> T }` that zero-initializes the struct or returns the first enum variant | Recursive: each field's type must be `Default`. Primitive types are `Default` with the value `0`, `false`, `'\0'`, or `{}` (for `void`). |
+| `@[derive(Zero)]` | Marker impl `impl T { fun zero() -> T }` that writes all-zero bytes via `std.mem.zero` | The struct must be `Zero`-compatible — every field type must be `Zero` (no embedded slices, `String`, `Option<T>` where `T` is not `Zero`, or other non-`Zero` types). This is a **fast path** for bulk initialization in tight loops (game frames, AI kernels, page-table zeroing). The compiler emits a single `memset` call. |
 
-Derive is a compile-time expansion — the synthesized methods are visible in the type system (overload resolution, `Clone`-as-trait dispatch) and can be specialized by the user with a hand-written `impl`. Other `#[derive(...)]` variants (`Debug`, `JSON`, `Eq`, `Hash`, `Ord`) are deferred to v2 (§19) along with the full macro framework.
+Derive is a compile-time expansion — the synthesized methods are visible in the type system (overload resolution, `Clone`-as-trait dispatch) and can be specialized by the user with a hand-written `impl`. Other `@[derive(...)]` variants (`Debug`, `JSON`, `Eq`, `Hash`, `Ord`) are deferred to v2 (§19) along with the full macro framework.
 
-**`Clone` and the no-hidden-allocation rule.** A generated `Clone` implementation may allocate when the struct contains a `String` or another non-`Copy` heap-allocating type. This is the **single exception** in v1 to the no-hidden-allocation principle (§1): the allocation is visible at the syntactic level (the user wrote `#[derive(Clone)]` and the field type is `String`), so it is treated as an explicit declaration rather than a hidden cost. To make the allocation site unambiguous at the call site, the `Clone` trait also provides `clone_into(self, dest: *T)` for the case where the caller already has a destination buffer.
+**`Clone` and the no-hidden-allocation rule.** A generated `Clone` implementation may allocate when the struct contains a `String` or another non-`Copy` heap-allocating type. This is the **single exception** in v1 to the no-hidden-allocation principle (§1): the allocation is visible at the syntactic level (the user wrote `@[derive(Clone)]` and the field type is `String`), so it is treated as an explicit declaration rather than a hidden cost. To make the allocation site unambiguous at the call site, the `Clone` trait also provides `clone_into(self, dest: *T)` for the case where the caller already has a destination buffer.
 
-**`Clone` does not deep-copy owning pointers.** If a struct field has type `*T` (owning single-item pointer, §3.2), the synthesized `clone()` produces a **shallow** copy of the pointer value — both the source and the clone believe they own the pointee, and freeing one leaves the other dangling. The `#[derive(Clone)]` attribute is therefore a **compile error** when the struct contains a `*T` field that is not annotated `#[clone(skip)]`. Use a hand-written `Clone` impl that performs a deep copy (`self.data.clone()`) or uses `Rc<T>` / `Arc<T>` for shared ownership. Non-owning pointer forms (`*const T`, `*raw T`, slices, nullable pointers) are `Copy` and clone by value.
+**`Clone` does not deep-copy owning pointers.** If a struct field has type `*T` (owning single-item pointer, §3.2), the synthesized `clone()` produces a **shallow** copy of the pointer value — both the source and the clone believe they own the pointee, and freeing one leaves the other dangling. The `@[derive(Clone)]` attribute is therefore a **compile error** when the struct contains a `*T` field that is not annotated `@[clone(skip)]`. Use a hand-written `Clone` impl that performs a deep copy (`self.data.clone()`) or uses `Rc<T>` / `Arc<T>` for shared ownership. Non-owning pointer forms (`*const T`, `*raw T`, slices, nullable pointers) are `Copy` and clone by value.
 
 ```
 struct Particle {
@@ -179,17 +179,17 @@ impl Particle {
 }
 
 var particles: [1024]Particle = [1024]Particle { Particle.zero() ... };
-#                     ^^^^^^^^^^ generated by #[derive(Zero)]; emits a single memset
+#                     ^^^^^^^^^^ generated by @[derive(Zero)]; emits a single memset
 ```
 
-`#[export]` uses the Zag function name as the linker symbol. `#[export("name")]` uses the given symbol name.
+`@[export]` uses the Zag function name as the linker symbol. `@[export("name")]` uses the given symbol name.
 
-`#[packed]` removes padding between struct fields (layout = C `__attribute__((packed))`).
-`#[align(N)]` sets a minimum byte alignment for a struct, field, or global variable.
-`#[allow_leak]` suppresses the leak-check error for `task.detach()` and `scope.detach(task)` on the annotated function.
-`#[blocking]` marks a function as blocking; the compiler warns if called from async context without `task.spawn_blocking`.
-`#[must_use]` emits a warning when the return value of the annotated function or method is discarded. For functions whose return type is `Result<T, E>` or `Option<T>`, this attribute is **implied** — the warning can be silenced by explicitly discarding with `let _ = ...`.
-`#[deprecated]` and `#[deprecated("message")]` emit a warning at every call site; the message form includes the explanation in the diagnostic.
+`@[packed]` removes padding between struct fields (layout = C `__attribute__((packed))`).
+`@[align(N)]` sets a minimum byte alignment for a struct, field, or global variable.
+`@[allow_leak]` suppresses the leak-check error for `task.detach()` and `scope.detach(task)` on the annotated function.
+`@[blocking]` marks a function as blocking; the compiler warns if called from async context without `task.spawn_blocking`.
+`@[must_use]` emits a warning when the return value of the annotated function or method is discarded. For functions whose return type is `Result<T, E>` or `Option<T>`, this attribute is **implied** — the warning can be silenced by explicitly discarding with `let _ = ...`.
+`@[deprecated]` and `@[deprecated("message")]` emit a warning at every call site; the message form includes the explanation in the diagnostic.
 
 ---
 
@@ -596,9 +596,9 @@ let m = max<i32>(3, 5);
 
 | Trait | Required methods | Auto-implemented when |
 |-------|------------------|----------------------|
-| `Clone` | `fun clone(self: *const Self) -> Self` | `#[derive(Clone)]` or manual `impl` |
-| `Default` | `fun default() -> Self` | `#[derive(Default)]` or manual `impl` |
-| `Zero` | `fun zero() -> Self` | `#[derive(Zero)]` (all fields `Zero`) |
+| `Clone` | `fun clone(self: *const Self) -> Self` | `@[derive(Clone)]` or manual `impl` |
+| `Default` | `fun default() -> Self` | `@[derive(Default)]` or manual `impl` |
+| `Zero` | `fun zero() -> Self` | `@[derive(Zero)]` (all fields `Zero`) |
 | `Ordered` | `__lt__`, `__le__`, `__gt__`, `__ge__` | All four operator overloads defined |
 | `Display` | `fun write(self: *const Self, w: *fmt.Writer) -> Result<(), fmt.Error>` | Manual `impl` |
 | `Iterator<T>` | `fun next(self: *Self) -> Option<T>` | Manual `impl` |
@@ -1208,7 +1208,7 @@ Zag's "no hidden control flow" principle means the language is **explicitly perm
 | Integer overflow (signed wrap) | Allowed; wraps silently on the target | `-fsanitize=undefined` |
 | Out-of-bounds array/slice access | Allowed; indexing is unchecked in `-O0`/`-O1`/`-O2`/`-O3` | `-Dbounds-check` (compile time, inserts guards) or `-fsanitize=undefined` |
 | Misaligned load/store via `*raw T` cast | Allowed; UB on most targets | `-fsanitize=undefined` |
-| Calling a blocking function from `async fun` | Allowed; blocks the event loop | `#[blocking]` attribute warning (compile time) |
+| Calling a blocking function from `async fun` | Allowed; blocks the event loop | `@[blocking]` attribute warning (compile time) |
 | Panicking across FFI boundaries | Allowed; aborts the process | Discipline (use `catch` at the FFI boundary) |
 | Iterator invalidation during `for` | Allowed; the language does not track container mutation | Discipline; use `copy` or collect before mutating |
 
@@ -1232,8 +1232,8 @@ Zag's "no hidden control flow" principle means the language is **explicitly perm
 | Raw pointer access to shared memory across tasks | §6.8 |
 | Implementing lock-free data structures via `std.atomic` | §6.8 |
 | FFI calls across threads for non-thread-safe C functions | §6.8 |
-| `task.detach()` outside `task.scope` / `#[allow_leak]` | §6.2 |
-| `scope.detach(task)` outside `#[allow_leak]` | §6.4.1 |
+| `task.detach()` outside `task.scope` / `@[allow_leak]` | §6.2 |
+| `scope.detach(task)` outside `@[allow_leak]` | §6.4.1 |
 
 ```
 unsafe {
@@ -1269,13 +1269,13 @@ unsafe {
 ### 5.6 FFI
 
 ```
-#[export("printf")]
+@[export("printf")]
 extern fun printf(fmt: *raw u8, ...) -> i32;
 
 extern fun open(path: *raw u8, flags: i32) -> i32;
 ```
 
-`extern fun` declares a function defined externally (C ABI). For v1, this is the only supported FFI ABI. `#[export("name")]` sets the exported linker symbol, either on a Zag function (making it callable from C) or on an `extern` declaration (specifying the library symbol name).
+`extern fun` declares a function defined externally (C ABI). For v1, this is the only supported FFI ABI. `@[export("name")]` sets the exported linker symbol, either on a Zag function (making it callable from C) or on an `extern` declaration (specifying the library symbol name).
 
 C variadic `...` in FFI declarations is distinct from Zag's variadic `T...` syntax (§8.1). C variadics accept any number of arguments of any type and are inherently unsafe — use only inside `unsafe` blocks or with a safe wrapper.
 
@@ -1283,22 +1283,22 @@ C variadic `...` in FFI declarations is distinct from Zag's variadic `T...` synt
 
 | Attribute | Meaning |
 |-----------|---------|
-| `#[repr(C)]` | C-compatible layout: fields in declaration order, platform padding/alignment rules |
-| `#[repr(C, packed)]` | C-compatible packed: no padding between fields (like `__attribute__((packed))`) |
-| `#[repr(C, opaque)]` | Opaque FFI type — size/alignment known, layout hidden; only usable via pointers |
-| `#[offset(N)]` | Field attribute: explicit byte offset for the field (must be monotonically increasing) |
-| `#[repr(C, int)]` | On enums: discriminant type (e.g., `i32`, `u8`); enum variants must have explicit values. Composes with `enum(T)` (e.g. `#[repr(C, u8)] enum(str) X`) — the C-ABI uses `u8`; the Zag-side value type is `str` |
+| `@[repr(C)]` | C-compatible layout: fields in declaration order, platform padding/alignment rules |
+| `@[repr(C, packed)]` | C-compatible packed: no padding between fields (like `__attribute__((packed))`) |
+| `@[repr(C, opaque)]` | Opaque FFI type — size/alignment known, layout hidden; only usable via pointers |
+| `@[offset(N)]` | Field attribute: explicit byte offset for the field (must be monotonically increasing) |
+| `@[repr(C, int)]` | On enums: discriminant type (e.g., `i32`, `u8`); enum variants must have explicit values. Composes with `enum(T)` (e.g. `@[repr(C, u8)] enum(str) X`) — the C-ABI uses `u8`; the Zag-side value type is `str` |
 
 ```
 # Force C-compatible layout (no padding reordering)
-#[repr(C)]
+@[repr(C)]
 struct CCompatible {
     a: i32,
     b: f64,        # offset 8 (not 4) — matches C struct layout
     c: i16,
 }
 
-#[repr(C, packed)]  # packed = no padding
+@[repr(C, packed)]  # packed = no padding
 struct PackedC {
     a: i32,
     b: f64,        # offset 4 — unaligned, matches C __attribute__((packed))
@@ -1306,20 +1306,20 @@ struct PackedC {
 }
 
 # Explicit field offsets (for GPU buffers, hardware registers)
-#[repr(C)]
+@[repr(C)]
 struct GpuVertex {
-    #[offset(0)]  pos: [3]f32,
-    #[offset(12)] normal: [3]f32,
-    #[offset(24)] uv: [2]f32,
-    #[offset(32)] color: [4]u8,
+    @[offset(0)]  pos: [3]f32,
+    @[offset(12)] normal: [3]f32,
+    @[offset(24)] uv: [2]f32,
+    @[offset(32)] color: [4]u8,
 }
 
 # Opaque FFI types — size/alignment known, layout hidden
-#[repr(C, opaque)]
+@[repr(C, opaque)]
 extern struct OpaqueHandle;
 
 # C-compatible enums (discriminant = int)
-#[repr(C, i32)]
+@[repr(C, i32)]
 enum CError {
     Ok = 0,
     NotFound = 1,
@@ -1327,7 +1327,7 @@ enum CError {
 }
 ```
 
-`#[repr(C)]` structs can be passed by value across FFI boundaries. `#[repr(C, opaque)]` types can only be used behind pointers (`*OpaqueHandle`, `*const OpaqueHandle`).
+`@[repr(C)]` structs can be passed by value across FFI boundaries. `@[repr(C, opaque)]` types can only be used behind pointers (`*OpaqueHandle`, `*const OpaqueHandle`).
 
 ### 5.7 Safety Tooling
 
@@ -1399,7 +1399,7 @@ async fun serve(addr: SocketAddr) -> Result<(), Error> {
 - `await` suspends the current task, yields to event loop
 - `task.spawn(future)` ? `Task<T>` handle for joining/cancellation
 - `task.spawn_blocking { ... }` runs blocking code in thread pool
-- `task.detach()` — fire-and-forget; drops the join handle without waiting. Requires `#[allow_leak]` on the enclosing function or wrapping in `unsafe`; a plain call produces a compile error unless the task was spawned inside a `task.scope` (where the scope tracks it)
+- `task.detach()` — fire-and-forget; drops the join handle without waiting. Requires `@[allow_leak]` on the enclosing function or wrapping in `unsafe`; a plain call produces a compile error unless the task was spawned inside a `task.scope` (where the scope tracks it)
 - `task.join()` — **async**; returns `Future<T>`. Must be `await`ed to get the result
 - Dropping a `Task` cancels it (runs its `defer` cleanups) without waiting
 - `?` propagates `Result.Err` and `Option.None` through async boundaries
@@ -1487,7 +1487,7 @@ async fun handle_request(req: Request) -> Result<Response> {
 - `scope.join_all()` awaits all children, returns tuple of results
 - On error: the first child to return `Err` cancels all remaining children; `join_all` returns that error. Panics in children are caught and converted to errors
 - On scope exit (normal return, `?` propagation, or panic), all remaining children are cancelled and joined — the scope never leaks tasks
-- `scope.detach(task)` removes a task from scope management; the task leaks unless manually joined later. Produces a **compile error** unless the call is wrapped in `unsafe` or the enclosing function is annotated with `#[allow_leak]`
+- `scope.detach(task)` removes a task from scope management; the task leaks unless manually joined later. Produces a **compile error** unless the call is wrapped in `unsafe` or the enclosing function is annotated with `@[allow_leak]`
 - A scope runs on the event loop; `await scope.join_all()` yields to the event loop while waiting, so nested awaits inside children do not block the parent
 - `scope` cannot outlive the async function it is declared in (statically enforced)
 
@@ -1756,7 +1756,7 @@ const HandleConn = struct {
 **Blocking calls in async:** Calling a blocking function (file I/O, legacy C lib, heavy compute) directly from `async fun` blocks the event loop. Use `task.spawn_blocking { ... }` or annotate the function:
 
 ```
-#[blocking]
+@[blocking]
 fun blocking_db_query(query: String) -> Result<Rows, Error> { ... }
 
 async fun handler() {
@@ -1764,7 +1764,7 @@ async fun handler() {
 }
 ```
 
-The `#[blocking]` attribute allows the compiler to warn if called without `task.spawn_blocking` from async context.
+The `@[blocking]` attribute allows the compiler to warn if called without `task.spawn_blocking` from async context.
 
 ### 6.8 Memory Model
 
@@ -2388,8 +2388,8 @@ Packages the bootstrap stdlib must provide:
 - `std.error` — `Context` struct, `ErrorExt` trait (`context(msg: String) -> Context`, `context_str(msg: str) -> Context`) for adding context to any error type (§3.3)
 - `std.traits` — compiler-known structural traits: `Ordered` (requires `__lt__`, `__le__`, `__gt__`, `__ge__`), `Clone`, `Default`, `Zero`, `Display`, `Iterator<T>`, `AsyncStream<T>`. These are auto-implemented when a type defines the required methods (§4.1).
 - `std.default` — `Default` trait and `Zero` trait:
-  - `trait Default { fun default() -> Self; }` — produces a type-appropriate "zero" value (`0`, `false`, `{}`, `'\0'`, `Option.None`, the first enum variant). `Default` is implemented for all primitive types and for any `struct` annotated with `#[derive(Default)]` (§2.5). Use it to give a struct a canonical empty value without writing a constructor. `Default` is the right choice when the type may contain non-`Copy` fields (e.g. `String`) that need a non-zero empty state. Because Zag has no trait bounds on generics (§4.1), `Default` is invoked through method call syntax (`T.default()`) — there is no top-level generic `default<T>()` function
-  - `trait Zero { fun zero() -> Self; }` — marker for "all-zero bytes is a valid value." `Zero` is implemented for all primitive types, `[N]T` where the element is `Zero`, and any `#[derive(Zero)]` struct where every field is `Zero` (no embedded slices, `String`, `Option<T>` where `T` is not `Zero`, or other non-`Zero` types). **Use `Zero` in hot loops** (game frames, AI kernels, page-table zeroing) where the compiler can emit a single `memset`; use `Default` when the struct is heterogeneous or contains `String` / `Option` / `Result`. `Zero` is a stronger precondition than `Default` — not every `Default` type is `Zero`, but every `Zero` type is `Default` (a `zero` value is a valid `default` value). Same caveat as `Default`: invoke via `T.zero()` method syntax, not generic helpers
+  - `trait Default { fun default() -> Self; }` — produces a type-appropriate "zero" value (`0`, `false`, `{}`, `'\0'`, `Option.None`, the first enum variant). `Default` is implemented for all primitive types and for any `struct` annotated with `@[derive(Default)]` (§2.5). Use it to give a struct a canonical empty value without writing a constructor. `Default` is the right choice when the type may contain non-`Copy` fields (e.g. `String`) that need a non-zero empty state. Because Zag has no trait bounds on generics (§4.1), `Default` is invoked through method call syntax (`T.default()`) — there is no top-level generic `default<T>()` function
+  - `trait Zero { fun zero() -> Self; }` — marker for "all-zero bytes is a valid value." `Zero` is implemented for all primitive types, `[N]T` where the element is `Zero`, and any `@[derive(Zero)]` struct where every field is `Zero` (no embedded slices, `String`, `Option<T>` where `T` is not `Zero`, or other non-`Zero` types). **Use `Zero` in hot loops** (game frames, AI kernels, page-table zeroing) where the compiler can emit a single `memset`; use `Default` when the struct is heterogeneous or contains `String` / `Option` / `Result`. `Zero` is a stronger precondition than `Default` — not every `Default` type is `Zero`, but every `Zero` type is `Default` (a `zero` value is a valid `default` value). Same caveat as `Default`: invoke via `T.zero()` method syntax, not generic helpers
 - `std.net`, `std.fs`, `std.io`, `std.json`, `std.bytes`, `std.math`
 
 **Deferred stdlib packages (planned, not in v1):** `std.crypto` (cryptographic primitives), `std.regex` (regular expressions), `std.ui` (GUI toolkit). See §19 for the full deferral list.
@@ -2474,7 +2474,7 @@ Source
 ## 13. Testing
 
 ```
-#[test]
+@[test]
 fun add_works() {
     assert(add(1, 2) == 3);
 }
@@ -2484,12 +2484,12 @@ Run with `zag test`.
 
 ### 13.1 Benchmarking
 
-Benchmark functions are marked with `#[bench]`. They take no arguments and return `void`. The `zag bench` command runs each benchmark a fixed number of iterations (1 by default, configurable via `--iterations` on the CLI) and prints timing and allocation statistics.
+Benchmark functions are marked with `@[bench]`. They take no arguments and return `void`. The `zag bench` command runs each benchmark a fixed number of iterations (1 by default, configurable via `--iterations` on the CLI) and prints timing and allocation statistics.
 
 ```
 import std.bench
 
-#[bench]
+@[bench]
 fun bench_matrix_multiply() {
     let a = Matrix4x4.identity();
     let b = Matrix4x4.identity();
@@ -2835,7 +2835,7 @@ The v1 language and bootstrap compiler deliberately omit several features common
 
 | Feature | Why deferred | Expected target |
 |---|---|---|
-| Full compile-time reflection / `#[derive(Debug, JSON, Eq, Hash, Ord)]` | v1 has `#[derive(Clone)]`, `#[derive(Default)]`, `#[derive(Zero)]` (§2.5) plus the `fields`, `size_of`, `align_of`, `type_name` builtins (§8.3). The remaining derives need a const-accessible AST API and user-defined derive macro hooks | v2 |
+| Full compile-time reflection / `@[derive(Debug, JSON, Eq, Hash, Ord)]` | v1 has `@[derive(Clone)]`, `@[derive(Default)]`, `@[derive(Zero)]` (§2.5) plus the `fields`, `size_of`, `align_of`, `type_name` builtins (§8.3). The remaining derives need a const-accessible AST API and user-defined derive macro hooks | v2 |
 | Macros / syntax extensions | Hygiene and resolution rules need experience with the type system in the field first | v2 |
 | Nested-tuple / struct / enum / array patterns in `for` | Single-level tuple destructuring is in v1 (§7.2); full pattern coverage awaits a v2 syntactic-sugar addition | v2 |
 | Associated types in traits | Currently expressible via generic type parameters; the syntactic sugar is non-trivial | v2 |
@@ -2844,7 +2844,7 @@ The v1 language and bootstrap compiler deliberately omit several features common
 | `const` generics with `*` patterns (`const N: usize where N > 0`) | Parsing complexity outpaces current benefit | v2 |
 | Built-in benchmark filtering / `criterion`-style statistics | `std.bench` returns raw timing; richer stats are a library addition | v2 |
 | Built-in test coverage instrumentation | Awaiting profiler/LLVM coverage format choice | v2 |
-| Built-in fuzz harness (`#[fuzz]`) | Awaiting feedback on a safe `unsafe`-aware fuzz API | v2 |
+| Built-in fuzz harness (`@[fuzz]`) | Awaiting feedback on a safe `unsafe`-aware fuzz API | v2 |
 | Source maps for panic messages across FFI boundaries | Requires a stable emission format | v2 |
 | Cyclic module dependency checker (module DAG) | v1 enforces a strict DAG; cycles produce a clear error | v2 |
 

@@ -2038,7 +2038,7 @@ test "codegen: multiple std imports take distinct __zag_imported_<i> indices" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_1 = @import(\"lib/std/fmt.zag\")") != null);
 }
 
-test "codegen: all 9 KNOWN_STD_MODULES entries render their expected lib/std/<path>.zag preamble" {
+test "codegen: all 12 KNOWN_STD_MODULES entries render their expected lib/std/<path>.zag preamble" {
     // Drift pin: KNOWN_STD_MODULES (src/parser/core.zig) and the
     // codegen preamble's resolveStdImport lookup MUST agree on the
     // same (name -> path) map. This test renders each entry as
@@ -2063,12 +2063,11 @@ test "codegen: all 9 KNOWN_STD_MODULES entries render their expected lib/std/<pa
         .{ .name = "std.bench",         .expected = "lib/std/bench.zag" },
         .{ .name = "std.async.stream",  .expected = "lib/std/async/stream.zag" },
         .{ .name = "std.arch.x86.avx2", .expected = "lib/std/arch/x86/avx2.zag" },
+        .{ .name = "std.concurrent.atomic", .expected = "lib/std/concurrent/atomic.zag" },
+        .{ .name = "std.concurrent.thread", .expected = "lib/std/concurrent/thread.zag" },
+        .{ .name = "std.concurrent.mutex",  .expected = "lib/std/concurrent/mutex.zag" },
     };
-    // Count pin: a future regression that drops an entry below 9
-    // (or grows above 9 without this test being updated) breaks here
-    // BEFORE the per-entry loop runs -- catches silent table size
-    // drift that per-entry assertions alone would miss.
-    try std.testing.expectEqual(@as(usize, 9), cases.len);
+    try std.testing.expectEqual(@as(usize, 12), cases.len);
 
     for (cases) |c| {
         var src_buf: [192]u8 = undefined;

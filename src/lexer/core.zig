@@ -64,10 +64,10 @@ pub const Lexer = struct {
                 if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '#') {
                     self.readDocComment(start_loc);
                 } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '[') {
-                    // `#[ ... ]` attribute (currently only `#[derive(...)]`
+                    // `@[ ... ]` attribute (currently only `@[derive(...)]`
                     // is in the grammar). Skip to the matching `]` so the
-                    // parser never sees `#[` as its own token. The brace
-                    // counting handles nested pairs like `#[derive(Eq)]`.
+                    // parser never sees `@[` as its own token. The brace
+                    // counting handles nested pairs like `@[derive(Eq)]`.
                     // The attribute is otherwise ignored (full derive impl
                     // is deferred per the user-confirmed scope); the parser
                     // sees nothing where the attribute lived.

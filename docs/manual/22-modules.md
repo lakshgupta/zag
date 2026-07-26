@@ -195,7 +195,7 @@ A few namespaces show up in docs and examples but are *not* stdlib modules:
 
 - `std.collections.*` — `List<T>`, `Map<K, V>`, `Set<T>` — implementations of these live as **user-space libraries** (see [Dependencies](#dependencies)), not in the toolchain-shipped std tree. The reason: collections are the canonical surface where language evolution matters most, and locking them into the toolchain's release cycle clashes with that.
 - `std.comptime` / `std.reflect` — deferred to v2 alongside the macro framework (§19).
-- `std.c` — bindings for the C standard library are generated at FFI declaration time, not pre-built. Use `extern fun printf(...)` (with `#[repr(C, opaque)]` for opaque types; §5.6) directly in user code rather than going through a std.c indirection.
+- `std.c` — bindings for the C standard library are generated at FFI declaration time, not pre-built. Use `extern fun printf(...)` (with `@[repr(C, opaque)]` for opaque types; §5.6) directly in user code rather than going through a std.c indirection.
 
 The `std.` prefix is reserved — third-party packages use their own prefix (`json.*`, `http.*`, `math.*` in this manual) and live in `deps/` (see [Dependencies](#dependencies) above).
 

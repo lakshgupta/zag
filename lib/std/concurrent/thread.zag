@@ -1,0 +1,9 @@
+## std.concurrent.thread — OS thread spawning and joining (docs/21)
+##
+##   import std.concurrent.thread
+##
+##   spawn(fn, args)   std.Thread.spawn(.{}, fn, args)
+##   join(handle)      handle.join()
+
+pub fun spawn(fn: *raw c_void, args: ());
+pub fun join(handle: *i32);

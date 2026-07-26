@@ -1,0 +1,25 @@
+## Atomic operations via std.concurrent.atomic (docs/21)
+##
+##   import std.concurrent.atomic
+##
+## Simple names: load, store, fetch_add, compare_exchange.
+## Each maps to one hardware instruction.
+##
+## Run: zag run atomics.zag
+
+import std.concurrent.atomic
+
+fun main() {
+    let ptr: *i32 = new i32(0);
+    defer free(ptr);
+
+    store(ptr, 42);
+    let val: i32 = load(ptr);
+    print("loaded: {val}\n");
+
+    let old: i32 = fetch_add(ptr, 1);
+    print("fetch_add old: {old}, new: {ptr}\n");
+
+    let cas: i32 = compare_exchange(ptr, old + 1, 99);
+    print("after cas: {ptr}\n");
+}

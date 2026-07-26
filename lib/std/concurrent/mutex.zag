@@ -1,0 +1,11 @@
+## std.concurrent.mutex — mutual exclusion (docs/21)
+##
+##   import std.concurrent.mutex
+##
+##   create()     std.Thread.Mutex{}
+##   lock(m)      m.lock()
+##   unlock(m)    m.unlock()
+
+pub fun create();
+pub fun lock(m: *i32);
+pub fun unlock(m: *i32);

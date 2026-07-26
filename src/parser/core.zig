@@ -624,6 +624,9 @@ pub const Parser = struct {
         .{ .name = "std.bench", .path = "lib/std/bench.zag" },
         .{ .name = "std.async.stream", .path = "lib/std/async/stream.zag" },
         .{ .name = "std.arch.x86.avx2", .path = "lib/std/arch/x86/avx2.zag" },
+        .{ .name = "std.concurrent.atomic", .path = "lib/std/concurrent/atomic.zag" },
+        .{ .name = "std.concurrent.thread", .path = "lib/std/concurrent/thread.zag" },
+        .{ .name = "std.concurrent.mutex", .path = "lib/std/concurrent/mutex.zag" },
     };
 
     pub fn resolveStdImport(dotted: []const u8) ?[]const u8 {

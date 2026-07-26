@@ -2,15 +2,15 @@
 
 ## Test Functions
 
-Mark tests with `#[test]`:
+Mark tests with `@[test]`:
 
 ```
-#[test]
+@[test]
 fun add_works() {
     assert(add(1, 2) == 3);
 }
 
-#[test]
+@[test]
 fun divide_by_zero() {
     let result = divide(10.0, 0.0);
     match result {
@@ -46,12 +46,12 @@ Tests can be in separate files or alongside source.
 
 ## Benchmarks
 
-Mark benchmarks with `#[bench]`:
+Mark benchmarks with `@[bench]`:
 
 ```
 import std.bench
 
-#[bench]
+@[bench]
 fun bench_matrix_multiply() {
     let a = Matrix4x4.identity();
     let b = Matrix4x4.identity();

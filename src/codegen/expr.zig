@@ -1425,5 +1425,67 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.genExpr(args[0]);
                 self.write(")");
             },
+            .builtin_atomic_load => {
+                self.write("@atomicLoad(@TypeOf(");
+                self.genExpr(args[0]);
+                self.write(".*), ");
+                self.genExpr(args[0]);
+                self.write(", .seq_cst)");
+            },
+            .builtin_atomic_store => {
+                self.write("@atomicStore(@TypeOf(");
+                self.genExpr(args[0]);
+                self.write(".*), ");
+                self.genExpr(args[0]);
+                self.write(", ");
+                self.genExpr(args[1]);
+                self.write(", .seq_cst)");
+            },
+            .builtin_atomic_fetch_add => {
+                self.write("@atomicRmw(@TypeOf(");
+                self.genExpr(args[0]);
+                self.write(".*), ");
+                self.genExpr(args[0]);
+                self.write(", .Add, ");
+                self.genExpr(args[1]);
+                self.write(", .seq_cst)");
+            },
+            .builtin_atomic_compare_exchange => {
+                self.write("@cmpxchgStrong(@TypeOf(");
+                self.genExpr(args[0]);
+                self.write(".*), ");
+                self.genExpr(args[0]);
+                self.write(", ");
+                self.genExpr(args[1]);
+                self.write(", ");
+                self.genExpr(args[2]);
+                self.write(", .seq_cst, .seq_cst)");
+            },
+            .builtin_thread_spawn => {
+                // thread_spawn(fn_name, args_tuple)
+                self.write("(std.Thread.spawn(.{}, ");
+                self.genExpr(args[0]);
+                self.write(", ");
+                self.genExpr(args[1]);
+                self.write(") catch @panic(\"thread spawn failed\"))");
+            },
+            .builtin_thread_join => {
+                self.write("(");
+                self.genExpr(args[0]);
+                self.write(".join())");
+            },
+            .builtin_mutex_create => {
+                self.write("std.Thread.Mutex{}");
+            },
+            .builtin_mutex_lock => {
+                self.write("(");
+                self.genExpr(args[0]);
+                self.write(".lock())");
+            },
+            .builtin_mutex_unlock => {
+                self.write("(");
+                self.genExpr(args[0]);
+                self.write(".unlock())");
+            },
         }
     }

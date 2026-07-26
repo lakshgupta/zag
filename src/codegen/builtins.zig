@@ -208,6 +208,43 @@ pub const BuiltinDispatch = enum {
     /// For MMIO reads that must not be cached or reordered.
     /// arity = 1: `volatile_load(ptr)`.
     builtin_volatile_load,
+
+    /// `builtin_atomic_load` — emit `@atomicLoad(T, ptr, .seq_cst)`.
+    /// The type T is inferred from `@TypeOf(ptr.*)` at zig level.
+    /// arity = 1: `atomic_load(ptr)`.
+    builtin_atomic_load,
+
+    /// `builtin_atomic_store` — emit `@atomicStore(T, ptr, val, .seq_cst)`.
+    /// arity = 2: `atomic_store(ptr, val)`.
+    builtin_atomic_store,
+
+    /// `builtin_atomic_fetch_add` — emit `@atomicRmw(T, ptr, .Add, val, .seq_cst)`.
+    /// arity = 2: `atomic_fetch_add(ptr, val)`.
+    builtin_atomic_fetch_add,
+
+    /// `builtin_atomic_compare_exchange` — emit `@cmpxchgStrong(...)`.
+    /// arity = 3: `atomic_compare_exchange(ptr, expected, new)`.
+    builtin_atomic_compare_exchange,
+
+    /// `builtin_thread_spawn` — emit `std.Thread.spawn(.{}, fn, args)`.
+    /// Returns a std.Thread handle. arity = 2: `thread_spawn(fn, args)`.
+    builtin_thread_spawn,
+
+    /// `builtin_thread_join` — emit `handle.join()`.
+    /// arity = 1: `thread_join(handle)`.
+    builtin_thread_join,
+
+    /// `builtin_mutex_create` — emit `std.Thread.Mutex{}`.
+    /// Returns a mutex value. arity = 0: `mutex_create()`.
+    builtin_mutex_create,
+
+    /// `builtin_mutex_lock` — emit `m.lock()`.
+    /// arity = 1: `mutex_lock(m)`.
+    builtin_mutex_lock,
+
+    /// `builtin_mutex_unlock` — emit `m.unlock()`.
+    /// arity = 1: `mutex_unlock(m)`.
+    builtin_mutex_unlock,
 };
 
 /// One row in the router table. The match shape is name + arity --
@@ -318,6 +355,15 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "align_of", .arity = 1, .receiver = null, .dispatch = .builtin_align_of },
     .{ .name = "volatile_store", .arity = 2, .receiver = null, .dispatch = .builtin_volatile_store },
     .{ .name = "volatile_load", .arity = 1, .receiver = null, .dispatch = .builtin_volatile_load },
+    .{ .name = "load", .arity = 1, .receiver = null, .dispatch = .builtin_atomic_load },
+    .{ .name = "store", .arity = 2, .receiver = null, .dispatch = .builtin_atomic_store },
+    .{ .name = "fetch_add", .arity = 2, .receiver = null, .dispatch = .builtin_atomic_fetch_add },
+    .{ .name = "compare_exchange", .arity = 3, .receiver = null, .dispatch = .builtin_atomic_compare_exchange },
+    .{ .name = "spawn", .arity = 2, .receiver = null, .dispatch = .builtin_thread_spawn },
+    .{ .name = "join", .arity = 1, .receiver = null, .dispatch = .builtin_thread_join },
+    .{ .name = "create", .arity = 0, .receiver = null, .dispatch = .builtin_mutex_create },
+    .{ .name = "lock", .arity = 1, .receiver = null, .dispatch = .builtin_mutex_lock },
+    .{ .name = "unlock", .arity = 1, .receiver = null, .dispatch = .builtin_mutex_unlock },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that

@@ -1,0 +1,18 @@
+## std.concurrent.atomic — lock-free atomic operations (docs/21)
+##
+## Atomic operations are single-instruction primitives for shared-memory
+## concurrency. Each operates on a pointer to a primitive type. All use
+## seq_cst ordering by default. The pointer type is inferred from
+## `@TypeOf(ptr.*)` at zig compile time.
+##
+##   import std.concurrent.atomic
+##
+##   load(ptr)                     @atomicLoad(T, ptr, .seq_cst)
+##   store(ptr, val)               @atomicStore(T, ptr, val, .seq_cst)
+##   fetch_add(ptr, val)           @atomicRmw(T, ptr, .Add, val, .seq_cst)
+##   compare_exchange(ptr, o, n)   @cmpxchgStrong(T, ptr, o, n, ...)
+
+pub fun load(ptr: *i32) -> i32;
+pub fun store(ptr: *i32, val: i32);
+pub fun fetch_add(ptr: *i32, val: i32) -> i32;
+pub fun compare_exchange(ptr: *i32, old: i32, new: i32) -> i32;

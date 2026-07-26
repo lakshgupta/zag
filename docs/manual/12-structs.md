@@ -150,7 +150,7 @@ Three construction forms, three purposes:
 ## Derive Attributes
 
 ```
-#[derive(Clone)]
+@[derive(Clone)]
 struct Particle {
     position: [3]f32,
     velocity: [3]f32,
@@ -167,10 +167,10 @@ let p2 = p1.clone();     # field-by-field copy
 Structs are `Copy` iff all fields are `Copy`:
 
 ```
-#[derive(Clone)]
+@[derive(Clone)]
 struct Point { x: f32, y: f32 }    # Copy (all fields Copy)
 
-#[derive(Clone)]
+@[derive(Clone)]
 struct Entity {
     id: u64,                         # Copy
     name: String,                    # NOT Copy

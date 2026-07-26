@@ -1,0 +1,35 @@
+## Threads via std.concurrent.thread (docs/21)
+##
+##   import std.concurrent.thread
+##
+## Simple names: spawn, join.
+##
+## Run: zag run threads.zag
+
+import std.concurrent.thread
+import std.concurrent.atomic
+
+fun worker_hello() {
+    print("hello from thread\n");
+}
+
+fun worker_increment(ptr: *i32) {
+    fetch_add(ptr, 1);
+}
+
+fun main() {
+    let h1 = spawn(worker_hello, ());
+    join(h1);
+
+    let counter: *i32 = new i32(0);
+    defer free(counter);
+
+    let h2 = spawn(worker_increment, (counter));
+    let h3 = spawn(worker_increment, (counter));
+
+    join(h2);
+    join(h3);
+
+    let val: i32 = load(counter);
+    print("counter = {val}\n");
+}

@@ -172,14 +172,14 @@ let ok_neq:   bool = (Status.Ok   != Status.Err); # true — 0 != 2
 
 > **Rust users take note:** `enum(str) Level { High = "high" }` introduces true value-equality (`Level.High == "high"`). This differs from Rust's bare-reference enum, where `High == "high"` is a compile error (different types). Read the provided methods above as the binding contract.
 
-**Combining with FFI:** `#[repr(C, T1)] enum(T2) X { … }` keeps `T2` as the zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries. See [FFI and Interop](24-ffi.md) for the full interaction.
+**Combining with FFI:** `@[repr(C, T1)] enum(T2) X { … }` keeps `T2` as the zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries. See [FFI and Interop](24-ffi.md) for the full interaction.
 
 ## Repr Control
 
-`#[repr(C, T)]` constrains an enum's tag width and layout to match a C-compatible representation:
+`@[repr(C, T)]` constrains an enum's tag width and layout to match a C-compatible representation:
 
 ```zag
-#[repr(C, i32)]
+@[repr(C, i32)]
 enum CError {
     Ok = 0,
     NotFound = 1,
@@ -187,7 +187,7 @@ enum CError {
 }
 ```
 
-The tag type follows `T`; explicit `= N` discriminants pin specific values. FFI requires `#[repr(C, T)]` if a C-side enum is involved. `#[repr(C, T1)] enum(T2) X { … }` composes: see [Backed Enums](#backed-enums-enumt) above.
+The tag type follows `T`; explicit `= N` discriminants pin specific values. FFI requires `@[repr(C, T)]` if a C-side enum is involved. `@[repr(C, T1)] enum(T2) X { … }` composes: see [Backed Enums](#backed-enums-enumt) above.
 
 ## `Error` Type
 

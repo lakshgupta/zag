@@ -181,10 +181,10 @@ The `ErrorExt` trait (in `std.error`) is implemented for any custom error union 
 
 > FFI on unions is a planned feature. See [FFI and Interop](24-ffi.md) for what's available in the current compiler. The example below shows the target surface.
 
-`#[repr(C, T)]` constrains a `union`'s tag width and discriminant layout to match a C-compatible representation. Discriminants can be pinned with `= N` for both bare and payload variants — the runtime ADT contract reserves distinct tags for unassigned variants too, but pinning is the established way to make the discriminant observable to C code:
+`@[repr(C, T)]` constrains a `union`'s tag width and discriminant layout to match a C-compatible representation. Discriminants can be pinned with `= N` for both bare and payload variants — the runtime ADT contract reserves distinct tags for unassigned variants too, but pinning is the established way to make the discriminant observable to C code:
 
 ```zag
-#[repr(C, u8)]
+@[repr(C, u8)]
 union PacketKind {
     Hello   = 0,
     Data    = 1,
@@ -204,5 +204,5 @@ Unions are stack-allocated. No heap allocation unless a variant contains a heap 
 - [Enums](13-enums.md) — bare enumerations (no payloads)
 - [Pattern Matching](27-pattern-matching.md) — full `match` syntax, payload destructuring
 - [Error Handling](18-error-handling.md) — Result / Option / Error / Context
-- [FFI and Interop](24-ffi.md) — `#[repr(C, T)]` for C compatibility
+- [FFI and Interop](24-ffi.md) — `@[repr(C, T)]` for C compatibility
 - [Spec](../spec.md) — canonical language spec; enums, backed enums, and unions live in §3.3 Compound Types
