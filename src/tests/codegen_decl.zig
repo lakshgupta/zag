@@ -3201,8 +3201,9 @@ test "codegen: @[test] annotation emits test \"name\" { ... } block" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "test \"my_test\" {") != null);
     // Does NOT emit pub fn
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn my_test(") == null);
-    // assert builtin emits std.testing.expect
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.testing.expect(true)") != null);
+    // assert builtin emits __zag_panic_at with zag source location
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_panic_at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "assertion failed") != null);
 }
 
 test "codegen: assert(false, msg) emits expect with message" {
@@ -3220,7 +3221,8 @@ test "codegen: assert(false, msg) emits expect with message" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "test \"msg_test\" {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.testing.expect(false)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_panic_at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "should be true") != null);
 }
 
 test "codegen: const block emits comptime blk with break :blk" {

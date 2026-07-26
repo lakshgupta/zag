@@ -1562,13 +1562,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(".unlock())");
             },
             .builtin_assert => {
-                self.write("(std.testing.expect(");
+                self.write("if (!(");
                 self.genExpr(args[0]);
-                self.write(") catch unreachable");
+                self.write(")) __zag_panic_at(");
                 if (args.len >= 2) {
-                    self.write("; _ = ");
                     self.genExpr(args[1]);
+                } else {
+                    self.write("\"assertion failed\"");
                 }
+                self.write(", \"");
+                self.write(self.source_path);
+                self.write("\", ");
+                self.writeInt(loc.line);
+                self.write(", ");
+                self.writeInt(loc.col);
                 self.write(")");
             },
             .builtin_type_name => {
