@@ -271,22 +271,22 @@ pub const BuiltinDispatch = enum {
 
     /// Returns the zig name for a known zag String method.
     pub fn stringMethodZigName(zag_name: []const u8) ?[]const u8 {
-        if (std.mem.eql(u8, zag_name, "as_str")) return "asStr";
-        if (std.mem.eql(u8, zag_name, "push_str")) return "pushStr";
-        if (std.mem.eql(u8, zag_name, "with_capacity")) return "withCapacity";
-        if (std.mem.eql(u8, zag_name, "push_ch")) return "pushCh";
-        if (std.mem.eql(u8, zag_name, "pop_ch")) return "popCh";
+        if (std.mem.eql(u8, zag_name, "as_str")) return "as_str";
+        if (std.mem.eql(u8, zag_name, "push_str")) return "push_str";
+        if (std.mem.eql(u8, zag_name, "with_capacity")) return "with_capacity";
+        if (std.mem.eql(u8, zag_name, "push_ch")) return "push_ch";
+        if (std.mem.eql(u8, zag_name, "pop_ch")) return "pop_ch";
         if (std.mem.eql(u8, zag_name, "clear")) return "clear";
-        if (std.mem.eql(u8, zag_name, "insert_ch")) return "insertCh";
+        if (std.mem.eql(u8, zag_name, "insert_ch")) return "insert_ch";
         return null;
     }
 
     /// Returns the zig name for a known Writer method.
     pub fn writerMethodZigName(zag_name: []const u8) ?[]const u8 {
-        if (std.mem.eql(u8, zag_name, "write_all")) return "writeAll";
+        if (std.mem.eql(u8, zag_name, "write_all")) return "write_all";
         if (std.mem.eql(u8, zag_name, "print")) return "print";
-        if (std.mem.eql(u8, zag_name, "std_out")) return "stdOut";
-        if (std.mem.eql(u8, zag_name, "std_err")) return "stdErr";
+        if (std.mem.eql(u8, zag_name, "std_out")) return "std_out";
+        if (std.mem.eql(u8, zag_name, "std_err")) return "std_err";
         return null;
     }
 };

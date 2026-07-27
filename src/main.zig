@@ -373,7 +373,7 @@ fn cmdGenerate(args: []const []const u8) !void {
     // File mode: transpile single file
     if (args.len >= 3 and hasZagExt(args[2])) {
         const source = try readFile(args[2]);
-        const result = try transpile(args[2], source);
+        const result = try transpile(args[2], source, false);
         // Use output dir as file path
         const out_path = if (std.mem.eql(u8, output_dir, "build/gen")) "build/gen/main.zig" else output_dir;
         _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
@@ -396,6 +396,13 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/bin", 0o755);
 
+    // v0.1 stdlib migration hybrid: write lib/std/*.zag →
+    // build/gen/std/*.zig BEFORE user-module transpile so the
+    // generated zig's `@import("std/<n>.zig")` lines (emitted by
+    // Codegen's hybrid preamble when `use_hybrid_stdlib = true`)
+    // resolve at compile time.
+    materializeStdlib();
+
     // Discover modules and transpile each
     const modules = project_mod.discoverModules();
     const has_main = for (modules) |m| {
@@ -413,7 +420,7 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
             std.debug.print("error: could not read {s}\n", .{mod.path});
             std.process.exit(1);
         };
-        const result = transpile(mod.path, source) catch |e| {
+        const result = transpile(mod.path, source, true) catch |e| {
             std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
             std.process.exit(1);
         };
@@ -523,6 +530,11 @@ fn generateProjectFiles() !void {
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
     _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
 
+    // v0.1 stdlib migration hybrid: same as projectCmd — materialise
+    // lib/std/*.zag to build/gen/std/*.zig so the `zag generate`
+    // output directory is consistent with `zag build`.
+    materializeStdlib();
+
     const modules = project_mod.discoverModules();
     const has_main = for (modules) |m| {
         if (std.mem.eql(u8, m.module_name, "main")) break true;
@@ -538,7 +550,7 @@ fn generateProjectFiles() !void {
             std.debug.print("error: could not read {s}\n", .{mod.path});
             std.process.exit(1);
         };
-        const result = transpile(mod.path, source) catch |e| {
+        const result = transpile(mod.path, source, true) catch |e| {
             std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
             std.process.exit(1);
         };
@@ -661,7 +673,7 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
     const f_bin = std.fmt.bufPrint(&path_leaf_bin, "/tmp/zag_leaf_{d}_bin", .{pid_num}) catch "/tmp/zag_leaf_bin";
 
     const source = try readFile(src);
-    const result = try transpile(src, source);
+    const result = try transpile(src, source, false);
     try writeFile(f_zig, result.zig);
 
     if (std.mem.eql(u8, flag, "test")) {
@@ -840,6 +852,88 @@ fn writeFile(path: []const u8, content: []const u8) !void {
     }
 }
 
+/// Materialize lib/std/{error,fmt,time,atomic,bench}.zag →
+/// build/gen/std/*.zig at the start of project-mode dispatch. The
+/// hybrid preamble in `src/codegen/core.zig::generate()` (gated by
+/// `use_hybrid_stdlib` on Codegen, set here via the `use_hybrid`
+/// parameter on `transpile`) emits `@import("std/<n>.zig")` lines
+/// that resolve against the files written by this step.
+///
+/// v0.1 hardcodes the migrated list. A Phase 2 should derive this
+/// from a manifest so future lib/std additions don't require
+/// main.zig touch-ups. Each file is fully re-emitted per zag
+/// invocation (~5 small files, ~few-ms cost); mtime-based skipping
+/// is a Phase 2 optimisation.
+///
+/// Silently no-ops if lib/std cannot be read or one of the migrated
+/// modules is missing (skips-on-missing-fixture convention used
+/// elsewhere in the test runners — callers keep going without
+/// stderr complaints).
+///
+/// The hybrid preamble that consumes these files leaves String and
+/// Writer INLINE in `src/codegen/core.zig` (per `use_hybrid_stdlib`'s
+/// docblock); the migrated zig files DO emit working String/Writer
+/// `pub const` declarations, but the user-facing alias name is
+/// wired directly to the inline preamble by stdlibPreambleName. A
+/// follow-up commit can reconcile by routing the user-importable
+/// Name through `@import("std/string.zig")` once the
+/// `String`/`Writer` callsites in `src/codegen/expr.zig` are
+/// rewritten to use the @imported module path.
+fn materializeStdlib() void {
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
+    var mkdir_buf: [256]u8 = undefined;
+    @memcpy(mkdir_buf[0..13], "build/gen/std");
+    mkdir_buf[13] = 0;
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&mkdir_buf), 0o755);
+
+    // v0.1 stdlib migration (String/Writer follow-up commit): the
+    // list extends from the prior commit's 5 modules to 7 — `string`
+    // and `fmt` migrated now that the inline preamble no longer
+    // hard-codes their type definitions (see `__zag_String_inline` /
+    // `__zag_Writer_inline` rename in `src/codegen/core.zig`).
+    // `__zag_page_alloc` family helpers and `__zag_fd_write` /
+    // `__zag_memcpy` are emitted as preamble always (file mode +
+    // hybrid mode) so the migrated impl blocks can express generic
+    // heap-alloc / fd-write primitives without dropping into raw
+    // zig. See `codegen::core::generate()` preamble for the emit.
+    // v0.1 stdlib migration follow-up commit (String/Writer): extend
+    // the list from 5 modules to 6 (the prior commit added `fmt`;
+    // the follow-up adds `string` so the @imported `String` rebinding
+    // resolves at compile time). `__zag_page_alloc` family helpers
+    // and `__zag_fd_write` / `__zag_memcpy` are emitted as preamble
+    // always (file mode + hybrid mode) so the migrated impl blocks
+    // can express generic heap-alloc / fd-write primitives without
+    // dropping into raw zig. See codegen::core::generate() preamble.
+    const modules = [_][]const u8{ "error", "fmt", "time", "atomic", "bench", "string" };
+    for (modules) |name| {
+        var src_buf: [256]u8 = undefined;
+        const src_path = std.fmt.bufPrint(&src_buf, "lib/std/{s}.zag", .{name}) catch continue;
+        const source = readFile(src_path) catch continue;
+
+        var l = lexer_mod.Lexer.init(source);
+        const tokens = l.tokenize();
+        var arena = ast.Arena.init();
+        var p = parser_mod.Parser.init(tokens, &arena);
+        const prog = p.parse();
+        var cg = codegen_mod.Codegen.init();
+        cg.source_path = src_path;
+        // The stdlib materialisation itself uses the legacy inline
+        // preamble path (use_hybrid = false). Embedding the hybrid
+        // rebindings inside the stdlib materialisation would create
+        // a chicken-and-egg (those rebindings reference
+        // `build/gen/std/*.zig` from a context where the on-disk
+        // files don't exist — the codegen output is in flight).
+        // Inlining the original preamble on this code-path keeps
+        // the dependency graph acyclic.
+        const zig = cg.generate(prog);
+
+        var dst_buf: [256]u8 = undefined;
+        const dst_path = std.fmt.bufPrint(&dst_buf, "build/gen/std/{s}.zig", .{name}) catch continue;
+        writeFile(dst_path, zig) catch continue;
+    }
+}
+
 fn writeMapFile(zig_path: []const u8, map_content: []const u8) !void {
     // map path: replace ".zig" suffix with ".zag.map"
     var buf: [512]u8 = undefined;
@@ -992,7 +1086,7 @@ const TranspileResult = struct {
     map: []const u8,
 };
 
-fn transpile(path: []const u8, source: []const u8) !TranspileResult {
+fn transpile(path: []const u8, source: []const u8, use_hybrid: bool) !TranspileResult {
     var l = lexer_mod.Lexer.init(source);
     const tokens = l.tokenize();
 
@@ -1002,6 +1096,12 @@ fn transpile(path: []const u8, source: []const u8) !TranspileResult {
 
     var cg = codegen_mod.Codegen.init();
     cg.source_path = path;
+    // v0.1 stdlib migration hybrid preamble toggle (see
+    // Codegen.use_hybrid_stdlib docblock). Project-mode codegen
+    // passes `true` after `materializeStdlib()` has written
+    // `build/gen/std/*.zig`; file-mode and leaf-process pass
+    // `false` so the inline preamble is the only stdlib source.
+    cg.use_hybrid_stdlib = use_hybrid;
     const zig = cg.generate(prog);
     cg.buildMapText();
     return .{ .zig = zig, .map = cg.getMapText() };

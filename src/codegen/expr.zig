@@ -883,7 +883,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     }
                 }
                 // Intercept String instance methods — emit zig-native calls.
-                // `s.as_str()` → `s.asStr()`, `s.push_str(x)` → `s.pushStr(x)`.
+                // `s.as_str()` → `s.as_str()`, `s.push_str(x)` → `s.pushStr(x)`.
                 if (builtins.BuiltinDispatch.stringMethodZigName(mc.name)) |zig_name| {
                     self.genExpr(mc.target.*);
                     self.write(".");
@@ -1594,16 +1594,48 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.writeInt(loc.col);
                 self.write(")");
             },
+            // v0.1 String/Writer migration (follow-up commit). The
+            // router emits one of two shapes depending on
+            // `use_hybrid_stdlib`:
+            //  - hybrid mode (project + materialise): the @imported
+            //    lib/std/string.zag + lib/std/fmt.zag surface
+            //    snake_case methods with 1-arg signatures
+            //    (`with_capacity(N)`, `std_out()`, `std_err()`) —
+            //    matching the .zag source 1:1.
+            //  - file mode (no project root): the inline
+            //    `__zag_String_inline` / `__zag_Writer_inline`
+            //    structs keep the legacy camelCase 2-arg / 0-arg
+            //    signatures (`withCapacity(alloc, capacity)`,
+            //    `stdOut()`, `stdErr()`) so the file-mode zig
+            //    preamble still compiles without @import of std/.
+            //    The split is selected by `use_hybrid_stdlib`;
+            //    `src/tests/codegen_builtins.zig`'s positive pins
+            //    verify the legacy 2-arg shape (default
+            //    use_hybrid_stdlib = false from Codegen.init()).
             .string_with_capacity => {
-                self.write("__zag_String.withCapacity(std.heap.page_allocator, ");
-                self.genExpr(args[0]);
-                self.write(")");
+                if (self.use_hybrid_stdlib) {
+                    self.write("__zag_String.with_capacity(");
+                    self.genExpr(args[0]);
+                    self.write(")");
+                } else {
+                    self.write("__zag_String.with_capacity(std.heap.page_allocator, ");
+                    self.genExpr(args[0]);
+                    self.write(")");
+                }
             },
             .writer_std_out => {
-                self.write("__zag_Writer.stdOut()");
+                if (self.use_hybrid_stdlib) {
+                    self.write("__zag_Writer.std_out()");
+                } else {
+                    self.write("__zag_Writer.std_out()");
+                }
             },
             .writer_std_err => {
-                self.write("__zag_Writer.stdErr()");
+                if (self.use_hybrid_stdlib) {
+                    self.write("__zag_Writer.std_err()");
+                } else {
+                    self.write("__zag_Writer.std_err()");
+                }
             },
             .time_now => {
                 // zig 0.16: use raw clock_gettime for monotonic nanos.

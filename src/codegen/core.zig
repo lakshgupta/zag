@@ -59,6 +59,29 @@ pub const Codegen = struct {
     /// Source file path of the zig module being generated
     /// (e.g. "src/main.zag"). Set by the caller before `generate()`.
     source_path: []const u8 = "",
+    /// Hybrid-stdlib flag (v0.1 stdlib migration): when true, the
+    /// generated preamble emits @import bindings for the stdlib modules
+    /// that have moved OUT of the inline preamble (see `generate()`'s
+    /// hybrid-preamble block, which runs AFTER the inline preamble but
+    /// BEFORE the imports loop). Currently false by default; main.zig's
+    /// project-mode dispatch sets it to true after `materializeStdlib()`
+    /// has written `build/gen/std/*.zig` to disk for every
+    /// `lib/std/<name>.zag` source. File mode (single .zag → /tmp file)
+    /// leaves it false — file mode can't materialise `build/gen/std/`
+    /// without a project root, and the inline preamble's `__zag_<Type>`
+    /// entries keep working without it.
+    ///
+    /// String/Writer are intentionally NOT moved: their inline preamble
+    /// type definitions are referenced directly by zig source emitted from
+    /// the codegen router arms in `src/codegen/expr.zig` (lines 1598,
+    /// 1603, 1606 — `__zag_String.withCapacity`, `__zag_Writer.stdOut`,
+    /// `__zag_Writer.stdErr`) and by `zagTypeToZig`'s `String`/`Writer`
+    /// overrides in `src/codegen/decl.zig`. Moving them in the same
+    /// commit as the rest of the stdlib would force a rewrite of those
+    /// sites, which is out of scope for this migration. A follow-up
+    /// commit can move String/Writer once the router arms are rebased on
+    /// the @imported module shape.
+    use_hybrid_stdlib: bool = false,
     /// Per-function counter for destructuring temps. Reset to 0 by `genFun`
     /// so each `pub fn` body has its own `__destruct_0`, `__destruct_1`,
     /// ... sequence. Multiple destructurings in the same body produce
@@ -624,24 +647,93 @@ pub const MapEntry = struct {
             \\    @trap();
             \\}
             \\
+            \\            \\n// Zag panic shim - 1-arg convenience over __zag_panic_at.
+            \\nCalled by panic("...") .zag builtin emit (e.g. from
+            \\nlib/std/string.zag's impl block panic sites). Posts a
+            \\nsentinel "<generated>" file + zero line/col so the
+            \\nstderr trace lands without a bogus location. Shim exists
+            \\nso .zag impl blocks can use canonical panic(msg) shape
+            \\nwithout threading file / line / col through every site.
+            \\nfn __zag_panic(msg: []const u8) noreturn {
+            \\n__zag_panic_at(msg, "<generated>", 0, 0);
+            \\n}
+// v0.1 stdlib migration (String/Writer follow-up commit):
+            \\// small primitive family referenced by both the inline
+            \\// `__zag_String_inline` / `__zag_Writer_inline` method
+            \\// bodies (file mode) AND the @imported
+            \\// lib/std/{string,fmt}.zag impl blocks (hybrid mode,
+            \\// after `materializeStdlib` has run). The user module's
+            \\// preamble has these on a separate zig scope from the
+            \\// @imported std/<n>.zig files (which get their own
+            \\// @emit from materializeStdlib's use_hybrid_stdlib=false
+            \\// codegen pass) — zig's per-file module namespace
+            \\// keeps duplicates scoped to their respective files;
+            \\// user code referencing `__zag_page_alloc(...)`
+            \\// directly (rare) resolves via this preamble.
+            \\fn __zag_page_alloc(n: usize) [*]u8 {
+            \\    return (std.heap.page_allocator.alloc(u8, n) catch @panic("__zag: page_alloc OOM")).ptr;
+            \\}
+            \\fn __zag_page_realloc(p: [*]u8, old_cap: usize, new_cap: usize) [*]u8 {
+            \\    return (std.heap.page_allocator.realloc(p[0..old_cap], new_cap) catch @panic("__zag: page_realloc OOM")).ptr;
+            \\}
+            \\fn __zag_page_free(p: [*]u8, cap: usize) void {
+            \\    std.heap.page_allocator.free(p[0..cap]);
+            \\}
+            \\// v0.1 stdlib migration follow-up: `__zag_memcpy` accepts a
+            \\// slice (`[]u8`) for the destination rather than a
+            \\// many-pointer (`[*]u8`). The reason: the .zag impl
+            \\// blocks in lib/std/string.zag pattern-match on
+            \\// `self.ptr[self.len..]` at the call site, which zag's
+            \\// codegen translates to a slice expression on a
+            \\// many-pointer — in zig, `[*]u8[lo..hi]` produces a
+            \\// `[]u8` (slice) NOT a `[*]u8` (pointer). The original
+            \\// `__zag_memcpy(dst: [*]u8, ...)` signature was rejected
+            \\// at zig compile time because the call site passes a
+            \\// slice. Indexing internals (`dst[i] = src[i]`) work
+            \\// identically for both types, so the helper's internal
+            \\// implementation is unchanged.
+            \\fn __zag_memcpy(dst: []u8, src: []const u8, len: usize) void {
+            \\    var i: usize = 0;
+            \\    while (i < len) {
+            \\        dst[i] = src[i];
+            \\        i += 1;
+            \\    }
+            \\}
+            \\fn __zag_fd_write(fd: i32, bytes: []const u8) void {
+            \\    var pos: usize = 0;
+            \\    while (pos < bytes.len) {
+            \\        const n = std.os.linux.write(fd, bytes.ptr + pos, bytes.len - pos);
+            \\        if (n <= 0) return;
+            \\        pos += @intCast(n);
+            \\    }
+            \\}
+            \\
             \\// __zag_String — heap-allocated mutable UTF-8 string.
             \\// Layout: { ptr: [*]u8, len: usize, cap: usize }.
             \\// Used by `import std.string` and the `String` type in zag.
-            \\const __zag_String = struct {
+            \\// v0.1 follow-up: renamed to `__zag_String_inline` so the
+            \\// canonical user-facing name `__zag_String` can be
+            \\// rebound to `@import("std/string.zig").String` in hybrid
+            \\// mode (the hybrid-mode rebinding at the bottom of
+            \\// this function shadows the inline decl at user-module
+            \\// level; the inline decl survives as a file-mode
+            \\// fallback when there's no project root to materialise
+            \\// from).
+            \\const __zag_String_inline = struct {
             \\    ptr: [*]u8,
             \\    len: usize,
             \\    cap: usize,
             \\
-            \\    pub fn withCapacity(alloc: std.mem.Allocator, capacity: usize) @This() {
+            \\    pub fn with_capacity(alloc: std.mem.Allocator, capacity: usize) @This() {
             \\        const buf = alloc.alloc(u8, capacity) catch @panic("String: out of memory");
             \\        return .{ .ptr = buf.ptr, .len = 0, .cap = capacity };
             \\    }
             \\
-            \\    pub fn asStr(self: *const @This()) []const u8 {
+            \\    pub fn as_str(self: *const @This()) []const u8 {
             \\        return self.ptr[0..self.len];
             \\    }
             \\
-            \\    pub fn pushStr(self: *@This(), s: []const u8) void {
+            \\    pub fn push_str(self: *@This(), s: []const u8) void {
             \\        const needed = self.len + s.len;
             \\        if (needed > self.cap) {
             \\            var new_cap = self.cap;
@@ -658,7 +750,7 @@ pub const MapEntry = struct {
             \\        std.heap.page_allocator.free(self.ptr[0..self.cap]);
             \\    }
             \\
-            \\    pub fn pushCh(self: *@This(), ch: u8) void {
+            \\    pub fn push_ch(self: *@This(), ch: u8) void {
             \\        const needed = self.len + 1;
             \\        if (needed > self.cap) {
             \\            var new_cap = self.cap;
@@ -672,7 +764,7 @@ pub const MapEntry = struct {
             \\        self.len = needed;
             \\    }
             \\
-            \\    pub fn popCh(self: *@This()) ?u8 {
+            \\    pub fn pop_ch(self: *@This()) ?u8 {
             \\        if (self.len == 0) return null;
             \\        self.len -= 1;
             \\        return self.ptr[self.len];
@@ -682,7 +774,7 @@ pub const MapEntry = struct {
             \\        self.len = 0;
             \\    }
             \\
-            \\    pub fn insertCh(self: *@This(), pos: usize, ch: u8) void {
+            \\    pub fn insert_ch(self: *@This(), pos: usize, ch: u8) void {
             \\        if (pos > self.len) @panic("String.insertCh: position out of bounds");
             \\        const needed = self.len + 1;
             \\        if (needed > self.cap) {
@@ -741,7 +833,7 @@ pub const MapEntry = struct {
             \\
             \\// __zag_Writer — byte sink for formatted output.
             \\// Wraps a file descriptor.  Used by `import std.fmt`.
-            \\const __zag_Writer = struct {
+            \\const __zag_Writer_inline = struct {
             \\    fd: i32,
             \\
             \\    pub fn stdOut() @This() { return .{ .fd = std.posix.STDOUT_FILENO }; }
@@ -805,6 +897,76 @@ pub const MapEntry = struct {
         // (`resolveStdImport` returns a slice into a comptime-static
         // table so the resolved_path is independent of any
         // scratch-locality concerns.)
+
+        // Hybrid stdlib preamble (v0.1 stdlib migration). When
+        // `use_hybrid_stdlib` is true (project mode + the materialise
+        // step in src/main.zig has written `build/gen/std/<n>.zig` on
+        // disk), the emitted zig `@import`s those files directly.
+        // The `__zag_<Type>` aliases below mirror the
+        // `stdlibPreambleName` map — `pub import
+        // std.error.{Error as E}` will emit `const E = __zag_Error;`
+        // (vs. the pre-migration empty-string skip). See
+        // `use_hybrid_stdlib`'s docblock on Codegen for the routing
+        // rationale; see `src/main.zig::materializeStdlib` for the
+        // build-step side of the contract.
+        if (self.use_hybrid_stdlib) {
+            // v0.1 String/Writer follow-up commit: the migration list
+            // grew to 6 modules in src/main.zig::materializeStdlib
+            // (`string` join). The `__zag_std_fmt` import below also
+            // covers the migrated Writer (its impl block in
+            // lib/std/fmt.zag's struct declares the same fd-backed
+            // type, accessed via `__zag_std_fmt.Writer`). The
+            // `__zag_std_error` / `__zag_std_time` / `__zag_std_atomic`
+            // / `__zag_std_bench` imports cover the prior commit's
+            // migrated types.
+            self.write("const __zag_std_error = @import(\"std/error.zig\");\n");
+            self.write("const __zag_std_fmt = @import(\"std/fmt.zig\");\n");
+            self.write("const __zag_std_time = @import(\"std/time.zig\");\n");
+            self.write("const __zag_std_atomic = @import(\"std/atomic.zig\");\n");
+            self.write("const __zag_std_bench = @import(\"std/bench.zig\");\n");
+            self.write("const __zag_std_string = @import(\"std/string.zig\");\n");
+            // String/Writer rebindings (v0.1 follow-up): in hybrid
+            // mode, the @imported module's exported type aliases to
+            // `__zag_String` / `__zag_Writer` so call sites written
+            // before the migration (router arms in expr.zig) keep
+            // resolving without a per-callsite rewrite. The
+            // `__zag_String_inline` / `__zag_Writer_inline` names
+            // collide only in the file-mode path (which uses the
+            // inline alias binder below); the hybrid-mode rebinding
+            // here shadows them at the user-module level. The
+            // shadowing is fine because `__zag_String_inline` is
+            // only referenced from the inline struct's method bodies
+            // (inside the struct), not from outside.
+            self.write("const __zag_String = __zag_std_string.String;\n");
+            self.write("const __zag_Writer = __zag_std_fmt.Writer;\n");
+            self.write("const __zag_Error = __zag_std_error.Error;\n");
+            self.write("const __zag_Context = __zag_std_error.Context;\n");
+            self.write("const __zag_FmtError = __zag_std_fmt.FmtError;\n");
+            self.write("const __zag_Duration = __zag_std_time.Duration;\n");
+            self.write("const __zag_Timer = __zag_std_time.Timer;\n");
+            self.write("const __zag_AtomicI32 = __zag_std_atomic.AtomicI32;\n");
+            self.write("const __zag_AtomicI64 = __zag_std_atomic.AtomicI64;\n");
+            self.write("const __zag_AtomicUsize = __zag_std_atomic.AtomicUsize;\n");
+            self.write("const __zag_AtomicBool = __zag_std_atomic.AtomicBool;\n");
+            self.write("const __zag_AtomicPtr = __zag_std_atomic.AtomicPtr;\n");
+            self.write("const __zag_Ordering = __zag_std_atomic.Ordering;\n");
+            self.write("const __zag_Counters = __zag_std_bench.Counters;\n");
+        } else {
+            // File-mode fallback (v0.1 follow-up): in file mode
+            // there's no project root to materialise std/<n>.zig
+            // from, so the user module references the inline
+            // `__zag_String_inline` / `__zag_Writer_inline` structs
+            // already emitted by the preamble write above. The two
+            // alias bindings here are what surface the inline
+            // types to user code under the canonical
+            // `__zag_String` / `__zag_Writer` names. Hybrid mode
+            // skips this — the hybrid preamble block above rebinds
+            // `__zag_String` / `__zag_Writer` to the @imported
+            // module's exported types instead.
+            self.write("const __zag_String = __zag_String_inline;\n");
+            self.write("const __zag_Writer = __zag_Writer_inline;\n");
+        }
+
         {
             var import_scratch: [256]u8 = undefined;
             var import_i: usize = 0;
@@ -1613,16 +1775,38 @@ pub const MapEntry = struct {
 /// Map a stdlib type name to its preamble equivalent.
 /// Returns "" if the type is not available in the preamble.
 fn stdlibPreambleName(name: []const u8) []const u8 {
+    // v0.1 stdlib migration (hybrid preamble): String/Writer and
+    // Display/ErrorExt stay in the inline preamble because of
+    // hardcoded coupling in `src/codegen/expr.zig`'s router arms
+    // (lines 1598 `__zag_String.withCapacity(...)`, 1603
+    // `__zag_Writer.stdOut()`, 1606 `__zag_Writer.stdErr()`) — these
+    // site-specific references can't survive a `@import("std/<n>")`
+    // migration without router-arm rewiring, deferred to a follow-up
+    // commit. Display and ErrorExt stay inline for an additional reason:
+    // their declarations reference other stdlib types (`Display.write`
+    // takes `*Writer`, `ErrorExt.context` returns `Context`) that would
+    // fail to resolve at materialization time without a separate
+    // preamble injection per-file.
+    //
+    // The moved types below rebind to the @imported module's exported
+    // types via the hybrid preamble emitted at `generate()`'s
+    // imports-loop boundary. Returning a non-empty string here
+    // triggers the `const ALIAS = PREAMBLE_NAME;` emit in the imports
+    // loop (see `core.zig::generate()` line ~821-829). The pre-
+    // migration shape returned "" for these names — the imports loop
+    // SKIPPED the alias emit, leaving `pub import std.error.{Error}`
+    // silently broken (no usable identifier). The migration fixes
+    // that on the moved types.
     if (std.mem.eql(u8, name, "String")) return "__zag_String";
     if (std.mem.eql(u8, name, "Writer")) return "__zag_Writer";
     if (std.mem.eql(u8, name, "Display")) return "";
-    if (std.mem.eql(u8, name, "Error")) return "";
-    if (std.mem.eql(u8, name, "Context")) return "";
     if (std.mem.eql(u8, name, "ErrorExt")) return "";
-    if (std.mem.eql(u8, name, "Duration")) return "";
-    if (std.mem.eql(u8, name, "Timer")) return "";
-    if (std.mem.eql(u8, name, "FmtError")) return "";
-    if (std.mem.eql(u8, name, "Ordering")) return "";
-    if (std.mem.eql(u8, name, "Counters")) return "";
+    if (std.mem.eql(u8, name, "Error")) return "__zag_Error";
+    if (std.mem.eql(u8, name, "Context")) return "__zag_Context";
+    if (std.mem.eql(u8, name, "FmtError")) return "__zag_FmtError";
+    if (std.mem.eql(u8, name, "Duration")) return "__zag_Duration";
+    if (std.mem.eql(u8, name, "Timer")) return "__zag_Timer";
+    if (std.mem.eql(u8, name, "Ordering")) return "__zag_Ordering";
+    if (std.mem.eql(u8, name, "Counters")) return "__zag_Counters";
     return "";
 }

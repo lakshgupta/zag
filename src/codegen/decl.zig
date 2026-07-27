@@ -608,8 +608,14 @@ const Codegen = core.Codegen;
         // return CANONICAL;` pattern; do NOT site-specialize the
         // alias to a single emit location.
         if (std.mem.eql(u8, text, "str")) return "[]const u8";
-        if (std.mem.eql(u8, text, "String")) return "__zag_String";
-        if (std.mem.eql(u8, text, "Writer")) return "__zag_Writer";
+        // v0.1 stdlib migration (String/Writer follow-up commit):
+        // String/Writer overrides removed in the String+Writer
+        // migration — see the rationale block above. Type aliases
+        // for these names now resolve via the imports loop's
+        // `pub import std.{string,fmt}.{String,Writer}` alias emit
+        // path; bare `: String` / `: Writer` references without an
+        // import fail zig compilation (a deliberate narrowing of the
+        // type-annotation surface area as the migration proceeds).
         // v1.5 raw pointer shapes (docs/09 §\"Raw Pointers\"): zag's
         //     *raw T        — raw pointer to T       →  zig   [*]T
         //     ?*raw T       — optional raw pointer   →  zig   ?[*]T

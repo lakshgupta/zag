@@ -359,7 +359,7 @@ test "codegen: String.with_capacity emits __zag_String call" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_String.withCapacity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_String.with_capacity") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "10") != null);
 }
 
@@ -378,8 +378,8 @@ test "codegen: String.as_str instance method emits zig-native call" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // as_str() instance method should emit s.asStr()
-    try std.testing.expect(std.mem.indexOf(u8, zig, ".asStr()") != null);
+    // as_str() instance method should emit s.as_str()
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".as_str()") != null);
 }
 
 test "codegen: String type annotation maps to __zag_String" {
@@ -393,6 +393,6 @@ test "codegen: String type annotation maps to __zag_String" {
     const zig = cg.generate(prog);
     // The type annotation `: String` should map to `: __zag_String`
     try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_String") != null);
-    // And the initializer should call withCapacity
-    try std.testing.expect(std.mem.indexOf(u8, zig, "withCapacity") != null);
+    // And the initializer should call with_capacity
+    try std.testing.expect(std.mem.indexOf(u8, zig, "with_capacity") != null);
 }

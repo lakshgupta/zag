@@ -1,10 +1,25 @@
 ## std.fmt — Display trait + Writer sink + formatting helpers.
 ##
-## Writer wraps a file descriptor and provides writeAll/print.
+## Writer wraps a file descriptor and provides write_all/print.
 ## Display is the canonical formatting trait.
 ## __zag_format_val converts any value to a stack-allocated string.
 ##
 ## Backed by __zag_Writer in the generated zig preamble.
+##
+## v0.1 stdlib migration follow-up: real impl-block methods below
+## compose against `__zag_fd_write` (always-emitted preamble helper
+## in src/codegen/core.zig — emits `std.os.linux.write(fd, ...)`
+## loops). `Writer.write_all(self, bytes)` is the canonical
+## impl that surfaces as the migrated method body across the
+## @import route. Snake_case method names match the codegen
+## router emit (`__zag_Writer.std_out()` / `__zag_Writer.std_err()`).
+##
+## Parser rule (scaffold_tests at lib/std/fmt.zag:9 surfaced this):
+## zag rejects `//` line comments at module-level scope — only
+## `##` doc comments are accepted there. The in-impl `//` comment
+## block previously written before `pub fun print` was removed
+## in this iteration (the `##` block above is the new module-level
+## rationale + carries migration context).
 
 pub trait Display {
     fun write(self: *const Self, writer: *Writer);
@@ -14,17 +29,27 @@ pub struct Writer {
     fd: i32,
 }
 
+## Real impl — `std_out` / `std_err` construct a Writer with the
+## canonical POSIX stdout/stderr fd (1/2). `write_all` delegates to
+## the always-emitted `__zag_fd_write` primitive in the generated
+## zig preamble (see src/codegen/core.zig); `print` is documented
+## as a Phase 2 widening — today's v1 surface uses
+## Writer.write_all with pre-formatted bytes.
 impl Writer {
     pub fun std_out() -> Writer {
         return Writer { fd: 1 };
     }
+
     pub fun std_err() -> Writer {
         return Writer { fd: 2 };
     }
+
     pub fun write_all(self: *const Writer, bytes: []const u8) -> void {
-        _ = bytes;
+        __zag_fd_write(self.fd, bytes);
     }
+
     pub fun print(self: *const Writer, fmt: str) -> void {
+        _ = self;
         _ = fmt;
     }
 }
