@@ -30,7 +30,7 @@ const build_options = @import("build_options");
 /// @import("../toolchain.zig")` is reached from the test module
 /// graph. The test binary is NOT installed (no `b.installArtifact`
 /// call in build.zig for it), so the test binary's embed copy never
-/// lands in `zig-out/bin/zag`.
+/// lands in `zig-out/bin/zag-<os>-<arch>`.
 ///
 /// In the production binary, this module is NOT a transitive
 /// dependency after the test-module split (main.zig no longer

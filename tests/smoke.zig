@@ -59,6 +59,7 @@
 // already captures.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const env_path = @import("env_path");
 
@@ -84,8 +85,29 @@ const fixture_default = "vendor/zig/zig.test";
 const materialize_default = build_options.z_install ++ "/zig";
 
 /// Path to the produced (and pre-built) `zag` binary. Hardcoded
-/// to the `b.installArtifact` destination.
-const zig_install = "./zig-out/bin/zag";
+/// to the `b.installArtifact` destination; the platform suffix is
+/// derived at comptime from `builtin.os.tag` + `builtin.cpu.arch`
+/// using the same `.macos`->`darwin` + `.aarch64`->`arm64` mapping
+/// as build.zig's `targetOsString` / `targetArchString` (duplicated
+/// locally because zig's module-graph rules forbid importing
+/// build.zig's helpers here -- the build script lives outside this
+/// runner's path scope).
+const zig_install = "./zig-out/bin/zag" ++ comptimeOsArchSuffix();
+
+fn comptimeOsArchSuffix() []const u8 {
+    const os_str = switch (builtin.os.tag) {
+        .linux => "linux",
+        .windows => "windows",
+        .macos => "darwin",
+        else => @tagName(builtin.os.tag),
+    };
+    const arch_str = switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "arm64",
+        else => @tagName(builtin.cpu.arch),
+    };
+    return std.fmt.comptimePrint("-{s}-{s}", .{ os_str, arch_str });
+}
 
 /// Vendor-zig path. After `scripts/install.sh` runs inside a zag
 /// source clone (detected by `build.zig` + `src/main.zig` presence),

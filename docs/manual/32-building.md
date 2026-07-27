@@ -16,7 +16,7 @@ From the repository root:
 zig build
 ```
 
-The built binary lands in `zig-out/bin/zag`.
+The built binary lands in `zig-out/bin/zag-<os>-<arch>` (build.zig's `b.addExecutable` uses `b.fmt("zag-{s}-{s}", ...)` to emit a platform-suffixed name; `.exe` is auto-appended on Windows).
 
 ## Build Modes
 

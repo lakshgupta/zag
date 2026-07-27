@@ -54,7 +54,7 @@ cd zag
 ./scripts/install-local.sh       # copy zig-out/bin/zag-<os>-<arch> to ~/.zag/bin and configure PATH
 ```
 
-`build.sh` runs `zig build`, copies the result into `zig-out/bin/zag-<os>-<arch>`, and `install-local.sh` configures your `PATH` the same way `install.sh` does.
+`build.sh` runs `zig build` (build.zig emits `zig-out/bin/zag-<os>-<arch>` directly via `b.addExecutable(.{ .name = b.fmt("zag-{s}-{s}", ...) })`), and `install-local.sh` configures your `PATH` the same way `install.sh` does.
 
 ### Verify
 

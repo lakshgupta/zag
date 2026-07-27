@@ -5,7 +5,7 @@ Zag is a systems language that emits Zig source and uses `zig` for native codege
 ## Build & test
 
 ```
-zig build                              # production binary → zig-out/bin/zag
+zig build                              # production binary → zig-out/bin/zag-<os>-<arch> (build.zig's b.fmt emits the platform-suffixed name; .exe appended on Windows)
 zig build -Doptimize=ReleaseFast       # release build
 zig build -Dzig_payload=<path>         # embed a zig binary (default: auto-detect vendor/zig/zig)
 

@@ -138,7 +138,25 @@ pub fn build(b: *std.Build) void {
     mod.addImport("env_path", env_path_mod);
 
     const exe = b.addExecutable(.{
-        .name = "zag",
+        // v0.1 install-script alignment: produce a platform-suffixed
+        // executable name so scripts/install-local.sh's
+        // `LOCAL_BIN="$ZAG_BINS_DIR/zag-${OS}-${ARCH}${SUFFIX}"` resolves
+        // without a manual `cp zig-out/bin/zag ...zig-${OS}-${ARCH}`
+        // workaround. Maps zig's .macos->darwin + .aarch64->arm64 to
+        // align with bash `uname` outputs expected by install-local.sh,
+        // build.sh, and package.sh (zig follows the Darwin-kernel
+        // naming convention; bash's uname -s reports "Darwin" but the
+        // install scripts lowercase to "darwin"). The .exe suffix is
+        // auto-appended by zig's `b.addExecutable` on Windows targets
+        // (verified zig 0.16 std.Build behavior), so the format string
+        // omits it; appending `.exe` here would produce
+        // `zag-windows-x86_64.exe.exe`. See `targetOsString` +
+        // `targetArchString` (bottom of this file) for the mapping
+        // logic.
+        .name = b.fmt("zag-{s}-{s}", .{
+            targetOsString(target.result.os.tag),
+            targetArchString(target.result.cpu.arch),
+        }),
         .root_module = mod,
     });
 
@@ -613,6 +631,57 @@ fn defaultZInstall(allocator: std.mem.Allocator) []const u8 {
         return std.fmt.allocPrint(allocator, "{s}/.cache/zag", .{home}) catch FALLBACK_ZINSTALL;
     }
     return FALLBACK_ZINSTALL;
+}
+
+/// Translate zig's `std.Target.Os.Tag` enum to the bash-uname-style
+/// OS string expected by `scripts/install-local.sh`,
+/// `scripts/build.sh`, and `scripts/package.sh` for the
+/// `zag-${OS}-${ARCH}${SUFFIX}` suffix-name. zig follows the kernel
+/// naming convention (macOS's BSD-derived `Darwin` kernel maps to
+/// `.macos`, Linux to `.linux`, Windows NT to `.windows`). bash's
+/// `uname -s` reports the same names uppercased ("Darwin", "Linux",
+/// "_NT-..."); the install scripts lowercase for the suffix, so we
+/// just need to feed the lowercase kernel-name match here. The only
+/// real divergence is `macos`/`darwin`; everything else is identical
+/// to `@tagName`.
+///
+/// Used by `pub fn build`'s `b.addExecutable(.{ .name = ... })` to
+/// produce the platform-suffixed artifact the install script reads.
+/// Lives in this file because the mapping is needed at build-config
+/// time (where `target.result.os.tag` is resolved); the same
+/// translation happens in `tests/runtime_smoke.zig` and
+/// `tests/smoke.zig` against `builtin.os.tag` (running on the same
+/// host they were compiled for), so the test files duplicate this
+/// function locally rather than reach back to build.zig (which would
+/// require a separate Module + circular-import gymnastics that zig's
+/// per-module file-membership rule prohibits).
+fn targetOsString(tag: std.Target.Os.Tag) []const u8 {
+    return switch (tag) {
+        .linux => "linux",
+        .windows => "windows",
+        .macos => "darwin",
+        else => @tagName(tag),
+    };
+}
+
+/// Translate zig's `std.Target.Cpu.Arch` enum to the bash-uname-style
+/// arch string expected by the install scripts. zig uses LLVM-style
+/// arch names (`.x86_64`, `.aarch64`, ...); bash `uname -m` uses the
+/// Linux-kernel-style names (`x86_64` happens to match, but
+/// `aarch64`/zig vs `arm64`/bash is the canonical divergence on
+/// Apple Silicon + AWS Graviton). Building the suffix-name from
+/// this mapping rather than the raw `@tagName` keeps the
+/// install/verify scripts coherent across platforms.
+///
+/// Non-matching archs (riscv64, wasm32, ...) fall through to
+/// `@tagName` unchanged; the install scripts would need a parallel
+/// update if a future zag build targets one of those.
+fn targetArchString(arch: std.Target.Cpu.Arch) []const u8 {
+    return switch (arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "arm64",
+        else => @tagName(arch),
+    };
 }
 
 /// openat(2) probe to detect `vendor/zig/zig` (or

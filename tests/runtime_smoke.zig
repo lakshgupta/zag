@@ -77,13 +77,39 @@
 // =====================================================================
 
 const std = @import("std");
+const builtin = @import("builtin");
 const env_path = @import("env_path");
 
 /// Path to the zag binary relative to the test runner's CWD. zig
 /// build's convention is that CWD = build.zig's directory at
-/// invocation time, so `./zig-out/bin/zag` resolves to
-/// `<project-root>/zig-out/bin/zag` from `zig build runtime_smoke`.
-const ZAG_BIN = "./zig-out/bin/zag";
+/// invocation time, so `./zig-out/bin/zag-${OS}-${ARCH}${EXE}`
+/// resolves to the platform-suffixed artifact produced by
+/// `b.addExecutable(.{ .name = b.fmt("zag-{s}-{s}", ...) })` in
+/// build.zig (see `targetOsString` + `targetArchString` there for
+/// the .macos->darwin + .aarch64->arm64 mapping rationale). This
+/// MUST mirror build.zig's mapping exactly; the constants below are
+/// duplicated locally rather than imported from build.zig because
+/// zig's per-module file-membership rule prohibits a circular
+/// graph-import of the build script's helpers into this test
+/// runner. Compiled at comptime so `ZAG_BIN` stays `const` (no
+/// runtime syscall, no allocation). `.exe` is auto-appended by
+/// zig's builder on Windows targets, matching build.zig's omission.
+const ZAG_BIN = "./zig-out/bin/zag" ++ comptimeOsArchSuffix();
+
+fn comptimeOsArchSuffix() []const u8 {
+    const os_str = switch (builtin.os.tag) {
+        .linux => "linux",
+        .windows => "windows",
+        .macos => "darwin",
+        else => @tagName(builtin.os.tag),
+    };
+    const arch_str = switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "arm64",
+        else => @tagName(builtin.cpu.arch),
+    };
+    return std.fmt.comptimePrint("-{s}-{s}", .{ os_str, arch_str });
+}
 
 /// All runtime assertions in one place. The expected stdout values
 /// are byte-exact captures from a manual `zag run <example>` against

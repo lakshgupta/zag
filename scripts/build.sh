@@ -135,22 +135,31 @@ echo ""
 echo ""
 success "Build complete"
 
-# ── Platform-name the binary ─────────────────────────────────────────────────
+# ── Verify the platform-suffixed binary landed ──────────────────────────────
+#
+# v0.1 install-script alignment: build.zig now produces the
+# platform-suffixed artifact name directly via
+# `b.addExecutable(.{ .name = b.fmt("zag-{s}-{s}", ...) })` (see
+# `targetOsString` + `targetArchString` in build.zig for the
+# .macos->darwin + .aarch64->arm64 mapping rationale). The prior
+# copy-step that renamed `zig` -> `zag-${OS}-${ARCH}${SUFFIX}` here
+# is deleted: the source path no longer exists, so the verify step
+# points directly at the artifact the install scripts + run_all.sh
+# + install-local.sh all expect. The chmod is defensive -- zig's
+# builder sets the executable bit on install, but a stale .zig-cache
+# rebuild path can occasionally disagree.
 
-SRC="${REPO_ROOT}/${ZAG_BUILD_OUT%/}/zag${SUFFIX}"
 DST="${REPO_ROOT}/${ZAG_BUILD_OUT%/}/zag-${OS}-${ARCH}${SUFFIX}"
 
-if [[ ! -f "$SRC" ]]; then
-    error "Built binary not found at $SRC"
+if [[ ! -f "$DST" ]]; then
+    error "Built binary not found at $DST"
     echo ""
-    echo "  Expected the build to produce: $SRC"
+    echo "  Expected the build to produce: $DST"
     echo "  Override with: ZAG_BUILD_OUT=<dir> ./scripts/build.sh"
     echo ""
     exit 1
 fi
 
-info "Naming binary for ${OS}-${ARCH}"
-cp "$SRC" "$DST"
 chmod +x "$DST"
 success "${ZAG_BUILD_OUT%/}/zag-${OS}-${ARCH}${SUFFIX}"
 

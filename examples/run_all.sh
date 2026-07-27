@@ -145,17 +145,17 @@ if [[ $BUILD -eq 1 ]]; then
         exit 1
     }
 
-    info "Placing built binary into zig-out/bin/..."
+    info "Verifying built binary at zig-out/bin/zag-${OS}-${ARCH}${SUFFIX}..."
     read -r OS ARCH SUFFIX <<< "$(detect_platform)"
-    local_src="${REPO_ROOT}/${ZAG_BUILD_OUT%/}/zag${SUFFIX}"
+    local packaged="${REPO_ROOT}/${ZAG_BUILD_OUT%/}/zag-${OS}-${ARCH}${SUFFIX}"
 
-    if [ -f "$local_src" ]; then
-        mkdir -p "${PROJECT_ROOT}/zig-out/bin"
-        cp "$local_src" "${PROJECT_ROOT}/zig-out/bin/zag-${OS}-${ARCH}${SUFFIX}"
-        chmod +x "${PROJECT_ROOT}/zig-out/bin/zag-${OS}-${ARCH}${SUFFIX}"
-        success "Placed zig-out/bin/zag-${OS}-${ARCH}${SUFFIX}"
+    if [ -x "$packaged" ]; then
+        # chmod is defensive -- zig's builder sets +x on install, but
+        # a stale .zig-cache rebuild path can occasionally disagree.
+        chmod +x "$packaged"
+        success "Verified zig-out/bin/zag-${OS}-${ARCH}${SUFFIX}"
     else
-        error "Built binary not found at ${local_src}"
+        error "Built binary not found at ${packaged}"
         echo ""
         echo "  Set ZAG_BUILD_OUT to the directory containing the zag binary:"
         echo "    ZAG_BUILD_OUT=build ./run_all.sh --build"
@@ -176,21 +176,15 @@ find_zag_binary() {
         echo -e "  ${YELLOW}⚠${NC} ZAG_BIN='${ZAG_BIN}' is not executable — auto-detecting instead" >&2
     fi
 
-    # 2. Auto-detect the canonical local build: `zig build` produces
-    #    `${PROJECT_ROOT}/zig-out/bin/zag` directly. Check this BEFORE
-    #    the platform-renamed copy (next step) and the PATH fallback
-    #    (last step) so a fresh `zig build` (without run_all.sh's
-    #    `--build` flag, which only places the platform-renamed copy)
-    #    still resolves to the canonical local artifact — this fixes
-    #    the stale-PATH-install blind spot where `which zag` returned
-    #    an old binary ahead of an up-to-date local build.
-    local local_build="${PROJECT_ROOT}/zig-out/bin/zag"
-    if [ -x "$local_build" ]; then
-        echo "$local_build"
-        return 0
-    fi
-
-    # 3. Auto-detect from zig-out/bin/ (built binary for this platform)
+    # 2. Auto-detect the canonical build artifact produced by `zig build`:
+    #    build.zig's `b.addExecutable(.{ .name = b.fmt("zag-{s}-{s}", ...) })`
+    #    emits `${PROJECT_ROOT}/zig-out/bin/zag-${OS}-${ARCH}${SUFFIX}`
+    #    directly (see `targetOsString` + `targetArchString` in build.zig
+    #    for the .macos->darwin + .aarch64->arm64 mapping rationale). Checked
+    #    BEFORE the PATH-installed fallback so a fresh `zig build` still
+    #    resolves to the canonical local artifact — fixes the stale-PATH-
+    #    install blind spot where `which zag` returned an old binary ahead
+    #    of an up-to-date local build.
     read -r OS ARCH SUFFIX <<< "$(detect_platform)"
     local packaged="${PROJECT_ROOT}/zig-out/bin/zag-${OS}-${ARCH}${SUFFIX}"
     if [ -x "$packaged" ]; then

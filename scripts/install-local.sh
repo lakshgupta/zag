@@ -107,6 +107,14 @@ do_check() {
         success "Binary found: $ZAG_BIN"
         if "$ZAG_BIN" version 2>/dev/null; then
             success "Runs successfully"
+            if [[ -d "$ZAG_HOME/lib/std" ]]; then
+                local stdlib_count
+                stdlib_count=$(find "$ZAG_HOME/lib/std" -maxdepth 1 -name '*.zag' 2>/dev/null | wc -l)
+                success "Stdlib present at $ZAG_HOME/lib/std/ ($stdlib_count modules)"
+            else
+                warn "Stdlib missing at $ZAG_HOME/lib/std/"
+                warn "  `zag build` will fail in end-user projects (src/main.zig 3-tier search)"
+            fi
             return 0
         else
             warn "Binary exists but fails to run"
@@ -207,6 +215,53 @@ if [[ ! -f "$LOCAL_BIN" ]]; then
 fi
 
 # Check if already installed and up to date
+
+# v0.1 stdlib migration: refresh $ZAG_HOME/lib/std/ BEFORE
+# the binary-freshness check so a no-op re-install (binary
+# bytes unchanged) still picks up changed/added lib/std/*.zag
+# files. Without this, users adding a new stdlib module
+# re-running this script WITHOUT --force would carry a stale
+# `~/.zag/lib/std/` and hit the v0.1 migration FileNotFound
+# bug at the next `zag build` in their project.
+
+# v0.1 stdlib migration: copy lib/std/*.zag next to the binary
+# so `zag build` in end-user projects (where cwd has no
+# `lib/std/`) can locate the stdlib at runtime. src/main.zig's
+# `materializeStdlib()` 3-tier search tries cwd-relative first
+# (preserves in-tree dev workflow), then `$ZAG_HOME/lib/std/`
+# (this installation), then `$HOME/.local/share/zag/lib/std/`
+# (future distro package path). Without this copy, the cwd-tier
+# fails for projects outside the zag source tree, leading to
+# empty `build/gen/std/*.zig` and `@import("std/<n>.zig")`
+# FileNotFound errors when zig compiles the user's main.zig.
+# (See v0.1 migration commit `fix(codegen): ...` for the
+# matching search-path fallback in src/main.zig.)
+ZAG_LIB_DIR="$ZAG_HOME/lib"
+ZAG_STDLIB_DIR="$ZAG_LIB_DIR/std"
+if [[ -d "$REPO_ROOT/lib/std" ]]; then
+    info "Copying stdlib to $ZAG_STDLIB_DIR/"
+    mkdir -p "$ZAG_STDLIB_DIR"
+    # `cp -r` with explicit `.` preserves the dir's contents
+    # (avoiding an extra nesting level `$ZAG_STDLIB_DIR/std/...`)
+    # and tolerates an already-present destination.
+    cp -r "$REPO_ROOT/lib/std/." "$ZAG_STDLIB_DIR/"
+    success "Installed stdlib ($REPO_ROOT/lib/std -> $ZAG_STDLIB_DIR)"
+else
+    warn "no $REPO_ROOT/lib/std/ found -- stdlib not installed"
+    warn "  `zag build` will fail in end-user projects until you fix this"
+    warn "  (re-run install-local.sh from a cloned zag repo, or set ZAG_LIB_DIR manually)"
+fi
+
+
+# Already-up-to-date check (BEFORE binary install). When not
+# --forced AND a prior binary exists AND its bytes match the
+# local build, exit early to skip the re-install. The
+# v0.1 stdlib copy block above already refreshed lib/std/
+# on this entry, so a "no-op-binary-install" run still picks
+# up changed stdlib surface -- the user's reported symptom
+# ("cmp + stdlib copy silently skipped on non-ReleaseFast
+# invocations") is resolved by colocating the bump-time refresh
+# (stdlib copy block) with this byte-equality early-exit.
 if [[ -x "$ZAG_BIN" ]] && [[ $FORCE -eq 0 ]]; then
     if cmp -s "$LOCAL_BIN" "$ZAG_BIN"; then
         success "Already up to date at $ZAG_BIN"
@@ -225,14 +280,16 @@ cp "$LOCAL_BIN" "$ZAG_BIN"
 chmod +x "$ZAG_BIN"
 success "Installed $ZAG_BIN"
 
-# Verify
+# Verify AFTER install (not before, as the prior order
+# assumed $ZAG_BIN existed already -- broken on fresh
+# installs with no prior binary at ~/.zag/bin/zag, which is
+# the user's actual fresh-install path).
 if "$ZAG_BIN" version 2>/dev/null; then
     success "Binary verified — runs correctly"
 else
     error "Binary copied but fails to run — it may need to be rebuilt"
     exit 1
 fi
-
 # ── Configure PATH ───────────────────────────────────────────────────────────
 
 SHELL_PROFILE="$(detect_shell_profile)"
