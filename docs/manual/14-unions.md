@@ -1,6 +1,6 @@
 # Unions
 
-Use `union` when variants' **payload types may differ**; the uniform-payload case (all variants sharing one `T`) is [`enum(T)`](13-enums.md#backed-enums-enumt) per §13. The `<T>` angle brackets in `Option<T>`, `Result<T, E>`, etc. follow the [Generics](16-generics.md) convention — they declare a type parameter, not a backing type.
+Use `union` when variants' **payload types may differ**; the uniform-payload case (all variants sharing one `T`) is [`enum(T)`](13-enums.md#backed-enums-enumt) per §13. The `<T>` angle brackets in `Option<T>`, `Result<T, E>`, etc. follow the [Generics](17-generics.md) convention — they declare a type parameter, not a backing type.
 
 A `union` is a tagged union (algebraic data type). Variants can:
 - Carry a payload: `Variant(T)`, `Variant(T, U)`
@@ -123,7 +123,7 @@ match risky() catch |err| {
 };
 ```
 
-See [Error Handling](18-error-handling.md) for the full discussion.
+See [Error Handling](19-error-handling.md) for the full discussion.
 
 ## Exhaustiveness
 
@@ -175,11 +175,11 @@ fun risky() -> Result<i32, MyError> {
 }
 ```
 
-The `ErrorExt` trait (in `std.error`) is implemented for any custom error union and lets you attach a context message — see [Error Handling](18-error-handling.md).
+The `ErrorExt` trait (in `std.error`) is implemented for any custom error union and lets you attach a context message — see [Error Handling](19-error-handling.md).
 
 ## FFI
 
-> FFI on unions is a planned feature. See [FFI and Interop](24-ffi.md) for what's available in the current compiler. The example below shows the target surface.
+> FFI on unions is a planned feature. See [FFI and Interop](25-ffi.md) for what's available in the current compiler. The example below shows the target surface.
 
 `@[repr(C, T)]` constrains a `union`'s tag width and discriminant layout to match a C-compatible representation. Discriminants can be pinned with `= N` for both bare and payload variants — the runtime ADT contract reserves distinct tags for unassigned variants too, but pinning is the established way to make the discriminant observable to C code:
 
@@ -202,7 +202,7 @@ Unions are stack-allocated. No heap allocation unless a variant contains a heap 
 ## See Also
 
 - [Enums](13-enums.md) — bare enumerations (no payloads)
-- [Pattern Matching](27-pattern-matching.md) — full `match` syntax, payload destructuring
-- [Error Handling](18-error-handling.md) — Result / Option / Error / Context
-- [FFI and Interop](24-ffi.md) — `@[repr(C, T)]` for C compatibility
+- [Pattern Matching](28-pattern-matching.md) — full `match` syntax, payload destructuring
+- [Error Handling](19-error-handling.md) — Result / Option / Error / Context
+- [FFI and Interop](25-ffi.md) — `@[repr(C, T)]` for C compatibility
 - [Spec](../spec.md) — canonical language spec; enums, backed enums, and unions live in §3.3 Compound Types

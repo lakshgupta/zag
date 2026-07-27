@@ -273,4 +273,4 @@ gh release create "${TAG}" \
 - `scripts/package.sh` — archives binaries + writes `checksums.txt` into `dist/<version>/`
 - `scripts/install.sh`, `zag-install.sh`, `scripts/install.ps1` — user-facing curl-pipe installers (consume these artifacts)
 - `.github/workflows/release.yml` — CI release workflow (currently all 6 platforms)
-- `docs/manual/31-building.md` § Distribution — the user-view of install
+- `docs/manual/32-building.md` § Distribution — the user-view of install

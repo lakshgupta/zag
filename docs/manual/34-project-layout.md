@@ -121,7 +121,7 @@ All build subcommands (`build`, `test`, `bench`, `run`) share `zig build`'s incr
 ```
 zag build -Doptimize=ReleaseFast          # matches zig build's OptimizeMode
 zag build -Dtarget=x86_64-linux-gnu       # cross-compile
-zag build -Dbounds-check                  # opt-in safety tools (see [Testing](25-testing.md))
+zag build -Dbounds-check                  # opt-in safety tools (see [Testing](26-testing.md))
 ```
 
 `zag build --emit-build` writes the transient `build.zig.zon` + `build.zig` it normally keeps inside `./zig-cache/zag-build/`. Useful for debugging the build flow; leave it off otherwise.

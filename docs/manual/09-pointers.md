@@ -21,7 +21,7 @@ Only `*T` (non-nullable, mutable) and `String` are not `Copy` — they move on a
 
 ## Allocating a pointer: `new`
 
-`new` allocates on the heap and returns an owning pointer. See `docs/19-memory.md` for the full heap-allocation surface.
+`new` allocates on the heap and returns an owning pointer. See `docs/20-memory.md` for the full heap-allocation surface.
 
 ```
 let p = new i32(42);        # global allocator (default)

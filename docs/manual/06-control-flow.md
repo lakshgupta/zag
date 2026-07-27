@@ -90,7 +90,7 @@ for (k, v) in map.iter() {
 
 Pattern matching with exhaustive checks.
 
-For partial matches, use `_` as the catch-all pattern. Pair it with the arms you want to handle and let `_` cover the rest (see [Pattern Matching → Exhaustiveness](27-pattern-matching.md#exhaustiveness) for the canonical exhaustive vs. catch-all pairing):
+For partial matches, use `_` as the catch-all pattern. Pair it with the arms you want to handle and let `_` cover the rest (see [Pattern Matching → Exhaustiveness](28-pattern-matching.md#exhaustiveness) for the canonical exhaustive vs. catch-all pairing):
 
 ```
 match opt {

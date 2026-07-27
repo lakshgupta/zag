@@ -109,4 +109,4 @@ fun main() {
 - [Literals](03-literals.md)
 - [Variables](04-variables.md)
 - [Types](07-types.md)
-- [Memory Model](19-memory.md)
+- [Memory Model](20-memory.md)

@@ -22,51 +22,52 @@ A comprehensive guide to the Zag programming language.
 - [Structs](12-structs.md) — Structs, embedding, methods, derive
 - [Enums](13-enums.md) — Bare enumerations
 - [Unions](14-unions.md) — Tagged unions, Option, Result
-- [Tuples](15-tuples.md) — Tuple types and destructuring
+- [Tuples](16-tuples.md) — Tuple types and destructuring
 
 ## Operations
 
 - [Operators](05-operators.md) — Arithmetic, comparison, assignment
-- [Operator Overloading](30-operator-overloading.md) — Custom operators via dunder methods
+- [Operator Overloading](31-operator-overloading.md) — Custom operators via dunder methods
 
 ## Control Flow
 
 - [Control Flow](06-control-flow.md) — if, while, for, match, defer, return
-- [Pattern Matching](27-pattern-matching.md) — match, destructuring, guards
+- [Pattern Matching](28-pattern-matching.md) — match, destructuring, guards
 
 ## Functions and Generics
 
 - [Functions](15-functions.md) — Declaration, parameters, closures
-- [Methods and impl](28-methods.md) — Methods, self parameter, impl blocks
-- [Method Overloading](29-method-overloading.md) — Compile-time overload resolution
-- [Generics](16-generics.md) — Generic functions and types, trait bounds
-- [Traits](17-traits.md) — Dynamic dispatch, trait implementation
+- [Methods and impl](29-methods.md) — Methods, self parameter, impl blocks
+- [Method Overloading](30-method-overloading.md) — Compile-time overload resolution
+- [Generics](17-generics.md) — Generic functions and types, trait bounds
+- [Traits](18-traits.md) — Dynamic dispatch, trait implementation
 
 ## Error Handling
 
-- [Error Handling](18-error-handling.md) — Result, Option, ?, catch, Context
-- [Defer and Errdefer](20-defer.md) — Cleanup patterns
+- [Error Handling](19-error-handling.md) — Result, Option, ?, catch, Context
+- [Defer and Errdefer](21-defer.md) — Cleanup patterns
 
 ## Memory
 
-- [Memory Model](19-memory.md) — Allocation, ownership, safety tooling
+- [Memory Model](20-memory.md) — Allocation, ownership, safety tooling
 - [Pointers](09-pointers.md) — Pointer types, dereferencing, slicing
 
 ## Concurrency
 
-- [Concurrency](21-concurrency.md) — Threads, async/await, channels, scopes
+- [Concurrency](22-concurrency.md) — Threads, async/await, channels, scopes
 
 ## Language Features
 
-- [Modules and Imports](22-modules.md) — File-based modules, visibility, mod.toml
-- [Compile-Time Execution](26-compile-time.md) — const blocks, builtins
-- [SIMD and Assembly](23-simd.md) — Vector types, inline asm, intrinsics
-- [FFI and Interop](24-ffi.md) — C ABI, repr(C), extern fun
+- [Modules and Imports](23-modules.md) — File-based modules, visibility, mod.toml
+- [Compile-Time Execution](27-compile-time.md) — const blocks, builtins
+- [SIMD and Assembly](24-simd.md) — Vector types, inline asm, intrinsics
+- [FFI and Interop](25-ffi.md) — C ABI, repr(C), extern fun
 
 ## Tooling
 
-- [Testing](25-testing.md) — Tests, benchmarks, safety checks
-- [Building and Releasing](31-building.md) — Build from source, release builds, distribution
+- [Testing](26-testing.md) — Tests, benchmarks, safety checks
+- [Building and Releasing](32-building.md) — Build from source, release builds, distribution
+- [Debugging](33-debugging.md) — Native debugging, gdb/lldb integration, panic routing
 - [Project Layout & Dependencies](34-project-layout.md) — Directory structure, `zag install / add / vendor` workflow, build/test/bench CLI
 - [`zag.toml` Schema](35-zag-toml-schema.md) — Formal reference for the package manifest
 

@@ -26,7 +26,7 @@ let tiny: f32 = 1.0e-10; # explicit type annotation
 let hex   = 0x1.0p10;    # hex float (IEEE 754 binary16/32/64 form)
 ```
 
-Sizes and hardware-acceleration notes are documented in [Primitives](08-primitives.md) and [SIMD](23-simd.md).
+Sizes and hardware-acceleration notes are documented in [Primitives](08-primitives.md) and [SIMD](24-simd.md).
 
 ## Boolean Literals
 
@@ -96,7 +96,7 @@ let unit                   = ();          # void / unit tuple — zero-sized
 let named                  = (x: 10, y: 20); # field names compile away; same ABI as (10, 20)
 ```
 
-**Memory:** Stack-allocated. Size is sum of element sizes (with padding). Names vanish at the ABI level — `(x: 10, y: 20)` and `(10, 20)` are identical in memory. See [Tuples](15-tuples.md) for destructuring.
+**Memory:** Stack-allocated. Size is sum of element sizes (with padding). Names vanish at the ABI level — `(x: 10, y: 20)` and `(10, 20)` are identical in memory. See [Tuples](16-tuples.md) for destructuring.
 
 ## Null and Undefined
 
@@ -114,4 +114,4 @@ let v     = f32x4 { 1.0, 2.0, 3.0, 4.0 };
 let zeros = i8x16 { 0 ... };
 ```
 
-**Memory:** Value-typed, stack-allocated, maps to the target SIMD register (16-64 bytes depending on lane count). Lane count and element type are part of the type — `f32x4` and `f32x8` are distinct. See [SIMD](23-simd.md) for the type taxonomy and hardware acceleration notes.
+**Memory:** Value-typed, stack-allocated, maps to the target SIMD register (16-64 bytes depending on lane count). Lane count and element type are part of the type — `f32x4` and `f32x8` are distinct. See [SIMD](24-simd.md) for the type taxonomy and hardware acceleration notes.

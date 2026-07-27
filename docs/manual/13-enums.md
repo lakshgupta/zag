@@ -109,9 +109,9 @@ Use qualified names when the type is ambiguous or for clarity.
 
 ## Backed Enums (`enum(T)`)
 
-Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](16-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type. See [`examples/types/enum_backed.zag`](../../examples/types/enum_backed.zag) for the end-to-end runnable demonstration covering `enum(u8)`, `enum(str)`, `enum(char)`, and the auto-inferred `enum(u8)` shape.
+Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](17-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type. See [`examples/types/enum_backed.zag`](../../examples/types/enum_backed.zag) for the end-to-end runnable demonstration covering `enum(u8)`, `enum(str)`, `enum(char)`, and the auto-inferred `enum(u8)` shape.
 
-Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](16-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type.
+Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](17-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type.
 
 An `enum` may declare a backing type `T`. The supported `T` universe is restricted to integer types, `bool`, `char`, and `str` — custom `Copy` struct/enum/array types as `T` are deferred. Each variant identifier is bound to a value of type `T` at compile time:
 
@@ -172,7 +172,7 @@ let ok_neq:   bool = (Status.Ok   != Status.Err); # true — 0 != 2
 
 > **Rust users take note:** `enum(str) Level { High = "high" }` introduces true value-equality (`Level.High == "high"`). This differs from Rust's bare-reference enum, where `High == "high"` is a compile error (different types). Read the provided methods above as the binding contract.
 
-**Combining with FFI:** `@[repr(C, T1)] enum(T2) X { … }` keeps `T2` as the zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries. See [FFI and Interop](24-ffi.md) for the full interaction.
+**Combining with FFI:** `@[repr(C, T1)] enum(T2) X { … }` keeps `T2` as the zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries. See [FFI and Interop](25-ffi.md) for the full interaction.
 
 ## Repr Control
 
@@ -191,10 +191,10 @@ The tag type follows `T`; explicit `= N` discriminants pin specific values. FFI 
 
 ## `Error` Type
 
-The canonical error type in the standard library is an `enum Error { NotFound, Permission, Io, Parse, InvalidInput, Unavailable, Other }` — all bare variants, hence `enum`, not `union`. See [Error Handling](18-error-handling.md) for the full discussion.
+The canonical error type in the standard library is an `enum Error { NotFound, Permission, Io, Parse, InvalidInput, Unavailable, Other }` — all bare variants, hence `enum`, not `union`. See [Error Handling](19-error-handling.md) for the full discussion.
 
 ## See Also
 
 - [Unions](14-unions.md) — tagged unions / sum types
-- [Pattern Matching](27-pattern-matching.md) — full `match` syntax
+- [Pattern Matching](28-pattern-matching.md) — full `match` syntax
 - [Spec](../spec.md) — canonical language spec; enums, backed enums, and unions live in §3.3 Compound Types

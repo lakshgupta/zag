@@ -133,7 +133,7 @@ Default compile settings; per-command flags on the CLI take precedence.
 | `target` | string | `"native"` | Zig target triple (e.g. `"x86_64-linux-gnu"`) or `"native"` |
 | `optimize` | string | `"Debug"` | One of `"Debug"`, `"ReleaseFast"`, `"ReleaseSafe"`, `"ReleaseSmall"` |
 | `output` | string | `"zig-out"` | Build output directory |
-| `check` | array of strings | `[]` | Opt-in safety checks (see [Testing](25-testing.md)) |
+| `check` | array of strings | `[]` | Opt-in safety checks (see [Testing](26-testing.md)) |
 
 ```toml
 [build]
@@ -249,7 +249,7 @@ exclude = ["**/internal/**", "**/.skip/**"]
 visibility = "public"
 ```
 
-Default behavior (section absent or `[modules]` with both lists empty): every `.zag` file under `deps/<name>/` is reachable from the import DAG, modulo the cyclic-DAG detector (see [Modules](22-modules.md)).
+Default behavior (section absent or `[modules]` with both lists empty): every `.zag` file under `deps/<name>/` is reachable from the import DAG, modulo the cyclic-DAG detector (see [Modules](23-modules.md)).
 
 ## Resolving Dependencies
 
