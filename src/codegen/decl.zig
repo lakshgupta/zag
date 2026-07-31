@@ -163,12 +163,6 @@ const Codegen = core.Codegen;
         // Without this reset, sibling pub fns would reuse the same
         // `__env_0` name and zig's no-redeclaration rule would reject
         // a sibling fn body's emit.
-        // Phase 2 codegen-router: fs_counter reset mirrors env_counter
-        // above. Sibling `pub fn` declarations with read_file calls
-        // get their own scoped counter slot to avoid `__fs_<N>`
-        // redeclaration when two fns in the same module both call
-        // read_file.
-        self.fs_counter = 0;
         // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
         // exec counters reset mirrors the fs_counter (Phase 2) pattern
         // above so each fn body has its own scoped counter slot
@@ -474,11 +468,6 @@ const Codegen = core.Codegen;
         // `__env_<N>` sequence starting at `_0`.
         // Phase 2 codegen-router: fs_counter reset mirrors env_counter
         // above so nested methods get a clean `__fs_<N>` sequence
-        // starting at `_0`. The fs_read_file dispatch emits
-        // `var __io_threaded = std.Io.Threaded.init(...)` per call
-        // so a sibling read_file in the same method body needs its
-        // own scoped counter slot to avoid `__fs_<N>` redeclaration.
-        self.fs_counter = 0;
         // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
         // exec counters reset mirrors the fs_counter (Phase 2) pattern
         // above so each fn body has its own scoped counter slot
@@ -1264,11 +1253,6 @@ const Codegen = core.Codegen;
         // the same
         // body produce distinct `__env_<N>` names. Sibling pub fns
         // start fresh at `_0` thanks to this reset.
-        // Phase 2 codegen-router: fs_counter reset (mirrors env_counter
-        // immediately above) so sibling read_file calls within the
-        // same body produce distinct `__fs_<N>` names. Sibling pub
-        // fns start fresh at `_0` thanks to this reset.
-        self.fs_counter = 0;
         // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
         // exec counters reset mirrors the fs_counter (Phase 2) pattern
         // above so each fn body has its own scoped counter slot
@@ -1474,7 +1458,6 @@ const Codegen = core.Codegen;
         self.alloc_counter = 0;
         self.match_counter = 0;
         self.blk_counter = 0;
-        self.fs_counter = 0;
 
         // Doc comment on the test block
         if (fun.doc) |d| self.genDocComment(d);

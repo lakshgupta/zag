@@ -1,28 +1,34 @@
-## stdlib/fs.zag — Phase 2.1 read_file smoke-test example.
+## stdlib/fs.zag — v0.1 read_file usage example.
 ##
 ## Reads a small known file and prints its byte count. The exact
 ## file is `examples/basics/hello.zag` — a tiny source file with
 ## predictable content (assert its size is stable across zag
 ## revisions so the smoke run's expected-output pin holds).
 ##
-## Heap-ownership contract (Phase 2.1 milestone): the returned
-## `[]u8` is `page_allocator`-owned. Phase 2.1 adds a `.free_expr`
-## slice-overload so `defer free data` lands on the slice-bearing
-## slot via `std.heap.page_allocator.free(data)` — closing the
-## ~4 KiB per-run leak that earlier phases tolerated via the OS's
-## process-exit reclaim.
+## v0.1 contract (this migration):
+## - `read_file(path) -> String` (heap `String`, not `[]u8`).
+##   Panics on open/read error today (see lib/std/fs.zag docblock).
+## - `String.as_str(self: *String) -> []const u8` returns a slice
+##   over the heap-owned buffer; `.len` on it is the byte count.
+## - Heap ownership: the returned `String`'s buffer is __zag_page_alloc
+##   backed; lifecycle is process-exit-reclaim today (Phase 2+ may
+##   add `data.free_expr()` once the docs/19 error-propagation
+##   zig-side codegen is wired).
+## - Migration from pre-v0.1 `[]u8` contract: drop any `defer free
+##   data` (the slice was codegen-router-owned, nu longer applies);
+##   replace with bare `let data: String = read_file(...)`.
 ##
-## Phase 2.1 discriminator contract: the slice overload fires
-## when the let-binding carries an explicit `: []u8` (or `: []const
-## u8`, `: []T`, `: str`) annotation. Untyped bindings (e.g.
-## legacy `let data = read_file(...)`) fall through to the
-## pointer-loading overload and would double-free at runtime —
-## always annotate `read_file` slots explicitly.
+## Imports contract: BOTH std.fs.{read_file} (the migrated impl)
+## AND std.string.{String} (the return type) must be visible at the
+## fixture's top — the imports-loop in src/codegen/core.zig bridges
+## @import("lib/std/...") + per-selector aliases only on explicit
+## `import` lines in user source. The `lib/std` namespace is NOT
+## ambient in fixture files.
 
 import std.fs.{read_file};
+import std.string.{String};
 
 fun main() {
-    let data: []u8 = read_file("examples/basics/hello.zag");
-    defer free(data);
-    print("read {data.len} bytes\n");
+    let data: String = read_file("examples/basics/hello.zag");
+    print("read {data.as_str().len} bytes\n");
 }

@@ -8,7 +8,7 @@ const Codegen = core.Codegen;
 // Phase 0 codegen-router table: src/codegen/builtins.zig holds the
 // `builtin_table` consulted by the `.call` and `.method_call` arms
 // BEFORE the verbatim fallback. Phase 0 ships with the table EMPTY
-// so this lookup is a no-op; Phase 1 (argv_get, env_var, fs_read_file)
+// so this lookup is a no-op; Phase 1 (argv_get, env_var)
 // and Phase 2+ widenings append entries to the table and matching
 // inline `switch (dispatch) case` arms in `genBuiltinCall` below.
 // The @import path is sibling-bucket (zig 0.16's module-local
@@ -197,7 +197,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     // registered entry writes directly into out_buf
                     // via genBuiltinCall; the inline emit shape is
                     // per-dispatch (argv_get emits a blk wrapper,
-                    // fs_read_file emits a `catch &[_]u8{}` for error
+                    // fs_read_file (legacy router arm, removed) emitted `catch &[_]u8{}` for error
                     // collapse, env_var wraps `orelse null` around
                     // std.os.getenv's `?[:0]const u8`). See
                     // src/codegen/builtins.zig for the per-dispatch
@@ -1151,7 +1151,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     // a non-null dispatch. Each switch arm emits the inline zig
     // shim that lowers the free-fn form to a direct zig stdlib
     // invocation. Phase 0 ships argv_get as the only wired entry;
-    // env_var and fs_read_file @panic at runtime so a future release
+    // env_var @panic at runtime so a future release
     // adding them to the table without wiring the helper case fails
     // LOUDLY at the user's host invocation (not silently falling
     // through to the verbatim form which would emit undeclared-name
@@ -1270,80 +1270,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("blk: { break :blk @as(?[]const u8, std.posix.getenv(");
                 self.genExpr(args[0]);
                 self.write(")); }");            },
-            .fs_read_file => {
-                // Phase 2 router: real emit shape for the fs_read_file
-                // dispatch. zig 0.16's `std.Io.Dir.readFileAlloc` (which
-                // RETIRED the legacy `std.fs.cwd().readFileAlloc` form —
-                // the 21-line `vendor/zig/lib/std/fs.zig` is a deprecation
-                // stub) requires an active `Io` event-loop instance. We
-                // construct one per call via `std.Io.Threaded.init` so
-                // each `read_file(path)` invocation owns a fresh Io
-                // context, leveraging zig's per-scope-stack-allocation
-                // for the `Threaded` struct itself + RAII via `defer
-                // __io_threaded.deinit()` to tear down the thread pool,
-                // signal handlers (`SIG.IO` / `SIG.PIPE`), environ scan
-                // scratch, and the random/pipe/null file handles the
-                // Threaded impl caches.
-                //
-                // Allocator: `std.heap.page_allocator` mirrors the
-                // existing `.new_expr` codegen path so heap-owned
-                // ownership policy stays consistent (user must free via
-                // `std.heap.page_allocator.free(slice)` before
-                // discarding; Phase 2.1 widening will add a `free
-                // <slice>` overload to `.free_expr` so the .zag
-                // surface gets a cleaner `defer free data` syntax).
-                // Memory ownership of the returned `[]u8` is the
-                // caller; page-aligned leaks at process exit are
-                // acceptable for short-lived zag binaries.
-                //
-                // Error collapse: `catch &[_]u8{}` silently coalesces
-                // every path of the triple-union error set
-                // (`Io.Dir.Reader.Error || std.mem.Allocator.Error ||
-                // Io.UnexpectedError`) into an empty-slice. The docs/18
-                // error-propagation contract isn't here yet — Phase 3
-                // may add a sibling `read_file_or` builtin that bubbles
-                // `error.FileNotFound` etc. via zag's `?` operator. v1
-                // surface keeps read_file simple: empty slice on
-                // failure, heap-allocated bytes on success, no error
-                // channel.
-                //
-                // Per-call scoping: each fs_read_file invocation steps
-                // fs_counter and emits a fresh `__fs_<N>` scratch —
-                // sibling read_file calls in the same body produce
-                // distinct names (zig's no-redeclaration rule would
-                // reject a clash). The counter is reset at the top of
-                // each function body (genFun + genMethod +
-                // genFreeMethod in decl.zig).
-                //
-                // NOTE: no `_ = args` suppression is needed — mirror
-                // the rationale on `.argv_get` and `.env_var` above.
-                const id = self.fs_counter;
-                self.fs_counter += 1;
-                var name_buf: [16]u8 = undefined;
-                const name = std.fmt.bufPrint(&name_buf, "__fs_{d}", .{id}) catch "__fs_0";
-
-                // Init order is LIFO at scope exit: `defer
-                // __io_threaded.deinit()` registers at construction
-                // time and runs AFTER `break :blk` captures the slice
-                // into the call site, so the Io's thread pool +
-                // signal handlers outlive the readFileAlloc call but
-                // are torn down before the surrounding block exits.
-                // The init is infallible (any CpuCountError is stored
-                // on `t.cpu_count_error`, NOT raised); no `catch` is
-                // needed.
-                var label_buf: [16]u8 = undefined;
-                const lbl = self.nextBlkLabel(&label_buf);
-                self.write(lbl);
-                self.write(": { var __io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); defer __io_threaded.deinit(); const ");
-                self.write(name);
-                self.write(" = __zag_err_to_result([]u8, std.Io.Dir.cwd().readFileAlloc(__io_threaded.io(), ");
-                self.genExpr(args[0]);
-                self.write(", std.heap.page_allocator, .unlimited)); break :");
-                self.write(lbl);
-                self.write(" ");
-                self.write(name);
-                self.write("; }");
-            },
             .fs_write_file => {
                 // Phase 3 (CLI migration) router: per-call (blk: { \u2026 })
                 // wrapper that opens the path via `std.posix.toPosixPath`
@@ -1423,7 +1349,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // child execve failure, otherwise W.EXITSTATUS).
                 // Phase 3 (CLI migration) router: per-call (blk: { ... })
                 // wrapper. The opening `{` is REQUIRED — every other dispatch
-                // helper in this switch (argv_get, env_var, fs_read_file,
+                // helper in this switch (argv_get, env_var,
                 // fs_write_file, fs_mkdir) emits `blk: { ... }` with the brace;
                 // .process_exec is the only one that emitted `blk:\n` (no
                 // brace), causing zig to parse the body's `var __exec_0_arg_bufs`

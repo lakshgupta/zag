@@ -1,60 +1,114 @@
 ## std.fs — file system read.
 ##
-## From docs/spec.md §6.4 (System Surfaces): read_file is exposed as
-## a free-fn form after the user writes `pub import std.fs.{read_file}`.
-## The router entry in src/codegen/builtins.zig maps `read_file`
-## (arity=1) to the `fs_read_file` dispatch.
+## v0.1 stdlib migration status (this file):
 ##
-## Phase 2 real emit (merged from the prior `@panic` runtime stub):
-## zig 0.16 retired `vendor/zig/lib/std/fs.zig` to a 21-line
-## deprecation-stub file. The canonical read-file entry moved to
-## `std.Io.Dir.readFileAlloc(dir, io, sub_path, gpa, limit)`, which
-## requires a `std.Io` event-loop instance.
+##   `read_file` — REAL impl. Uses the always-emitted __zag_posix
+##   preamble family from src/codegen/core.zig::generate():
+##     __zag_openat(dirfd, path, flags, mode) -> fd
+##     __zag_read(fd, buf, len) -> bytes-read
+##     __zag_close(fd) -> 0
+##   After this migration, `pub import std.fs.{read_file}` resolves to
+##   this real function via the @import + per-selector alias emitted by
+##   src/codegen/core.zig's imports loop (Option A fallthrough — when
+##   stdlibPreambleName(sel.name) returns "" the import-routing path
+##   emits `const __zag_imported_<i> = @import("lib/std/fs.zag")`
+##   plus `const read_file = __zag_imported_<i>.read_file` rather than
+##   dropping the selector silently).
 ##
-## The codegen-router emit (see src/codegen/expr.zig's
-## `.fs_read_file` arm) per-call wraps the readFileAlloc invocation
-## in a blk that owns the Io context:
-##   `var __io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});`
-##   `defer __io_threaded.deinit();`
-## so each `read_file(path)` call gets a fresh Threaded Io on its
-## stack, tearable down via `defer` at the blk scope's exit
-## (post-`break :blk` capture).
+##   Chunked-read approach (v0.1): no __zag_fstat / __zag_lseek exist
+##   in the landed preamble, so we don't precompute total size. Each
+##   read loop iterates 4 KiB at a time and `push_str`-es into a heap
+##   `String` until __zag_read returns 0 (EOF) or negative (errno).
+##   The `String` accumulator comes from `String.with_capacity` in
+##   lib/std/string.zag, which is itself backed by __zag_page_alloc
+##   in the preamble — same heap ownership contract as before.
 ##
-## Memory model (Phase 2 surface, conservative):
-##   - Allocator: `std.heap.page_allocator`. Each successful read
-##     allocates a fresh heap byte-slice for the file contents.
-##   - Ownership: caller OWNS the returned `[]u8`. User MUST free
-##     via `std.heap.page_allocator.free(slice)` before discarding;
-##     page-aligned leaks at process exit are tolerable for short-
-##     lived binaries (a v1 limitation).
-##   - Phase 2.1 widening (deferred) will add a `free <slice>` overload
-##     to `.free_expr` so the .zag surface gets a cleaner
-##     `defer free data` syntax.
+##   Error model: __zag_openat / __zag_read errno values (returned as
+##   high-bit-set usize / negative isize respectively) collapse into
+##   `__zag_panic(...)` today. v1 keeps the surface simple: any open
+##   or read failure panics. Phase 2+ may lift `read_file_or` (boots
+##   to `?String` or `!String`) once the docs/19 error-propagation
+##   zig-side codegen is wired.
 ##
-## Error model: `catch &[_]u8{}` silently coalesces every error
-## (the `Io.Dir.Reader.Error || std.mem.Allocator.Error ||
-## Io.UnexpectedError` triple-union) into an empty slice. v1 docs/18
-## error-propagation contract isn't wired here yet — Phase 3 may
-## add a sibling `read_file_or` builtin that bubbles specific errors
-## via zag's `?` operator.
+##   `write_file` + `mkdir` — STILL codegen-router-only builtins
+##   (fs_write_file / fs_mkdir in src/codegen/builtins.zig). Their
+##   stub bodies below are never executed because the router REWRITES
+##   their call sites before runtime (see src/codegen/expr.zig's
+##   .fs_write_file + .fs_mkdir arms). They follow the same throwaway-
+##   stub-convention the pre-migration lib/std/fs.zag documented.
+##   Future migration: lift them to __zag_openat / __zag_write /## __zag_mkdirat real impls, mirroring read_file's path here.
 ##
-## Stub: throwaway body for the existing .zag parse-stubs-out
-## convention. The (now-real) router arm REWRITES the call site
-## before any reader sees the verbatim form, so the body never
-## executes at runtime.
+## String import: see the inline `pub import std.string.{String}`
+## just below -- needed so project-mode `zag generate` parses
+## fs.zag in isolation without an ambient std namespace.
+##
+## Contract change (v0.1): read_file returns `String` directly, NOT
+## `[]u8` + Result-as-Optional like the pre-migration codegen-router
+## inline emit. Existing user source that wrote
+## `let d: []u8 = read_file("X")?;` is replaced by
+## `let s: String = read_file("X"); s.as_str()` -- the String
+## ergonomics removed the result-bridge and the heap
+## page_allocator.free obligation. The `?` operator no longer
+## applies on `read_file(...)` because `String` is neither an error
+## union nor an optional. The examples/stdlib/fs.zag fixture was
+## updated to demonstrate the new contract.
+##
+## Zombie-alias note: the imports-loop Option A fallthrough emits
+## `const write_file = __zag_imported_<i>.write_file;` and
+## `const mkdir = __zag_imported_<i>.mkdir;` whenever any selector
+## of a lib/std/fs.zag import lacks a preamble-equivalent name. The
+## fs_write_file / fs_mkdir routers still rewrite all call sites
+## into per-call `blk: { ... }` shapes that never reference the
+## alias, so the const aliases compile but are never invoked --
+## harmless dead bindings today, but the stub bodies for write_file
+## / mkdir MUST remain parseable so the alias resolution succeeds.
+## Removing the stubs while any caller still imports fs.{write_file}
+## / fs.{mkdir} would compile-fail at the user's call site.
 
-pub fun read_file(path: str) -> []u8 {
-    return &[_]u8{};
+## Bring String into scope for fs.zag's body. Without this
+## explicit import, project-mode `zag generate` parses fs.zag in
+## isolation and rejects `String.with_capacity(...)` with "use of
+## undeclared identifier 'String'". The pre-migration stub worked
+## because its throwaway body referenced String-OBLIVIOUS slice
+## syntax; the post-migration real impl exercises String directly.
+pub import std.string.{String}
+
+pub fun read_file(path: str) -> String {
+    var path_z: [1024]u8 = undefined;
+    let n: usize = path.len;
+    if (n + 1 > path_z.len) {
+        __zag_panic("std.fs.read_file: path exceeds 1023 bytes");
+    }
+    __zag_memcpy(&path_z[0], path.ptr, n);
+    path_z[n] = 0;
+
+    // openat uses a sentinel-terminated many-pointer for path;
+    // cast our [1024]u8 mutable buffer's first-elem ptr to the
+    // required shape. The trailing NUL we wrote at path_z[n]
+    // satisfies the sentinel contract.
+    const fd_raw: usize = __zag_openat(std.posix.AT.FDCWD, &path_z[0] as [*:0]const u8, 0, 0);
+    // openat errno convention: high bit of usize set when negative
+    // errno was returned by the kernel.
+    if ((fd_raw & 0x8000000000000000) != 0) {
+        __zag_panic("std.fs.read_file: openat failed");
+    }
+    const fd: i32 = fd_raw as i32;
+
+    var sb: String = String.with_capacity(4096);
+    var stack_buf: [4096]u8 = undefined;
+    while (true) {
+        const n_signed: isize = __zag_read(fd, &stack_buf[0], stack_buf.len);
+        if (n_signed <= 0) { break; }
+        sb.push_str(stack_buf[0..n_signed as usize]);
+    }
+    _ = __zag_close(fd);
+    return sb;
 }
 
-## Phase 3 (CLI migration) additions: `write_file` + `mkdir`.
-##
-## Both are wired as codegen-router builtins in
-## src/codegen/builtins.zig's builtin_table (arity=2 and arity=1
-## respectively) — the function declarations below are the
-## router's lookup target; the throwaway bodies are never
-## executed because the router rewrites the call site before
-## the produced zig source reaches zig's compile phase.
+## write_file + mkdir: stub bodies keep the lib/std parser happy while
+## the codegen router rewrites every actual call site. Do NOT delete
+## these (a `pub fun` declared in lib/std/mod.zag's selective-import
+## list must resolve to a `pub fun` in this .zag file).
 
 pub fun write_file(path: str, content: []const u8) -> i32 {
     return -1;

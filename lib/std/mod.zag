@@ -21,8 +21,14 @@ pub import std.bench.{Counters}
 #
 # Phase 0 entry: `pub import std.argv.{get}` → builtin argv_get (Phase 0 wired).
 # Phase 1 entries:
-#   `pub import std.env.{getEnv}`         → builtin env_var   (Phase 1 wired; emits std.posix.system.getenv).
-#   `pub import std.fs.{read_file}`      → builtin fs_read_file (Phase 1 DEFERRED — emits @panic; see lib/std/fs.zag docblock for why).
+#   `pub import std.env.{getEnv}`         → builtin env_var   (Phase 1 wired; emits std.posix.getenv).
+#   `pub import std.fs.{read_file}`      → REAL impl in lib/std/fs.zag backed by the
+#                                          __zag_posix preamble family (__zag_openat /
+#                                          __zag_read / __zag_close / __zag_memcpy).
+#                                          The codegen-router entry fs_read_file was
+#                                          RETIRED in favour of the @import+alias
+#                                          fallthrough in src/codegen/core.zig's imports
+#                                          loop (Option A pass-through).
 pub import std.argv.{get}
 pub import std.env.{getEnv}
 pub import std.fs.{read_file}

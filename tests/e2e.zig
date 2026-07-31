@@ -270,6 +270,23 @@ pub fn main() !u8 {
         return 90;
     }
     std.debug.print("e2e PASS -- `zig run` produced 'hello, E2E' via {s}\n", .{zig_path});
+
+    // v3 modules smoke: exercises discoverModules()'s new
+    // getdents64 walker in the integration path. Creates a tiny
+    // project under /tmp/zag_e2e_modules (src/main.zag +
+    // src/math.zag), fork+execves `<zag> generate` inside it,
+    // then verifies build/gen/main.zig AND build/gen/math.zig
+    // both exist — which means the walker discovered both
+    // modules (the old 14-name allow-list would have missed
+    // `math` only by coincidence here, but missed any other
+    // file the user actually wanted). Skips when no local zag
+    // binary is built (no zig-out/bin/zag-*).
+    const modules_rc = runModulesSmoke(allocator) catch |e| {
+        std.debug.print("modules smoke error: {s}\n", .{@errorName(e)});
+        return 95;
+    };
+    if (modules_rc != 0) return modules_rc;
+
     return 0;
 }
 
@@ -480,7 +497,7 @@ fn resolveZigPath(allocator: std.mem.Allocator) ![]u8 {
         std.debug.print("e2e: zig resolved to {s} (vendor)\n", .{vendor});
         return try allocator.dupe(u8, vendor);
     }
-    if (std.posix.getenv("ZAG_ZIG_PATH")) |zp| {
+    if (env_path.getenv("ZAG_ZIG_PATH")) |zp| {
         std.debug.print("e2e: zig resolved to {s} (ZAG_ZIG_PATH)\n", .{zp});
         return try allocator.dupe(u8, zp);
     }
@@ -579,4 +596,170 @@ fn writeZigFile(path: []const u8, content: []const u8) !void {
         if (n == 0) return error.WriteFailed;
         written += n;
     }
+}
+
+// =====================================================================
+// Modules discovery smoke test (v3 discoverModules getdents64 walker).
+//
+// Builds a tiny project tree at /tmp/zag_e2e_modules with
+// `src/main.zag` + `src/math.zag`. fork+execves the locally-built
+// zag binary at `zig generate`, then verifies that
+// `build/gen/main.zig` AND `build/gen/math.zig` both exist (which
+// only happens if discoverModules() correctly walked src/ and
+// emitted perModule zig for both files).
+//
+// Skips on missing-fixture when no zag binary is found at any of
+// the standard `zig-out/bin/zag-<os>-<arch>` candidates — callers
+// without a built zag (no `zig build` step ran) won't trip the
+// modules regression. The sister hello-world e2e above already
+// gates on a similar no-zig-found path.
+// =====================================================================
+
+fn runModulesSmoke(allocator: std.mem.Allocator) !u8 {
+    const project_root = "/tmp/zag_e2e_modules";
+
+    // -- 1. Build the test project tree. --
+    ensureWorkdir(project_root);
+    ensureWorkdir(project_root ++ "/src");
+
+    const toml_content =
+        \\[package]
+        \\name = "modules-smoke"
+        \\
+    ;
+    try writeZigFile(project_root ++ "/zag.toml", toml_content);
+
+    const main_content =
+        \\pub fun main() -> void {
+        \\    print("hello, modules\n");
+        \\}
+        \\
+    ;
+    try writeZigFile(project_root ++ "/src/main.zag", main_content);
+
+    const math_content =
+        \\pub fun add(a: i64, b: i64) -> i64 {
+        \\    return a + b;
+        \\}
+        \\
+    ;
+    try writeZigFile(project_root ++ "/src/math.zag", math_content);
+
+    // -- 2. Locate the locally-built zag binary. --
+    const zag_path = resolveZagPath(allocator) orelse {
+        std.debug.print("modules smoke SKIP -- zag binary not found at zig-out/bin/zag-*\n", .{});
+        return 0;
+    };
+    defer allocator.free(zag_path);
+
+    // -- 3. fork+execve `zag generate` from inside project_root. --
+    // Mirrors the zig-run plumbing above: pipe(FDS), fork,
+    // child dup2 + close + chdir + execve, parent close +
+    // drain + waitpid.
+    var pipe_fds: [2]i32 = undefined;
+    if (std.os.linux.pipe(&pipe_fds) != 0) return error.PipeFailed;
+
+    const pid = std.math.cast(i32, std.os.linux.fork()) orelse return error.ForkFailed;
+    if (pid == 0) {
+        _ = std.os.linux.dup2(pipe_fds[1], 1);
+        _ = std.os.linux.dup2(pipe_fds[1], 2);
+        _ = std.os.linux.close(pipe_fds[0]);
+        _ = std.os.linux.close(pipe_fds[1]);
+        // chdir the *child* (parent CWD unchanged -- nieces the
+        // sibling e2e flow). Path is absolute, no CWD assumption.
+        var cwd_nul: [256]u8 = undefined;
+        @memcpy(cwd_nul[0..project_root.len], project_root);
+        cwd_nul[project_root.len] = 0;
+        _ = std.os.linux.chdir(@ptrCast(&cwd_nul[0..project_root.len]));
+
+        var arg_bufs: [2]?[:0]u8 = .{ null } ** 2;
+        defer for (arg_bufs) |maybe_buf| if (maybe_buf) |buf| allocator.free(buf);
+        var argv_z: [3]?[*:0]const u8 = .{ null } ** 3;
+        const argv_inputs = [_][]const u8{ zag_path, "generate" };
+        for (argv_inputs, 0..) |arg, i| {
+            const buf = try allocator.allocSentinel(u8, arg.len, 0);
+            @memcpy(buf, arg);
+            arg_bufs[i] = buf;
+            argv_z[i] = buf.ptr;
+        }
+
+        var envp_z: [513]?[*:0]const u8 = .{ null } ** 513;
+        const env_count = @min(env_path.environ_count, envp_z.len - 1);
+        for (env_path.environ_entries[0..env_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
+        const argv_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&argv_z);
+        const envp_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&envp_z);
+        const buf0: [:0]u8 = arg_bufs[0] orelse std.os.linux.exit(127);
+        _ = std.os.linux.execve(buf0.ptr, argv_z_ptr, envp_z_ptr);
+        std.os.linux.exit(127);
+    }
+
+    _ = std.os.linux.close(pipe_fds[1]);
+
+    var out: [4096]u8 = undefined;
+    var out_total: usize = 0;
+    while (out_total < out.len) {
+        const n = std.os.linux.read(pipe_fds[0], out[out_total..].ptr, out.len - out_total);
+        if (n > std.math.maxInt(isize)) return error.ReadSyscallFailed;
+        if (n == 0) break;
+        out_total += n;
+    }
+    _ = std.os.linux.close(pipe_fds[0]);
+
+    var status: u32 = 0;
+    _ = std.os.linux.waitpid(pid, &status, 0);
+    if (!std.os.linux.W.IFEXITED(status)) {
+        std.debug.print("modules smoke FAIL -- child died on signal\n", .{});
+        std.debug.print("captured output ({d} bytes):\n{s}\n", .{ out_total, out[0..out_total] });
+        return 91;
+    }
+    const exit_code = std.os.linux.W.EXITSTATUS(status);
+    if (exit_code != 0) {
+        std.debug.print("modules smoke FAIL -- `zag generate` exited {d}\n", .{exit_code});
+        std.debug.print("captured output ({d} bytes):\n{s}\n", .{ out_total, out[0..out_total] });
+        return 92;
+    }
+
+    // -- 4. Verify build/gen/main.zig AND build/gen/math.zig exist. --
+    const main_zig = project_root ++ "/build/gen/main.zig";
+    const math_zig = project_root ++ "/build/gen/math.zig";
+    if (std.posix.openat(std.posix.AT.FDCWD, main_zig, .{ .ACCMODE = .RDONLY }, 0)) |fd| {
+        _ = std.os.linux.close(fd);
+    } else |_| {
+        std.debug.print("modules smoke FAIL -- {s} not found\n", .{main_zig});
+        return 93;
+    }
+    if (std.posix.openat(std.posix.AT.FDCWD, math_zig, .{ .ACCMODE = .RDONLY }, 0)) |fd| {
+        _ = std.os.linux.close(fd);
+    } else |_| {
+        std.debug.print("modules smoke FAIL -- {s} not found\n", .{math_zig});
+        return 94;
+    }
+
+    std.debug.print("modules smoke PASS -- both main.zig and math.zig present in build/gen/\n", .{});
+    return 0;
+}
+
+/// Locate the locally-built zag production binary by probing
+/// std `zig-out/bin/zag-<os>-<arch>` candidates. Same shape as
+/// the existing `resolveZigPath` for zig — except the candidates
+/// here are hardcoded (the build.zig's b.femit emits a single
+/// platform-suffixed name per host). Returns null when none of
+/// the candidates is a runnable ELF (same `isRunnableZig` gate
+/// used for zig — see that helper for the magic+class+data
+/// rationale).
+fn resolveZagPath(allocator: std.mem.Allocator) ?[]u8 {
+    const candidates = [_][]const u8{
+        "./zig-out/bin/zag-linux-x86_64",
+        "./zig-out/bin/zag-linux-aarch64",
+        "./zig-out/bin/zag-macos-aarch64",
+        "./zig-out/bin/zag-macos-x86_64",
+        "../zig-out/bin/zag-linux-x86_64",
+        "../zig-out/bin/zag-linux-aarch64",
+        "../zig-out/bin/zag-macos-aarch64",
+        "../zig-out/bin/zag-macos-x86_64",
+    };
+    for (candidates) |p| {
+        if (isRunnableZig(p)) return allocator.dupe(u8, p) catch null;
+    }
+    return null;
 }

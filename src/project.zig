@@ -65,40 +65,191 @@ var module_paths_pos: usize = 0;
 var module_names_buf: [128 * 64]u8 = undefined;
 var module_names_pos: usize = 0;
 
-/// Walk `src/` and discover all `.zag` source files. Returns a slice
-/// of ModuleEntry structures, each with a path and derived module
-/// name. Files are discovered in order.
+/// Walk `src/` and discover all `.zag` source files (recursive).
+///
+/// v3 change: replaces the prior hard-coded 14-name allow-list
+/// (`lib`, `math`, `util`, `types`, ...) with a real
+/// `getdents64`-based recursive walker. Any `.zag` file under
+/// `src/` is now detected, with the matching module name derived
+/// from its path (see "Module-name derivation" below).
+///
+/// Module-name derivation: given a project-relative path, the
+/// module name is the path with the leading `src/` prefix and
+/// trailing `.zag` suffix stripped, and any remaining `/`
+/// replaced with `.`. Examples:
+///   - `src/main.zag`        → `main`
+///   - `src/foo.zag`         → `foo`
+///   - `src/db/schema.zag`   → `db.schema`
+///   - `src/a/b/c.zag`       → `a.b.c`
+///
+/// Walk policy:
+///   - Recursive: descends every sub-directory under `src/` that
+///     isn't dropped by the skip rules.
+///   - Skip rules (deliberate, conservative):
+///     - hidden entries (`.git`, `.cache`, `.idea`, etc.),
+///     - the `build/` output directory.
+///   - d_type gating: only `DT.DIR` and `DT.REG` are acted on;
+///     `DT.UNKNOWN` (some FUSE / NFS mounts) is skipped — see
+///     the latency note below.
+///
+/// Boundary semantics:
+///   - `src/` doesn't exist at all              → empty slice.
+///   - `src/` exists but is empty               → empty slice.
+///   - `src/` non-empty but no `src/main.zag`   → empty slice
+///     (matches v1; `src/main.zig`'s `projectCmd` already exits
+///     with "no src/main.zag" on empty discovery).
+///
+/// Result ordering: v3 sorts the slice alphabetically by `path` so
+/// the output is deterministic across runs (getdents64 doesn't
+/// guarantee order across filesystems and we want stable
+/// debugger-map output for the
+/// `docs/manual/33-debugging.md` §"Multi-module projects" example).
 pub fn discoverModules() []const ModuleEntry {
     module_count = 0;
     module_paths_pos = 0;
     module_names_pos = 0;
 
-    // Check src/main.zag (required entry point)
-    if (posix.openat(posix.AT.FDCWD, "src/main.zag", .{ .ACCMODE = .RDONLY }, 0)) |fd| {
-        _ = std.os.linux.close(fd);
-        addModuleEntry("src/main.zag", "main") catch {};
-    } else |_| {
-        return &[_]ModuleEntry{};
-    }
+    const src_fd = posix.openat(posix.AT.FDCWD, "src", .{ .ACCMODE = .RDONLY }, 0) catch return &[_]ModuleEntry{};
+    defer _ = std.os.linux.close(src_fd);
 
-    // Scan for additional modules in src/ using a simple approach:
-    // list all .zag files by trying common patterns.
-    // Full getdents64 enumeration is deferred — for v1 we support a
-    // hardcoded set of common module directory + file patterns.
-    const modules = [_][]const u8{
-        "lib", "math", "util", "types", "io", "parse", "config",
-        "models", "handlers", "services", "db", "api", "cli",
-    };
-    for (modules) |m| {
-        var buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "src/{s}.zag", .{m}) catch continue;
-        if (posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0)) |fd| {
-            _ = std.os.linux.close(fd);
-            addModuleEntry(path, m) catch {};
-        } else |_| {}
-    }
+    walkSrcTree(src_fd, "");
+    sortByPath();
 
-    return module_buf[0..module_count];
+    // Gate on main: src/main.zag is required (matches v1).
+    for (module_buf[0..module_count]) |m| {
+        if (std.mem.eql(u8, m.module_name, "main")) return module_buf[0..module_count];
+    }
+    module_count = 0;
+    return &[_]ModuleEntry{};
+}
+
+/// Recursive walker given an open fd to a directory under `src/`
+/// and the path of that directory relative to `src/` (`""` at
+/// top-level, `"db"` inside `src/db/`, `"db/sub"` at three
+/// levels deep, etc.).
+///
+/// Uses the proper buffer-and-offset `getdents64` pattern: one
+/// syscall per batch, then iterate the batch via `d_reclen`
+/// offsets. Sidesteps the shape used by the legacy
+/// `remapDwarfElf` walker in `src/main.zig` which only reads the
+/// first entry of each batch — that walker is one-syscall-per-
+/// dirent, which is wrong on barriers and doesn't expose
+/// subsequent entries after `d.off = 0`.
+///
+/// Caveat: `DT.UNKNOWN` is treated as "skip". This is fine on
+/// ext4, btrfs, tmpfs, xfs (all of which populate d_type). On
+/// filesystems that don't (e.g., some FUSE mounts configured
+/// with `-o default_permissions,nodiratime`), the walker will
+/// under-discover. Future fix: switch those branches to a
+/// `posix.fstatat` fallback if it ever bites a real project.
+fn walkSrcTree(dir_fd: i32, rel_to_src: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.os.linux.getdents64(dir_fd, &buf, buf.len);
+        if (n == 0) break;
+        if (n > std.math.maxInt(isize)) break;
+
+        var pos: usize = 0;
+        while (pos < n) {
+            const entry: *const std.os.linux.dirent64 = @ptrCast(&buf[pos]);
+            pos += entry.d_reclen;
+
+            // `d_name` is a flexible-array member; treat as
+            // sentinel-terminated pointer then slice to the NUL.
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.d_name)));
+            const name = name_z[0..name_z.len];
+
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (name[0] == '.') continue;
+            // `name == "build"` is checked ONLY inside the
+            // DT_DIR branch below — a top-level `src/build.zag`
+            // file (whose module name is just `build`) is a
+            // legitimate source file. Deliberate trade-off:
+            // skipping a directory called `build/` keeps the
+            // output dir out of the source-walk, but a
+            // plain file at any depth is processed normally.
+
+            if (entry.d_type == std.os.linux.DT.DIR) {
+                if (std.mem.eql(u8, name, "build")) continue;
+                // Build new_rel = rel_to_src ++ "/" ++ name (or
+                // just `name` when at the top level).
+                var new_rel_buf: [512]u8 = undefined;
+                const new_rel: []const u8 = if (rel_to_src.len == 0)
+                    std.fmt.bufPrint(&new_rel_buf, "{s}", .{name}) catch continue
+                else
+                    std.fmt.bufPrint(&new_rel_buf, "{s}/{s}", .{ rel_to_src, name }) catch continue;
+
+                // Open the child relative to CWD (rather than
+                // relative to dir_fd) — easier reasoning + the
+                // path-buf overhead is dominated by syscall
+                // cost on every walker step anyway. `child_path`
+                // is "src/<new_rel>".
+                var child_path_buf: [1024]u8 = undefined;
+                const child_path = std.fmt.bufPrint(&child_path_buf, "src/{s}", .{new_rel}) catch continue;
+                const child_fd = posix.openat(posix.AT.FDCWD, child_path, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+                walkSrcTree(child_fd, new_rel);
+                _ = std.os.linux.close(child_fd);
+            } else if (entry.d_type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
+                // Build abs path "src/<rel>/<name>" (only `name`
+                // for top-level entries).
+                var path_buf: [1024]u8 = undefined;
+                const abs_path: []const u8 = if (rel_to_src.len == 0)
+                    std.fmt.bufPrint(&path_buf, "src/{s}", .{name}) catch continue
+                else
+                    std.fmt.bufPrint(&path_buf, "src/{s}/{s}", .{ rel_to_src, name }) catch continue;
+
+                // Build dotted module name directly into
+                // module_names_buf: combine rel_to_src's `/` → `.`
+                // rewrite with the file's stem (name minus `.zag`).
+                // Examples:
+                //   rel="db" name="schema.zag"     → "db.schema"
+                //   rel="db/sub" name="foo.zag"    → "db.sub.foo"
+                //   rel="" name="main.zag"         → "main"
+                //   rel="" name="foo.zag"          → "foo"
+                const stem_len = name.len - ".zag".len;
+                const dotted_len: usize = if (rel_to_src.len == 0)
+                    stem_len
+                else
+                    rel_to_src.len + 1 + stem_len;
+
+                if (module_names_pos + dotted_len > module_names_buf.len) continue;
+                var di: usize = module_names_pos;
+                if (rel_to_src.len > 0) {
+                    @memcpy(module_names_buf[di..][0..rel_to_src.len], rel_to_src);
+                    var j: usize = 0;
+                    while (j < rel_to_src.len) : (j += 1) {
+                        if (module_names_buf[di + j] == '/') module_names_buf[di + j] = '.';
+                    }
+                    di += rel_to_src.len;
+                    module_names_buf[di] = '.';
+                    di += 1;
+                }
+                @memcpy(module_names_buf[di..][0..stem_len], name[0..stem_len]);
+
+                const mod_name = module_names_buf[module_names_pos..][0..dotted_len];
+                module_names_pos += dotted_len;
+
+                addModuleEntry(abs_path, mod_name) catch continue;
+            }
+        }
+    }
+}
+
+/// Insertion sort module_buf[0..module_count] in place by `path`
+/// (byte-wise lexicographic). Bounded by the 128-entry
+/// module_buf ceiling — O(n²) is fine for that scale.
+fn sortByPath() void {
+    var i: usize = 1;
+    while (i < module_count) : (i += 1) {
+        const cur = module_buf[i];
+        var j: usize = i;
+        while (j > 0 and std.mem.lessThan(u8, module_buf[j - 1].path, cur.path)) {
+            module_buf[j] = module_buf[j - 1];
+            j -= 1;
+        }
+        module_buf[j] = cur;
+    }
 }
 
 fn addModuleEntry(path: []const u8, mod_name: []const u8) !void {

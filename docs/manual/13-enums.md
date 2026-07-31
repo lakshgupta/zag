@@ -111,8 +111,6 @@ Use qualified names when the type is ambiguous or for clarity.
 
 Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](17-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type. See [`examples/types/enum_backed.zag`](../../examples/types/enum_backed.zag) for the end-to-end runnable demonstration covering `enum(u8)`, `enum(str)`, `enum(char)`, and the auto-inferred `enum(u8)` shape.
 
-Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](17-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type.
-
 An `enum` may declare a backing type `T`. The supported `T` universe is restricted to integer types, `bool`, `char`, and `str` — custom `Copy` struct/enum/array types as `T` are deferred. Each variant identifier is bound to a value of type `T` at compile time:
 
 ```zag
@@ -134,9 +132,6 @@ enum(u8) Status {
 **Rules:**
 - For str-backed enums, every variant MUST carry `= "value"` (zig's `const`-field requires an initializer; zig rejects an empty const-decl without one). Omitting the value routes through the codegen's `""` fallback (same string-literal syntax as the empty `="\\"\\""` source-side form).
 - For int-/char/bool-backed enums, `= v` is OPTIONAL — variants without an explicit value auto-infer (zig picks the next T-value, walking up from the prior variant — `First = 0`, `Second = 1`, `Third = 2` for an all-implicit `enum(u8)`).
-- Default `enum { V1, V2 }` (no `T`) keeps bare-only behavior; tag-only memory layout (1-byte tag for ≤256 variants).
-- Storage: `sizeof(T)` per value. The variant identifier IS the value — there is no extra tag byte.
-- Variants remain bare; there is no per-variant payload type distinct from `T`.
 - Default `enum { V1, V2 }` (no `T`) keeps bare-only behavior; tag-only memory layout (1-byte tag for ≤256 variants).
 - Storage: `sizeof(T)` per value. The variant identifier IS the value — there is no extra tag byte.
 - Variants remain bare; there is no per-variant payload type distinct from `T`.

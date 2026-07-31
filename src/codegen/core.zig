@@ -121,15 +121,6 @@ pub const Codegen = struct {
     /// `genFreeMethod` so each `pub fn` body has its own `__env_<N>`
     /// sequence. Two getEnv calls in the same body produce
     /// `__env_0` and `__env_1` so zig's no-redeclaration rule is
-    /// satisfied. The counter steps ONLY on the env_var dispatch path.
-    /// Per-function counter for the fs-read scratch variable emitted
-    /// by the `fs_read_file` builtin route (Phase 2 codegen router).
-    /// Reset to 0 by `genFun` / `genMethod` / `genFreeMethod` so
-    /// each `pub fn` body has its own `__fs_<N>` sequence. Two
-    /// read_file calls in the same body produce `__fs_0` and
-    /// `__fs_1` so zig's no-redeclaration rule is satisfied. The
-    /// counter steps ONLY on the fs_read_file dispatch path.
-    fs_counter: u32,
     /// Per-function counter for the fs-write scratch namespace
     /// emitted by the `fs_write_file` builtin route (Phase 3 CLI
     /// migration). Reset to 0 by `genFun` / `genMethod` /
@@ -394,14 +385,6 @@ pub const MapEntry = struct {
             // `getEnv` builtin emit steps it and emits a fresh
             // `__env_<N>` scratch used to bridge
             // `std.posix.system.getenv`'s `?[*:0]u8` surface to the
-            // zag-side `?[]const u8` shape via `std.mem.span`.
-            // Phase 2 fs-read scratch: each `read_file` builtin emit
-            // reuses the same `__fs_0` temp scoped to its blk: { ... }
-            // block. Multiple read_file calls in the same body
-            // produce distinct scoped names so zig's no-redeclaration
-            // rule is satisfied.
-            .fs_counter = 0,
-            // Phase 3 (CLI migration): fs_write_file, fs_mkdir, and
             // process_exec dispatches each emit a hardcoded scratch
             // name (`__wf_file`, `__mk_buf`, `__exec_res`) scoped
             // to the per-call blk: { ... } block. process_exit
@@ -865,6 +848,123 @@ pub const MapEntry = struct {
             \\    return std.fmt.bufPrint(buf, "{any}", .{value}) catch "(fmt overflow)";
             \\}
             \\
+            \\// __zag_posix family — raw POSIX syscall wrappers
+            \\// exposed so lib/std/{fs,env,process,time}.zag can be
+            \\// written entirely in .zag (no inline-preamble
+            \\// std.Io / std.process / std.fs calls). Linux-only
+            \\// (project is Linux-first per AGENTS.md).
+            \\
+            \\// __zag_openat — raw `openat(2)`. Returns fd on
+            \\// success, errno-encoded usize on failure.
+            \\fn __zag_openat(dirfd: i32, path: [*:0]const u8, flags: u32, mode: u32) usize {
+            \\    return std.os.linux.openat(dirfd, path, flags, mode);
+            \\}
+            \\// __zag_read — raw `read(2)`. Returns bytes read
+            \\// (partial reads possible) or -1.
+            \\fn __zag_read(fd: i32, buf: [*]u8, len: usize) isize {
+            \\    return std.os.linux.read(fd, buf, len);
+            \\}
+            \\// __zag_write — raw `write(2)`. Returns bytes
+            \\// written (partial writes possible) or -1.
+            \\fn __zag_write(fd: i32, buf: [*]const u8, len: usize) isize {
+            \\    return std.os.linux.write(fd, buf, len);
+            \\}
+            \\// __zag_close — raw `close(2)`. Returns 0 on
+            \\// success, errno-encoded usize on failure.
+            \\fn __zag_close(fd: i32) usize {
+            \\    return std.os.linux.close(fd);
+            \\}
+            \\// __zag_getdents64 — raw `getdents64(2)`. Returns
+            \\// bytes written into `buf` (0 = EOF). Caller walks
+            \\// entries via the canonical `d_reclen` offset walk
+            \\// (see src/project.zig::walkSrcTree).
+            \\fn __zag_getdents64(fd: i32, buf: [*]u8, buf_len: usize) usize {
+            \\    return std.os.linux.getdents64(fd, buf, buf_len);
+            \\}
+            \\// __zag_clock_gettime — ns since clock-id epoch
+            \\// (CLOCK_REALTIME=0, CLOCK_MONOTONIC=1 on Linux).
+            \\fn __zag_clock_gettime(clockid: i32) i64 {
+            \\    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+            \\    _ = std.os.linux.clock_gettime(clockid, &ts);
+            \\    return @as(i64, ts.sec) * 1_000_000_000 + @as(i64, ts.nsec);
+            \\}
+            \\// __zag_getcwd — CWD written into a 4096-byte static
+            \\// scratch; returns a slice of it. Two calls in the
+            \\// same expression will alias.
+            \\const __zag_cwd_buf: [4096]u8 = undefined;
+            \\fn __zag_getcwd() []const u8 {
+            \\    const n = std.os.linux.getcwd(&__zag_cwd_buf, __zag_cwd_buf.len);
+            \\    if (n == 0) return "";
+            \\    const eff = if (__zag_cwd_buf[n - 1] == 0) n - 1 else n;
+            \\    return __zag_cwd_buf[0..eff];
+            \\}
+            \\// __zag_getenv — scans /proc/self/environ for `name=value\0`.
+            \\// Pure self-contained impl: no dependency on the zig
+            \\// stdlib's env accessor (which has churned across zig
+            \\// versions and zig 0.16 has no libc-getenv bridge at
+            \\// all). Reads env fresh on each call; hot-path callers
+            \\// should cache. Returns the value slice (without the
+            \\// NUL) or null when unset.
+            \\const __zag_env_buf: [32768]u8 = undefined;
+            \\fn __zag_getenv(name: [*:0]const u8) ?[]const u8 {
+            \\    const fd_raw = __zag_openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
+            \\    const fd_signed: isize = @bitCast(fd_raw);
+            \\    if (fd_signed < 0) return null;
+            \\    const fd: i32 = @intCast(fd_signed);
+            \\    defer _ = __zag_close(fd);
+            \\    const n = __zag_read(fd, __zag_env_buf[0..].ptr, __zag_env_buf.len);
+            \\    if (n <= 0) return null;
+            \\    const env_len: usize = @intCast(n);
+            \\    const name_len = std.mem.len(name);
+            \\    if (name_len == 0) return null;
+            \\    var i: usize = 0;
+            \\    while (i < env_len) {
+            \\        const entry_start = i;
+            \\        while (i < env_len and __zag_env_buf[i] != 0) : (i += 1) {}
+            \\        const entry_len = i - entry_start;
+            \\        if (entry_len > name_len and
+            \\            std.mem.eql(u8, __zag_env_buf[entry_start..][0..name_len], name) and
+            \\            __zag_env_buf[entry_start + name_len] == '=') {
+            \\            return __zag_env_buf[entry_start + name_len + 1 .. i];
+            \\        }
+            \\        if (i < env_len) i += 1;
+            \\    }
+            \\    return null;
+            \\}
+            \\// __zag_exit — `_exit(2)`. noreturn.
+            \\fn __zag_exit(code: i32) noreturn {
+            \\    std.os.linux.exit(code);
+            \\}
+            \\// __zag_posix_spawn — fork + execve + waitpid,
+            \\// blocking. Caller passes sentinel-terminated
+            \\// argv + envp (build `[]?[*:0]const u8` ending in
+            \\// null, then pass `.ptr`). Returns child's exit
+            \\// code on success, -1 on fork-fail or signal-death.
+            \\fn __zag_posix_spawn(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) i32 {
+            \\    const pid = std.math.cast(i32, std.os.linux.fork()) orelse return -1;
+            \\    if (pid == 0) {
+            \\        std.os.linux.execve(argv[0].?, argv, envp);
+            \\        std.os.linux.exit(127);
+            \\    }
+            \\    var status: u32 = 0;
+            \\    _ = std.os.linux.waitpid(pid, &status, 0);
+            \\    if (std.os.linux.W.IFEXITED(status)) {
+            \\        return @as(i32, std.os.linux.W.EXITSTATUS(status));
+            \\    }
+            \\    return -1;
+            \\}
+            \\// __zag_waitpid — blocks waiting for an
+            \\// already-spawned child. Returns exit code on
+            \\// success, -1 on signal-death.
+            \\fn __zag_waitpid(pid: i32) i32 {
+            \\    var status: u32 = 0;
+            \\    _ = std.os.linux.waitpid(pid, &status, 0);
+            \\    if (std.os.linux.W.IFEXITED(status)) {
+            \\        return @as(i32, std.os.linux.W.EXITSTATUS(status));
+            \\    }
+            \\    return -1;
+            \\}
+            \\
         );
 
         // Module imports (docs/manual/22-modules.md §Imports): walk
@@ -974,19 +1074,80 @@ pub const MapEntry = struct {
                 const imp = prog.imports[import_i];
                 const dotted = parser.Parser.joinDottedPath(&import_scratch, imp.path_nodes);
                 if (parser.Parser.resolveStdImport(dotted)) |resolved_path| {
-                    // Stdlib imports: the types are defined in the generated
-                    // preamble (e.g. __zag_String, __zag_Writer), so skip the
-                    // @import of the .zag source file (zig can't import .zag).
-                    // Emit selector aliases directly to preamble types.
+                    // Stdlib imports: types that ARE in the preamble
+                    // (e.g. __zag_String, __zag_Writer, __zag_Error)
+                    // alias directly to the preamble type. Types /
+                    // functions that are NOT in the preamble
+                    // (e.g. std.fs.read_file after the v0.1 migration
+                    // to a real .zag file) alias through
+                    // `__zag_imported_<i>.<name>`, requiring us to
+                    // emit the @import preamble line for the .zag
+                    // source's compiled form. The first-pass scan
+                    // distinguishes these two cases so we only emit
+                    // the @import line when genuinely needed (the
+                    // fast-path preserves the prior shape byte-for-
+                    // byte for imports that ONLY resolve to
+                    // preamble types — no zig-side regression).
                     if (std.mem.startsWith(u8, resolved_path, "lib/std/")) {
+                        var any_needs_import = false;
                         for (imp.selectors) |sel| {
-                            const preamble_name = stdlibPreambleName(sel.name);
-                            if (preamble_name.len > 0) {
+                            if (stdlibPreambleName(sel.name).len == 0) {
+                                any_needs_import = true;
+                                break;
+                            }
+                        }
+
+                        // Fast path: every selector maps to a
+                        // preamble type — no @import line needed
+                        // (preserves the pre-migration behaviour
+                        // byte-for-byte).
+                        if (!any_needs_import) {
+                            for (imp.selectors) |sel| {
+                                const preamble_name = stdlibPreambleName(sel.name);
                                 const user_name = sel.alias orelse sel.name;
                                 self.write("const ");
                                 self.write(user_name);
                                 self.write(" = ");
                                 self.write(preamble_name);
+                                self.write(";\n");
+                            }
+                            continue;
+                        }
+
+                        // Slow path: at least one selector lives in
+                        // the .zag source file (the v0.1 migration's
+                        // case for std.fs.{read_file}). Emit the
+                        // @import preamble ONCE, then per-selector
+                        // emit chooses the right bridge.
+                        self.write("const __zag_imported_");
+                        var idx_buf: [16]u8 = undefined;
+                        const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{import_i}) catch "X";
+                        self.write(idx_str);
+                        self.write(" = @import(\"");
+                        self.write(resolved_path);
+                        self.write("\");\n");
+                        for (imp.selectors) |sel| {
+                            const preamble_name = stdlibPreambleName(sel.name);
+                            const user_name = sel.alias orelse sel.name;
+                            if (preamble_name.len > 0) {
+                                // Known-preamble-name: alias directly
+                                // to the preamble type (no need to
+                                // plumb through __zag_imported_<i>).
+                                self.write("const ");
+                                self.write(user_name);
+                                self.write(" = ");
+                                self.write(preamble_name);
+                                self.write(";\n");
+                            } else {
+                                // .zag-source-backed: forward through
+                                // the @import alias so zig sees
+                                // `__zag_imported_<i>.<canonical>`.
+                                self.write("const ");
+                                self.write(user_name);
+                                self.write(" = __zag_imported_");
+                                self.write(idx_str);
+                                self.write(".");
+                                self.write(sel.name);
                                 self.write(";\n");
                             }
                         }

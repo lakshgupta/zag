@@ -358,6 +358,48 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     scaffold_mod.addImport("parser", scaffold_parser_helper_mod);
+
+    // -----------------------------------------------------------------
+    // `zig build fs_smoke` -- end-to-end smoke for the v0.1 std.fs
+    // .read_file migration (lib/std/fs.zag as a real .zag file backed
+    // by the __zag_posix preamble family). Mirrors the SKIP-on-
+    // missing-fixture pattern of tests/smoke.zig: the in-process
+    // codegen-shape pin always runs (cheap, <1s), and the full
+    // project-mode run-with-zag stage is staged for a follow-up once
+    // a real `./zig-out/bin/zag` binary is available end-to-end.
+    //
+    // Located AFTER `scaffold_parser_helper_mod` is defined above so
+    // the forward reference resolves at module-level const-init
+    // (zig rejects forward refs to const-bound module identifiers;
+    // see the review-round that caught the original placement under
+    // the smoke_step block).
+    //
+    // Module wiring re-uses `scaffold_parser_helper_mod` (consolidated
+    // at `src/parser.zig` -- the canonical one-module-for-lexer+parser
+    // +ast pattern documented in the scaffold block above) and the
+    // shared `env_path_mod` so fs_smoke's `@import("parser")` +
+    // `@import("env_path")` resolve to the SAME compile-graph
+    // modules as smoke + scaffold.
+    //
+    // Deliberately NOT calling `b.installArtifact` for fs-smoke-
+    // runner -- the runner is a stage-side binary, not a production
+    // artifact. `addRunArtifact` below runs from the build cache
+    // without polluting zig-out/.
+    // -----------------------------------------------------------------
+    const fs_smoke_runner_mod = b.addModule("fs-smoke-runner", .{
+        .root_source_file = b.path("tests/fs_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fs_smoke_runner_mod.addImport("parser", scaffold_parser_helper_mod);
+    fs_smoke_runner_mod.addImport("env_path", env_path_mod);
+    const fs_smoke_runner_exe = b.addExecutable(.{
+        .name = "fs-smoke-runner",
+        .root_module = fs_smoke_runner_mod,
+    });
+    const run_fs_smoke = b.addRunArtifact(fs_smoke_runner_exe);
+    const fs_smoke_step = b.step("fs_smoke", "Run end-to-end fs.read_file smoke (SKIP-on-missing-zag-binary)");
+    fs_smoke_step.dependOn(&run_fs_smoke.step);
     // Stub content embedding. The 9 `lib/std/*.zag` files can't be
     // `@embedFile`d from inside `tests/scaffold.zig` for the same
     // path-scope reason (path scope is `tests/`, the .zag files are

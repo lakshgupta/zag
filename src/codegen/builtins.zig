@@ -56,8 +56,7 @@ const std = @import("std");
 /// one switch case in expr.zig.
 ///
 /// Phase 0 wired `argv_get`; Phase 1 widens with `env_var` (real emit)
-/// and `fs_read_file` (DEFERRED -- @panic placeholder, see the
-/// fs_read_file variant comment below for why). Future Phase 2+
+/// (DEFERRED -- @panic placeholder for future-shape rows). Future Phase 2+
 /// entries (`process.exec`, `hash.sha256`, `time.now_utc`, …)
 /// extend this same enum without breaking prior wirings -- the use
 /// site is a comptime-known switch which zig exhaustiveness-checks at
@@ -93,66 +92,6 @@ pub const BuiltinDispatch = enum {
     env_var,
 
     /// `fs_read_file` -- Phase 2 real emit.
-    ///
-    /// zig 0.16 retired `vendor/zig/lib/std/fs.zig` to a 21-line
-    /// deprecation-stub file (every entry there is just
-    /// `Deprecated, use std.Io.Dir.<X>`) and relocated the real fs
-    /// surface to `std.Io.Dir.readFileAlloc(dir, io, allocator,
-    /// sub_path, limit)`. The signature requires a `std.Io`
-    /// event-loop instance.
-    ///
-    /// Per-call blk wrapper shape (the design that landed in
-    /// Phase 2 commit):
-    ///   ```
-    ///   blk: {
-    ///       var __io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    ///       defer __io_threaded.deinit();
-    ///       const __fs_<N>: []u8 = std.Io.Dir.cwd().readFileAlloc(
-    ///           __io_threaded.io(),
-    ///           <args[0]>,
-    ///           std.heap.page_allocator,
-    ///           .unlimited,
-    ///       ) catch &[_]u8{};
-    ///       break :blk __fs_<N>;
-    ///   }
-    ///   ```
-    ///
-    /// Init order is LIFO at scope exit:
-    /// `defer __io_threaded.deinit()` registers at construction
-    /// time and runs AFTER `break :blk` captures the slice into the
-    /// call site, so the Io's thread pool + signal handlers
-    /// (`SIG.IO` / `SIG.PIPE`) outlive the `readFileAlloc` call but
-    /// are torn down before the surrounding block exits. The init
-    /// is infallible (any `CpuCountError` is stored on
-    /// `t.cpu_count_error`, NOT raised) so no `catch` is needed.
-    ///
-    /// Allocator choice (`std.heap.page_allocator`) mirrors the
-    /// existing `.new_expr` codegen path so heap allocation policy
-    /// stays consistent across .zag's surface. Memory ownership
-    /// of the returned `[]u8` is the caller; the user MUST free
-    /// via `std.heap.page_allocator.free(slice)` before discarding
-    /// (a Phase 2.1 widening will add `free <slice>` overload to
-    /// `.free_expr` so the .zag surface gets a cleaner `defer free
-    /// data` syntax). Page-aligned leaks at process exit are
-    /// acceptable for short-lived zag binaries.
-    ///
-    /// Error collapse: `catch &[_]u8{}` silently coalesces every
-    /// path of the triple-union error set
-    /// (`Io.Dir.Reader.Error || std.mem.Allocator.Error ||
-    /// Io.UnexpectedError`) into an empty-slice. The docs/18
-    /// error-propagation contract isn't here yet — Phase 3 may add
-    /// a sibling `read_file_or` builtin that bubbles
-    /// `error.FileNotFound` etc. via zag's `?` operator. v1
-    /// surface keeps `read_file` simple: empty slice on failure,
-    /// heap-allocated bytes on success, no error channel.
-    ///    /// Per-call scoping: each fs_read_file invocation steps
-        /// `fs_counter` and emits a fresh `__fs_<N>` scratch — sibling
-        /// `read_file` calls in the same body produce distinct names
-        /// (zig's no-redeclaration rule would reject a clash). The
-        /// counter resets at the top of each function body
-        /// (`genFun` + `genMethod` + `genFreeMethod` in decl.zig).
-        fs_read_file,
-
     /// `fs_write_file` -- Phase 3 real emit (CLI migration). Bridges
     /// cli.zag's `init` handler to a self-allocating write-loop on the
     /// posix fd surface (no `Io` event-loop needed for write, only
@@ -320,7 +259,8 @@ pub const BuiltinRoute = struct {
 };
 
 /// Comptime-known router table. Phase 0 shipped this with a single
-/// argv_get row; Phase 1 widens with env_var and fs_read_file. Phase 2+
+/// argv_get row; Phase 1 widens with env_var. fs_read_file retired
+/// (lib/std/fs.zag's real impl + @import+alias fallthrough). Phase 2+
 /// widens further (`process.exec`, `hash.sha256`, `time.now_utc`, etc.)
 /// to a Phase 6 steady-state surface of ≤30 rows. All ≤32 entries at
 /// lifetime so a linear-scan lookup is bounded.
@@ -360,25 +300,24 @@ pub const builtin_table = [_]BuiltinRoute{
     // `std.posix.system.getenv`, which is independent of how the
     // user-facing zag call name is spelled.
     .{ .name = "getEnv", .arity = 1, .receiver = null, .dispatch = .env_var },
-    // Phase 2 entry: `read_file` (no-receiver free-fn form after
-    // `pub import std.fs.{read_file}` selective import) routes to
-    // the fs_read_file dispatch which now emits a real zig 0.16
-    // `std.Io.Dir.readFileAlloc` shim — see the `fs_read_file`
-    // variant docblock above for the per-call blk wrapper shape +
-    // the Io lifecycle (`Threaded.init` + `defer deinit`) +
-    // page_allocator ownership contract. arity = 1 is EXACT-match:
-    // only the `read_file("PATH")` one-arg form routes; a future
-    // `read_file(path, limit)` widening would add a SECOND row
-    // with arity=2 rather than overloading this one, so the
-    // exact-arity contract is preserved per Phase 0's note.
-    .{ .name = "read_file", .arity = 1, .receiver = null, .dispatch = .fs_read_file },
     // Phase 3 (CLI migration): four additions that close the loop for
     // cli.zag as the canonical CLI dispatcher. Each is additive —
     // prior tests stay byte-identical because the existing argv_get /
-    // env_var / fs_read_file rows are untouched. arity is exact-match
+    // env_var rows are untouched. arity is exact-match
     // per Phase 0's footgun note: a hypothetical `write_file(p)` (no
     // content arg) would NOT route here, avoiding the silent-wrong-
     // emit trap of the prior arity-wildcard design.
+    //
+    //   Note: `read_file` was retired as a builtin row in favour of
+    //   lib/std/fs.zag's real impl (backed by the __zag_posix
+    //   preamble family: __zag_openat / __zag_read / __zag_close).
+    //   `pub import std.fs.{read_file}` now emits the @import +
+    //   `const read_file = __zag_imported_<i>.read_file;` alias via
+    //   the imports loop's Option A fallthrough (see
+    //   src/codegen/core.zig's imports section), so the bare-name
+    //   `read_file(path)` call site is emitted verbatim. arity on
+    //   the user's call site is no longer a codegen-router
+    //   concern since no router arms consume it.
     //
     //   `write_file`  arity=2  -> fs_write_file (path, content) -> i32
     //                                          posix.openat + write loop

@@ -947,51 +947,90 @@ fn writeMapFile(zig_path: []const u8, map_content: []const u8) !void {
     try writeFile(map_path, map_content);
 }
 
+/// Pair of arrays carrying the zig→zag source-file mappings
+/// extracted from a directory's `.zag.map` files. Both arrays
+/// are zero-terminated per entry; `count` is the populated
+/// prefix length (≤ zig.len).
+///
+/// Extracted so the walker (`collectRemapMappings`) can be
+/// regression-tested in isolation rather than driving the full
+/// remapDwarfElf side-effect path (binary read + DWARF patch).
+const RemapMappings = struct {
+    zig: [32][256]u8,
+    zag: [32][256]u8,
+    count: usize,
+};
+
+/// One-level flat walk over a zag generator output dir (e.g.
+/// `build/gen`) collecting up to 32 `.zag.map` entries — each
+/// pairing a generated zig path with the `.zag` source path
+/// recorded in its first line.
+///
+/// Uses the same `getdents64` buffer-and-offset pattern as
+/// `src/project.zig::walkSrcTree`: one syscall per batch,
+/// iterate within the batch via `d_reclen`. Replaced the prior
+/// shape which called `getdents64` with a buffer the size of
+/// *one* `dirent64` — the kernel returned at most one entry per
+/// syscall, so multi-`.zag.map` projects were under-discovered.
+///
+/// DT-gating: `DT.REG` only (build/gen is a flat directory of
+/// files only; sub-directories mean stale state, not source).
+/// `DT.UNKNOWN` skipped (documented NFS / FUSE caveat).
+/// Hidden entries (`.foo`) and `.` / `..` excluded.
+fn collectRemapMappings(map_dir: []const u8) RemapMappings {
+    var result: RemapMappings = .{ .zig = undefined, .zag = undefined, .count = 0 };
+    const map_dir_fd = posix.openat(posix.AT.FDCWD, map_dir, .{ .ACCMODE = .RDONLY }, 0) catch return result;
+    defer _ = std.os.linux.close(map_dir_fd);
+
+    var buf: [4096]u8 = undefined;
+    var full = false;
+    while (!full) {
+        const nread = std.os.linux.getdents64(map_dir_fd, &buf, buf.len);
+        if (nread == 0) break;
+        if (nread > std.math.maxInt(isize)) break;
+
+        var pos: usize = 0;
+        while (pos < nread) {
+            const entry: *const std.os.linux.dirent64 = @ptrCast(&buf[pos]);
+            pos += entry.d_reclen;
+
+            // `d_name` is a flexible-array member; treat as
+            // sentinel-terminated then slice to the NUL.
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.d_name)));
+            const name = name_z[0..name_z.len];
+
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (name[0] == '.') continue;
+            if (entry.d_type != std.os.linux.DT.REG) continue;
+            if (!std.mem.endsWith(u8, name, ".zag.map")) continue;
+            if (result.count >= result.zig.len) {
+                full = true;
+                break;
+            }
+
+            const zig_base = name[0..(name.len - ".zag.map".len)];
+            _ = std.fmt.bufPrint(&result.zig[result.count], "{s}/{s}", .{ map_dir, zig_base }) catch continue;
+
+            const zag_path = readFirstMapEntry(map_dir, name) catch continue;
+            if (zag_path.len > 0) {
+                @memcpy(result.zag[result.count][0..zag_path.len], zag_path);
+                result.zag[result.count][zag_path.len] = 0;
+                result.count += 1;
+            }
+        }
+    }
+    return result;
+}
+
 /// Patch DWARF debug info in a compiled ELF binary so debuggers
 /// reference .zag source files instead of build/gen/*.zig.
 fn remapDwarfElf(binary_path: []const u8) void {
-    // Collect zig→zag mappings from .zag.map files
-    var zig_paths: [32][256]u8 = undefined;
-    var zag_paths: [32][256]u8 = undefined;
-    var mapping_count: usize = 0;
-
-    // Load map entries
-    {
-        const map_dir = "build/gen";
-        const map_dir_fd = posix.openat(posix.AT.FDCWD, map_dir, .{ .ACCMODE = .RDONLY }, 0) catch return;
-        defer _ = std.os.linux.close(map_dir_fd);
-
-        var ptr: usize = 0;
-        while (true) : (ptr += 1) {
-            var d: std.os.linux.dirent64 = undefined;
-            const nread = std.os.linux.getdents64(map_dir_fd, @ptrCast(&d), @sizeOf(std.os.linux.dirent64));
-            if (nread <= 0) break;
-            const name_ptr: [*:0]const u8 = @ptrCast(&d.name);
-            const name_len = std.mem.indexOfScalar(u8, std.mem.span(name_ptr), 0) orelse 0;
-            const entry_name = std.mem.span(name_ptr)[0..name_len];
-            if (!std.mem.endsWith(u8, entry_name, ".zag.map")) {
-                if (d.off == 0) break;
-                ptr = @intCast(d.off);
-                continue;
-            }
-            if (mapping_count >= zig_paths.len) break;
-
-            const zig_base = entry_name[0..entry_name.len - 8];
-            _ = std.fmt.bufPrint(&zig_paths[mapping_count], "build/gen/{s}", .{zig_base}) catch continue;
-
-            const zag_path = readFirstMapEntry(map_dir, entry_name) catch continue;
-            if (zag_path.len > 0) {
-                @memcpy(zag_paths[mapping_count][0..zag_path.len], zag_path);
-                zag_paths[mapping_count][zag_path.len] = 0;
-                mapping_count += 1;
-            }
-
-            if (d.off == 0) break;
-            ptr = @intCast(d.off);
-        }
-    }
-
-    if (mapping_count == 0) return;
+    // Collect zig→zag mappings from .zag.map files (one-level
+    // walk over `build/gen/` — see collectRemapMappings for the
+    // walker contract; factored out so it's unit-testable).
+    const mappings = collectRemapMappings("build/gen");
+    if (mappings.count == 0) return;
 
     // Read binary
     const bin_fd = posix.openat(posix.AT.FDCWD, binary_path, .{ .ACCMODE = .RDWR }, 0) catch return;
@@ -1013,9 +1052,9 @@ fn remapDwarfElf(binary_path: []const u8) void {
     if (data.len < 4 or !std.mem.eql(u8, data[0..4], "\x7fELF")) return;
 
     var patched: usize = 0;
-    for (0..mapping_count) |i| {
-        const zig_path: []const u8 = zig_paths[i][0..(std.mem.indexOfScalar(u8, &zig_paths[i], 0) orelse 256)];
-        const zag_path: []const u8 = zag_paths[i][0..(std.mem.indexOfScalar(u8, &zag_paths[i], 0) orelse 256)];
+    for (0..mappings.count) |i| {
+        const zig_path: []const u8 = mappings.zig[i][0..(std.mem.indexOfScalar(u8, &mappings.zig[i], 0) orelse 256)];
+        const zag_path: []const u8 = mappings.zag[i][0..(std.mem.indexOfScalar(u8, &mappings.zag[i], 0) orelse 256)];
         if (zag_path.len > zig_path.len or zag_path.len == 0) continue;
 
         var search_pos: usize = 0;
@@ -1105,4 +1144,99 @@ fn transpile(path: []const u8, source: []const u8, use_hybrid: bool) !TranspileR
     const zig = cg.generate(prog);
     cg.buildMapText();
     return .{ .zig = zig, .map = cg.getMapText() };
+}
+
+// =====================================================================
+// remap walker regression test.
+//
+// Locks down the buffer-and-offset `getdents64` pattern that
+// replaced the broken one-syscall-per-dirent shape in this
+// function. Builds a synthetic build/gen/ tree with 3 `.zag.map`
+// files (mimicking a `zag generate` run on a project with
+// src/main.zag + src/math.zag + src/db.zag), then verifies
+// collectRemapMappings() reports count==3 and finds each source.
+//
+// Failure mode this pins: if the walker ever regresses to a
+// one-batch / wrong-d_reclen shape, `mappings.count` will be 1
+// (only the first dirent of the batch survives) and the test
+// fails loudly.
+test "remap walker: collects all .zag.map entries when 3 files present" {
+    // PID-prefixed tmp dir name — guarantees a fresh dir per
+    // test invocation. Without this, prior runs' leftover
+    // `.zag.map` files would inflate `mappings.count` above
+    // the expected 3 and flake the test. Reviewer Item #5.
+    const synth_root_buf: [256]u8 = undefined;
+    const pid = std.os.linux.getpid();
+    const synth_root = std.fmt.bufPrint(&synth_root_buf, "/tmp/zag_remap_walker_test_{d}", .{pid}) catch unreachable;
+
+    mkPath(synth_root);
+    mkPath(synth_root ++ "/build");
+    mkPath(synth_root ++ "/build/gen");
+
+    writeSyntheticZagMap(synth_root ++ "/build/gen/main.zag.map", "src/main.zag");
+    writeSyntheticZagMap(synth_root ++ "/build/gen/math.zag.map", "src/math.zag");
+    writeSyntheticZagMap(synth_root ++ "/build/gen/db.zag.map", "src/db.zag");
+
+    const mappings = collectRemapMappings(synth_root ++ "/build/gen");
+
+    try std.testing.expectEqual(@as(usize, 3), mappings.count);
+    try std.testing.expect(remapMappingsContainsZag(mappings, "src/main.zag"));
+    try std.testing.expect(remapMappingsContainsZag(mappings, "src/math.zag"));
+    try std.testing.expect(remapMappingsContainsZag(mappings, "src/db.zag"));
+
+    // Sanity: zig_path field must include the
+    // `<synth_root>/build/gen/<basename>.zig` shape the
+    // production remapDwarfElf loops over.
+    try std.testing.expect(remapMappingsContainsZig(mappings, synth_root ++ "/build/gen/main.zig"));
+    try std.testing.expect(remapMappingsContainsZig(mappings, synth_root ++ "/build/gen/math.zig"));
+    try std.testing.expect(remapMappingsContainsZig(mappings, synth_root ++ "/build/gen/db.zig"));
+}
+
+/// `mkdir -p`-ish for `path`. Ignores EEXIST (already present).
+/// Mirrors the same shape used by `src/project.zig::createProject`:
+/// copies path into a stack buffer with a trailing NUL, then
+/// `std.os.linux.mkdirat(AT_FDCWD, ptr, 0o755)` (which takes a
+/// `[*:0]const u8` -- not a slice).
+fn mkPath(path: []const u8) void {
+    var buf: [512]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&buf), 0o755);
+}
+
+/// Write a tiny `.zag.map` file at `path` containing one
+/// tab-separated line whose 5th field is `zag_source` -- the
+/// shape `readFirstMapEntry` expects. POSIX openat with
+/// CREAT+TRUNC + raw write loop, no std.fs.
+fn writeSyntheticZagMap(path: []const u8, zag_source: []const u8) void {
+    var line: [256]u8 = undefined;
+    const line_z = std.fmt.bufPrint(&line, "1\t1\t1\tsym\t{s}\n", .{zag_source}) catch return;
+    const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return;
+    defer _ = std.os.linux.close(fd);
+    var written: usize = 0;
+    while (written < line_z.len) {
+        const n = std.os.linux.write(fd, line_z[written..].ptr, line_z.len - written);
+        if (n == 0) return;
+        written += n;
+    }
+}
+
+/// Linear scan of `mappings.zag[0..count]` for an exact-match on
+/// `expected`. Each entry is zero-terminated so we slice to the
+/// NUL before `eql`.
+fn remapMappingsContainsZag(mappings: RemapMappings, expected: []const u8) bool {
+    for (0..mappings.count) |i| {
+        const entry_z = std.mem.span(@as([*:0]const u8, @ptrCast(&mappings.zag[i])));
+        if (std.mem.eql(u8, entry_z, expected)) return true;
+    }
+    return false;
+}
+
+/// Same as remapMappingsContainsZag but scans the zig-path side.
+fn remapMappingsContainsZig(mappings: RemapMappings, expected: []const u8) bool {
+    for (0..mappings.count) |i| {
+        const entry_z = std.mem.span(@as([*:0]const u8, @ptrCast(&mappings.zig[i])));
+        if (std.mem.eql(u8, entry_z, expected)) return true;
+    }
+    return false;
 }

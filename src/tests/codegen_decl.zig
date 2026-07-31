@@ -1975,13 +1975,18 @@ test "codegen: pub import std.string.{String as MyStr, Display} emits preamble +
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    // Stdlib imports now skip @import and emit direct preamble aliases.
-    // `String as MyStr` → `const MyStr = __zag_String;`
+    // Mixed-selector stdlib import: `String as MyStr` is preamble-known
+    // (fast path emits `const MyStr = __zag_String;` directly); `Display`
+    // is .zag-source backed (slow path emits `const Display =
+    // __zag_imported_<i>.Display;` after the @import preamble line).
+    // v0.1 imports-loop Option A fallthrough: when ANY selector lacks a
+    // preamble-equivalent, the slow path fires for the whole import —
+    // emitting `@import("lib/std/string.zag")` BEFORE per-selector
+    // bridges (preamble shortcut for known types, import alias for
+    // others). Pre-migration, `Display` was silently dropped.
     try std.testing.expect(std.mem.indexOf(u8, zig, "const MyStr = __zag_String") != null);
-
-    // Alias-less selector `Display` has no preamble type yet, so it's skipped.
-    // Verify the import mechanism is still wired (no @import of .zag file).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const Display = __zag_imported_") != null);
 }
 
 test "codegen: whole-module import (no selectors) skips stdlib @import" {
@@ -2203,19 +2208,34 @@ test "codegen: getEnv routes through builtin_table to std.posix.getenv (no verba
     try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(\"HOME\")") == null);
 }
 
-test "codegen: readFileAlloc emits Threaded.init + readFileAlloc shim" {
-    // The Phase 2 router emit shape: per-call blk wrapper
-    // around std.Io.Dir.cwd().readFileAlloc bridged to
-    // []u8 via std.Io.Threaded.init(...) (per-call Io
-    // lifecycle) plus page_allocator ownership via
-    // defer __io_threaded.deinit(). A
-    // read_file("examples/basics/hello.zag") source site
-    // must surface these substrings so zig sees the Io
-    // event-loop instantiation at the use site, NOT an
-    // undeclared read_file(...) form or a std.fs.cwd()
-    // legacy form (the latter was retired in zig 0.16 -
-    // std.fs.zig is a 21-line deprecation stub now).
-    const src = "fun f() {\n    let d: []u8 = read_file(\"examples/basics/hello.zag\")?;\n}\n";
+test "codegen: read_file routes through @import+alias fallthrough (no fs_read_file router)" {
+    // v0.1 stdlib migration of std.fs.read_file from
+    // fs_read_file codegen-router inline emit to a real
+    // lib/std/fs.zag backed by __zag_posix. With the
+    // router retired, `pub import std.fs.{read_file}`
+    // emits `const __zag_imported_<i> = @import(
+    // "lib/std/fs.zag");` plus the per-selector alias
+    // `const read_file = __zag_imported_<i>.read_file;`
+    // (src/codegen/core.zig's imports loop Option A
+    // fallthrough). The bare-name read_file("/etc/hostname")
+    // call site is THEN emitted VERBATIM at the user's
+    // zig level — no per-call blk wrapper, no Io
+    // event-loop instantiation, no __fs_<N> scratch.
+    //
+    // This test pins that the new shape lands: the @import
+    // + alias pair both appear in the generated zig; the
+    // user call site is verbatim; and the legacy router
+    // substrings (readFileAlloc / std.Io.Threaded.init /
+    // __fs_<N>) are absent. A regression that re-adds the
+    // router (or fails to wire the imports-loop fallthrough)
+    // would fail the positive or negative substrings.
+    const src =
+        \\pub import std.fs.{read_file}
+        \\fun f() {
+        \\    let d: String = read_file("/etc/hostname");
+        \\}
+        \\
+    ;
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2223,32 +2243,43 @@ test "codegen: readFileAlloc emits Threaded.init + readFileAlloc shim" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Per-call Io init + deinit pair
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "defer __io_threaded.deinit()") != null);
-    // The actual readFileAlloc call
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Dir.cwd().readFileAlloc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, ".unlimited") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator") != null);
-    // Result capture via labeled block (label is __blk_N)
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_0") != null);
-    // Error bridge wraps zig errors into Result
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_err_to_result") != null);
+
+    // Positive: imports loop's @import preamble line.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"lib/std/fs.zag\")") != null);
+    // Positive: per-selector alias forwarding through import.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const read_file = __zag_imported_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".read_file;") != null);
+    // Positive: user's call site is verbatim (no router rewrite).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "read_file(\"/etc/hostname\")") != null);
+
+    // Negative: legacy fs_read_file router substrings must NOT
+    // appear — closing the regression path if the router is
+    // re-introduced.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Dir.cwd().readFileAlloc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "defer __io_threaded.deinit()") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_1") == null);
 }
 
-test "codegen: fs_counter increments across multiple read_file calls" {
-    // The per-function fs_counter (reset at genFun /
-    // genMethod / genFreeMethod) must step cleanly across
-    // sibling read_file calls so zig's no-redeclaration
-    // rule is satisfied. The : []u8 annotation is
-    // REQUIRED on both let a and let b: zag's grammar
-    // rejects bare let foo = <expr> for non-tuple rhs
-    // (the parser needs the type slot to dispatch []u8
-    // unchanged). Mirrors the explicit annotations on
-    // let home (Phase 1 test 1) and let a: ?str
-    // (Phase 1 test 2).
-    const src = "fun f() {\n    let a: []u8 = read_file(\"foo\")?;\n    let b: []u8 = read_file(\"bar\")?;\n}\n";
+test "codegen: read_file is emitted verbatim (no per-call scratch)" {
+    // The fs_count bump that the old fs_read_file router
+    // needed (one __fs_<N> per call to satisfy zig's no-
+    // redeclaration rule) is RETIRED. Multiple read_file
+    // calls in the same body now produce identical verbatim
+    // emit shapes — the call site IS the declaration, no
+    // scratch interposed. Naming is now the @import + alias
+    // const read_file = __zag_imported_<i>.read_file, which
+    // is declared once per import scope (not per call),
+    // so sibling calls share the alias without conflict.
+    const src =
+        \\pub import std.fs.{read_file}
+        \\fun f() {
+        \\    let a: String = read_file("foo");
+        \\    let b: String = read_file("bar");
+        \\}
+        \\
+    ;
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2256,21 +2287,31 @@ test "codegen: fs_counter increments across multiple read_file calls" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_1") != null);
+
+    // Both call sites verbatim, in source order.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "read_file(\"foo\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "read_file(\"bar\")") != null);
+    // No per-call scratch namespaced temp.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fs_1") == null);
+    // No router-emit substrings.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") == null);
 }
 
-test "codegen: read_file routes through builtin_table (no verbatim fallback)" {
-    // The router catches read_file("X") before the verbatim
-    // <name>(<args>) fallback in expr.zig's .call arm. A
-    // let d: []u8 = read_file("examples/basics/hello.zag")
-    // source must surface std.Io.Threaded.init (the shim)
-    // but must NOT leave a bare = read_file( substring in
-    // the emitted zig - the router consumed the call site.
-    // A regression that bypasses builtins.lookup(...) would
-    // leave the verbatim form intact and zig would reject
-    // with "use of undeclared identifier 'read_file'".
-    const src = "fun f() {\n    let d: []u8 = read_file(\"examples/basics/hello.zag\")?;\n}\n";
+test "codegen: read_file no longer routes through fs_read_file builtin router" {
+    // Locks down that the fs_read_file entry was removed
+    // from src/codegen/builtins.zig's builtin_table: a
+    // regression that re-adds it would surface
+    // std.Io.Threaded.init here. The user's call is now
+    // verbatim, NOT consumed by builtins.lookup inside
+    // src/codegen/expr.zig's genCallSite arm.
+    const src =
+        \\pub import std.fs.{read_file}
+        \\fun f() {
+        \\    let d: String = read_file("/etc/hostname");
+        \\}
+        \\
+    ;
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2278,9 +2319,27 @@ test "codegen: read_file routes through builtin_table (no verbatim fallback)" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "= read_file(") == null);
+
+    // Positive: verbatim call site AND the alias bridge.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "read_file(\"/etc/hostname\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const read_file = __zag_imported_") != null);
+    // Negative: router-substituted emit (no longer present).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") == null);
 }
+
+// Fixture note: a 4th mixed-selector test exercising
+// `pub import std.fs.{read_file, write_file, mkdir}` was attempted
+// here but deferred — write_file / mkdir are still on the
+// codegen-router (fs_write_file / fs_mkdir in expr.zig), so their
+// call sites are REWRITTEN by the router into per-call `blk: { ... }`
+// shapes (not verbatim). The mixed-selector test would need either:
+//   (a) drop write_file / mkdir from the source (degenerates to
+//       single-selector -- already covered by the rewrite above), or
+//   (b) migrate write_file / mkdir too -- out-of-scope for this turn.
+// Future migration of fs.{write_file, mkdir} is described in
+// lib/std/fs.zag's docblock and is the next .zag-file-to-real-
+// impl target. Reserved as a follow-up: when those land, the
+// mixed-selector test re-emits with all-three-verbatim coverage.
 
 test "codegen: raw pointer .add(N) emits zig-fallback @ptrFromInt + @sizeOf(@typeInfo(@TypeOf(...)).pointer.child)" {
     // Closes the BLOCKER finding from the §09 Pointers audit review:
@@ -3269,4 +3328,92 @@ test "codegen: while let Option.Some(val) emits while (expr) |val| capture" {
     const zig = cg.generate(prog);
     // while let emits zig's while (expr) |capture|
     try std.testing.expect(std.mem.indexOf(u8, zig, "while (opt) |val| {") != null);
+}
+
+test "codegen: __zag_posix preamble pins all 11 helpers + locks out steered-around substrings" {
+    // The __zag_posix family (openat/read/write/close/getdents64/
+    // clock_gettime/getcwd/getenv/exit/posix_spawn/waitpid) is emitted
+    // verbatim into the `generate()` preamble in src/codegen/core.zig.
+    // Trivia zag source (no call sites) exercises the preamble alone,
+    // so any per-helper drop shows up as a missing substring.
+    //
+    // Locks-down regression for two steered-around substrings that
+    // historically leaked through the preamble multi-line literal (the
+    // raw-string literal escapes comments verbatim into generated zig):
+    //
+    //   - `std.posix.system.getenv` — retired in zig 0.16; the
+    //     self-contained `__zag_getenv` impl replaced it with a
+    //     /proc/self/environ scanner (no stdlib dependency).
+    //   - `std.mem.span` — used in the prior __zag_getenv bridge from
+    //     `?[*:0]u8` → `[]const u8`; the new impl never needs it.
+    //
+    // A future zig 0.16 retirement (or a std.posix.* name that churned
+    // back to a std.mem.* helper) will be caught by the negative
+    // substring assertions at the bottom.
+    const src = "fun f() {}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    // Positive: each of the 11 __zag_posix helpers must appear in the
+    // preamble (verbatim, with fn-name intact).
+    const __zag_posix_names = [_][]const u8{
+        "__zag_openat",
+        "__zag_read",
+        "__zag_write",
+        "__zag_close",
+        "__zag_getdents64",
+        "__zag_clock_gettime",
+        "__zag_getcwd",
+        "__zag_getenv",
+        "__zag_exit",
+        "__zag_posix_spawn",
+        "__zag_waitpid",
+    };
+    inline for (__zag_posix_names) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, zig, name) != null);
+    }
+
+    // Positive (signature): pin the structurally-unusual signatures
+    // that are most likely to regress on a future migration:
+    //   - __zag_openat uses `dirfd: i32` rather than `usize` because
+    //     its caller passes `std.posix.AT.FDCWD` (which is -100). A
+    //     usize migration would silently break the FDCWD bridge.
+    //   - __zag_posix_spawn takes a many-pointer-with-sentinel slice of
+    //     optional many-pointers — a shape that doesn't appear anywhere
+    //     else in the codebase; regressing to `[*]const [*:0]const u8`
+    //     would break execve's envp contract.
+    // Other 9 helpers (read/write/close/getdents64/clock_gettime/getcwd/
+    // getenv/exit/waitpid) pin by name only — their forwarders onto
+    // `std.os.linux.*` have no regression-prone shape worth substringing.
+    // Arg names (dirfd, argv) are POSIX/Linux-canonical; safe to pin
+    // verbatim without re-bumping on every minor rename.
+    const __zag_posix_sigs = [_][]const u8{
+        "__zag_openat(dirfd: i32",
+        "__zag_posix_spawn(argv: [*:null]const ?[*:0]const u8",
+    };
+    inline for (__zag_posix_sigs) |sig| {
+        try std.testing.expect(std.mem.indexOf(u8, zig, sig) != null);
+    }
+
+    // Negative: steered-around substrings must not leak back into the
+    // preamble (covers both code paths AND comment text inside the
+    // raw-multi-line preamble literal — see core.zig generate()).
+    // `std.posix.getenv` IS what the per-call getEnv builtin emits
+    // (a zig-0.16 form; replacement for the retired `system.getenv`),
+    // but the PREAMBLE itself must never reference it — only
+    // `__zag_getenv` may. Trivia zag source has no getEnv call site,
+    // so any `std.posix.getenv` hit is a preamble leak.
+    const forbidden = [_][]const u8{
+        "std.posix.system.getenv",
+        "std.posix.getenv",
+        "std.mem.span",
+    };
+    inline for (forbidden) |substr| {
+        try std.testing.expect(std.mem.indexOf(u8, zig, substr) == null);
+    }
 }
