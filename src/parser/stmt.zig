@@ -530,6 +530,34 @@ pub fn parseIndexAssign(self: *Parser) Stmt.IndexAssignStmt {
     }
 
 
+/// `name.field[index] = value;` — index-write through a member-access
+/// target (the `self.ptr[self.len] = ch;` shape in lib/std/string.zag).
+/// parseIndexAssign's `parsePrimary()` target cannot consume the
+/// `.dot` chain, so this builds the member_access Expr explicitly,
+/// then consumes the bracket/index/equals/value. Codegen's
+/// `.index_assign` arm emits `genExpr(target)[index] = value`
+/// verbatim for any Expr target — only the leading `name.field`
+/// member-access construction differs from the plain-ident path.
+pub fn parseIndexAssignField(self: *Parser) Stmt.IndexAssignStmt {
+        const target_loc = self.peek().loc;
+        const base_name = self.expectIdent();
+        self.expect(.dot);
+        const field_name = self.expectIdent();
+        self.expect(.lbracket);
+        const index = self.parseExpr();
+        self.expect(.rbracket);
+        self.expect(.equals);
+        const value = self.parseExpr();
+        const target_buf = self.arena.alloc(Expr, 1);
+        const base_buf = self.arena.alloc(Expr, 1);
+        base_buf[0] = Expr{ .payload = .{ .ident = base_name }, .loc = target_loc };
+        target_buf[0] = Expr{ .payload = .{ .member_access = .{ .target = &base_buf[0], .name = field_name } }, .loc = target_loc };
+        const index_buf = self.arena.alloc(Expr, 1);
+        index_buf[0] = index;
+        return .{ .target = &target_buf[0], .index = &index_buf[0], .value = value };
+    }
+
+
 pub fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
         self.expect(.match_kw);
         // Suppress struct-literal parsing in match-scrutinee position.
@@ -903,6 +931,24 @@ pub fn parseStmt(self: *Parser) Stmt {
                         self.tokens[self.pos + 3].tag == .equals)
                     {
                         return Stmt{ .payload = .{ .field_assign = self.parseFieldAssign() }, .loc = tok.loc };
+                    }
+                    // 4-token lookahead for `name . ident [ expr ] =` — the
+                    // field-index-write form used by lib/std/string.zag's
+                    // push_ch / insert_ch (`self.ptr[self.len] = ch;`). The
+                    // target is a member_access (`self.ptr`) so it cannot
+                    // ride the plain `.index_assign` path (which expects
+                    // the `.lbracket` immediately after the leading ident);
+                    // this arm routes to parseIndexAssignField which builds
+                    // the member_access target then consumes the bracket +
+                    // index + equals + value. Codegen's `.index_assign` arm
+                    // emits any Expr target verbatim, so no codegen change.
+                    if (next == .dot and
+                        self.pos + 2 < self.tokens.len and
+                        self.tokens[self.pos + 2].tag == .identifier and
+                        self.pos + 3 < self.tokens.len and
+                        self.tokens[self.pos + 3].tag == .lbracket)
+                    {
+                        return Stmt{ .payload = .{ .index_assign = self.parseIndexAssignField() }, .loc = tok.loc };
                     }
                 }
                 return Stmt{ .payload = .{ .expr_stmt = self.parseExpr() }, .loc = tok.loc };

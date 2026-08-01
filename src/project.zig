@@ -151,12 +151,12 @@ fn walkSrcTree(dir_fd: i32, rel_to_src: []const u8) void {
 
         var pos: usize = 0;
         while (pos < n) {
-            const entry: *const std.os.linux.dirent64 = @ptrCast(&buf[pos]);
-            pos += entry.d_reclen;
+            const entry: *const std.os.linux.dirent64 = @ptrCast(@alignCast(&buf[pos]));
+            pos += entry.reclen;
 
             // `d_name` is a flexible-array member; treat as
             // sentinel-terminated pointer then slice to the NUL.
-            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.d_name)));
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.name)));
             const name = name_z[0..name_z.len];
 
             if (name.len == 0) continue;
@@ -170,7 +170,7 @@ fn walkSrcTree(dir_fd: i32, rel_to_src: []const u8) void {
             // output dir out of the source-walk, but a
             // plain file at any depth is processed normally.
 
-            if (entry.d_type == std.os.linux.DT.DIR) {
+            if (entry.type == std.os.linux.DT.DIR) {
                 if (std.mem.eql(u8, name, "build")) continue;
                 // Build new_rel = rel_to_src ++ "/" ++ name (or
                 // just `name` when at the top level).
@@ -190,7 +190,7 @@ fn walkSrcTree(dir_fd: i32, rel_to_src: []const u8) void {
                 const child_fd = posix.openat(posix.AT.FDCWD, child_path, .{ .ACCMODE = .RDONLY }, 0) catch continue;
                 walkSrcTree(child_fd, new_rel);
                 _ = std.os.linux.close(child_fd);
-            } else if (entry.d_type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
+            } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
                 // Build abs path "src/<rel>/<name>" (only `name`
                 // for top-level entries).
                 var path_buf: [1024]u8 = undefined;
@@ -281,6 +281,70 @@ var cfg_name_buf: [256]u8 = undefined;
 /// TOCTOU-style truncation surprises for niche `ZAG_HOME` paths.
 var cfg_zig_buf: [4096]u8 = undefined;
 
+// =====================================================================
+// Dependency-tracking surface (v0.1 pkg CLI).
+// =====================================================================
+
+/// One deps/dev-deps entry, parsed from a single line in
+/// `[dependencies]` / `[dev-dependencies]`. Schema per
+/// `docs/manual/35-zag-toml-schema.md` §[dependencies]:
+///   `name = { git = "...", rev|branch|version|path = "...", optional = bool }`
+/// Exactly one of `git` or `path` must be set on a well-formed entry.
+/// The parser is tolerant: if both are set, `path` wins (matches the
+/// "local-sibling workspace" override contract from the manual).
+pub const DepEntry = struct {
+    name: []const u8,
+    git: ?[]const u8 = null,
+    /// SHA only populated by `LockEntry`, not `DepEntry`. Kept on
+    /// the same struct for write-back convenience (a freshly-resolved
+    /// `git+rev` becomes a `DepEntry` with a populated `sha` before
+    /// being emitted to lockfile).
+    sha: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    rev: ?[]const u8 = null,
+    branch: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    optional: bool = false,
+};
+
+/// Lockfile resolution of a `DepEntry` — only `git` deps get a SHA.
+/// `path` deps have no SHA (their integrity is verified per-build
+/// against the local filesystem).
+pub const LockEntry = struct {
+    name: []const u8,
+    git: ?[]const u8 = null,
+    sha: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+};
+
+/// Resolved lockfile state, written to `zag.lock`.
+pub const Lockfile = struct {
+    deps: []LockEntry = &[_]LockEntry{},
+    dev_deps: []LockEntry = &[_]LockEntry{},
+};
+
+// Backing buffers for parsed deps + dev_deps from zag.toml.
+// Sized conservatively (64 + 32) — typical projects have well under
+// 10 transitive deps. Larger projects would block here.
+var dep_entry_buf: [64]DepEntry = undefined;
+var dep_entry_count: usize = 0;
+var dev_dep_entry_buf: [32]DepEntry = undefined;
+var dev_dep_entry_count: usize = 0;
+
+// Backing buffers for the inline-table field strings (one slice per
+// (key, value) pair). Each entry is `null`-terminated inline; the
+// DepEntry's g1/labels point into this buffer.
+var dep_field_buf: [64 * 4][256]u8 = undefined; // name + git+rev + branch+version + path + optional
+var dep_field_pos: usize = 0;
+
+// Backing for lockfile entries.
+var lock_entry_buf: [64]LockEntry = undefined;
+var lock_entry_count: usize = 0;
+var dev_lock_entry_buf: [32]LockEntry = undefined;
+var dev_lock_entry_count: usize = 0;
+var lock_field_buf: [96 * 2][256]u8 = undefined;
+var lock_field_pos: usize = 0;
+
 /// Walk `root_dir` then `zag.toml`, parse, return `ProjectConfig`.
 /// Returns `null` when:
 ///   - no `zag.toml` is reachable at `root_dir` (or cwd if empty),
@@ -341,38 +405,46 @@ pub fn detectProject(root_dir: []const u8) !?ProjectConfig {
 /// `[package].name` line, the file is malformed for our purposes.
 /// `zig` is optional (it stays null when no `[toolchain]` section
 /// is present, which the CLI treats as "no project-level override").
+/// `deps` + `dev_deps` are populated from `[dependencies]` and
+/// `[dev-dependencies]` sections (parallel arrays; entries point
+/// into module-private buffers via deps slots owned by this struct).
 const TomlFields = struct {
     name: ?[]const u8,
     zig: ?[]const u8,
+    deps: []const DepEntry = &[_]DepEntry{},
+    dev_deps: []const DepEntry = &[_]DepEntry{},
 };
 
 /// State-machine line walker for zag.toml. Recognises:
 ///   - `[section]` headers — switches the active section;
 ///   - `key = "value"` body lines — captures the quoted value into
-///     the active section's slot.
+///     the active section's slot;
+///   - `name = { k = "v", ... }` dep-table body lines in `[dependencies]`
+///     or `[dev-dependencies]` — extracts a `DepEntry` via the inline
+///     table parser (`extractTable`).
 /// Section "package" is the implicit top-level (initial state) so
 /// that legacy scaffold output (bare `name = "..."` without a
 /// `[package]` header) keeps parsing in lockstep with the new
-/// scaffold format (`[package]\nname = "..."`). Section "toolchain"
-/// is explicit-only (must be declared in the file to be picked up).
-/// Other sections (forward-looking `[dependencies]`, `[build]`,
-/// etc.) switch the state to `.none`, suppressing accidental
-/// capture of `name`/`zig`-shaped keys from unrelated subtables.
+/// scaffold format (`[package]\nname = "..."`). Sections
+/// "toolchain" / "dependencies" / "dev-dependencies" are explicit-
+/// only. Other sections (forward-looking `[build]`, `[scripts]`,
+/// `[modules]`, etc.) switch the state to `.none`, suppressing
+/// accidental capture of `name`/`zig`-shaped keys.
 ///
 /// Implementation note: section state starts as `.package` rather
 /// than `.none` purely for backward compatibility — the pre-v2.1
 /// scaffold (`createProject` used to emit just `name = "..."`)
 /// still parses. New scaffolds emit `[package]\nname = "..."`
 /// explicitly (clearer intent, matches the schema doc).
-fn parseToml(content: []const u8) ?TomlFields {
-    const Section = enum { package, toolchain, none };
+pub fn parseToml(content: []const u8) ?TomlFields {
+    const Section = enum { package, toolchain, dependencies, dev_dependencies, none };
     var section: Section = .package; // backward-compat default
     var name_field: ?[]const u8 = null;
     var zig_field: ?[]const u8 = null;
 
     var cursor: usize = 0;
     while (cursor < content.len) {
-        const nl_index = std.mem.indexOfScalar(u8, content[cursor..], '\n');
+        const nl_index = std.mem.findScalar(u8, content[cursor..], '\n');
         const line_end = if (nl_index) |e| cursor + e else content.len;
         const raw_line = content[cursor..line_end];
         const trimmed = std.mem.trim(u8, raw_line, " \t\r");
@@ -386,8 +458,20 @@ fn parseToml(content: []const u8) ?TomlFields {
                 const sect = trimmed[1 .. trimmed.len - 1];
                 if (std.mem.eql(u8, sect, "package")) {
                     section = .package;
+                    // Reset dep counts on transition INTO a non-deps
+                    // section so subsequent writes don't accumulate
+                    // into the wrong array. The counts go back to 0
+                    // when a non-deps section is entered, but the
+                    // already-parsed slice is preserved by reading
+                    // it before the reset.
+                    if (dep_entry_count > 0) dep_entry_count = 0;
+                    if (dev_dep_entry_count > 0) dev_dep_entry_count = 0;
                 } else if (std.mem.eql(u8, sect, "toolchain")) {
                     section = .toolchain;
+                } else if (std.mem.eql(u8, sect, "dependencies")) {
+                    section = .dependencies;
+                } else if (std.mem.eql(u8, sect, "dev-dependencies")) {
+                    section = .dev_dependencies;
                 } else {
                     section = .none;
                 }
@@ -406,6 +490,8 @@ fn parseToml(content: []const u8) ?TomlFields {
                             zig_field = cfg_zig_buf[0..v.len];
                         }
                     },
+                    .dependencies => parseDepLine(trimmed, false),
+                    .dev_dependencies => parseDepLine(trimmed, true),
                     .none => {},
                 }
             }
@@ -414,7 +500,12 @@ fn parseToml(content: []const u8) ?TomlFields {
         cursor = line_end + 1;
     }
 
-    return TomlFields{ .name = name_field, .zig = zig_field };
+    return TomlFields{
+        .name = name_field,
+        .zig = zig_field,
+        .deps = dep_entry_buf[0..dep_entry_count],
+        .dev_deps = dev_dep_entry_buf[0..dev_dep_entry_count],
+    };
 }
 
 /// Find a substring `key = "value"` on `line` and return the value
@@ -453,8 +544,341 @@ fn extractQuoted(line: []const u8, key: []const u8) ?[]const u8 {
     if (i >= line.len or line[i] != '"') return null;
 
     const vstart = i + 1;
-    const vrel_end = std.mem.indexOfScalar(u8, line[vstart..], '"') orelse return null;
+    const vrel_end = std.mem.findScalar(u8, line[vstart..], '"') orelse return null;
     return line[vstart..][0..vrel_end];
+}
+
+/// Parse a dep-table line `name = { k = "v", k2 = "v2", ... }` and
+/// append it to either the deps or dev_deps backing buffer. The
+/// table body's keys are matched against the schema's known set:
+/// `git`, `rev`, `branch`, `version`, `path`, `optional`. Unknown
+/// keys are silently dropped (matches the most-toml implementations'
+/// forward-compat contract — the user can round-trip new keys
+/// without us needing to track them). Sub-parses the `{` ... `}`
+/// table body and extracts each `k = "v"` pair via `extractQuoted`.
+///
+/// Returns silently on parse failure (line consumed but no entry
+/// added). `name` captures the dep key (the identifier on the
+/// left of `=`); the rest populate the inline-table fields.
+fn parseDepLine(line: []const u8, is_dev: bool) void {
+    // Find the `{` that opens the table body.
+    const lbrace = std.mem.findScalar(u8, line, '{') orelse return;
+    // Strip everything up to and including the `{` to get the
+    // dep-name prefix `name = ` (and any leading whitespace).
+    const prefix = std.mem.trim(u8, line[0..lbrace], " \t");
+
+    // Parse the prefix `<name> =` — extract the key (everything
+    // before the first `=`, trimmed).
+    const eq_idx = std.mem.findScalar(u8, prefix, '=') orelse return;
+    const dep_name = std.mem.trim(u8, prefix[0..eq_idx], " \t");
+
+    // Get the matching `}` -- naive scan, sufficient for the
+    // well-formed lines `zag` itself emits.
+    const rbrace = std.mem.findScalarPos(u8, line, lbrace, '}') orelse return;
+    const inner = line[lbrace + 1 .. rbrace];
+
+    // Allocate a DepEntry slot in the appropriate buffer.
+    const dep_target = if (is_dev) blk: {
+        if (dev_dep_entry_count >= dev_dep_entry_buf.len) return;
+        const idx = dev_dep_entry_count;
+        dev_dep_entry_count += 1;
+        break :blk &dev_dep_entry_buf[idx];
+    } else blk: {
+        if (dep_entry_count >= dep_entry_buf.len) return;
+        const idx = dep_entry_count;
+        dep_entry_count += 1;
+        break :blk &dep_entry_buf[idx];
+    };
+
+    // Copy name into the data-table slot (lock_field_buf shares
+    // storage with the parsed [dependencies] name slots; for dep
+    // entries we use the dep_field_buf).
+    if (dep_name.len > dep_field_buf[dep_field_pos].len) return;
+    @memcpy(dep_field_buf[dep_field_pos][0..dep_name.len], dep_name);
+    dep_field_buf[dep_field_pos][dep_name.len] = 0;
+    dep_target.name = dep_field_buf[dep_field_pos][0..dep_name.len];
+    dep_field_pos += 1;
+
+    // Extract each `k = "v"` pair from the inner table body.
+    const known_keys = [_][]const u8{ "git", "rev", "branch", "version", "path", "sha" };
+    inline for (known_keys) |key| {
+        if (extractQuoted(inner, key)) |v| {
+            // zig 0.16: `continue` inside `inline for` is comptime control flow
+            // inside a runtime block; invert condition + use if/else so the
+            // loop body stays scrutable.
+            if (v.len <= dep_field_buf[dep_field_pos].len) {
+                @memcpy(dep_field_buf[dep_field_pos][0..v.len], v);
+                dep_field_buf[dep_field_pos][v.len] = 0;
+                const slot: ?[]const u8 = dep_field_buf[dep_field_pos][0..v.len];
+                dep_field_pos += 1;
+                inline for (known_keys) |slot_key| {
+                    if (std.mem.eql(u8, slot_key, key)) {
+                        @field(dep_target, slot_key) = slot;
+                    }
+                }
+            }
+        }
+    }
+
+    // `optional = true` — scan for "optional = true" substring.
+    if (std.mem.indexOf(u8, inner, "optional") != null and
+        std.mem.indexOf(u8, inner, "true") != null)
+    {
+        dep_target.optional = true;
+    }
+}
+
+/// Parse `zag.lock` (TOML-style with `[deps]` + `[dev-deps]` tables
+/// holding `name = { git = "...", sha = "..." }` rows). Returns
+/// null on parse failure or absence of required structure.
+pub fn parseLockfile(content: []const u8) ?Lockfile {
+    const Section = enum { deps, dev_deps, none };
+    var section: Section = .none;
+
+    lock_entry_count = 0;
+    dev_lock_entry_count = 0;
+    lock_field_pos = 0;
+
+    var cursor: usize = 0;
+    while (cursor < content.len) {
+        const nl_index = std.mem.findScalar(u8, content[cursor..], '\n');
+        const line_end = if (nl_index) |e| cursor + e else content.len;
+        const raw_line = content[cursor..line_end];
+        const trimmed = std.mem.trim(u8, raw_line, " \t\r");
+
+        if (trimmed.len > 0 and trimmed[0] != '#') {
+            if (trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+                const sect = trimmed[1 .. trimmed.len - 1];
+                if (std.mem.eql(u8, sect, "deps")) {
+                    section = .deps;
+                } else if (std.mem.eql(u8, sect, "dev-deps")) {
+                    section = .dev_deps;
+                } else {
+                    section = .none;
+                }
+            } else {
+                // `<name> = { git = "...", sha = "..." }` — strip the
+                // name = prefix, then split the inner table.
+                const eq_idx = std.mem.findScalar(u8, trimmed, '=') orelse {
+                    cursor = line_end + 1;
+                    continue;
+                };
+                const dep_name = std.mem.trim(u8, trimmed[0..eq_idx], " \t");
+                const lbrace2 = std.mem.findScalarPos(u8, trimmed, eq_idx, '{') orelse {
+                    cursor = line_end + 1;
+                    continue;
+                };
+                const rbrace2 = std.mem.findScalarPos(u8, trimmed, lbrace2, '}') orelse {
+                    cursor = line_end + 1;
+                    continue;
+                };
+                const inner = trimmed[lbrace2 + 1 .. rbrace2];
+
+                const tgt = switch (section) {
+                    .deps => blk: {
+                        if (lock_entry_count >= lock_entry_buf.len) break :blk null;
+                        const idx = lock_entry_count;
+                        lock_entry_count += 1;
+                        break :blk &lock_entry_buf[idx];
+                    },
+                    .dev_deps => blk: {
+                        if (dev_lock_entry_count >= dev_lock_entry_buf.len) break :blk null;
+                        const idx = dev_lock_entry_count;
+                        dev_lock_entry_count += 1;
+                        break :blk &dev_lock_entry_buf[idx];
+                    },
+                    .none => null,
+                };
+                if (tgt == null) {
+                    cursor = line_end + 1;
+                    continue;
+                }
+
+                if (dep_name.len > lock_field_buf[lock_field_pos].len) {
+                    cursor = line_end + 1;
+                    continue;
+                }
+                @memcpy(lock_field_buf[lock_field_pos][0..dep_name.len], dep_name);
+                lock_field_buf[lock_field_pos][dep_name.len] = 0;
+                tgt.?.name = lock_field_buf[lock_field_pos][0..dep_name.len];
+                lock_field_pos += 1;
+
+                if (extractQuoted(inner, "git")) |v| {
+                    if (v.len > lock_field_buf[lock_field_pos].len) {
+                        cursor = line_end + 1;
+                        continue;
+                    }
+                    @memcpy(lock_field_buf[lock_field_pos][0..v.len], v);
+                    lock_field_buf[lock_field_pos][v.len] = 0;
+                    tgt.?.git = lock_field_buf[lock_field_pos][0..v.len];
+                    lock_field_pos += 1;
+                }
+                if (extractQuoted(inner, "sha")) |v| {
+                    if (v.len > lock_field_buf[lock_field_pos].len) {
+                        cursor = line_end + 1;
+                        continue;
+                    }
+                    @memcpy(lock_field_buf[lock_field_pos][0..v.len], v);
+                    lock_field_buf[lock_field_pos][v.len] = 0;
+                    tgt.?.sha = lock_field_buf[lock_field_pos][0..v.len];
+                    lock_field_pos += 1;
+                }
+                if (extractQuoted(inner, "path")) |v| {
+                    if (v.len > lock_field_buf[lock_field_pos].len) {
+                        cursor = line_end + 1;
+                        continue;
+                    }
+                    @memcpy(lock_field_buf[lock_field_pos][0..v.len], v);
+                    lock_field_buf[lock_field_pos][v.len] = 0;
+                    tgt.?.path = lock_field_buf[lock_field_pos][0..v.len];
+                    lock_field_pos += 1;
+                }
+            }
+        }
+
+        cursor = line_end + 1;
+    }
+
+    return Lockfile{
+        .deps = lock_entry_buf[0..lock_entry_count],
+        .dev_deps = dev_lock_entry_buf[0..dev_lock_entry_count],
+    };
+}
+
+/// Serialize a Lockfile back into zag.lock TOML format. Writes a
+/// comment header + `[deps]` table + `[dev-deps]` table. Caller
+/// is responsible for writing the returned buffer to disk via
+/// the existing `writeFile` helper.
+pub fn writeLockfileToBuf(buf: []u8, lockfile: Lockfile) usize {
+    var pos: usize = 0;
+    const header = "# zag.lock -- auto-generated, do not hand-edit.\n\n";
+    @memcpy(buf[pos..][0..header.len], header);
+    pos += header.len;
+
+    const deps_open = "[deps]\n";
+    if (pos + deps_open.len <= buf.len) {
+        @memcpy(buf[pos..][0..deps_open.len], deps_open);
+        pos += deps_open.len;
+    }
+    for (lockfile.deps) |dep| {
+        const line = writeLockEntry(dep, buf[pos..]) catch break;
+        pos += line;
+    }
+
+    if (lockfile.dev_deps.len > 0) {
+        const dev_open = "\n[dev-deps]\n";
+        if (pos + dev_open.len <= buf.len) {
+            @memcpy(buf[pos..][0..dev_open.len], dev_open);
+            pos += dev_open.len;
+        }
+        for (lockfile.dev_deps) |dep| {
+            const line = writeLockEntry(dep, buf[pos..]) catch break;
+            pos += line;
+        }
+    }
+
+    return pos;
+}
+
+/// Re-emit a zag.lock for the given zag.toml content. Walks the
+/// parsed `deps` + `dev_deps` slices from `parseToml` and builds a
+/// parallel `Lockfile` via `writeLockfileToBuf`. Only entries with
+/// a `git` field are emitted; path-only entries are skipped since
+/// they need no remote fetch.
+///
+/// Returns the number of bytes written. Errors with
+/// `error.LockEntryBufOverflow` if the 64-slot primary or 32-slot
+/// dev-dep buffer would be exceeded. Errors with `error.TomlParseFailed`
+/// if the content can't be parsed (parseToml returns null).
+///
+/// This is the v0.1 "lockfile mirrors manifest" helper: the 4 cmd
+/// handlers in src/main.zig call it after every manifest mutation
+/// so the lockfile stays in sync without per-handler locking logic.
+/// A follow-up commit can replace this with a streaming diff against
+/// the project's own config struct.
+pub fn writeLockfileFromToml(buf: []u8, content: []const u8) !usize {
+    const fields = parseToml(content) orelse return error.TomlParseFailed;
+
+    var n_primary: usize = 0;
+    var n_dev: usize = 0;
+
+    for (fields.deps) |dep| {
+        if (dep.git == null) continue;
+        if (n_primary >= 64) return error.LockEntryBufOverflow;
+        lock_entry_buf[n_primary] = LockEntry{
+            .name = dep.name,
+            .git = dep.git,
+            .sha = dep.sha,
+            .path = dep.path,
+        };
+        n_primary += 1;
+    }
+    for (fields.dev_deps) |dep| {
+        if (dep.git == null) continue;
+        if (n_dev >= 32) return error.LockEntryBufOverflow;
+        dev_lock_entry_buf[n_dev] = LockEntry{
+            .name = dep.name,
+            .git = dep.git,
+            .sha = dep.sha,
+            .path = dep.path,
+        };
+        n_dev += 1;
+    }
+
+    const lockfile = Lockfile{
+        .deps = lock_entry_buf[0..n_primary],
+        .dev_deps = dev_lock_entry_buf[0..n_dev],
+    };
+    return writeLockfileToBuf(buf, lockfile);
+}
+
+fn writeLockEntry(dep: LockEntry, buf: []u8) !usize {
+    var pos: usize = 0;
+    const wrap_open = "\"";
+    const wrap_close = "\" = { ";
+    const brace_close = " }\n";
+    @memcpy(buf[pos..][0..wrap_open.len], wrap_open);
+    pos += wrap_open.len;
+    @memcpy(buf[pos..][0..dep.name.len], dep.name);
+    pos += dep.name.len;
+    @memcpy(buf[pos..][0..wrap_close.len], wrap_close);
+    pos += wrap_close.len;
+
+    if (dep.git) |g| {
+        const git_open = "git = \"";
+        @memcpy(buf[pos..][0..git_open.len], git_open);
+        pos += git_open.len;
+        @memcpy(buf[pos..][0..g.len], g);
+        pos += g.len;
+        const close = "\", ";
+        @memcpy(buf[pos..][0..close.len], close);
+        pos += close.len;
+    }
+    if (dep.sha) |s| {
+        const sha_open = "sha = \"";
+        @memcpy(buf[pos..][0..sha_open.len], sha_open);
+        pos += sha_open.len;
+        @memcpy(buf[pos..][0..s.len], s);
+        pos += s.len;
+        const close = "\", ";
+        @memcpy(buf[pos..][0..close.len], close);
+        pos += close.len;
+    }
+    if (dep.path) |p| {
+        const path_open = "path = \"";
+        @memcpy(buf[pos..][0..path_open.len], path_open);
+        pos += path_open.len;
+        @memcpy(buf[pos..][0..p.len], p);
+        pos += p.len;
+        const close = "\", ";
+        @memcpy(buf[pos..][0..close.len], close);
+        pos += close.len;
+    }
+    // Trim trailing ", " if present.
+    if (pos >= 2 and buf[pos - 2] == ',' and buf[pos - 1] == ' ') pos -= 2;
+    @memcpy(buf[pos..][0..brace_close.len], brace_close);
+    pos += brace_close.len;
+    return pos;
 }
 
 /// Scaffold a new zag project at `dir` (or `.` if `dir` is empty).
@@ -607,6 +1031,203 @@ fn writeFile(path: []const u8, content: []const u8) !void {
         if (n == 0) return error.WriteFailed;
         written += n;
     }
+}
+
+// =====================================================================
+// Manifest write-back helpers (v0.1 pkg CLI).
+// =====================================================================
+//
+// The `appendDepToToml` / `removeDepFromToml` helpers are the
+// read-modify-write half of the pkg CLI. They preserve non-deps
+// bytes byte-for-byte; only the target `[dependencies]` /
+// `[dev-dependencies]` block mutates. The output goes into a
+// module-private write-back buffer (caller MUST write to disk
+// before the next call — the buffer is reused).
+
+/// Module-private storage for write-back slices. 8 KiB covers
+/// typical config files (the largest commit prior to this turn
+/// didn't exceed ~2 KiB). Larger files would block here with
+/// `error.BufferTooSmall` — caller's problem to chunk or
+/// allocate their own buffer.
+var writeback_buf: [8192]u8 = undefined;
+
+/// Locate the splice-position (byte index) of the next section
+/// header `[NAME]` after `start`. Returns null at EOF. Naive
+/// scan: `\n[` lookahead is sufficient because inline tables
+/// inside the current section's body don't open with `[` at
+/// line-start position.
+fn findNextSectionHeader(content: []const u8, start: usize) ?usize {
+    var i: usize = start;
+    while (i + 1 < content.len) {
+        if (content[i] == '\n' and content[i + 1] == '[') return i + 1;
+        i += 1;
+    }
+    return null;
+}
+
+/// Build `<name> = { ... }` inside `buf` for `dep`. Field order
+/// is fixed (git → rev → branch → version → path → sha →
+/// optional) so the on-disk shape is stable across runs.
+fn buildDepLine(buf: []u8, dep: DepEntry) !usize {
+    var pos: usize = 0;
+    if (dep.name.len > buf.len) return error.BufferTooSmall;
+    @memcpy(buf[pos..][0..dep.name.len], dep.name);
+    pos += dep.name.len;
+    const eq_open = " = { ";
+    if (pos + eq_open.len > buf.len) return error.BufferTooSmall;
+    @memcpy(buf[pos..][0..eq_open.len], eq_open);
+    pos += eq_open.len;
+
+    var first = true;
+    if (dep.git) |v| try appendKV(buf, &pos, "git", v, &first);
+    if (dep.rev) |v| try appendKV(buf, &pos, "rev", v, &first);
+    if (dep.branch) |v| try appendKV(buf, &pos, "branch", v, &first);
+    if (dep.version) |v| try appendKV(buf, &pos, "version", v, &first);
+    if (dep.path) |v| try appendKV(buf, &pos, "path", v, &first);
+    if (dep.sha) |v| try appendKV(buf, &pos, "sha", v, &first);
+    if (dep.optional) {
+        if (!first) {
+            if (pos + 2 > buf.len) return error.BufferTooSmall;
+            buf[pos] = ',';
+            buf[pos + 1] = ' ';
+            pos += 2;
+        }
+        const opt_kv = "optional = true";
+        if (pos + opt_kv.len > buf.len) return error.BufferTooSmall;
+        @memcpy(buf[pos..][0..opt_kv.len], opt_kv);
+        pos += opt_kv.len;
+        first = false;
+    }
+
+    if (pos + 1 > buf.len) return error.BufferTooSmall;
+    buf[pos] = '}';
+    pos += 1;
+    return pos;
+}
+
+fn appendKV(buf: []u8, pos: *usize, key: []const u8, value: []const u8, first: *bool) !void {
+    if (!first.*) {
+        if (pos.* + 2 > buf.len) return error.BufferTooSmall;
+        buf[pos.*] = ',';
+        buf[pos.* + 1] = ' ';
+        pos.* += 2;
+    }
+    @memcpy(buf[pos.*..][0..key.len], key);
+    pos.* += key.len;
+    const eq = " = \"";
+    if (pos.* + eq.len + value.len + 1 > buf.len) return error.BufferTooSmall;
+    @memcpy(buf[pos.*..][0..eq.len], eq);
+    pos.* += eq.len;
+    @memcpy(buf[pos.*..][0..value.len], value);
+    pos.* += value.len;
+    buf[pos.*] = '"';
+    pos.* += 1;
+    first.* = false;
+}
+
+/// Splice `insert` at position `at` in `src`. If `eol_before` is
+/// true, ensure a `\n` separator is present at the splice point.
+/// Returns a slice into the module-private writeback_buf.
+fn spliceInsert(src: []const u8, at: usize, insert: []const u8, eol_before: bool) ![]const u8 {
+    const needed = src.len + insert.len + if (eol_before) @as(usize, 1) else @as(usize, 0);
+    if (needed > writeback_buf.len) return error.BufferTooSmall;
+    @memcpy(writeback_buf[0..at], src[0..at]);
+    var pos: usize = at;
+    if (eol_before) {
+        if (pos == 0 or src[pos - 1] != '\n') {
+            writeback_buf[pos] = '\n';
+            pos += 1;
+        }
+    }
+    if (insert.len > 0) {
+        @memcpy(writeback_buf[pos..][0..insert.len], insert);
+        pos += insert.len;
+    }
+    @memcpy(writeback_buf[pos..][0..src.len - at], src[at..]);
+    pos += src.len - at;
+    return writeback_buf[0..pos];
+}
+
+/// Append a `<name> = { ... }` line to the `[dependencies]` (or
+/// `[dev-dependencies]`) block of `content`. If the section is
+/// absent, a new header is prepended at EOF. Bytes outside the
+/// section are preserved byte-for-byte.
+pub fn appendDepToToml(content: []const u8, dep: DepEntry, is_dev: bool) ![]const u8 {
+    const section_name: []const u8 = if (is_dev) "dev-dependencies" else "dependencies";
+
+    var dep_line: [1024]u8 = undefined;
+    const dl_len = try buildDepLine(&dep_line, dep);
+
+    var header_marker: [64]u8 = undefined;
+    const hm_full = std.fmt.bufPrint(&header_marker, "[{s}]\n", .{section_name}) catch return error.SectionNameTooLong;
+    const hm_no_nl = hm_full[0 .. hm_full.len - 1];
+
+    if (std.mem.indexOf(u8, content, hm_no_nl)) |hi| {
+        // Section present — splice dep_line at end of section body.
+        const body_start = hi + hm_full.len;
+        const next_section = findNextSectionHeader(content, body_start);
+        const insert_pos = next_section orelse content.len;
+        return spliceInsert(content, insert_pos, dep_line[0..dl_len], false);
+    }
+    // Section absent — append at EOF: newline boundary + header + dep_line.
+    if (content.len + hm_full.len + dl_len + 2 > writeback_buf.len) return error.BufferTooSmall;
+    @memcpy(writeback_buf[0..content.len], content);
+    var pos: usize = content.len;
+    if (pos == 0 or content[pos - 1] != '\n') {
+        writeback_buf[pos] = '\n';
+        pos += 1;
+    }
+    @memcpy(writeback_buf[pos..][0..hm_full.len], hm_full);
+    pos += hm_full.len;
+    @memcpy(writeback_buf[pos..][0..dl_len], dep_line[0..dl_len]);
+    pos += dl_len;
+    if (dl_len > 0 and dep_line[dl_len - 1] != '\n') {
+        writeback_buf[pos] = '\n';
+        pos += 1;
+    }
+    return writeback_buf[0..pos];
+}
+
+/// Remove the dep line matching `dep_name` from the
+/// `[dependencies]` (or `[dev-dependencies]`) block. Returns an
+/// error if the section or the dep is not found. Bytes outside
+/// the removed line are preserved byte-for-byte.
+pub fn removeDepFromToml(content: []const u8, dep_name: []const u8, is_dev: bool) ![]const u8 {
+    const section_name: []const u8 = if (is_dev) "dev-dependencies" else "dependencies";
+
+    var header_marker: [64]u8 = undefined;
+    const hm_full = std.fmt.bufPrint(&header_marker, "[{s}]\n", .{section_name}) catch return error.SectionNameTooLong;
+    const hm_no_nl = hm_full[0 .. hm_full.len - 1];
+
+    const header_idx = std.mem.indexOf(u8, content, hm_no_nl) orelse return error.SectionNotFound;
+    const body_start = header_idx + hm_full.len;
+    const next_section = findNextSectionHeader(content, body_start);
+    const body_end = next_section orelse content.len;
+
+    var i: usize = body_start;
+    while (i < body_end) {
+        const nl = std.mem.findScalarPos(u8, content, i, '\n') orelse body_end;
+        const line = std.mem.trim(u8, content[i..nl], " \t\r");
+
+        // Skip blank + commented-out dep lines (`# foo = { ... }`).
+        const is_comment_or_blank = line.len == 0 or line[0] == '#';
+
+        if (!is_comment_or_blank and std.mem.startsWith(u8, line, dep_name)) {
+            var j: usize = dep_name.len;
+            while (j < line.len and (line[j] == ' ' or line[j] == '\t')) : (j += 1) {}
+            if (j < line.len and line[j] == '=') {
+                // Match. Splice out content[i..line_end_inclusive].
+                const line_end = if (nl < content.len) nl + 1 else nl;
+                if (content.len - (line_end - i) > writeback_buf.len) return error.BufferTooSmall;
+                @memcpy(writeback_buf[0..i], content[0..i]);
+                @memcpy(writeback_buf[i..][0..content.len - line_end], content[line_end..]);
+                return writeback_buf[0 .. content.len - (line_end - i)];
+            }
+        }
+        i = if (nl < content.len) nl + 1 else body_end;
+    }
+
+    return error.DepNotFound;
 }
 
 // =====================================================================
@@ -781,20 +1402,161 @@ test "parseToml: scaffold-emitted [package]\nname = \"...\"\n round-trips" {
 }
 
 test "parseToml: bare top-level zig = ...\"path\"... is ignored (not in [toolchain])" {
-    // Subtle invariant: parser starts in .package state, so a
-    // bare `zig = "..."` key without a preceding [toolchain]
-    // header is silently dropped. Confirms the opt-in-to-override
-    // contract -- accidental naked keys don't accidentally enable
-    // the override.
     const content =
         \\[package]
         \\name = "myproj"
         \\zig = "/accidental/no-toolchain-header"
+        \\\
+    ;
+    const fields = parseToml(content).?;
+    try std.testing.expect(fields.name != null);
+    try std.testing.expect(fields.zig == null);
+}
+
+// =====================================================================
+// In-file pin tests for the v0.1 pkg CLI helpers.
+// =====================================================================
+
+test "appendDepToToml: section absent prepends header + dep row" {
+    const content =
+        \\[package]
+        \\name = "myproj"
+        \\\
+    ;
+    const dep = DepEntry{ .name = "json", .git = "https://github.com/zag/json", .rev = "v0.2.4" };
+    const out = try appendDepToToml(content, dep, false);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[dependencies]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "json = { git = \"https://github.com/zag/json\", rev = \"v0.2.4\" }") != null);
+    // Original bytes preserved verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[package]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "name = \"myproj\"") != null);
+}
+
+test "appendDepToToml: section present splices at end of body" {
+    const content =
+        \\[package]
+        \\name = "myproj"
+        \\
+        \\[dependencies]
+        \\json = { git = "https://github.com/zag/json", rev = "v0.2.4" }
+        \\
+        \\[toolchain]
+        \\zig = "/opt/zig/zig"
+        \\\
+    ;
+    const dep = DepEntry{ .name = "log", .git = "https://github.com/zag/log", .branch = "main" };
+    const out = try appendDepToToml(content, dep, false);
+    // The new dep lands BEFORE [toolchain], AFTER the existing json dep.
+    const json_marker = "json = {";
+    const log_marker = "log = {";
+    const tool_marker = "[toolchain]";
+    const json_off = std.mem.indexOf(u8, out, json_marker).?;
+    const log_off = std.mem.indexOf(u8, out, log_marker).?;
+    const tool_off = std.mem.indexOf(u8, out, tool_marker).?;
+    try std.testing.expect(json_off < log_off);
+    try std.testing.expect(log_off < tool_off);
+    // Section boundary preserved.
+    try std.testing.expect(std.mem.indexOf(u8, out, "zig = \"/opt/zig/zig\"") != null);
+}
+
+test "removeDepFromToml: happy path splices out matching line" {
+    const content =
+        \\[package]
+        \\name = "myproj"
+        \\
+        \\[dependencies]
+        \\json = { git = "https://github.com/zag/json", rev = "v0.2.4" }
+        \\log  = { git = "https://github.com/zag/log", branch = "main" }
+        \\
+        \\[toolchain]
+        \\zig = "/opt/zig/zig"
+        \\\
+    ;
+    const out = try removeDepFromToml(content, "json", false);
+    // json dep gone.
+    try std.testing.expect(std.mem.indexOf(u8, out, "json = {") == null);
+    // Other dep + sections preserved.
+    try std.testing.expect(std.mem.indexOf(u8, out, "log = {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[toolchain]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zig = \"/opt/zig/zig\"") != null);
+}
+
+test "removeDepFromToml: missing dep returns error.DepNotFound" {
+    const content =
+        \\[dependencies]
+        \\json = { git = "https://github.com/zag/json" }
+        \\\
+    ;
+    const result = removeDepFromToml(content, "log", false);
+    try std.testing.expectError(error.DepNotFound, result);
+}
+
+test "removeDepFromToml: prefix-bounded — does NOT match longer-name dep" {
+    // Both `"foo"` and `"foobar"` are present; removeDepFromToml("foo") must
+    // splice ONLY the `"foo"` line, leaving `"foobar"` intact. Locks down the
+    // `line[dep_name.len] == '='` post-check (with optional whitespace skip)
+    // that prevents `foo` from greedily matching `foobar`.
+    const content =
+        \\[dependencies]
+        \\"foo" = { git = "https://github.com/a/foo", sha = "1" }
+        \\"foobar" = { git = "https://github.com/a/foobar", sha = "2" }
         \\
     ;
-    cfg_name_buf = [_]u8{0} ** cfg_name_buf.len;
-    cfg_zig_buf = [_]u8{0} ** cfg_zig_buf.len;
-    const fields = parseToml(content).?;
-    try std.testing.expectEqualStrings("myproj", fields.name.?);
-    try std.testing.expect(fields.zig == null);
+    const out = try removeDepFromToml(content, "foo", false);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"foo\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"foobar\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "git = \"https://github.com/a/foobar\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sha = \"2\"") != null);
+}
+
+test "removeDepFromToml: skips commented-out dep lines" {
+    // If the only line mentioning "foo" is commented out (`# ...`), the call
+    // must return error.DepNotFound rather than splice out the comment.
+    const content =
+        \\[dependencies]
+        \\# "foo" = { git = "https://github.com/a/foo" }
+        \\"bar" = { git = "https://github.com/a/bar" }
+        \\
+    ;
+    const result = removeDepFromToml(content, "foo", false);
+    try std.testing.expectError(error.DepNotFound, result);
+    // Bar must still be present (the unmatched call didn't touch anything else).
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"bar\"") != null);
+}
+
+test "buildDepLine: emits field order git ? rev ? branch ? version ? path ? sha ? optional" {
+    const dep_a = DepEntry{
+        .name = "json",
+        .git = "https://github.com/zag/json",
+        .rev = "v0.2.4",
+        .branch = null,
+        .version = null,
+        .path = null,
+        .sha = null,
+        .optional = false,
+    };
+    var buf_a: [512]u8 = undefined;
+    const a_len = try buildDepLine(&buf_a, dep_a);
+    const a_str = buf_a[0..a_len];
+    try std.testing.expectEqualStrings(
+        "json = { git = \"https://github.com/zag/json\", rev = \"v0.2.4\" }",
+        a_str,
+    );
+
+    const dep_b = DepEntry{
+        .name = "local",
+        .path = "../local",
+        .git = null,
+        .rev = null,
+        .branch = null,
+        .version = null,
+        .sha = null,
+        .optional = true,
+    };
+    var buf_b: [512]u8 = undefined;
+    const b_len = try buildDepLine(&buf_b, dep_b);
+    try std.testing.expectEqualStrings(
+        "local = { path = \"../local\", optional = true }",
+        buf_b[0..b_len],
+    );
 }

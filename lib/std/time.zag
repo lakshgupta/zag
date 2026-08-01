@@ -1,9 +1,19 @@
 ## std.time — Duration, Timer, and time-query free functions.
 ##
-## Duration and Timer are defined as real types in the generated zig preamble.
-## `now()` returns `std.time.nanoTimestamp()` (i64 nanos since monotonic epoch).
+## Duration and Timer are declared here; their bodies are real
+## (self-consistent) but currently unused surface.
 ##
-## Methods route through the codegen router.
+## v0.1 Tier-1 migration: `now()` is a real zag impl backed by the
+## always-emitted `__zag_clock_gettime` preamble helper
+## (src/codegen/core.zig, a forwarder onto `std.os.linux.clock_gettime`).
+## clockid 1 = CLOCK_MONOTONIC on Linux — i64 nanoseconds since the
+## monotonic epoch. The pre-migration `time_now` router row emitted
+## the same syscall inline as a blk-expression; retired in the
+## Tier-1 migration — this .zag body is the single source of truth.
+
+pub fun now() -> i64 {
+    return __zag_clock_gettime(1);
+}
 
 pub struct Duration {
     nanos: i64,
@@ -11,22 +21,25 @@ pub struct Duration {
 
 impl Duration {
     pub fun from_millis(ms: u64) -> Duration {
+        _ = ms;
         return Duration { nanos: 0 };
     }
     pub fun as_millis(self: *Duration) -> u64 {
+        _ = self;
         return 0;
     }
 }
 
 pub struct Timer {
-    start: i64,
+    start_ns: i64,
 }
 
 impl Timer {
     pub fun start() -> Timer {
-        return Timer { start: 0 };
+        return Timer { start_ns: 0 };
     }
     pub fun elapsed(self: *Timer) -> Duration {
+        _ = self;
         return Duration { nanos: 0 };
     }
 }

@@ -1985,7 +1985,7 @@ test "codegen: pub import std.string.{String as MyStr, Display} emits preamble +
     // bridges (preamble shortcut for known types, import alias for
     // others). Pre-migration, `Display` was silently dropped.
     try std.testing.expect(std.mem.indexOf(u8, zig, "const MyStr = __zag_String") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"lib/std/string.zag\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"std/string.zig\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "const Display = __zag_imported_") != null);
 }
 
@@ -2137,12 +2137,24 @@ test "codegen: argv_get builtin routes through __zag_argv module-level global" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "[32][]const u8") == null);
 }
 
-test "codegen: getEnv emits std.posix.getenv shim with @as(?[]const u8, ...) coercion" {
-    // zig 0.16: std.posix.system.getenv was retired in favour of
-    // std.posix.getenv (which takes []const u8 and returns ?[:0]const u8).
-    // The new minimal shape wraps it in @as(?[]const u8, ...) to bridge
-    // the sentinel-terminated return to zag's `?[]const u8` shape.
-    const src = "fun f() {\n    let home: ?str = getEnv(\"HOME\");\n}\n";
+test "codegen: get_env routes through @import+alias fallthrough (no env_var router)" {
+    // v0.1 Tier-1 migration of std.env.get_env from the env_var
+    // codegen-router inline emit to a real lib/std/env.zag backed
+    // by __zag_getenv. With the router retired, `pub import
+    // std.env.{get_env}` emits `const __zag_imported_<i> = @import(
+    // "lib/std/env.zag");` plus the per-selector alias
+    // `const get_env = __zag_imported_<i>.get_env;` (src/codegen/
+    // core.zig's imports loop Option A fallthrough). The bare-name
+    // get_env("HOME") call site is THEN emitted VERBATIM at the
+    // user's zig level — no per-call blk wrapper, no std.posix.getenv
+    // shim, no __env_<N> scratch.
+    const src =
+        \\pub import std.env.{get_env}
+        \\fun f() {
+        \\    let home: ?str = get_env("HOME");
+        \\}
+        \\
+    ;
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2150,27 +2162,29 @@ test "codegen: getEnv emits std.posix.getenv shim with @as(?[]const u8, ...) coe
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Positive (substring): the router fired with the new stdlib + coercion.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(?[]const u8") != null);
-    // Negative: the legacy per-call temp + std.posix.system surface is retired.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_0") == null);
+    // Positive: the @import + alias pair both land (imports-loop
+    // Option A fallthrough fired, materialised-mirror path).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"std/env.zig\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const get_env = __zag_imported_") != null);
+    // Positive: the user call site is verbatim get_env("HOME").
+    try std.testing.expect(std.mem.indexOf(u8, zig, "get_env(\"HOME\")") != null);
+    // Negative: the retired router emit surface is gone.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.mem.span") == null);
-    // Negative: the verbatim `getEnv(...)` form must NOT appear
-    // (proves the builtin_table router fired).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(\"HOME\")") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_") == null);
 }
 
-test "codegen: multiple getEnv calls each route through std.posix.getenv" {
-    // The env_counter pattern (per-call `__env_<N>` temps) was retired
-    // alongside the env_var emit-shape simplification: the new
-    // minimal `blk: { break :blk @as(?[]const u8, std.posix.getenv(...)) }`
-    // shape has no temp var to name. Sibling getEnv calls in the same
-    // body now produce identical emit shapes — this test pins that
-    // BOTH calls route through the builtin_table (not the verbatim
-    // fallback) and each gets its own std.posix.getenv invocation.
-    const src = "fun f() {\n    let a: ?str = getEnv(\"HOME\");\n    let b: ?str = getEnv(\"PATH\");\n}\n";
+test "codegen: get_env call without std.env import emits verbatim (router retired)" {
+    // The env_var router row is RETIRED — a bare get_env("HOME")
+    // call with no `pub import std.env.{get_env}` now falls through
+    // to the verbatim emit (the same treatment the retired
+    // fs_read_file router got). This is a deliberate correctness
+    // change: previously the router rewrote the call site into
+    // std.posix.getenv even without an import; now the zag
+    // compile-error at the zig level (undefined `get_env`) is the
+    // surface, matching the @import+alias contract of every other
+    // stdlib function.
+    const src = "fun f() {\n    let x: ?str = get_env(\"HOME\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2178,34 +2192,40 @@ test "codegen: multiple getEnv calls each route through std.posix.getenv" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Positive: both getEnv calls route through std.posix.getenv with
-    // their respective name arguments preserved verbatim.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv(\"HOME\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv(\"PATH\")") != null);
+    // Positive (verbatim): no router touched the call site.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "get_env(\"HOME\")") != null);
+    // Negative: the retired router surface is gone.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_") == null);
+}
+
+test "codegen: multiple get_env calls each emit verbatim with distinct args" {
+    // Sibling get_env calls in the same body now produce identical
+    // verbatim emit shapes (no per-call temp namespace — the
+    // env_counter pattern was retired alongside the router). This
+    // test pins that BOTH call sites survive verbatim with their
+    // respective name arguments preserved.
+    const src =
+        \\pub import std.env.{get_env}
+        \\fun f() {
+        \\    let a: ?str = get_env("HOME");
+        \\    let b: ?str = get_env("PATH");
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: both call sites verbatim with args preserved.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "get_env(\"HOME\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "get_env(\"PATH\")") != null);
     // Negative: the retired per-call temp pattern is gone.
     try std.testing.expect(std.mem.indexOf(u8, zig, "var __env_") == null);
-    // Negative: the verbatim `getEnv(...)` form must NOT appear for
-    // either call (proves the router fired for both).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(") == null);
-}
-
-test "codegen: getEnv routes through builtin_table to std.posix.getenv (no verbatim fallback)" {
-    // zig 0.16: std.posix.system.getenv was retired in favour of
-    // std.posix.getenv (takes []const u8, returns ?[:0]const u8). The
-    // builtin_table router fires for the `getEnv` free-fn call,
-    // producing the inline shim that uses the new stdlib surface.
-    const src = "fun f() {\n    let x: ?str = getEnv(\"HOME\");\n}\n";
-    var l = lexer_mod.Lexer.init(src);
-    const tokens = l.tokenize();
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-    var cg = codegen_mod.Codegen.init();
-    const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv") != null);
-    // Negative: the legacy std.posix.system.getenv path is retired.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.system.getenv") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "= getEnv(\"HOME\")") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.posix.getenv") == null);
 }
 
 test "codegen: read_file routes through @import+alias fallthrough (no fs_read_file router)" {
@@ -2244,8 +2264,10 @@ test "codegen: read_file routes through @import+alias fallthrough (no fs_read_fi
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    // Positive: imports loop's @import preamble line.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"lib/std/fs.zag\")") != null);
+    // Positive: imports loop's @import preamble line (v0.1 Tier-1:
+    // the materialised-mirror path `std/fs.zig`, not the raw
+    // `lib/std/fs.zag` — see src/codegen/core.zig's imports loop).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"std/fs.zig\")") != null);
     // Positive: per-selector alias forwarding through import.
     try std.testing.expect(std.mem.indexOf(u8, zig, "const read_file = __zag_imported_") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, ".read_file;") != null);
@@ -2329,17 +2351,19 @@ test "codegen: read_file no longer routes through fs_read_file builtin router" {
 
 // Fixture note: a 4th mixed-selector test exercising
 // `pub import std.fs.{read_file, write_file, mkdir}` was attempted
-// here but deferred — write_file / mkdir are still on the
-// codegen-router (fs_write_file / fs_mkdir in expr.zig), so their
-// call sites are REWRITTEN by the router into per-call `blk: { ... }`
+// here but deferred — as of the v0.1 Tier-1 migration, write_file is
+// a REAL impl in lib/std/fs.zag (call sites verbatim), but mkdir is
+// still on the codegen-router (fs_mkdir in expr.zig), so ITS call
+// sites are REWRITTEN by the router into per-call `blk: { ... }`
 // shapes (not verbatim). The mixed-selector test would need either:
-//   (a) drop write_file / mkdir from the source (degenerates to
-//       single-selector -- already covered by the rewrite above), or
-//   (b) migrate write_file / mkdir too -- out-of-scope for this turn.
-// Future migration of fs.{write_file, mkdir} is described in
-// lib/std/fs.zag's docblock and is the next .zag-file-to-real-
-// impl target. Reserved as a follow-up: when those land, the
-// mixed-selector test re-emits with all-three-verbatim coverage.
+//   (a) drop mkdir from the source (degenerates to the
+//       verbatim-only selectors — a superset of the coverage
+//       above: read_file + write_file), or
+//   (b) migrate mkdir too — out-of-scope for this turn.
+// Future migration of fs.mkdir is described in lib/std/fs.zag's
+// docblock and is the next .zag-file-to-real-impl target. Reserved
+// as a follow-up: when it lands, the mixed-selector test re-emits
+// with all-three-verbatim coverage.
 
 test "codegen: raw pointer .add(N) emits zig-fallback @ptrFromInt + @sizeOf(@typeInfo(@TypeOf(...)).pointer.child)" {
     // Closes the BLOCKER finding from the §09 Pointers audit review:
@@ -3403,11 +3427,13 @@ test "codegen: __zag_posix preamble pins all 11 helpers + locks out steered-arou
     // Negative: steered-around substrings must not leak back into the
     // preamble (covers both code paths AND comment text inside the
     // raw-multi-line preamble literal — see core.zig generate()).
-    // `std.posix.getenv` IS what the per-call getEnv builtin emits
-    // (a zig-0.16 form; replacement for the retired `system.getenv`),
-    // but the PREAMBLE itself must never reference it — only
-    // `__zag_getenv` may. Trivia zag source has no getEnv call site,
-    // so any `std.posix.getenv` hit is a preamble leak.
+    // `std.posix.getenv` was the per-call getEnv builtin's emit
+    // (zig-0.16 form; replacement for the retired `system.getenv`),
+    // but BOTH are retired as of the v0.1 Tier-1 migration — env
+    // lookup lives in lib/std/env.zag's real impl (__zag_getenv).
+    // The PREAMBLE itself must never reference std.posix.getenv —
+    // only `__zag_getenv` may. Trivia zag source has no get_env
+    // call site, so any `std.posix.getenv` hit is a preamble leak.
     const forbidden = [_][]const u8{
         "std.posix.system.getenv",
         "std.posix.getenv",

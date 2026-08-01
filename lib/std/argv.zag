@@ -16,5 +16,6 @@
 ## before any reader sees the verbatim form.
 
 pub fun get() -> []const []const u8 {
-    return &[_][]const u8{};
+    var empty: [0][]const u8 = undefined;
+    return empty[0..0];
 }

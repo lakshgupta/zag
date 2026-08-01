@@ -157,17 +157,6 @@ const Codegen = core.Codegen;
         self.match_counter = 0;
         self.blk_counter = 0;
         self.current_symbol = m.name;
-        // Phase 1 codegen-router: env_counter reset mirrors the argv
-        // counter pattern so sibling `__env_<N>` temps (one per
-        // env_var / getEnv call site) start fresh at `_0` per fn.
-        // Without this reset, sibling pub fns would reuse the same
-        // `__env_0` name and zig's no-redeclaration rule would reject
-        // a sibling fn body's emit.
-        // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
-        // exec counters reset mirrors the fs_counter (Phase 2) pattern
-        // above so each fn body has its own scoped counter slot
-        // starting at `_0`. `process_exit` doesn't need a counter —
-        // its emit is a single inline statement with no temp names.
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
         // v1.6 byte-slice widening: set the per-body method-receiver
@@ -463,16 +452,6 @@ const Codegen = core.Codegen;
         self.match_counter = 0;
         self.blk_counter = 0;
         self.current_symbol = m.name;
-        // Phase 1 codegen-router: env_counter reset mirrors the argv
-        // counter pattern above so nested methods get a clean
-        // `__env_<N>` sequence starting at `_0`.
-        // Phase 2 codegen-router: fs_counter reset mirrors env_counter
-        // above so nested methods get a clean `__fs_<N>` sequence
-        // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
-        // exec counters reset mirrors the fs_counter (Phase 2) pattern
-        // above so each fn body has its own scoped counter slot
-        // starting at `_0`. `process_exit` doesn't need a counter —
-        // its emit is a single inline statement with no temp names.
         // Re-populate the per-function type-info map for any locally-
         // declared typed bindings inside the method body so the
         // div-shim predicate (`needsIntDivShim`) gets correct info
@@ -666,6 +645,12 @@ const Codegen = core.Codegen;
         // array-of-strings shape that the CLI bootstrap uses.
         if (std.mem.eql(u8, text, "[]str")) return "[][]const u8";
         if (std.mem.eql(u8, text, "[3]str")) return "[3][]const u8";
+        // Optional-string form `?str` → `?[]const u8` — the get_env
+        // contract (`get_env(name) -> ?str`) and user `let x: ?str`
+        // bindings both emit this shape. Surfaced when the Tier-1
+        // stdlib migration made lib/std/env.zag's `-> ?str` return
+        // type compile through zig for the first time.
+        if (std.mem.eql(u8, text, "?str")) return "?[]const u8";
         // v2 char fix path (docs/features.md §08 v2 4-byte Unicode char
         // row): zag's `char` ident silently rewrites to zig's `u32`
         // primitive so let-bind / var-bind / struct-field / enum-varlist /
@@ -1248,16 +1233,6 @@ const Codegen = core.Codegen;
         // their own counters to start fresh at `_0`.
         self.match_counter = 0;
         self.blk_counter = 0;
-        // Phase 1 codegen-router: env_counter reset (mirrors the
-        // match_counter reset above) so sibling getEnv calls within
-        // the same
-        // body produce distinct `__env_<N>` names. Sibling pub fns
-        // start fresh at `_0` thanks to this reset.
-        // Phase 3 (CLI migration) codegen-router: write_file / mkdir /
-        // exec counters reset mirrors the fs_counter (Phase 2) pattern
-        // above so each fn body has its own scoped counter slot
-        // starting at `_0`. `process_exit` doesn't need a counter —
-        // its emit is a single inline statement with no temp names.
         // Top-level `fun` is parsed for return_type in Phase 2, but
         // `fn_returns_value` is only relevant for impl-block methods
         // where the typed-return drives tail-position match emission.

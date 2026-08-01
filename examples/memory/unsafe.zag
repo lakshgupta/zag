@@ -8,6 +8,8 @@
 ##
 ## Run: zag run unsafe.zag
 
+import std.mem.{alloc};
+
 fun main() {
     unsafe {
         # Raw pointer arithmetic on `*raw u8` — allowed in zig 0.16

@@ -6,6 +6,12 @@
 ##   lock(m)      m.lock()
 ##   unlock(m)    m.unlock()
 
-pub fun create();
-pub fun lock(m: *i32);
-pub fun unlock(m: *i32);
+pub fun create() {
+    return;
+}
+pub fun lock(m: *i32) {
+    return;
+}
+pub fun unlock(m: *i32) {
+    return;
+}

@@ -640,11 +640,16 @@ pub const Parser = struct {
         .{ .name = "std", .path = "lib/std/mod.zag" },
         .{ .name = "std.string", .path = "lib/std/string.zag" },
         .{ .name = "std.error", .path = "lib/std/error.zag" },
+        .{ .name = "std.env", .path = "lib/std/env.zag" },
+        .{ .name = "std.argv", .path = "lib/std/argv.zag" },
+        .{ .name = "std.process", .path = "lib/std/process.zag" },
         .{ .name = "std.fs", .path = "lib/std/fs.zag" },
         .{ .name = "std.fmt", .path = "lib/std/fmt.zag" },
         .{ .name = "std.time", .path = "lib/std/time.zag" },
         .{ .name = "std.atomic", .path = "lib/std/atomic.zag" },
         .{ .name = "std.bench", .path = "lib/std/bench.zag" },
+        .{ .name = "std.mem", .path = "lib/std/mem.zag" },
+        .{ .name = "std.debug", .path = "lib/std/debug.zag" },
         .{ .name = "std.async.stream", .path = "lib/std/async/stream.zag" },
         .{ .name = "std.arch.x86.avx2", .path = "lib/std/arch/x86/avx2.zag" },
         .{ .name = "std.concurrent.atomic", .path = "lib/std/concurrent/atomic.zag" },
@@ -724,6 +729,7 @@ pub const Parser = struct {
     pub const parseForStmt = @import("stmt.zig").parseForStmt;
     pub const parseIfBranch = @import("stmt.zig").parseIfBranch;
     pub const parseIndexAssign = @import("stmt.zig").parseIndexAssign;
+    pub const parseIndexAssignField = @import("stmt.zig").parseIndexAssignField;
     pub const parseMatchExpr = @import("stmt.zig").parseMatchExpr;
     pub const parsePattern = @import("stmt.zig").parsePattern;
     pub const parsePatternBinding = @import("stmt.zig").parsePatternBinding;

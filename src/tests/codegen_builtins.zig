@@ -233,7 +233,14 @@ test "codegen: free of call expr falls back to page_allocator.destroy (non-ident
     try std.testing.expect(std.mem.indexOf(u8, zig, "page_allocator.free(42)") == null);
 }
 
-test "codegen: alloc(N) emits page_allocator.alloc(u8, N) with OOM catch" {
+test "codegen: alloc call without std.mem import emits verbatim (router retired)" {
+    // v0.1 Tier-1 migration: the builtin_alloc router row is retired
+    // — `alloc(1024)` now falls through to the verbatim emit unless
+    // `pub import std.mem.{alloc}` wires the @import+alias
+    // fallthrough (lib/std/mem.zag's real impl, backed by
+    // __zag_page_alloc). This test pins the no-import fallback:
+    // the call site is emitted verbatim, and the retired router
+    // emit surface (page_allocator / OOM catch) is absent.
     const src = "fun main() { let buf: []u8 = alloc(1024); }\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -242,9 +249,42 @@ test "codegen: alloc(N) emits page_allocator.alloc(u8, N) with OOM catch" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Emits page_allocator.alloc with OOM panic
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.alloc(u8, 1024)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@panic(\"OOM\")") != null);
+    // Verbatim call site survives.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "alloc(1024)") != null);
+    // Retired router emit surface is gone. NOTE: the preamble always
+    // contains the __zag_page_alloc helper body (`page_allocator.alloc`)
+    // and its own `@panic("__zag: page_alloc OOM")`, so the negatives
+    // pin the ROUTER's distinctive shapes: the arg-baked alloc call
+    // with the bare "OOM" message.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.alloc(u8, 1024)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@panic(\"OOM\")") == null);
+}
+
+test "codegen: alloc routes through @import+alias fallthrough (no builtin_alloc router)" {
+    // With `pub import std.mem.{alloc}`, the imports-loop Option A
+    // fallthrough emits `const __zag_imported_<i> = @import(
+    // "lib/std/mem.zag");` plus `const alloc = __zag_imported_<i>.alloc;`
+    // and the bare-name alloc(1024) call site is emitted verbatim.
+    // The real impl body (lib/std/mem.zag) does the
+    // __zag_page_alloc call at the .zag level.
+    const src =
+        \\pub import std.mem.{alloc}
+        \\fun main() {
+        \\    let buf: []u8 = alloc(1024);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"std/mem.zig\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const alloc = __zag_imported_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "alloc(1024)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.alloc(u8, 1024)") == null);
 }
 
 test "codegen: size_of(T) emits @sizeOf(T)" {
@@ -271,7 +311,14 @@ test "codegen: align_of(T) emits @alignOf(T)" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "@alignOf(f64)") != null);
 }
 
-test "codegen: panic(msg) emits __zag_panic_at" {
+test "codegen: panic call without std.debug import emits verbatim (router retired)" {
+    // v0.1 Tier-1 migration: the builtin_panic router row is retired
+    // — `panic("boom")` now falls through to the verbatim emit unless
+    // `pub import std.debug.{panic}` wires the @import+alias
+    // fallthrough (lib/std/debug.zag's real impl, backed by
+    // __zag_panic). This test pins the no-import fallback: the call
+    // site is emitted verbatim, and the retired router emit surface
+    // (__zag_panic_at + call-site location threading) is absent.
     const src = "fun main() { panic(\"boom\"); }\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -281,8 +328,47 @@ test "codegen: panic(msg) emits __zag_panic_at" {
     var cg = codegen_mod.Codegen.init();
     cg.source_path = "test.zag";
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_panic_at") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "test.zag") != null);
+    // Verbatim call site survives.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "panic(\"boom\")") != null);
+    // Retired router emit surface is gone. NOTE: the preamble always
+    // contains the __zag_panic_at / __zag_panic helper declarations,
+    // so the negative pins the ROUTER's distinctive call-site shape:
+    // `__zag_panic_at(<msg>, "<source_path>", ...)` with the threading
+    // of the call-site location. (The sourcemap's "test.zag" entries
+    // are unrelated to panic emit.)
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_panic_at(\"boom\"") == null);
+}
+
+test "codegen: panic routes through @import+alias fallthrough (no builtin_panic router)" {
+    // With `pub import std.debug.{panic}`, the imports-loop Option A
+    // fallthrough emits `const __zag_imported_<i> = @import(
+    // "lib/std/debug.zag");` plus `const panic = __zag_imported_<i>.panic;`
+    // and the bare-name panic("boom") call site is emitted verbatim.
+    // The real impl body (lib/std/debug.zag) posts the sentinel
+    // "<generated>" location through the __zag_panic shim — the
+    // location-accuracy trade-off vs the retired router is
+    // documented in lib/std/debug.zag.
+    const src =
+        \\pub import std.debug.{panic}
+        \\fun main() {
+        \\    panic("boom");
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    cg.source_path = "test.zag";
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"std/debug.zig\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const panic = __zag_imported_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "panic(\"boom\")") != null);
+    // Router call-site shape gone (preamble helper decls still exist;
+    // the sourcemap's "test.zag" entries are unrelated to panic emit).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_panic_at(\"boom\"") == null);
 }
 
 test "codegen: sourcemap emitted when expression has location" {

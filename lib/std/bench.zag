@@ -14,6 +14,7 @@ pub struct Counters {
 
 impl Counters {
     pub fun snapshot(self: *Counters) -> Counters {
+        _ = self;
         return Counters { bytes_live: 0, bytes_total: 0, allocations: 0 };
     }
 }

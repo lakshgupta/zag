@@ -12,7 +12,15 @@
 ##   fetch_add(ptr, val)           @atomicRmw(T, ptr, .Add, val, .seq_cst)
 ##   compare_exchange(ptr, o, n)   @cmpxchgStrong(T, ptr, o, n, ...)
 
-pub fun load(ptr: *i32) -> i32;
-pub fun store(ptr: *i32, val: i32);
-pub fun fetch_add(ptr: *i32, val: i32) -> i32;
-pub fun compare_exchange(ptr: *i32, old: i32, new: i32) -> i32;
+pub fun load(ptr: *i32) -> i32 {
+    return 0;
+}
+pub fun store(ptr: *i32, val: i32) {
+    return;
+}
+pub fun fetch_add(ptr: *i32, val: i32) -> i32 {
+    return 0;
+}
+pub fun compare_exchange(ptr: *i32, old: i32, new: i32) -> i32 {
+    return 0;
+}

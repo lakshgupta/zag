@@ -72,35 +72,6 @@ pub const BuiltinDispatch = enum {
     /// the loop is bounded.
     argv_get,
 
-    /// `env_var` -- emit a per-call blk wrapper that calls
-    /// `std.posix.system.getenv(<args[0]>)` and bridges the
-    /// `?[*:0]u8` libc surface to zag's `?[]const u8` shape via
-    /// `std.mem.span`. The blk-wrapped form lets the result variable
-    /// live across the explicit `if (...)|s|` arm's scope without
-    /// leaking the zig-typed `[*:0]u8` pointer into the zag call site's
-    /// expression context. `std.posix.system` aliases to `std.c`
-    /// when the build links libc (typical user-binary case), and to
-    /// `std.os.linux`/`std.os.windows`/etc. otherwise -- so the emit
-    /// compiles both with and without libc without an `-Dlibc` flag.
-    /// The `orelse null`-style handling is NOT used here because
-    /// `std.posix.system.getenv` returns `null` natively on unset
-    /// variables (matches `Option<None>` directly) -- the explicit
-    /// `if(...)|s|` arm avoids the `orelse`-on-non-optional-type
-    /// footgun that Phase 0 hit on the argv element type. Errors
-    /// are NOT bubbled; `env_var` is a convenience lookup, not a
-    /// control-flow primitive.
-    env_var,
-
-    /// `fs_read_file` -- Phase 2 real emit.
-    /// `fs_write_file` -- Phase 3 real emit (CLI migration). Bridges
-    /// cli.zag's `init` handler to a self-allocating write-loop on the
-    /// posix fd surface (no `Io` event-loop needed for write, only
-    /// for read in zig 0.16's retired `std.fs` layout). Returns i32:
-    /// 0 on success, -1 on any open/write failure. The 2-arity shape
-    /// matches the cli.zag call: `write_file(path_str, content_slice)`.
-    /// docblock mirrored in the table row below.
-    fs_write_file,
-
     /// `fs_mkdir` -- Phase 3 (CLI migration). Single-arg mkdir patterns
     /// the cli.zag `init <name>` semantics (mkdir -p: EEXIST silent,
     /// other errors surface as -1 from the call). docblock mirrored
@@ -115,19 +86,6 @@ pub const BuiltinDispatch = enum {
     /// place rather than re-implementing it in zag source).
     /// docblock mirrored in the table row below.
     process_exec,
-
-    /// `process_exit` -- Phase 3 (CLI migration). Lets cli.zag's
-    /// `cli_main() -> i32` exit code propagate through the zag-side
-    /// `exit(rc)` call instead of zig-side `std.process.exit`.
-    /// docblock mirrored in the table row below.
-    process_exit,
-
-    /// `builtin_alloc` — emit a per-call blk wrapper that calls
-    /// `std.heap.page_allocator.alloc(u8, N) catch @panic("OOM")`
-    /// and returns `[]u8` (heap-allocated byte slice, docs/19 §1).
-    /// The user MUST free with `free(buf)` when done. arity = 1:
-    /// only the `alloc(N)` one-arg form routes.
-    builtin_alloc,
 
     /// `builtin_size_of` — emit zig's `@sizeOf(T)` for compile-time
     /// type-size reflection. The single argument must be a type ident;
@@ -193,10 +151,6 @@ pub const BuiltinDispatch = enum {
     /// type reflection. arity = 1: `type_name(T)`.
     builtin_type_name,
 
-    /// `builtin_panic` — emit zig's `@panic(msg)` which prints a stack
-    /// trace in debug mode and aborts the program. arity = 1: `panic(msg)`.
-    builtin_panic,
-
     /// `string_with_capacity` — `String.with_capacity(n)` → `__zag_String.withCapacity(alloc, n)`.
     string_with_capacity,
 
@@ -204,9 +158,6 @@ pub const BuiltinDispatch = enum {
     writer_std_out,
     /// `writer_std_err` — `Writer.std_err()` → `__zag_Writer.stdErr()`.
     writer_std_err,
-
-    /// `time_now` — `now()` → `std.time.nanoTimestamp()` (i64 nanos since monotonic epoch).
-    time_now,
 
     /// Returns the zig name for a known zag String method.
     pub fn stringMethodZigName(zag_name: []const u8) ?[]const u8 {
@@ -282,56 +233,26 @@ pub const builtin_table = [_]BuiltinRoute{
     // silently routed to argv_get's emit shape and burned the
     // user's args).
     .{ .name = "get", .arity = 0, .receiver = null, .dispatch = .argv_get },
-    // Phase 1 second entry: `getEnv` (no-receiver free-fn form
-    // after `pub import std.env.{getEnv}` selective import) routes
-    // to the env_var dispatch which emits the bridge-blk around
-    // `std.posix.system.getenv(<args[0]>)`. arity = 1 is EXACT-match:
-    // only the `getEnv("NAME")` one-arg form routes; a future
-    // `getEnv("NAME", default_value)` widening would add a SECOND
-    // row with arity=2 rather than overloading this one, so the
-    // exact-arity contract is preserved per Phase 0's note.
-    //
-    // The naming is camelCase (`getEnv`, not `get_env` or `var`) per
-    // the user's explicit "we use camel case for methods" instruction
-    // at the time of Phase 1's planning. The prior docblock here
-    // named the placeholder entry "var"; the rename is purely
-    // docblock-facing -- the BuiltinDispatch variant stays `.env_var`
-    // because that name describes the WIRE to zig-side
-    // `std.posix.system.getenv`, which is independent of how the
-    // user-facing zag call name is spelled.
-    .{ .name = "getEnv", .arity = 1, .receiver = null, .dispatch = .env_var },
-    // Phase 3 (CLI migration): four additions that close the loop for
+    // Phase 3 (CLI migration): additions that close the loop for
     // cli.zag as the canonical CLI dispatcher. Each is additive —
-    // prior tests stay byte-identical because the existing argv_get /
-    // env_var rows are untouched. arity is exact-match
-    // per Phase 0's footgun note: a hypothetical `write_file(p)` (no
-    // content arg) would NOT route here, avoiding the silent-wrong-
-    // emit trap of the prior arity-wildcard design.
+    // prior tests stay byte-identical because the existing argv_get
+    // rows are untouched. arity is exact-match per Phase 0's
+    // footgun note.
     //
-    //   Note: `read_file` was retired as a builtin row in favour of
-    //   lib/std/fs.zag's real impl (backed by the __zag_posix
-    //   preamble family: __zag_openat / __zag_read / __zag_close).
-    //   `pub import std.fs.{read_file}` now emits the @import +
-    //   `const read_file = __zag_imported_<i>.read_file;` alias via
-    //   the imports loop's Option A fallthrough (see
-    //   src/codegen/core.zig's imports section), so the bare-name
-    //   `read_file(path)` call site is emitted verbatim. arity on
-    //   the user's call site is no longer a codegen-router
-    //   concern since no router arms consume it.
+    //   `read_file` / `write_file` / `exit` / `alloc` / `panic` /
+    //   `now` / `getEnv`(→get_env) were retired as builtin rows in
+    //   the v0.1 Tier-1 migration in favour of real lib/std .zag
+    //   impls backed by the __zag_posix preamble family (see
+    //   lib/std/{fs,env,process,time,mem,debug}.zag). Their call
+    //   sites now resolve through the @import+alias fallthrough in
+    //   src/codegen/core.zig's imports loop (Option A pass-through).
     //
-    //   `write_file`  arity=2  -> fs_write_file (path, content) -> i32
-    //                                          posix.openat + write loop
     //   `mkdir`       arity=1  -> fs_mkdir      (path)
     //                                          std.os.linux.mkdir via toPosixPath
     //   `exec`        arity=1  -> process_exec  (argv []const []const u8)
     //                                          fork + execve + waitpid
-    //   `exit`        arity=1  -> process_exit  (code: i32, clamped to u8)
-    //                                          std.os.linux.exit
-    .{ .name = "write_file", .arity = 2, .receiver = null, .dispatch = .fs_write_file },
     .{ .name = "mkdir", .arity = 1, .receiver = null, .dispatch = .fs_mkdir },
     .{ .name = "exec", .arity = 1, .receiver = null, .dispatch = .process_exec },
-    .{ .name = "exit", .arity = 1, .receiver = null, .dispatch = .process_exit },
-    .{ .name = "alloc", .arity = 1, .receiver = null, .dispatch = .builtin_alloc },
     .{ .name = "size_of", .arity = 1, .receiver = null, .dispatch = .builtin_size_of },
     .{ .name = "align_of", .arity = 1, .receiver = null, .dispatch = .builtin_align_of },
     .{ .name = "volatile_store", .arity = 2, .receiver = null, .dispatch = .builtin_volatile_store },
@@ -348,14 +269,11 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "assert", .arity = 1, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "assert", .arity = 2, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "type_name", .arity = 1, .receiver = null, .dispatch = .builtin_type_name },
-    .{ .name = "panic", .arity = 1, .receiver = null, .dispatch = .builtin_panic },
     // String type static method — receiver = "String" for dispatch
     .{ .name = "with_capacity", .arity = 1, .receiver = "String", .dispatch = .string_with_capacity },
     // Writer type static methods
     .{ .name = "std_out", .arity = 0, .receiver = "Writer", .dispatch = .writer_std_out },
     .{ .name = "std_err", .arity = 0, .receiver = "Writer", .dispatch = .writer_std_err },
-    // Time builtin
-    .{ .name = "now", .arity = 0, .receiver = null, .dispatch = .time_now },
 };
 
 /// Lookup a free-fn call: returns the dispatch if `<name>` with that

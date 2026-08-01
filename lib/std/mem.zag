@@ -1,0 +1,20 @@
+## std.mem — heap allocation primitives (docs/manual/20-memory.md).
+##
+## `alloc(N)` returns a heap-allocated byte slice backed by the
+## always-emitted `__zag_page_alloc` preamble helper
+## (src/codegen/core.zig → std.heap.page_allocator). The caller MUST
+## free with the `free` keyword (`defer free(buf)`), which emits the
+## matching `std.heap.page_allocator.free(buf)` for slice targets —
+## same allocator, so the ownership contract is unchanged from the
+## pre-migration shape.
+##
+## v0.1 Tier-1 migration: the pre-migration `builtin_alloc` router
+## row emitted `(std.heap.page_allocator.alloc(u8, N) catch
+## @panic("OOM"))` inline. Retired — this real .zag body is the
+## single source of truth. Callers must now `import std.mem.{alloc}`
+## (the bare-name router no longer rewrites the call site).
+
+pub fun alloc(n: usize) -> []u8 {
+    let p: *raw u8 = __zag_page_alloc(n);
+    return p[0..n];
+}

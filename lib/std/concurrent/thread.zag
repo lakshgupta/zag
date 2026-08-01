@@ -5,5 +5,9 @@
 ##   spawn(fn, args)   std.Thread.spawn(.{}, fn, args)
 ##   join(handle)      handle.join()
 
-pub fun spawn(fn: *raw c_void, args: ());
-pub fun join(handle: *i32);
+pub fun spawn(fn: *raw c_void, args: *raw c_void) -> i32 {
+    return 0;
+}
+pub fun join(handle: *i32) -> i32 {
+    return 0;
+}

@@ -71,6 +71,16 @@ pub const Codegen = struct {
     /// without a project root, and the inline preamble's `__zag_<Type>`
     /// entries keep working without it.
     ///
+    /// v0.1 Tier-1 migration follow-up: file mode now materialises the
+    /// stdlib next to the leaf zig (main.zig::leafProcess), so
+    /// `use_hybrid_stdlib` is set true in BOTH modes — the hybrid
+    /// preamble's `@import("std/<n>.zig")` lines resolve against the
+    /// materialised mirror in both layouts, and the `__zag_<Type>`
+    /// aliases (String/Writer/Error/…) rebind to the materialised
+    /// module types so a stdlib function returning `String` and a user
+    /// `import std.string.{String}` see the SAME zig type (no
+    /// inline-vs-imported split).
+    ///
     /// String/Writer are intentionally NOT moved: their inline preamble
     /// type definitions are referenced directly by zig source emitted from
     /// the codegen router arms in `src/codegen/expr.zig` (lines 1598,
@@ -82,6 +92,21 @@ pub const Codegen = struct {
     /// commit can move String/Writer once the router arms are rebased on
     /// the @imported module shape.
     use_hybrid_stdlib: bool = false,
+    /// Relative path prefix (from the generated zig file's directory to
+    /// the materialised `std/` mirror) used when emitting stdlib
+    /// `@import("<base><rel>.zig")` lines in the imports loop.
+    ///
+    /// v0.1 Tier-1 migration: the user-module emit sits at
+    /// `build/gen/main.zig` (project mode) or `<leaf>/main.zig` (file
+    /// mode) with the mirror one level down, so the default `"std/"`
+    /// resolves correctly in both layouts. Stdlib materialisation
+    /// (main.zig::materializeStdlib) transpiles each `lib/std/*.zag`
+    /// INTO the mirror itself, where sibling modules live in the same
+    /// directory — that pass sets this to `""` so
+    /// `import std.string.{String}` inside `lib/std/fs.zag` emits
+    /// `@import("string.zig")` (same-dir relative) instead of a
+    /// `std/`-prefixed path that would double-nest.
+    import_std_base: []const u8 = "std/",
     /// Per-function counter for destructuring temps. Reset to 0 by `genFun`
     /// so each `pub fn` body has its own `__destruct_0`, `__destruct_1`,
     /// ... sequence. Multiple destructurings in the same body produce
@@ -112,38 +137,6 @@ pub const Codegen = struct {
     /// existing counters here would create collisions with destructuring
     /// temps (`__destruct_<N>`) and `new` heap locals (`__p_<N>`).
     match_counter: u32,
-    /// Per-function counter for argv-slice temps emitted by the
-    /// `argv_get` builtin route (Phase 0 codegen router). Reset to 0
-    /// by `genFun` so each `pub fn` body has its own `__argv_<N>` /
-    /// Per-function counter for the env-result scratch variable
-    /// emitted by the `env_var` builtin route (Phase 1 codegen
-    /// router). Reset to 0 by `genFun` / `genMethod` /
-    /// `genFreeMethod` so each `pub fn` body has its own `__env_<N>`
-    /// sequence. Two getEnv calls in the same body produce
-    /// `__env_0` and `__env_1` so zig's no-redeclaration rule is
-    /// Per-function counter for the fs-write scratch namespace
-    /// emitted by the `fs_write_file` builtin route (Phase 3 CLI
-    /// migration). Reset to 0 by `genFun` / `genMethod` /
-    /// `genFreeMethod` so each `pub fn` body has its own `__wf_<N>_*`
-    /// sequence. Two write_file calls in the same body produce
-    /// `__wf_0_*` and `__wf_1_*` so zig's no-redeclaration rule is
-    /// satisfied across the per-call (fd, byte-count, ...) namespace.
-    /// The counter steps ONLY on the fs_write_file dispatch path.
-    /// Per-function counter for the mkdir scratch emitted by the
-    /// `fs_mkdir` builtin route (Phase 3 CLI migration). Reset to 0
-    /// by `genFun` / `genMethod` / `genFreeMethod` so each fn body
-    /// has its own `__mk_<N>_z` slot. Two mkdir calls in the same
-    /// body produce `__mk_0_z` and `__mk_1_z` so zig's
-    /// no-redeclaration rule is satisfied across the toPosixPath
-    /// scratch variable.
-    /// Per-function counter for the exec scratch namespace emitted
-    /// by the `process_exec` builtin route (Phase 3 CLI migration).
-    /// Reset to 0 by `genFun` / `genMethod` / `genFreeMethod` so
-    /// each fn body has its own `__exec_<N>_*` sequence. The
-    /// execution shape stacks several local vars per call
-    /// (arg_bufs, argv_z, env_buf, envp_z, pid, status) so a
-    /// fresh namespace per call avoids zig's no-redeclaration
-    /// rejection on sibling `exec` calls.
     /// Per-function flag: true when the currently-walked function body
     /// has a non-void return type (only relevant for impl-block methods
     /// because top-level `pub fun` declarations ALWAYS emit
@@ -158,6 +151,16 @@ pub const Codegen = struct {
     /// Per-function counter for labeled blocks (`blk: { ... }`).
     /// Reset to 0 by genFun/genMethod so each fn body has unique
     /// `__blk_0`, `__blk_1`, ... labels (zig rejects duplicate labels).
+    ///
+    /// NOTE (v0.1 Tier-1 migration): the Phase 0-3 router counters
+    /// (argv_counter, env_counter, write_file_counter, mkdir_counter,
+    /// exec_counter) have ALL been retired — the remaining routed
+    /// dispatches either reference a module-level global (`.argv_get`
+    /// → `__zag_argv`, no per-call temp) or emit self-contained
+    /// inline `blk:` expressions (`.fs_mkdir`, `.process_exec`) with
+    /// no temp names that can collide. Only `alloc_counter`
+    /// (`new`-heap-local temps) and `destructure_counter` /
+    /// `match_counter` / `blk_counter` remain live.
     blk_counter: u32 = 0,
     /// Tracked trait-decl names (Phase 3 trait-cast, docs/17 §"Using
     /// Traits"): populated at `generate()` entry from `prog.traits`
@@ -268,6 +271,7 @@ pub const MapEntry = struct {
 
 
     pub const collectTypedBindings = @import("stmt.zig").collectTypedBindings;
+    pub const collectNestedBindings = @import("stmt.zig").collectNestedBindings;
     pub const emitPatternCond = @import("stmt.zig").emitPatternCond;
     pub const genArrayLit = @import("primary.zig").genArrayLit;
     pub const genBinding = @import("stmt.zig").genBinding;
@@ -303,6 +307,7 @@ pub const MapEntry = struct {
     pub const init = @import("core.zig").init;
     pub const isClosureBound = @import("core.zig").isClosureBound;
     pub const isFloatIdentType = @import("core.zig").isFloatIdentType;
+    pub const isIntTypeName = @import("core.zig").isIntTypeName;
     pub const isTrackedTrait = @import("core.zig").isTrackedTrait;
     pub const getSourceTypeName = @import("core.zig").getSourceTypeName;
     // Canonical `with Trait (m)` dispatch (docs/17 §"Diamond
@@ -613,11 +618,14 @@ pub const MapEntry = struct {
             // because it's assigned at runtime from init.io.
             \\var __zag_io: std.Io = undefined;
             \\
-            \\// Zag panic routing — zig safety checks (OOB, overflow, etc.) use
-            \\// zig's default panic handler which prints a full stack trace with
-            \\// file:line info.  Explicit `panic(msg)` calls in zag source use
-            \\// __zag_panic_at below for zag-source file:line:col locations.
-            \\pub const panic = std.debug.FullPanic(std.debug.defaultPanic);
+            \\// Zig safety checks (OOB, overflow, etc.) use zig's default
+            \\// panic handler (no explicit `pub const panic` override — the
+            \\// pre-Tier-1 `pub const panic = std.debug.FullPanic(...)` shim
+            \\// was retired because it collides with the migrated
+            \\// `import std.debug.{panic}` alias at user-module scope).
+            \\// Explicit `panic(msg)` calls in zag source route through
+            \\// lib/std/debug.zag → __zag_panic below for zag-source
+            \\// file:line:col locations.
             \\
             \\// Zag panic helper — prints a panic message with zag source location.
             \\// Called by `panic(msg)` builtin. Writes to stderr and calls @trap().
@@ -630,16 +638,20 @@ pub const MapEntry = struct {
             \\    @trap();
             \\}
             \\
-            \\            \\n// Zag panic shim - 1-arg convenience over __zag_panic_at.
-            \\nCalled by panic("...") .zag builtin emit (e.g. from
-            \\nlib/std/string.zag's impl block panic sites). Posts a
-            \\nsentinel "<generated>" file + zero line/col so the
-            \\nstderr trace lands without a bogus location. Shim exists
-            \\nso .zag impl blocks can use canonical panic(msg) shape
-            \\nwithout threading file / line / col through every site.
-            \\nfn __zag_panic(msg: []const u8) noreturn {
-            \\n__zag_panic_at(msg, "<generated>", 0, 0);
-            \\n}
+            \\// Zag panic shim - 1-arg convenience over __zag_panic_at.
+            \\// Called by lib/std/debug.zag's panic() real impl (v0.1
+            \\// Tier-1 migration, replaces the retired builtin_panic
+            \\// router) and by lib/std/string.zag's impl block panic
+            \\// sites. Posts a sentinel "<generated>" file + zero
+            \\// line/col so the stderr trace lands without a bogus
+            \\// location. Shim exists so .zag impl blocks can use the
+            \\// canonical panic(msg) shape without threading file /
+            \\// line / col through every site — the location accuracy
+            \\// trade-off vs the old router emit (which knew the call
+            \\// site) is documented in lib/std/debug.zag.
+            \\fn __zag_panic(msg: []const u8) noreturn {
+            \\    __zag_panic_at(msg, "<generated>", 0, 0);
+            \\}
 // v0.1 stdlib migration (String/Writer follow-up commit):
             \\// small primitive family referenced by both the inline
             \\// `__zag_String_inline` / `__zag_Writer_inline` method
@@ -701,14 +713,18 @@ pub const MapEntry = struct {
             \\// this function shadows the inline decl at user-module
             \\// level; the inline decl survives as a file-mode
             \\// fallback when there's no project root to materialise
-            \\// from).
+            \\// from). The `with_capacity` param is named `allocator`
+            \\// (not `alloc`) so a user-module `import std.mem.{alloc}`
+            \\// alias at module scope doesn't trigger zig 0.16's
+            \\// strict-shadow error on the param (surfaced by the
+            \\// Tier-1 mem.zag migration).
             \\const __zag_String_inline = struct {
             \\    ptr: [*]u8,
             \\    len: usize,
             \\    cap: usize,
             \\
-            \\    pub fn with_capacity(alloc: std.mem.Allocator, capacity: usize) @This() {
-            \\        const buf = alloc.alloc(u8, capacity) catch @panic("String: out of memory");
+            \\    pub fn with_capacity(allocator: std.mem.Allocator, capacity: usize) @This() {
+            \\        const buf = allocator.alloc(u8, capacity) catch @panic("String: out of memory");
             \\        return .{ .ptr = buf.ptr, .len = 0, .cap = capacity };
             \\    }
             \\
@@ -855,19 +871,22 @@ pub const MapEntry = struct {
             \\// (project is Linux-first per AGENTS.md).
             \\
             \\// __zag_openat — raw `openat(2)`. Returns fd on
-            \\// success, errno-encoded usize on failure.
+            \\// success, errno-encoded usize on failure. zig 0.16's
+            \\// `std.os.linux.openat` takes the packed-bitfield
+            \\// `os.linux.O` flags type (not a bare u32), so the
+            \\// helper bitcasts the raw flag word at the boundary.
             \\fn __zag_openat(dirfd: i32, path: [*:0]const u8, flags: u32, mode: u32) usize {
-            \\    return std.os.linux.openat(dirfd, path, flags, mode);
+            \\    return std.os.linux.openat(dirfd, path, @bitCast(flags), @intCast(mode));
             \\}
             \\// __zag_read — raw `read(2)`. Returns bytes read
             \\// (partial reads possible) or -1.
-            \\fn __zag_read(fd: i32, buf: [*]u8, len: usize) isize {
-            \\    return std.os.linux.read(fd, buf, len);
+            \\fn __zag_read(fd: i32, buf: []u8, len: usize) isize {
+            \\    return @bitCast(std.os.linux.read(fd, buf.ptr, len));
             \\}
             \\// __zag_write — raw `write(2)`. Returns bytes
             \\// written (partial writes possible) or -1.
-            \\fn __zag_write(fd: i32, buf: [*]const u8, len: usize) isize {
-            \\    return std.os.linux.write(fd, buf, len);
+            \\fn __zag_write(fd: i32, buf: []const u8, len: usize) isize {
+            \\    return @bitCast(std.os.linux.write(fd, buf.ptr, len));
             \\}
             \\// __zag_close — raw `close(2)`. Returns 0 on
             \\// success, errno-encoded usize on failure.
@@ -883,9 +902,12 @@ pub const MapEntry = struct {
             \\}
             \\// __zag_clock_gettime — ns since clock-id epoch
             \\// (CLOCK_REALTIME=0, CLOCK_MONOTONIC=1 on Linux).
+            \\// zig 0.16's `std.os.linux.clock_gettime` takes the
+            \\// `clockid_t` enum, so the helper casts the i32 at the
+            \\// boundary.
             \\fn __zag_clock_gettime(clockid: i32) i64 {
             \\    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-            \\    _ = std.os.linux.clock_gettime(clockid, &ts);
+            \\    _ = std.os.linux.clock_gettime(@enumFromInt(clockid), &ts);
             \\    return @as(i64, ts.sec) * 1_000_000_000 + @as(i64, ts.nsec);
             \\}
             \\// __zag_getcwd — CWD written into a 4096-byte static
@@ -904,18 +926,26 @@ pub const MapEntry = struct {
             \\// versions and zig 0.16 has no libc-getenv bridge at
             \\// all). Reads env fresh on each call; hot-path callers
             \\// should cache. Returns the value slice (without the
-            \\// NUL) or null when unset.
-            \\const __zag_env_buf: [32768]u8 = undefined;
-            \\fn __zag_getenv(name: [*:0]const u8) ?[]const u8 {
+            \\// NUL) or null when unset. Takes `[]const u8` (not a
+            \\// sentinel-terminated pointer) so the lib/std/env.zag
+            \\// call site passes `name` directly — no `&buf[0] as
+            \\// [*:0]const u8` cast at the zag level (a single
+            \\// pointer cannot @as-cast into a many-pointer in zig
+            \\// 0.16; surfaced by the Tier-1 env.zag migration).
+            \\var __zag_env_buf: [32768]u8 = undefined;
+            \\// (`var` not `const` so `__zag_env_buf[0..].ptr` is
+            \\// `[*]u8` — a const buffer yields `[*]const u8`, which
+            \\// __zag_read's `[*]u8` buf param rejects)
+            \\fn __zag_getenv(name: []const u8) ?[]const u8 {
             \\    const fd_raw = __zag_openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
             \\    const fd_signed: isize = @bitCast(fd_raw);
             \\    if (fd_signed < 0) return null;
             \\    const fd: i32 = @intCast(fd_signed);
             \\    defer _ = __zag_close(fd);
-            \\    const n = __zag_read(fd, __zag_env_buf[0..].ptr, __zag_env_buf.len);
+            \\    const n = __zag_read(fd, __zag_env_buf[0..], __zag_env_buf.len);
             \\    if (n <= 0) return null;
             \\    const env_len: usize = @intCast(n);
-            \\    const name_len = std.mem.len(name);
+            \\    const name_len = name.len;
             \\    if (name_len == 0) return null;
             \\    var i: usize = 0;
             \\    while (i < env_len) {
@@ -1100,8 +1130,24 @@ pub const MapEntry = struct {
                         // Fast path: every selector maps to a
                         // preamble type — no @import line needed
                         // (preserves the pre-migration behaviour
-                        // byte-for-byte).
-                        if (!any_needs_import) {
+                        // byte-for-byte). User-module modes only
+                        // (import_std_base = "std/"): in MATERIALIZED
+                        // std files (import_std_base = "") the
+                        // preamble types are the inline per-file
+                        // copies, so aliasing `String` to
+                        // `__zag_String` would produce a DIFFERENT
+                        // type than the user module's `String`
+                        // (rebound to `@import("std/string.zig").String`
+                        // in the hybrid block above) — read_file
+                        // returning the inline String would fail the
+                        // user's `let s: String = read_file(...)`
+                        // binding (Tier-1 migration surfaced this on
+                        // examples exercising fs.read_file). The
+                        // materialized files fall through to the slow
+                        // path, which emits the same-dir
+                        // `@import("string.zig")` and yields the
+                        // shared real String type.
+                        if (!any_needs_import and self.import_std_base.len > 0) {
                             for (imp.selectors) |sel| {
                                 const preamble_name = stdlibPreambleName(sel.name);
                                 const user_name = sel.alias orelse sel.name;
@@ -1119,20 +1165,49 @@ pub const MapEntry = struct {
                         // case for std.fs.{read_file}). Emit the
                         // @import preamble ONCE, then per-selector
                         // emit chooses the right bridge.
+                        //
+                        // v0.1 Tier-1 migration: the import path is
+                        // rewritten from the KNOWN_STD_MODULES
+                        // `lib/std/<rel>.zag` shape into the
+                        // materialised-mirror shape
+                        // `<import_std_base><rel>.zig` (e.g.
+                        // `std/fs.zig` from build/gen/main.zig,
+                        // `string.zig` from inside the mirror
+                        // itself). `lib/std/*.zag` files are never
+                        // directly @importable — zig resolves the
+                        // emitted path relative to the generated
+                        // module's directory, and only the
+                        // materialised `.zig` copies live there.
+                        const rel_start = "lib/std/".len;
+                        if (resolved_path.len <= rel_start) continue;
+                        const rel_path = resolved_path[rel_start..];
+                        const zig_ext_start = if (std.mem.endsWith(u8, rel_path, ".zag"))
+                            rel_path.len - ".zag".len
+                        else
+                            rel_path.len;
                         self.write("const __zag_imported_");
                         var idx_buf: [16]u8 = undefined;
                         const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{import_i}) catch "X";
                         self.write(idx_str);
                         self.write(" = @import(\"");
-                        self.write(resolved_path);
-                        self.write("\");\n");
+                        self.write(self.import_std_base);
+                        self.write(rel_path[0..zig_ext_start]);
+                        self.write(".zig\");\n");
                         for (imp.selectors) |sel| {
                             const preamble_name = stdlibPreambleName(sel.name);
                             const user_name = sel.alias orelse sel.name;
-                            if (preamble_name.len > 0) {
+                            if (preamble_name.len > 0 and self.import_std_base.len > 0) {
                                 // Known-preamble-name: alias directly
                                 // to the preamble type (no need to
                                 // plumb through __zag_imported_<i>).
+                                // User-module modes only — in
+                                // materialized std files
+                                // (import_std_base = "") the
+                                // preamble-name alias would point at
+                                // the per-file inline type, breaking
+                                // cross-module type identity (see the
+                                // fast-path docblock above); those
+                                // files alias through the @import.
                                 self.write("const ");
                                 self.write(user_name);
                                 self.write(" = ");
@@ -1626,6 +1701,21 @@ pub const MapEntry = struct {
         return std.mem.eql(u8, type_name, "f64") or
             std.mem.eql(u8, type_name, "f32") or
             std.mem.eql(u8, type_name, "f16");
+    }
+
+    pub     fn isIntTypeName(type_name: []const u8) bool {
+        // zig int-family type names. `usize` / `isize` are arch-sized
+        // ints; `i8..i64` / `u8..u64` are the fixed-width families.
+        return std.mem.eql(u8, type_name, "usize") or
+            std.mem.eql(u8, type_name, "isize") or
+            std.mem.eql(u8, type_name, "i8") or
+            std.mem.eql(u8, type_name, "i16") or
+            std.mem.eql(u8, type_name, "i32") or
+            std.mem.eql(u8, type_name, "i64") or
+            std.mem.eql(u8, type_name, "u8") or
+            std.mem.eql(u8, type_name, "u16") or
+            std.mem.eql(u8, type_name, "u32") or
+            std.mem.eql(u8, type_name, "u64");
     }
 
     pub     fn isClosureBound(self: *Codegen, name: []const u8) bool {

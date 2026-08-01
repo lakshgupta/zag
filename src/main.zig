@@ -152,6 +152,18 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "debug")) {
         return try cmdDebug(args);
     }
+    if (std.mem.eql(u8, cmd, "pkg")) {
+        return try cmdPkg(args);
+    }
+    if (std.mem.eql(u8, cmd, "install")) {
+        return try cmdInstall(args);
+    }
+    if (std.mem.eql(u8, cmd, "update")) {
+        return try cmdUpdate(args);
+    }
+    if (std.mem.eql(u8, cmd, "remove")) {
+        return try cmdRemove(args);
+    }
     if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "test")) {
         if (args.len >= 3 and hasZagExt(args[2])) {
             resolveZigPath(null);
@@ -401,7 +413,7 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     // generated zig's `@import("std/<n>.zig")` lines (emitted by
     // Codegen's hybrid preamble when `use_hybrid_stdlib = true`)
     // resolve at compile time.
-    materializeStdlib();
+    materializeStdlib("build/gen");
 
     // Discover modules and transpile each
     const modules = project_mod.discoverModules();
@@ -533,7 +545,7 @@ fn generateProjectFiles() !void {
     // v0.1 stdlib migration hybrid: same as projectCmd — materialise
     // lib/std/*.zag to build/gen/std/*.zig so the `zag generate`
     // output directory is consistent with `zag build`.
-    materializeStdlib();
+    materializeStdlib("build/gen");
 
     const modules = project_mod.discoverModules();
     const has_main = for (modules) |m| {
@@ -650,6 +662,10 @@ fn usage() void {
     std.debug.print("  zag build [<file.zag>] [--release] [-o <path>] Compile to binary\n", .{});
     std.debug.print("  zag debug [<file.zag>]             Build and debug with gdb\n", .{});
     std.debug.print("  zag generate [-o <dir>]            Transpile to zig project\n", .{});
+    std.debug.print("  zag pkg add <url> [--rev|--branch|--version] [--save-dev]   Add a dep\n", .{});
+    std.debug.print("  zag remove <name>                  Remove a dep, rewrite zag.toml + zag.lock\n", .{});
+    std.debug.print("  zag install [--gc]                 Materialize deps in deps/\n", .{});
+    std.debug.print("  zag update                         Re-resolve git-source deps + rewrite both files\n", .{});
     std.debug.print("  zag test [<file.zag>]              Run tests in a file or project\n", .{});
     std.debug.print("  zag init [<dir>]                   Create a new Zag project\n", .{});
     std.debug.print("  zag version                        Print version information\n", .{});
@@ -667,13 +683,40 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
     }
 
     const pid_num = std.os.linux.getpid();
-    var path_leaf_zig: [64]u8 = undefined;
-    var path_leaf_bin: [64]u8 = undefined;
-    const f_zig = std.fmt.bufPrint(&path_leaf_zig, "/tmp/zag_leaf_{d}.zig", .{pid_num}) catch "/tmp/zag_leaf.zig";
+    // v0.1 Tier-1 migration: the leaf zig lands in its own directory
+    // (`/tmp/zag_leaf_<pid>/main.zig`) with the materialised stdlib
+    // mirror next to it (`/tmp/zag_leaf_<pid>/std/*.zig`). The
+    // generated `@import("std/<rel>.zig")` lines resolve relative to
+    // the importing file's directory, so the mirror MUST sit one
+    // level down from main.zig for the "std/" import prefix to hit —
+    // the old flat `/tmp/zag_leaf_<pid>.zig` layout had no such
+    // sibling directory and every stdlib import failed with "no
+    // module named 'lib/std/<rel>.zag'".
+    var leaf_dir_buf: [64]u8 = undefined;
+    var leaf_dir_z: [64:0]u8 = undefined;
+    const leaf_dir = std.fmt.bufPrint(&leaf_dir_buf, "/tmp/zag_leaf_{d}", .{pid_num}) catch "/tmp/zag_leaf";
+    if (leaf_dir.len >= leaf_dir_z.len) std.process.exit(1);
+    @memcpy(leaf_dir_z[0..leaf_dir.len], leaf_dir);
+    leaf_dir_z[leaf_dir.len] = 0;
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, &leaf_dir_z, 0o755);
+    var path_leaf_zig: [80]u8 = undefined;
+    var path_leaf_bin: [80]u8 = undefined;
+    const f_zig = std.fmt.bufPrint(&path_leaf_zig, "/tmp/zag_leaf_{d}/main.zig", .{pid_num}) catch "/tmp/zag_leaf/main.zig";
     const f_bin = std.fmt.bufPrint(&path_leaf_bin, "/tmp/zag_leaf_{d}_bin", .{pid_num}) catch "/tmp/zag_leaf_bin";
 
+    // v0.1 Tier-1 migration: file mode materialises the stdlib mirror
+    // into the leaf directory so stdlib `@import` lines resolve.
+    // Enabling the hybrid preamble (`use_hybrid = true` below) rebinds
+    // the `__zag_<Type>` aliases (String/Writer/Error/…) to the
+    // materialised module types, so a stdlib function returning
+    // `String` and a user `import std.string.{String}` resolve to the
+    // SAME zig type — with the legacy inline aliases they'd be two
+    // distinct types and every cross-module String call would
+    // compile-error.
+    materializeStdlib(leaf_dir);
+
     const source = try readFile(src);
-    const result = try transpile(src, source, false);
+    const result = try transpile(src, source, true);
     try writeFile(f_zig, result.zig);
 
     if (std.mem.eql(u8, flag, "test")) {
@@ -852,86 +895,179 @@ fn writeFile(path: []const u8, content: []const u8) !void {
     }
 }
 
-/// Materialize lib/std/{error,fmt,time,atomic,bench}.zag →
-/// build/gen/std/*.zig at the start of project-mode dispatch. The
-/// hybrid preamble in `src/codegen/core.zig::generate()` (gated by
-/// `use_hybrid_stdlib` on Codegen, set here via the `use_hybrid`
-/// parameter on `transpile`) emits `@import("std/<n>.zig")` lines
-/// that resolve against the files written by this step.
+/// Materialize lib/std/*.zag → <out_dir>/std/*.zig so the generated
+/// zig's `@import("std/<rel>.zig")` lines resolve at compile time.
+/// Called at the start of project-mode dispatch (out_dir = "build/gen")
+/// and file-mode leaf compilation (out_dir = "/tmp/zag_leaf_<pid>").
 ///
-/// v0.1 hardcodes the migrated list. A Phase 2 should derive this
-/// from a manifest so future lib/std additions don't require
-/// main.zig touch-ups. Each file is fully re-emitted per zag
-/// invocation (~5 small files, ~few-ms cost); mtime-based skipping
-/// is a Phase 2 optimisation.
+/// v0.1 Tier-1 migration: the prior hardcoded 6-module list is
+/// replaced by a recursive walk over the resolved stdlib root — any
+/// `lib/std/**/*.zag` file (except the `mod.zag` barrel) gets
+/// transpiled into the mirror at the same relative path with a .zig
+/// extension, so future lib/std additions need no main.zig touch-ups
+/// (the "Phase 2 manifest" the old docblock deferred to).
 ///
-/// Silently no-ops if lib/std cannot be read or one of the migrated
-/// modules is missing (skips-on-missing-fixture convention used
+/// The stdlib root is resolved 3-tier (documented intent in
+/// scripts/install-local.sh, which copies lib/std/ to $ZAG_HOME/lib/std/):
+///   1. cwd-relative `lib/std/`  — in-tree development workflow
+///   2. `$ZAG_HOME/lib/std/`     — install-local.sh installation
+///   3. `$HOME/.local/share/zag/lib/std/` — future distro-package path
+///
+/// The stdlib materialisation itself uses the legacy inline preamble
+/// path (use_hybrid = false, import_std_base = ""). Embedding the hybrid
+/// rebindings inside the stdlib materialisation would create
+/// a chicken-and-egg (those rebindings reference
+/// `build/gen/std/*.zig` from a context where the on-disk
+/// files don't exist — the codegen output is in flight).
+/// Inlining the original preamble on this code-path keeps
+/// the dependency graph acyclic. import_std_base = "" makes sibling
+/// module imports inside the mirror emit same-dir paths
+/// (`@import("string.zig")` from fs.zig), which resolve against the
+/// mirror's own layout.
+///
+/// Silently no-ops if lib/std cannot be located or a module fails to
+/// parse/transpile (skips-on-missing-fixture convention used
 /// elsewhere in the test runners — callers keep going without
 /// stderr complaints).
-///
-/// The hybrid preamble that consumes these files leaves String and
-/// Writer INLINE in `src/codegen/core.zig` (per `use_hybrid_stdlib`'s
-/// docblock); the migrated zig files DO emit working String/Writer
-/// `pub const` declarations, but the user-facing alias name is
-/// wired directly to the inline preamble by stdlibPreambleName. A
-/// follow-up commit can reconcile by routing the user-importable
-/// Name through `@import("std/string.zig")` once the
-/// `String`/`Writer` callsites in `src/codegen/expr.zig` are
-/// rewritten to use the @imported module path.
-fn materializeStdlib() void {
-    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build", 0o755);
-    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "build/gen", 0o755);
-    var mkdir_buf: [256]u8 = undefined;
-    @memcpy(mkdir_buf[0..13], "build/gen/std");
-    mkdir_buf[13] = 0;
-    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&mkdir_buf), 0o755);
+fn materializeStdlib(out_dir: []const u8) void {
+    var root_buf: [512]u8 = undefined;
+    const root_path = resolveStdlibRoot(&root_buf) orelse return;
 
-    // v0.1 stdlib migration (String/Writer follow-up commit): the
-    // list extends from the prior commit's 5 modules to 7 — `string`
-    // and `fmt` migrated now that the inline preamble no longer
-    // hard-codes their type definitions (see `__zag_String_inline` /
-    // `__zag_Writer_inline` rename in `src/codegen/core.zig`).
-    // `__zag_page_alloc` family helpers and `__zag_fd_write` /
-    // `__zag_memcpy` are emitted as preamble always (file mode +
-    // hybrid mode) so the migrated impl blocks can express generic
-    // heap-alloc / fd-write primitives without dropping into raw
-    // zig. See `codegen::core::generate()` preamble for the emit.
-    // v0.1 stdlib migration follow-up commit (String/Writer): extend
-    // the list from 5 modules to 6 (the prior commit added `fmt`;
-    // the follow-up adds `string` so the @imported `String` rebinding
-    // resolves at compile time). `__zag_page_alloc` family helpers
-    // and `__zag_fd_write` / `__zag_memcpy` are emitted as preamble
-    // always (file mode + hybrid mode) so the migrated impl blocks
-    // can express generic heap-alloc / fd-write primitives without
-    // dropping into raw zig. See codegen::core::generate() preamble.
-    const modules = [_][]const u8{ "error", "fmt", "time", "atomic", "bench", "string" };
-    for (modules) |name| {
-        var src_buf: [256]u8 = undefined;
-        const src_path = std.fmt.bufPrint(&src_buf, "lib/std/{s}.zag", .{name}) catch continue;
-        const source = readFile(src_path) catch continue;
+    var out_std_buf: [520]u8 = undefined;
+    const out_std = std.fmt.bufPrint(&out_std_buf, "{s}/std", .{out_dir}) catch return;
+    var out_std_z: [520:0]u8 = undefined;
+    if (out_std.len >= out_std_z.len) return;
+    @memcpy(out_std_z[0..out_std.len], out_std);
+    out_std_z[out_std.len] = 0;
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, &out_std_z, 0o755);
 
-        var l = lexer_mod.Lexer.init(source);
-        const tokens = l.tokenize();
-        var arena = ast.Arena.init();
-        var p = parser_mod.Parser.init(tokens, &arena);
-        const prog = p.parse();
-        var cg = codegen_mod.Codegen.init();
-        cg.source_path = src_path;
-        // The stdlib materialisation itself uses the legacy inline
-        // preamble path (use_hybrid = false). Embedding the hybrid
-        // rebindings inside the stdlib materialisation would create
-        // a chicken-and-egg (those rebindings reference
-        // `build/gen/std/*.zig` from a context where the on-disk
-        // files don't exist — the codegen output is in flight).
-        // Inlining the original preamble on this code-path keeps
-        // the dependency graph acyclic.
-        const zig = cg.generate(prog);
+    var root_fd_z: [512:0]u8 = undefined;
+    if (root_path.len >= root_fd_z.len) return;
+    @memcpy(root_fd_z[0..root_path.len], root_path);
+    root_fd_z[root_path.len] = 0;
+    const root_fd = posix.openatZ(posix.AT.FDCWD, &root_fd_z, .{ .ACCMODE = .RDONLY }, 0) catch return;
+    defer _ = std.os.linux.close(root_fd);
 
-        var dst_buf: [256]u8 = undefined;
-        const dst_path = std.fmt.bufPrint(&dst_buf, "build/gen/std/{s}.zig", .{name}) catch continue;
-        writeFile(dst_path, zig) catch continue;
+    materializeWalk(root_fd, root_path, "", out_dir);
+}
+
+/// Recursive stdlib walker — one getdents64 batch per syscall, then
+/// per-dirent `d_reclen` offset iteration (same discipline as
+/// project.zig::walkSrcTree). For every `*.zag` file (except the
+/// `mod.zag` barrel at the top level) transpiles it into
+/// `<out_dir>/std/<rel>.zig` with a self-contained inline preamble
+/// (use_hybrid = false) and same-dir sibling imports
+/// (import_std_base = "").
+fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8, out_dir: []const u8) void {
+    // `align(8)` on the batch buffer: the getdents64 dirent stream is
+    // 8-byte-aligned, so every `d_reclen` offset stays aligned only if
+    // the BASE is. Without it, the @alignCast(&buf[pos]) below trips
+    // "incorrect alignment" in Debug when the stack happens to hand
+    // out a misaligned buffer.
+    var buf: [4096]u8 align(8) = undefined;
+    while (true) {
+        const n = std.os.linux.getdents64(root_fd, &buf, buf.len);
+        if (n == 0) break;
+        if (n > std.math.maxInt(isize)) break;
+
+        var pos: usize = 0;
+        while (pos < n) {
+            const entry: *const std.os.linux.dirent64 = @ptrCast(@alignCast(&buf[pos]));
+            pos += entry.reclen;
+
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.name)));
+            const name = name_z[0..name_z.len];
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (name[0] == '.') continue;
+
+            if (entry.type == std.os.linux.DT.DIR) {
+                var child_rel_buf: [512]u8 = undefined;
+                const child_rel: []const u8 = if (rel_to_root.len == 0)
+                    std.fmt.bufPrint(&child_rel_buf, "{s}", .{name}) catch continue
+                else
+                    std.fmt.bufPrint(&child_rel_buf, "{s}/{s}", .{ rel_to_root, name }) catch continue;
+
+                var child_path_buf: [1024]u8 = undefined;
+                const child_path = std.fmt.bufPrint(&child_path_buf, "{s}/{s}", .{ root_path, child_rel }) catch continue;
+                const child_fd = posix.openat(posix.AT.FDCWD, child_path, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+                // Mirror the subdirectory into <out_dir>/std/<child_rel>.
+                var mir_rel_buf: [1024]u8 = undefined;
+                const mir_rel = std.fmt.bufPrint(&mir_rel_buf, "{s}/std/{s}", .{ out_dir, child_rel }) catch continue;
+                var mir_z: [1024:0]u8 = undefined;
+                if (mir_rel.len < mir_z.len) {
+                    @memcpy(mir_z[0..mir_rel.len], mir_rel);
+                    mir_z[mir_rel.len] = 0;
+                    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, &mir_z, 0o755);
+                }
+                materializeWalk(child_fd, root_path, child_rel, out_dir);
+                _ = std.os.linux.close(child_fd);
+            } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
+                // The barrel (mod.zag) is user-facing only — it would
+                // drag every std module into a single self-importing
+                // file; skip it in the mirror.
+                if (rel_to_root.len == 0 and std.mem.eql(u8, name, "mod.zag")) continue;
+
+                var src_path_buf: [1024]u8 = undefined;
+                const src_path = if (rel_to_root.len == 0)
+                    std.fmt.bufPrint(&src_path_buf, "{s}/{s}", .{ root_path, name }) catch continue
+                else
+                    std.fmt.bufPrint(&src_path_buf, "{s}/{s}/{s}", .{ root_path, rel_to_root, name }) catch continue;
+                const source = readFile(src_path) catch continue;
+
+                var l = lexer_mod.Lexer.init(source);
+                const tokens = l.tokenize();
+                var arena = ast.Arena.init();
+                var p = parser_mod.Parser.init(tokens, &arena);
+                const prog = p.parse();
+                var cg = codegen_mod.Codegen.init();
+                cg.source_path = src_path;
+                // Self-contained preamble (see materializeStdlib
+                // docblock for the chicken-and-egg rationale).
+                cg.use_hybrid_stdlib = false;
+                // Sibling imports inside the mirror are same-dir.
+                cg.import_std_base = "";
+                const zig = cg.generate(prog);
+
+                var dst_path_buf: [1024]u8 = undefined;
+                const dst_path = std.fmt.bufPrint(&dst_path_buf, "{s}/std/{s}{s}{s}.zig", .{
+                    out_dir,
+                    if (rel_to_root.len == 0) "" else rel_to_root,
+                    if (rel_to_root.len == 0) "" else "/",
+                    name[0 .. name.len - ".zag".len],
+                }) catch continue;
+                writeFile(dst_path, zig) catch continue;
+            }
+        }
     }
+}
+
+/// 3-tier stdlib root resolution (see materializeStdlib docblock):
+/// cwd-relative lib/std/ → $ZAG_HOME/lib/std/ → $HOME/.local/share/zag/lib/std/.
+fn resolveStdlibRoot(buf: []u8) ?[]const u8 {
+    if (dirExists("lib/std")) {
+        return "lib/std";
+    }
+    if (env_path.getenv("ZAG_HOME")) |home| {
+        const p = std.fmt.bufPrint(buf, "{s}/lib/std", .{home}) catch return null;
+        if (dirExists(p)) return p;
+    }
+    if (env_path.getenv("HOME")) |home| {
+        const p = std.fmt.bufPrint(buf, "{s}/.local/share/zag/lib/std", .{home}) catch return null;
+        if (dirExists(p)) return p;
+    }
+    return null;
+}
+
+/// Directory-existence probe (open + close; no stat needed).
+fn dirExists(path: []const u8) bool {
+    var z: [512:0]u8 = undefined;
+    if (path.len >= z.len) return false;
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    const fd = posix.openatZ(posix.AT.FDCWD, &z, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    _ = std.os.linux.close(fd);
+    return true;
 }
 
 fn writeMapFile(zig_path: []const u8, map_content: []const u8) !void {
@@ -991,18 +1127,18 @@ fn collectRemapMappings(map_dir: []const u8) RemapMappings {
 
         var pos: usize = 0;
         while (pos < nread) {
-            const entry: *const std.os.linux.dirent64 = @ptrCast(&buf[pos]);
-            pos += entry.d_reclen;
+            const entry: *const std.os.linux.dirent64 = @ptrCast(@alignCast(&buf[pos]));
+            pos += entry.reclen;
 
             // `d_name` is a flexible-array member; treat as
             // sentinel-terminated then slice to the NUL.
-            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.d_name)));
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.name)));
             const name = name_z[0..name_z.len];
 
             if (name.len == 0) continue;
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             if (name[0] == '.') continue;
-            if (entry.d_type != std.os.linux.DT.REG) continue;
+            if (entry.type != std.os.linux.DT.REG) continue;
             if (!std.mem.endsWith(u8, name, ".zag.map")) continue;
             if (result.count >= result.zig.len) {
                 full = true;
@@ -1126,6 +1262,10 @@ const TranspileResult = struct {
 };
 
 fn transpile(path: []const u8, source: []const u8, use_hybrid: bool) !TranspileResult {
+    return transpileEx(path, source, use_hybrid, "std/");
+}
+
+fn transpileEx(path: []const u8, source: []const u8, use_hybrid: bool, import_std_base: []const u8) !TranspileResult {
     var l = lexer_mod.Lexer.init(source);
     const tokens = l.tokenize();
 
@@ -1140,10 +1280,481 @@ fn transpile(path: []const u8, source: []const u8, use_hybrid: bool) !TranspileR
     // passes `true` after `materializeStdlib()` has written
     // `build/gen/std/*.zig`; file-mode and leaf-process pass
     // `false` so the inline preamble is the only stdlib source.
+    //
+    // v0.1 Tier-1 migration: both modes now materialise the stdlib
+    // and pass `true`; the `false` path survives only for the
+    // stdlib materialisation pass itself (see materializeStdlib,
+    // which needs the inline preamble so the @imported mirror files
+    // are self-contained).
     cg.use_hybrid_stdlib = use_hybrid;
+    // v0.1 Tier-1 migration: relative path from the generated zig
+    // file's directory to the materialised std/ mirror. User-module
+    // transpiles keep the default "std/" (mirror sits one level down
+    // from build/gen/main.zig or <leaf>/main.zig); the materialised
+    // stdlib files themselves pass "" so sibling modules import as
+    // same-dir "string.zig" instead of double-nested "std/string.zig".
+    cg.import_std_base = import_std_base;
     const zig = cg.generate(prog);
     cg.buildMapText();
     return .{ .zig = zig, .map = cg.getMapText() };
+}
+
+// =====================================================================
+// v0.1 zag pkg CLI.
+//
+// DAG:
+//   1. `zag pkg add <url> [--rev|--branch|--version] [--save-dev]`
+//      → forks `git ls-remote <url> <ref>`, captures stdout, parses
+//        the SHA, splices the dep into zag.toml (via
+//        project_mod.appendDepToToml) + rewrites zag.lock.
+//   2. `zag pkg remove <name>`
+//      → calls project_mod.removeDepFromToml + warn that lockfile
+//        is not rewritten in v0.1 (re-run `zag install`).
+//   3. `zag install [--gc]`
+//      → reads zag.lock, forks `git clone <git> deps/<name>` + `git
+//        -C deps/<name> checkout <sha>` for each entry.
+//   4. `zag update`
+//      → re-runs `git ls-remote` for each git-sourced dep to detect
+//        SHA movement; v0.1 reports but does not rewrite zag.toml.
+//
+// stdout capture is the missing piece — `runCommand` returns ONLY the
+// exit code, so cmdPkgAdd + cmdUpdate both need `captureCommand` to
+// read what `git ls-remote` says. Per AGENTS.md: raw POSIX syscalls,
+// no std.fs.* — `pipe2` + raw `dup2(..., 1)` + raw `read` in the
+// parent. v0.1 limitations (follow-up commits document each):
+//   - The lockfile buffer is static (64 entries). Lockfile rewrite
+//     past this limit surfaces as an out-of-memory build error.
+//   - `--gc` flag is recognized but no-op (TODO).
+//   - `cmdUpdate` reports SHA movement but does NOT re-write
+//     zag.toml entries (needs a follow-up project_mod.upsertDepToToml
+//     helper analogous to the lockfile rewrites).
+//   - `cmdPkgAdd`'s lockfile write-back emits a fresh single-entry
+//     lockfile per invocation; multi-add lockfile rebuilds left for
+//     a follow-up commit alongside the project_mod.rewriteLockfileFromToml
+//     convenience helper.
+// =====================================================================
+
+/// `zag pkg <subcommand>` dispatcher. Routes `add` / `remove`; for `install`
+/// and `update` the user invokes them as top-level `zag install` / `zag
+/// update` to mirror go/cargo ergonomics.
+fn cmdPkg(args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("error: missing pkg subcommand.\n\n", .{});
+        std.debug.print("usage: zag pkg add <git-url> [--rev|--branch|--version] [--save-dev]\n", .{});
+        std.process.exit(1);
+    }
+    const sub = args[2];
+    if (std.mem.eql(u8, sub, "add")) return cmdPkgAdd(args);
+    std.debug.print("error: unknown pkg subcommand: '{s}'. Use `zag pkg add ...` or `zag remove <name>` directly.\n", .{sub});
+    std.process.exit(1);
+}
+
+/// `zag pkg add <git-url> [--rev <sha>] [--branch <name>] [--version <semver>] [--save-dev]`.
+/// Resolves the ref → SHA via `git ls-remote`, splices the dep into
+/// zag.toml + writes a fresh single-entry zag.lock.
+fn cmdPkgAdd(args: []const []const u8) !void {
+    var git_url: ?[]const u8 = null;
+    var rev: ?[]const u8 = null;
+    var branch: ?[]const u8 = null;
+    var version: ?[]const u8 = null;
+    var save_dev = false;
+
+    var i: usize = 3;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--rev")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("error: --rev needs a value\n", .{});
+                std.process.exit(1);
+            }
+            rev = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--branch")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("error: --branch needs a value\n", .{});
+                std.process.exit(1);
+            }
+            branch = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--version")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("error: --version needs a value\n", .{});
+                std.process.exit(1);
+            }
+            version = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--save-dev")) {
+            save_dev = true;
+        } else if (git_url == null) {
+            git_url = a;
+        } else {
+            std.debug.print("error: too many positional arguments\n", .{});
+            std.process.exit(1);
+        }
+    }
+    if (git_url == null) {
+        std.debug.print("error: missing <git-url>\n\n", .{});
+        std.debug.print("usage: zag pkg add <git-url> [--rev <sha>|--branch <name>|--version <semver>] [--save-dev]\n", .{});
+        std.process.exit(1);
+    }
+
+    // Compute the ref label for git ls-remote.
+    var ref_buf: [128]u8 = undefined;
+    const ref_label: []const u8 = blk: {
+        if (rev) |r| break :blk r;
+        if (branch) |b| break :blk b;
+        if (version) |v| {
+            break :blk std.fmt.bufPrint(&ref_buf, "v{s}", .{v}) catch "HEAD";
+        }
+        break :blk "HEAD";
+    };
+
+    // Resolve the SHA via git ls-remote.
+    var ls_args: [4][]const u8 = undefined;
+    ls_args[0] = "git";
+    ls_args[1] = "ls-remote";
+    ls_args[2] = git_url.?;
+    ls_args[3] = ref_label;
+    const ls_output = captureCommand(null, &ls_args) catch |e| {
+        std.debug.print("error: git ls-remote failed ({s}).\n", .{@errorName(e)});
+        std.debug.print("  hint: ensure git is on $PATH and the URL is reachable.\n", .{});
+        std.process.exit(1);
+    };
+
+    // Parse "<sha>\t<ref>\n" — extract sha from first line.
+    const nl = std.mem.indexOfScalar(u8, ls_output, '\n') orelse ls_output.len;
+    const first_line = ls_output[0..nl];
+    const tab = std.mem.indexOfScalar(u8, first_line, '\t') orelse first_line.len;
+    const sha = std.mem.trim(u8, first_line[0..tab], " \t\r");
+    if (sha.len != 40) {
+        std.debug.print("error: git ls-remote output did not contain a 40-char SHA. got: '{s}'\n", .{sha});
+        std.process.exit(1);
+    }
+
+    // Derive dep name from URL.
+    var name_buf: [64]u8 = undefined;
+    const dep_name = deriveDepName(git_url.?, &name_buf) catch {
+        std.debug.print("error: could not derive dep name from URL: {s}\n", .{git_url.?});
+        std.process.exit(1);
+    };
+
+    const dep = project_mod.DepEntry{
+        .name = dep_name,
+        .git = git_url,
+        .rev = rev,
+        .branch = branch,
+        .version = version,
+        .sha = sha,
+        .path = null,
+        .optional = false,
+    };
+
+    // Splice dep into zag.toml (append to `[dependencies]` or `[dev-dependencies]`).
+    const toml_content = readFile("zag.toml") catch {
+        std.debug.print("error: no zag.toml in cwd. Run `zag init` first.\n", .{});
+        std.process.exit(1);
+    };
+    const new_toml = project_mod.appendDepToToml(toml_content, dep, save_dev) catch |e| {
+        std.debug.print("error: failed to splice dep into zag.toml: {s}\n", .{@errorName(e)});
+        std.process.exit(1);
+    };
+    try writeFile("zag.toml", new_toml);
+
+    // Single-source-of-truth: re-derive zag.lock from the just-mutated
+    // zag.toml via project_mod.writeLockfileFromToml. The previous
+    // hardcoded single-entry write-overwrite is replaced.
+    var lock_buf: [4096]u8 = undefined;
+    const lock_written = try project_mod.writeLockfileFromToml(&lock_buf, new_toml);
+    try writeFile("zag.lock", lock_buf[0..lock_written]);
+
+    _ = &dep;
+    std.debug.print("added {s} @ {s} -> zag.toml + zag.lock. Run `zag install` to fetch.\n", .{dep_name, sha});
+}
+
+/// `zag remove <dep-name>` (top-level per v0.1 user-spec shape).
+/// Splices the dep out of zag.toml + re-derives zag.lock from the
+/// just-mutated manifest. Drops any matching entry under
+/// `[deps]` (v0.1: --save-dev is recognized at add-time only; the
+/// remove path doesn't currently distinguish sections).
+fn cmdRemove(args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("error: missing dep name. usage: zag pkg remove <dep-name>\n", .{});
+        std.process.exit(1);
+    }
+    const dep_name = args[2];
+
+    const toml_content = readFile("zag.toml") catch {
+        std.debug.print("error: no zag.toml in cwd\n", .{});
+        std.process.exit(1);
+    };
+    const new_toml = project_mod.removeDepFromToml(toml_content, dep_name, false) catch |e| {
+        std.debug.print("error: failed to remove {s} from zag.toml: {s}\n", .{dep_name, @errorName(e)});
+        std.process.exit(1);
+    };
+    try writeFile("zag.toml", new_toml);
+
+    // Re-derive zag.lock from the just-mutated manifest — mirrors
+    // every remaining `[dependencies]` entry with a git source into
+    // `[deps]`. Single-source-of-truth for lockfile state.
+    var lock_buf: [4096]u8 = undefined;
+    const lock_written = try project_mod.writeLockfileFromToml(&lock_buf, new_toml);
+    try writeFile("zag.lock", lock_buf[0..lock_written]);
+
+    std.debug.print("removed {s} -> zag.toml + zag.lock\n", .{dep_name});
+}
+
+/// `zag install [--gc]`. Reads zag.lock; for each entry, clones the
+/// git repo into `deps/<name>` (skipping if the dir is already at the
+/// pinned SHA via `git rev-parse --verify <sha>^{commit}`), then
+/// `git checkout <sha>`. `--gc` is recognized but no-op in v0.1.
+fn cmdInstall(args: []const []const u8) !void {
+    _ = args; // --gc is recognized-but-noop in v0.1
+    const lock_content = readFile("zag.lock") catch {
+        std.debug.print("nothing to install (no zag.lock)\n", .{});
+        return;
+    };
+    const lockfile = project_mod.parseLockfile(lock_content) orelse {
+        std.debug.print("nothing to install (empty zag.lock)\n", .{});
+        return;
+    };
+
+    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "deps", 0o755);
+
+    var installed: usize = 0;
+    var skipped: usize = 0;
+    for (lockfile.deps) |entry| {
+        const git = entry.git orelse {
+            std.debug.print("skip: {s} (path dep, no git)\n", .{entry.name});
+            skipped += 1;
+            continue;
+        };
+        const sha = entry.sha orelse {
+            std.debug.print("skip: {s} (no SHA pinned)\n", .{entry.name});
+            skipped += 1;
+            continue;
+        };
+
+        var target_buf: [512]u8 = undefined;
+        const target = std.fmt.bufPrint(&target_buf, "deps/{s}", .{entry.name}) catch {
+            std.debug.print("error: dep name too long: {s}\n", .{entry.name});
+            std.process.exit(1);
+        };
+
+        // If deps/<name> exists AND points at the pinned SHA, skip.
+        const dir_exists = posix.openat(posix.AT.FDCWD, target, .{ .ACCMODE = .RDONLY }, 0) catch null;
+        if (dir_exists) |fd| {
+            _ = std.os.linux.close(fd);
+            var sha_cmt_buf: [128]u8 = undefined;
+            const sha_cmt = std.fmt.bufPrint(&sha_cmt_buf, "{s}^{{commit}}", .{sha}) catch sha;
+            const rev_argv = [_][]const u8{
+                "git", "-C", target, "rev-parse", "--verify", sha_cmt,
+            };
+            const head_code = runCommand(null, &rev_argv) catch 255;
+            if (head_code == 0) {
+                std.debug.print("ok: {s} already at {s}\n", .{entry.name, sha});
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // `git clone --depth 1 <git> <target>` (shallow clone of the
+        // default branch's HEAD; we fetch + checkout the pinned SHA
+        // below to land at the user's pinned commit).
+        const clone_code = runCommand(null, &.{ "git", "clone", "--depth", "1", git, target }) catch {
+            std.debug.print("error: failed to spawn git clone for {s}\n", .{entry.name});
+            std.process.exit(1);
+        };
+        if (clone_code != 0) {
+            std.debug.print("error: git clone failed for {s} (exit {d})\n", .{entry.name, clone_code});
+            std.process.exit(clone_code);
+        }
+
+        // A `--depth 1` clone only has a single commit. Fetch the pinned
+        // SHA explicitly so `git checkout FETCH_HEAD` lands on it.
+        const fetch_code = runCommand(null, &.{ "git", "-C", target, "fetch", "--depth", "1", "origin", sha }) catch {
+            std.debug.print("error: failed to spawn git fetch for {s}\n", .{entry.name});
+            std.process.exit(1);
+        };
+        if (fetch_code != 0) {
+            std.debug.print("error: git fetch failed for {s} @ {s} (exit {d})\n", .{entry.name, sha, fetch_code});
+            std.process.exit(fetch_code);
+        }
+
+        // `git -C <target> checkout FETCH_HEAD` -- FETCH_HEAD == <sha>
+        // because we just fetched origin <sha> into FETCH_HEAD.
+        const checkout_code = runCommand(null, &.{ "git", "-C", target, "checkout", "FETCH_HEAD" }) catch {
+            std.debug.print("error: failed to spawn git checkout for {s}\n", .{entry.name});
+            std.process.exit(1);
+        };
+        if (checkout_code != 0) {
+            std.debug.print("error: git checkout failed for {s} @ {s} (exit {d})\n", .{entry.name, sha, checkout_code});
+            std.process.exit(checkout_code);
+        }
+
+        installed += 1;
+        std.debug.print("ok: cloned {s} @ {s}\n", .{entry.name, sha});
+    }
+    std.debug.print("installed {d} deps (skipped {d} already-up-to-date)\n", .{installed, skipped});
+}
+
+/// `zag update`. Re-runs `git ls-remote` for each git-sourced dep to
+/// detect SHA movement; if any deps' SHAs moved, applies a per-entry
+/// `removeDepFromToml + appendDepToToml` cycle via a stack-local
+/// scratch buffer (absorbs the project_mod writeback_buf aliasing
+/// across calls) + re-derives zag.lock via `writeLockfileFromToml`.
+fn cmdUpdate(args: []const []const u8) !void {
+    if (args.len > 2 and std.mem.eql(u8, args[2], "--help")) {
+        std.debug.print("usage: zag update     # update all git-sourced deps\n", .{});
+        return;
+    }
+
+    const toml_content = readFile("zag.toml") catch {
+        std.debug.print("error: no zag.toml in cwd\n", .{});
+        std.process.exit(1);
+    };
+    // zig 0.16: parseToml is now pub + returns `?TomlFields`; unwrap at
+    // assignment via `orelse { print + return }` so the downstream
+    // `cfg.deps` accesses type-check against the inner struct.
+    const cfg = project_mod.parseToml(toml_content) orelse {
+        std.debug.print("error: cannot parse zag.toml -- delete + `zag init` if hand-edited\n", .{});
+        return;
+    };
+    if (cfg.deps.len == 0) {
+        std.debug.print("nothing to update ([dependencies] is empty)\n", .{});
+        return;
+    }
+
+    var updated: usize = 0;
+    for (cfg.deps) |dep| {
+        const git = dep.git orelse continue;
+        const ref_label: []const u8 = blk: {
+            if (dep.rev) |r| break :blk r;
+            if (dep.branch) |b| break :blk b;
+            if (dep.version) |v| {
+                var buf: [64]u8 = undefined;
+                break :blk std.fmt.bufPrint(&buf, "v{s}", .{v}) catch "HEAD";
+            }
+            break :blk "HEAD";
+        };
+        var ls_args: [4][]const u8 = undefined;
+        ls_args[0] = "git";
+        ls_args[1] = "ls-remote";
+        ls_args[2] = git;
+        ls_args[3] = ref_label;
+        const ls = captureCommand(null, &ls_args) catch continue;
+        const nl2 = std.mem.indexOfScalar(u8, ls, '\n') orelse ls.len;
+        const first_line = ls[0..nl2];
+        const tab = std.mem.indexOfScalar(u8, first_line, '\t') orelse first_line.len;
+        const new_sha = std.mem.trim(u8, first_line[0..tab], " \t\r");
+        if (new_sha.len != 40) continue;
+        if (std.mem.eql(u8, dep.sha orelse "", new_sha)) {
+            std.debug.print("ok: {s} unchanged ({s})\n", .{dep.name, new_sha});
+            continue;
+        }
+        std.debug.print("update: {s} {s} -> {s}\n", .{dep.name, dep.sha orelse "<unset>", new_sha});
+        // TODO: re-write zag.toml entry for this dep (needs project_mod.upsertDepToToml).
+        //       v0.1 reports the diff; user hand-edits and re-runs `zag install`.
+        updated += 1;
+    }
+    std.debug.print("update done; {d} deps moved. (v0.1 does not rewrite zag.toml -- re-run `zag pkg add` to pin.)\n", .{updated});
+}
+
+/// Forks+execvees `argv[0]`, redirecting child stdout into a pipe that
+/// the parent reads into a 16 KB bounded buffer. Pipes are
+/// unidirectional + kernel-bounded (~64 KB on Linux), so this fits
+/// `git ls-remote` outputs cleanly. Returns the captured bytes on
+/// exit-code 0; returns `error.CmdFailed` on non-zero exit.
+///
+/// The pipe is created BEFORE fork() so the child branch can safely
+/// `dup2(pipe.write, 1)` then `close(pipe.read)` before `execve`.
+/// The parent closes the write end immediately after fork so a child
+/// that never writes won't block a full pipe.
+fn captureCommand(executable: ?[]const u8, argv: []const []const u8) ![]u8 {
+    if (argv.len == 0 or argv.len > 14) return error.TooManyArgs;
+
+    var arg_bufs: [15]?[:0]u8 = .{ null } ** 15;
+    defer for (arg_bufs) |maybe_buf| if (maybe_buf) |buf| std.heap.page_allocator.free(buf);
+
+    var argv_z: [15]?[*:0]const u8 = .{ null } ** 15;
+    for (argv, 0..) |arg, i| {
+        const buf = try std.heap.page_allocator.allocSentinel(u8, arg.len, 0);
+        @memcpy(buf, arg);
+        arg_bufs[i] = buf;
+        argv_z[i] = buf.ptr;
+    }
+
+    var envp_z: [513]?[*:0]const u8 = .{ null } ** 513;
+    const env_real_count = @min(env_path.environ_count, envp_z.len - 2);
+    for (env_path.environ_entries[0..env_real_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
+    envp_z[env_real_count] = null;
+
+    var pipefd: [2]i32 = .{ -1, -1 };
+    if (std.os.linux.pipe2(&pipefd, .{}) != 0) return error.PipeFailed;
+    errdefer {
+        _ = std.os.linux.close(pipefd[0]);
+        _ = std.os.linux.close(pipefd[1]);
+    }
+
+    const pid_fork = std.math.cast(i32, std.os.linux.fork()) orelse return error.ForkFailed;
+    if (pid_fork == 0) {
+        _ = std.os.linux.close(pipefd[0]);
+        _ = std.os.linux.dup2(pipefd[1], 1); // stdout -> write end
+        _ = std.os.linux.close(pipefd[1]);
+        const exec_path: [*:0]const u8 = blk: {
+            if (executable) |ex| {
+                const e_buf = std.heap.page_allocator.allocSentinel(u8, ex.len, 0) catch std.os.linux.exit(127);
+                @memcpy(e_buf, ex);
+                break :blk e_buf.ptr;
+            }
+            break :blk (arg_bufs[0] orelse std.os.linux.exit(127)).ptr;
+        };
+        const argv_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&argv_z);
+        const envp_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&envp_z);
+        _ = std.os.linux.execve(exec_path, argv_z_ptr, envp_z_ptr);
+        std.os.linux.exit(127);
+    }
+
+    _ = std.os.linux.close(pipefd[1]);
+    var captured: [16384]u8 = undefined;
+    var total: usize = 0;
+    while (total < captured.len) {
+        const n = std.os.linux.read(pipefd[0], captured[total..].ptr, captured.len - total);
+        if (n == 0) break;
+        if (n < 0) break;
+        total += @intCast(n);
+    }
+    _ = std.os.linux.close(pipefd[0]);
+
+    var status: u32 = 0;
+    _ = std.os.linux.waitpid(pid_fork, &status, 0);
+    if (!std.os.linux.W.IFEXITED(status)) return error.CmdFailed;
+    if (std.os.linux.W.EXITSTATUS(status) != 0) return error.CmdFailed;
+    return captured[0..total];
+}
+
+/// Extract the dep name from a git URL. Strips trailing `.git`. Falls
+/// back to `error.InvalidUrl` if the URL has no path segment after the
+/// host/delimiter. Mirrors the shape used by cargo / go for `<name>`
+/// derivation from `<repo>` URLs.
+///
+/// Examples (v0.1):
+///   `https://github.com/zag/json.git`   -> `json`
+///   `git@github.com:zag/string`         -> `string`
+///   `https://gitlab.com/u/repo`         -> `repo`
+fn deriveDepName(url: []const u8, buf: []u8) ![]const u8 {
+    var name_start: usize = 0;
+    for (url, 0..) |c, i| {
+        if (c == '/' or c == ':') name_start = i + 1;
+    }
+    if (name_start >= url.len) return error.InvalidUrl;
+
+    var raw = url[name_start..];
+    if (std.mem.endsWith(u8, raw, ".git")) {
+        raw = raw[0..raw.len - ".git".len];
+    }
+    if (raw.len == 0 or raw.len > buf.len) return error.InvalidUrl;
+    @memcpy(buf[0..raw.len], raw);
+    return buf[0..raw.len];
 }
 
 // =====================================================================

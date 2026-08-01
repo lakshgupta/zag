@@ -126,6 +126,55 @@ pub fn collectCastType(self: *Parser) []const u8 {
                     continue;
                 }
             }
+            // Sentinel-terminated / many-pointer bracket prefix
+            // `[*:0]` (and `[*]`, `[:0]`) — the shape lib/std's
+            // __zag_posix casts use (`&path_z[0] as [*:0]const u8`,
+            // __zag_getenv's name argument). The `[` is followed by
+            // `*` / `:` / digits / idents, NOT `]` (slice) or a
+            // single size token (array) — the two carve-outs above
+            // don't fire, and without this arm the interior `:`
+            // hit the is_term `.colon` rule and truncated the
+            // captured type text to `[*`, breaking the emitted
+            // cast. Consume the whole bracket pair verbatim and
+            // glue the next identifier on (`[*:0]const u8`).
+            if (tok.tag == .lbracket) {
+                const nxt = self.peekAhead(1);
+                if (nxt == .star or nxt == .colon) {
+                    if (len + 1 <= buf.len) {
+                        buf[len] = '[';
+                        len += 1;
+                    }
+                    self.advance(); // consume `[`
+                    var closed = false;
+                    while (!self.eof()) {
+                        const inner = self.peek();
+                        if (inner.tag == .rbracket) {
+                            if (len + 1 <= buf.len) {
+                                buf[len] = ']';
+                                len += 1;
+                            }
+                            self.advance(); // consume `]`
+                            closed = true;
+                            break;
+                        }
+                        if (inner.tag == .newline or inner.tag == .eof or inner.tag == .comma or inner.tag == .rparen) {
+                            break; // unterminated — bail to is_term path
+                        }
+                        const inner_text = inner.text;
+                        if (len + inner_text.len <= buf.len) {
+                            @memcpy(buf[len..][0..inner_text.len], inner_text);
+                            len += inner_text.len;
+                        }
+                        self.advance();
+                    }
+                    if (closed) {
+                        prev_was_ptr = true;
+                        continue;
+                    }
+                    // Unterminated: fall through to is_term dispatch
+                    // (the `.rbracket`-as-term rule exits the loop).
+                }
+            }
             // Nullable pointer prefix `?` — consume as a single byte and
             // mark `prev_was_ptr` so the next identifier or `*` glues on
             // without a separator (`?i32`, `?*T`). The `.rbracket`-as-term
@@ -315,7 +364,7 @@ pub fn parseBitXor(self: *Parser) Expr {
 
 pub fn parseCast(self: *Parser) Expr {
         const start_loc = self.peek().loc;
-        const lhs = self.parsePostfix();
+        const lhs = self.parseUnary();
         if (self.peek().tag != .as_kw) return lhs;
         const binding_loc = self.peek().loc;
         self.advance();
@@ -471,7 +520,7 @@ pub fn parseLogicalOr(self: *Parser) Expr {
 
 
 pub fn parseMultiplicative(self: *Parser) Expr {
-        var lhs = self.parseUnary();
+        var lhs = self.parseCast();
         while (true) {
             const op: ast.Expr.BinaryOp = switch (self.peek().tag) {
                 .star => .mul,
@@ -480,7 +529,7 @@ pub fn parseMultiplicative(self: *Parser) Expr {
                 else => break,
             };
             self.advance();
-            const rhs = self.parseUnary();
+            const rhs = self.parseCast();
             lhs = self.makeBinary(op, lhs, rhs);
         }
         return lhs;
@@ -556,7 +605,7 @@ pub fn parseUnary(self: *Parser) Expr {
             .bang => .lnot,
             .star => .deref,
             .amp => .addr,
-            else => return self.parseCast(),
+            else => return self.parsePostfix(),
         };
         self.advance();
         const operand = self.parseUnary();

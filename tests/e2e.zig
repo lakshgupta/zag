@@ -529,7 +529,15 @@ fn resolveZigPath(allocator: std.mem.Allocator) ![]u8 {
 fn isRunnableZig(path: []const u8) bool {
     // X_OK=1 per linux <unistd.h>; pass the literal rather than
     // importing std.os.linux.X_OK which zig 0.16 doesn't expose.
-    const access_rc = std.os.linux.access(@ptrCast(path.ptr), 1);
+    // access() needs a sentinel-terminated pointer — copy the
+    // slice into a fixed NUL-terminated buffer (resolveZagPath's
+    // absolute candidate is NOT sentinel-terminated as a bare slice).
+    var path_z: [2048:0]u8 = undefined;
+    if (path.len >= path_z.len) return false;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const path_zp: [*:0]const u8 = &path_z;
+    const access_rc = std.os.linux.access(path_zp, 1);
     if (access_rc > std.math.maxInt(isize)) return false; // errno-encoded failure
     if (access_rc != 0) return false; // not executable
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
@@ -667,10 +675,16 @@ fn runModulesSmoke(allocator: std.mem.Allocator) !u8 {
         _ = std.os.linux.close(pipe_fds[1]);
         // chdir the *child* (parent CWD unchanged -- nieces the
         // sibling e2e flow). Path is absolute, no CWD assumption.
-        var cwd_nul: [256]u8 = undefined;
+        // `&cwd_nul` (the whole sentinel-terminated array) coerces
+        // to the `[*:0]const u8` chdir expects. (Previous form
+        // `@ptrCast(&cwd_nul[0..project_root.len])` cast a
+        // SLICE-DESCRIPTOR pointer `*[]u8` to `[*:0]const u8`,
+        // making chdir read the descriptor's ptr+len bytes as the
+        // path — strace showed `chdir("#[\266\5\375\177") = ENOENT`.)
+        var cwd_nul: [256:0]u8 = undefined;
         @memcpy(cwd_nul[0..project_root.len], project_root);
         cwd_nul[project_root.len] = 0;
-        _ = std.os.linux.chdir(@ptrCast(&cwd_nul[0..project_root.len]));
+        _ = std.os.linux.chdir(&cwd_nul);
 
         var arg_bufs: [2]?[:0]u8 = .{ null } ** 2;
         defer for (arg_bufs) |maybe_buf| if (maybe_buf) |buf| allocator.free(buf);
@@ -748,18 +762,33 @@ fn runModulesSmoke(allocator: std.mem.Allocator) !u8 {
 /// used for zig — see that helper for the magic+class+data
 /// rationale).
 fn resolveZagPath(allocator: std.mem.Allocator) ?[]u8 {
+    // The candidate paths are CWD-relative. runModulesSmoke chdirs
+    // the CHILD into /tmp/zag_e2e_modules before execve, so the
+    // returned path MUST be absolute — resolve it against the
+    // parent's CWD here (getcwd) before the fork.
+    var cwd_buf: [1024:0]u8 = undefined;
+    const cwd_len = std.os.linux.getcwd(&cwd_buf, cwd_buf.len);
+    if (cwd_len > std.math.maxInt(isize)) return null;
+    // Raw getcwd syscall returns the length INCLUDING the trailing
+    // NUL — strip it so the joined path has no embedded NUL
+    // (toPosixPath in isRunnableZig asserts NUL-free slices).
+    var cwd_nl: usize = cwd_len;
+    if (cwd_nl > 0 and cwd_buf[cwd_nl - 1] == 0) cwd_nl -= 1;
+    const cwd = cwd_buf[0..cwd_nl];
     const candidates = [_][]const u8{
-        "./zig-out/bin/zag-linux-x86_64",
-        "./zig-out/bin/zag-linux-aarch64",
-        "./zig-out/bin/zag-macos-aarch64",
-        "./zig-out/bin/zag-macos-x86_64",
-        "../zig-out/bin/zag-linux-x86_64",
-        "../zig-out/bin/zag-linux-aarch64",
-        "../zig-out/bin/zag-macos-aarch64",
-        "../zig-out/bin/zag-macos-x86_64",
+        "zig-out/bin/zag-linux-x86_64",
+        "zig-out/bin/zag-linux-aarch64",
+        "zig-out/bin/zag-macos-aarch64",
+        "zig-out/bin/zag-macos-x86_64",
     };
+    var abs_buf: [2048]u8 = undefined;
     for (candidates) |p| {
-        if (isRunnableZig(p)) return allocator.dupe(u8, p) catch null;
+        if (p.len + 1 + cwd.len > abs_buf.len) continue;
+        @memcpy(abs_buf[0..cwd.len], cwd);
+        abs_buf[cwd.len] = '/';
+        @memcpy(abs_buf[cwd.len + 1 ..][0..p.len], p);
+        const abs = abs_buf[0 .. cwd.len + 1 + p.len];
+        if (isRunnableZig(abs)) return allocator.dupe(u8, abs) catch null;
     }
     return null;
 }

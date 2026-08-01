@@ -7,6 +7,8 @@
 ##
 ## Run: zag run systems_memory.zag
 
+import std.mem.{alloc};
+
 fun main() {
     # ── Stack allocation (zero overhead) ─────────────────────────
     # Fixed array on stack — no heap, no allocator, just LEA/RSP

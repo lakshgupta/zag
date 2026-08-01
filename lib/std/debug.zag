@@ -1,0 +1,19 @@
+## std.debug — panic primitive.
+##
+## `panic(msg)` aborts the process via the always-emitted
+## `__zag_panic` preamble shim (src/codegen/core.zig → 1-arg
+## convenience over `__zag_panic_at`, which writes "panic: <msg>" to
+## stderr and @trap()s).
+##
+## v0.1 Tier-1 migration: the pre-migration `builtin_panic` router
+## row emitted `__zag_panic_at(msg, "<source path>", line, col)`
+## with the call site's exact zag location. A library function
+## cannot know its caller's source position, so the .zag body posts
+## a sentinel "<generated>" location — the trade-off is documented
+## in the preamble shim. `assert(cond)` keeps its compiler-router
+## shape (it still threads the call-site location through
+## `__zag_panic_at`).
+
+pub fun panic(msg: str) {
+    __zag_panic(msg);
+}

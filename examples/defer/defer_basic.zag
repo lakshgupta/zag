@@ -5,6 +5,8 @@
 ##
 ## Run: zag run defer_basic.zag
 
+import std.mem.{alloc};
+
 fun main() {
     let p: *i32 = new i32(42);
     defer free(p);                     # runs LAST

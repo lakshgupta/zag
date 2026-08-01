@@ -1,13 +1,20 @@
 ## std.process — process spawn / exit primitives.
 ##
-## Phase 3 surface for the cli.zag dispatcher. The two functions
-## below let cli.zag fork+execve child processes (to recursively
-## invoke zag in --leaf-process mode) and forward exit codes
-## from cli_main back to the parent shell. As with the rest of
-## std/* (argv/env/fs), the bodies here are throwaway; the
-## codegen router in src/codegen/builtins.zig REWRITES the call
-## site at compile time before any zag reader sees the verbatim
-## form.
+## v0.1 Tier-1 migration: `exit` is now a real zag impl backed by the
+## always-emitted `__zag_exit` preamble helper (src/codegen/core.zig,
+## a forwarder onto `std.os.linux.exit`). The pre-migration
+## `process_exit` router row emitted
+## `(std.os.linux.exit(@as(u8, @intCast(code))))` inline; the
+## preamble helper takes `i32` directly so the .zag body is the
+## 1-line canonical form. Router row retired in the Tier-1 migration.
+##
+## `exec` is STILL a codegen-router-only builtin (process_exec in
+## src/codegen/builtins.zig) — its stub body below is never executed
+## because the router REWRITES its call site before runtime (see
+## src/codegen/expr.zig's .process_exec arm). Do NOT delete the stub:
+## `pub import std.process.{exec}` resolves to it through the
+## @import+alias fallthrough and a missing `pub fun` would
+## compile-fail at the user's call site.
 ##
 ## exec emits a per-call (blk: { ... }) wrapper containing:
 ##   - per-arg [:0]u8 allocations via page_allocator
@@ -15,17 +22,12 @@
 ##   - fork+execve+waitpid with the caller's argv
 ## It returns the child's i32 exit code (or 255 on parent
 ## fork failure / 127 on child exec failure).
-##
-## exit emits (std.os.linux.exit(@as(u8, @intCast(arg)))) as a
-## statement-shaped value — it works in both statement position
-## (`exit(rc);`) and expression position (`let _ = exit(rc);`).
-## std.os.linux.exit takes u8 only (POSIX exit-code convention);
-## the @as(u8, @intCast(...)) clamps wider i32 to one byte.
-
-pub fun exec(argv: []const []const u8) -> i32 {
-    return 255;
-}
 
 pub fun exit(code: i32) {
-    return;
+    __zag_exit(code);
+}
+
+pub fun exec(argv: []const []const u8) -> i32 {
+    _ = argv;
+    return 255;
 }

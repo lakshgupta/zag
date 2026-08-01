@@ -29,9 +29,25 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .let => stmt.payload.let,
             .var_binding => stmt.payload.var_binding,
             .const_binding => stmt.payload.const_binding,
-            else => return,
+            else => {
+                // Recurse into block-carrying statements so bindings
+                // declared inside nested bodies (while/for/if/match/
+                // unsafe blocks) are visible to the cast carve-outs
+                // (@floatCast / @intCast), which look up the operand
+                // ident's source type in `type_info_buf`. Previously
+                // only top-level fn-body bindings were recorded —
+                // lib/std/fs.zag's `n_signed as usize` (declared
+                // inside a while-loop body) fell through to the
+                // `@as(usize, isize)` emit which zig 0.16 rejects
+                // (Tier-1 migration).
+                self.collectNestedBindings(stmt);
+                return;
+            },
         };
-        if (b.pattern != null) return;
+        if (b.pattern != null) {
+            self.collectNestedBindings(stmt);
+            return;
+        }
         if (self.type_info_count >= self.type_info_buf.len) return;
         // Closure-typed binding — no `: T` annotation required.
         // Const-block bindings (`b.init == null`) carry no Expr to
@@ -59,6 +75,33 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .is_closure = false,
         };
         self.type_info_count += 1;
+        self.collectNestedBindings(stmt);
+    }
+
+    /// Walk block-carrying statements and collect typed bindings from
+    /// their nested bodies (if-branches, while/for bodies, unsafe
+    /// blocks, match arms). See collectTypedBindings' docblock.
+    pub     fn collectNestedBindings(self: *Codegen, stmt: ast.Stmt) void {
+        switch (stmt.payload) {
+            .if_stmt => |ifs| {
+                for (ifs.then_body) |s| self.collectTypedBindings(s);
+                switch (ifs.else_kind) {
+                    .none => {},
+                    .block => |blk| for (blk) |s| self.collectTypedBindings(s),
+                    .if_chain => |inner| self.collectTypedBindings(ast.Stmt{ .payload = .{ .if_stmt = inner.* }, .loc = stmt.loc }),
+                }
+            },
+            .while_stmt => |ws| {
+                for (ws.body) |s| self.collectTypedBindings(s);
+            },
+            .for_stmt => |fs| {
+                for (fs.body) |s| self.collectTypedBindings(s);
+            },
+            .unsafe_block => |stmts| {
+                for (stmts) |s| self.collectTypedBindings(s);
+            },
+            else => {},
+        }
     }
 
     pub     fn genDocComment(self: *Codegen, doc: []const u8) void {
@@ -206,8 +249,22 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     for (ws.body) |s| self.genStmt(s, false);
                     self.write("    }\n");
                 } else {
+                    // Plain `while (cond) { … }`. Binary conds
+                    // self-parenthesize in genExpr (`(i < 10)`), but a
+                    // bare-ident / bool-literal cond (`while (true)`)
+                    // emits unwrapped (`while true`) which zig 0.16
+                    // rejects. Wrap only the non-binary conds in
+                    // explicit parens (surfaced by lib/std/fs.zag
+                    // read_file's `while (true)` loop in the Tier-1
+                    // migration).
                     self.write("    while ");
-                    self.genExpr(ws.cond);
+                    if (ws.cond.payload == .binary or ws.cond.payload == .unary) {
+                        self.genExpr(ws.cond);
+                    } else {
+                        self.write("(");
+                        self.genExpr(ws.cond);
+                        self.write(")");
+                    }
                     self.write(" {\n");
                     for (ws.body) |s| self.genStmt(s, false);
                     self.write("    }\n");

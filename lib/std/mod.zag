@@ -10,6 +10,7 @@ pub import std.error.{Error, Context, ErrorExt}
 pub import std.string.{String, Display as StringDisplay}
 pub import std.fmt.{Display, Writer, FmtError}
 pub import std.time.{Duration, Timer}
+pub import std.time.{now}
 pub import std.atomic.{AtomicI32, AtomicI64, AtomicUsize, AtomicBool, Ordering}
 pub import std.bench.{Counters}
 # Phase 1: codegen-router-wired entries. Each selective import here
@@ -21,18 +22,34 @@ pub import std.bench.{Counters}
 #
 # Phase 0 entry: `pub import std.argv.{get}` → builtin argv_get (Phase 0 wired).
 # Phase 1 entries:
-#   `pub import std.env.{getEnv}`         → builtin env_var   (Phase 1 wired; emits std.posix.getenv).
-#   `pub import std.fs.{read_file}`      → REAL impl in lib/std/fs.zag backed by the
-#                                          __zag_posix preamble family (__zag_openat /
-#                                          __zag_read / __zag_close / __zag_memcpy).
-#                                          The codegen-router entry fs_read_file was
-#                                          RETIRED in favour of the @import+alias
-#                                          fallthrough in src/codegen/core.zig's imports
-#                                          loop (Option A pass-through).
+#   `pub import std.env.{get_env}`     → REAL impl in lib/std/env.zag backed by
+#                                         __zag_getenv (Tier-1 migration;
+#                                         renamed from `getEnv`).
+#   `pub import std.fs.{read_file}`    → REAL impl in lib/std/fs.zag backed by the
+#                                         __zag_posix preamble family (__zag_openat /
+#                                         __zag_read / __zag_close / __zag_memcpy).
+#                                         The codegen-router entry fs_read_file was
+#                                         RETIRED in favour of the @import+alias
+#                                         fallthrough in src/codegen/core.zig's imports
+#                                         loop (Option A pass-through).
+# v0.1 Tier-1 migration notes:
+#   `pub import std.time.{now}`        → REAL impl in lib/std/time.zag (__zag_clock_gettime).
+#   `pub import std.fs.{write_file}`   → REAL impl in lib/std/fs.zag (__zag_openat/write/close);
+#                                         fs_write_file router row retired.
+#   `pub import std.process.{exit}`    → REAL impl in lib/std/process.zag (__zag_exit);
+#                                         process_exit router row retired.
+#   `pub import std.mem.{alloc}`       → REAL impl in lib/std/mem.zag (__zag_page_alloc);
+#                                         builtin_alloc router row retired.
+#   `pub import std.debug.{panic}`     → REAL impl in lib/std/debug.zag (__zag_panic);
+#                                         builtin_panic router row retired.
+#   `pub import std.fs.{mkdir}`        → STILL router-only (fs_mkdir).
+#   `pub import std.process.{exec}`    → STILL router-only (process_exec).
 pub import std.argv.{get}
-pub import std.env.{getEnv}
+pub import std.env.{get_env}
 pub import std.fs.{read_file}
 pub import std.fs.{write_file}
 pub import std.fs.{mkdir}
 pub import std.process.{exec}
 pub import std.process.{exit}
+pub import std.mem.{alloc}
+pub import std.debug.{panic}

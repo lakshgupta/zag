@@ -32,18 +32,18 @@
 ##    round 3 surfaced this at lib/std/string.zag:52:31).
 
 pub struct String {
-    ptr: *u8,
+    ptr: *raw u8,
     len: usize,
     cap: usize,
 }
 
 impl String {
     pub fun with_capacity(cap: usize) -> String {
-        let p: *u8 = __zag_page_alloc(cap);
+        let p: *raw u8 = __zag_page_alloc(cap);
         return String { ptr: p, len: 0, cap: cap };
     }
 
-    pub fun as_str(self: *String) -> []const u8 {
+    pub fun as_str(self: *const String) -> []const u8 {
         return self.ptr[0..self.len];
     }
 
@@ -56,7 +56,7 @@ impl String {
             self.ptr = __zag_page_realloc(self.ptr, self.cap, new_cap);
             self.cap = new_cap;
         }
-        __zag_memcpy(self.ptr[self.len..], s, s.len);
+        __zag_memcpy(self.ptr[self.len..self.len + s.len], s, s.len);
         self.len = needed;
     }
 

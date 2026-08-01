@@ -206,7 +206,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     // genBuiltinCall case simultaneously or zig will
                     // hard-error at compile time (the switch is
                     // exhaustiveness-checked).
-                    self.genBuiltinCall(dispatch, c.args, expr.loc);
+                    self.genBuiltinCall(dispatch, c.args, expr.loc, null);
                 } else {
                     // Generics (docs/16 §"Turbofish"):
                     // `name<type_args...>(regular_args...)` emits
@@ -422,10 +422,47 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         }
                     }
                 }
+                // Int-family narrowing carve-out (`fd_raw as i32` where
+                // fd_raw: usize): zig 0.16's `@as(i32, usize_var)` is
+                // rejected ("signed 32-bit int cannot represent all
+                // possible unsigned 64-bit values"). Emit the canonical
+                // `@as(T, @intCast(value))` pair — the @as provides the
+                // explicit result type (zig 0.16's single-arg @intCast
+                // requires a known target from context, which binary
+                // positions like `pos + n_signed` don't provide).
+                // Surfaced by lib/std/fs.zag's fd + write-loop casts
+                // (Tier-1 migration).
+                if (core.isIntTypeName(target_zig) and c.expr.payload == .ident) {
+                    const op_ident = c.expr.payload.ident;
+                    if (self.getSourceTypeName(op_ident)) |source_type| {
+                        if (core.isIntTypeName(source_type) and !std.mem.eql(u8, source_type, target_zig)) {
+                            self.write("@as(");
+                            self.writeType(c.type_text);
+                            self.write(", @intCast(");
+                            self.genExpr(c.expr.*);
+                            self.write("))");
+                            return;
+                        }
+                    }
+                }
                 self.write("@as(");
                 self.writeType(c.type_text);
                 self.write(", ");
-                self.genExpr(c.expr.*);
+                // Many-pointer cast targets (`[*:0]const u8` sentinel
+                // pointers) reject `@as(T, single_ptr)` in zig 0.16 —
+                // "a single pointer cannot cast into a many pointer".
+                // Wrap the operand in @ptrCast so the emitted shape is
+                // `@as([*:0]const u8, @ptrCast(&buf[0]))`, the canonical
+                // zig form for the lib/std/fs.zag openat path argument
+                // (surfaced by the Tier-1 migration's first full zig
+                // compile of the materialized stdlib).
+                if (std.mem.startsWith(u8, c.type_text, "[*")) {
+                    self.write("@ptrCast(");
+                    self.genExpr(c.expr.*);
+                    self.write(")");
+                } else {
+                    self.genExpr(c.expr.*);
+                }
                 self.write(")");
             },
             .free_expr => |f| {
@@ -878,7 +915,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // emit shape for non-builtin method calls.
                 if (mc.target.payload == .ident) {
                     if (builtins.lookupWithRecv(mc.target.payload.ident, mc.name, mc.args.len)) |dispatch| {
-                        self.genBuiltinCall(dispatch, mc.args, expr.loc);
+                        self.genBuiltinCall(dispatch, mc.args, expr.loc, mc.target.payload.ident);
                         return;
                     }
                 }
@@ -1176,7 +1213,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     // even though the stubbed arms were never reached. `@panic`
     // is the runtime-only equivalent that preserves the loud-fail
     // when-reached intent without the compile-time false positive.
-    pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr, loc: ast.Loc) void {
+    pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr, loc: ast.Loc, receiver: ?[]const u8) void {
         switch (dispatch) {
             .argv_get => {
                 // zig 0.16 main-signature migration: argv is no
@@ -1199,116 +1236,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // write_file_counter, mkdir_counter, and
                 // exec_counter).
                 self.write("__zag_argv");
-            },
-            .env_var => {
-                // Phase 1 router: real emit shape for the env_var
-                // dispatch. The bridge is intentionally minimal: copy
-                // the user-side name arg into a sentinel-terminated
-                // stack buffer via `std.posix.toPosixPath`, pass that
-                // buffer's pointer to `std.posix.system.getenv`, and
-                // convert the non-null arm's `[*:0]u8` pointer to a
-                // `[]const u8` slice via `std.mem.span`. The end
-                // result is the zag-side `?[]const u8` shape (the
-                // docs/11 borrowed-string-view contract: non-null is a
-                // sentinel-terminated slice to a process-owned buffer
-                // — users wanting heap ownership must copy or convert).
-                //
-                // Per-call scoping: each env_var invocation steps
-                // env_counter and emits a fresh `__env_<N>` result
-                // variable + per-call `__env_<N>_z` sentinel buffer
-                // ref. Sibling getEnv calls in the same body produce
-                // distinct names (zig's no-redeclaration rule would
-                // reject a clash). The counter resets at the top of
-                // each function body (genFun + genMethod +
-                // genFreeMethod in decl.zig).
-                // Emit a (blk: { ... }) wrapper that
-                //   1. allocates a fresh `var __env_<N>: ?[]const u8 = null;`
-                //   2. tries to copy the user-side name arg into a
-                //      sentinel-terminated buffer via toPosixPath (the
-                //      if-let [|__env_<N>_z|] silently degrades to
-                //      `null` on PATH-too-long without bubbling);
-                //   3. passes `&__env_<N>_z` (the inner-`[]:0`u8` array
-                //      pointer) to `std.posix.system.getenv` — the `&`
-                //      coerces `*[PATH_MAX-1:0]u8` to `[*:0]const u8`
-                //      for the libc-or-syscall layer's argument shape;
-                //   4. on non-null inner if-let, sets `__env_<N> =
-                //      std.mem.span(__s)` which widens the
-                //      sentinel-terminated pointer to the zag-side
-                //      `[]const u8` slice shape.
-                //   5. `break :blk __env_<N>` yields the nullable slice
-                //      out of the blk to the zag call site.
-                //
-                // The double-`if-let` (vs a single `if-let {|n|
-                // try...else null`) preserves the docs/11 borrow
-                // contract — neither arm produces a heap allocation,
-                // both arms stay on the borrowed env-block storage
-                // managed by the OS, and the user's copy/convert
-                // decision is left at the call site.
-                // Const-cast rationale (the v1 caveat). Two cast
-                // points: (a) `&__env_<N>_z` is `*[4095:0]u8`
-                // (mutable) but `std.posix.system.getenv` expects
-                // `[*:0]const u8` — zig 0.16 will not implicitly
-                // coerce `*[N:0]u8` → `[*:0]const u8`, hence
-                // `@constCast(&__env_<N>_z)`. (b) `std.mem.span(__s)`
-                // where `__s: [*:0]u8` resolves to the mutable slice
-                // overload that returns `[]u8`; assigning into the
-                // outer `?[]const u8` slot requires `@constCast` for
-                // the same reason. The const-cast is sound on both
-                // sides — the underlying storage is the OS-managed
-                // env-block which is logically read-only for the
-                // lifetime of the process, so we are just restoring
-                // the const-ness the OS ABI would have offered if
-                // zig exposed a const-native getenv return type
-                // (it doesn't, by design — libc's `getenv` returns
-                // the mutable pointer for in-place modification).
-                // zig 0.16: std.posix.toPosixPath, std.posix.system.getenv,
-                // and std.mem.span were all retired. std.posix.getenv is the
-                // canonical replacement — takes []const u8 directly, returns
-                // ?[:0]const u8. The @as(?[]const u8, ...) coerces the
-                // sentinel-terminated optional into the docs/11 borrowed-
-                // string-view shape zag exposes.
-                self.write("blk: { break :blk @as(?[]const u8, std.posix.getenv(");
-                self.genExpr(args[0]);
-                self.write(")); }");            },
-            .fs_write_file => {
-                // Phase 3 (CLI migration) router: per-call (blk: { \u2026 })
-                // wrapper that opens the path via `std.posix.toPosixPath`
-                // (the same shape `env_var` uses for libc getenv) then
-                // `std.posix.openat(WRONLY|CREAT|TRUNC, 0o644)` + a per-
-                // chunk write loop. Returns 0 on success, -1 on any open
-                // or write failure (the cli.zag init handler treats -1
-                // as "scaffolding failed" and exits with code 1).
-                // zig 0.16: `std.posix.openat`, `std.posix.write`, and
-                // `std.posix.close` were all retired. `std.fs.cwd().createFile`
-                // is the canonical replacement — takes a `[]const u8` path,
-                // returns a `File` handle with `writeAll` and `close` methods.
-                // The `.truncate = true` flag matches the prior
-                // `O_WRONLY|O_CREAT|O_TRUNC` behavior. Single `writeAll` call
-                // replaces the per-chunk write loop (small files only — the
-                // cli.zag init boilerplate is < 100 bytes).
-                // zig 0.16 STUB: the vendored stdlib's std.fs / std.Io.Dir /
-                // std.posix.s API surface diverges significantly from standard
-                // zig 0.16. The real implementation requires either:
-                //   (a) an Io event-loop handle (std.Io.Dir.createFile needs
-                //       dir, io, sub_path, flags), or
-                //   (b) raw std.posix.openat(AT_FDCWD, ...) with a
-                //       null-terminated stack buffer for the path.
-                // Both are substantial refactors deferred to a followup
-                // commit once the vendored stdlib surface stabilises. For
-                // now, emit a clear runtime error so the user sees what's
-                // missing instead of a zig panic.
-                // The .len and .ptr references consume args[0] and args[1]
-                // so zig doesn't flag them as unused locals in the caller
-                // (e.g. cli.zag's `let boilerplate = ...; write_file(p, boilerplate)`).
-                // zig 0.16: std.Io.Dir.cwd().createFile(io, path, flags)
-                // opens a file at the current working directory. writePositionalAll
-                // (offset=0) replaces the per-chunk write loop. close on defer
-                // is the v1 RAII shape.
-                self.write("blk: { const __wf_file = std.Io.Dir.cwd().createFile(__zag_io, ");
-                self.genExpr(args[0]);
-                self.write(", .{ .truncate = true }) catch break :blk -1; defer __wf_file.close(__zag_io); __wf_file.writePositionalAll(__zag_io, ");
-                self.genExpr(args[1]);
-                self.write(", 0) catch break :blk -1; break :blk @as(i32, 0); }");
             },
             .fs_mkdir => {
                 // Phase 3 (CLI migration) router: per-call (blk: { ... })
@@ -1383,25 +1310,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("blk: { var __child = std.process.spawn(__zag_io, .{ .argv = ");
                 self.genExpr(args[0]);
                 self.write(" }) catch break :blk 255; defer __child.kill(__zag_io); const __term = __child.wait(__zag_io) catch break :blk 255; switch (__term) { .exited => |__c| break :blk @as(i32, __c), else => break :blk 255, } }");
-            },
-            .process_exit => {
-                // Phase 3 (CLI migration) router: bare statement-shaped
-                // emit. Outer parens let it work in both statement and
-                // expression positions. @as(u8, @intCast(...)) clamps
-                // i32 to one byte since std.os.linux.exit only takes u8.
-                // No per-call counter needed (no temp names).
-                self.write("(std.os.linux.exit(@as(u8, @intCast(");
-                self.genExpr(args[0]);
-                self.write("))))");
-            },
-            .builtin_alloc => {
-                // `alloc(N)` — heap-allocate N bytes via page_allocator.
-                // Returns []u8 (heap-allocated byte slice). The caller
-                // MUST free with `free(buf)` (already routed through
-                // the slice-overload arm of free_expr).
-                self.write("(std.heap.page_allocator.alloc(u8, ");
-                self.genExpr(args[0]);
-                self.write(") catch @panic(\"OOM\"))");
             },
             .builtin_size_of => {
                 self.write("@sizeOf(");
@@ -1509,17 +1417,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.genExpr(args[0]);
                 self.write(")");
             },
-            .builtin_panic => {
-                self.write("__zag_panic_at(");
-                self.genExpr(args[0]);
-                self.write(", \"");
-                self.write(self.source_path);
-                self.write("\", ");
-                self.writeInt(loc.line);
-                self.write(", ");
-                self.writeInt(loc.col);
-                self.write(")");
-            },
             // v0.1 String/Writer migration (follow-up commit). The
             // router emits one of two shapes depending on
             // `use_hybrid_stdlib`:
@@ -1539,8 +1436,24 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             //    verify the legacy 2-arg shape (default
             //    use_hybrid_stdlib = false from Codegen.init()).
             .string_with_capacity => {
-                if (self.use_hybrid_stdlib) {
-                    self.write("__zag_String.with_capacity(");
+                // v0.1 Tier-1 follow-up: emit the receiver name from
+                // the call site (e.g. `String.with_capacity(4096)` in
+                // lib/std/fs.zag) instead of the legacy
+                // `__zag_String` alias. The old `__zag_String`
+                // spelling points at the per-file INLINE struct in
+                // materialized std files, whose type differs from the
+                // user-facing imported `String` — returning the
+                // inline type from a `var sb: String = ...` binding
+                // failed zig's type check. With the receiver name,
+                // the emitted call resolves through the file's own
+                // `String` alias (imported real type in materialized
+                // mode, hybrid-rebound type in user mode). File mode
+                // (import_std_base = "std/", no mirror) keeps the
+                // legacy 2-arg inline shape.
+                if (self.import_std_base.len == 0 or self.use_hybrid_stdlib) {
+                    const recv = receiver orelse "String";
+                    self.write(recv);
+                    self.write(".with_capacity(");
                     self.genExpr(args[0]);
                     self.write(")");
                 } else {
@@ -1562,10 +1475,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 } else {
                     self.write("__zag_Writer.std_err()");
                 }
-            },
-            .time_now => {
-                // zig 0.16: use raw clock_gettime for monotonic nanos.
-                self.write("(blk: { var __ts: std.posix.timespec = undefined; _ = std.os.linux.clock_gettime(std.os.linux.clockid_t.MONOTONIC, &__ts); break :blk @as(i64, @intCast(__ts.sec)) * 1_000_000_000 + @as(i64, @intCast(__ts.nsec)); })");
             },
         }
     }
