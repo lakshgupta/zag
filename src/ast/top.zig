@@ -106,8 +106,22 @@ pub const Program = struct {
 };
 
 pub const Arena = struct {
+    /// Overflow chunks — appended on demand once the inline `buf`
+    /// (64KiB) is exhausted. Large stdlib modules (e.g. hash.zag's
+    /// 64-entry SHA-256 K table + 32-entry digest literal) exceed
+    /// 64KiB of AST nodes; without this the parser aborts with an
+    /// out-of-bounds panic in `alloc`. Growth chunks are allocated
+    /// from the page allocator and linked into a singly-linked list
+    /// (`next`); they live for the process lifetime (arena semantics
+    /// — the parser never deinits its AST).
+    const OverflowChunk = struct {
+        next: ?*OverflowChunk,
+        buf: [65536]u8,
+        pos: usize,
+    };
     buf: [65536]u8,
     pos: usize,
+    overflow: ?*OverflowChunk = null,
 
     pub fn init() Arena {
         return .{ .buf = undefined, .pos = 0 };
@@ -117,8 +131,28 @@ pub const Arena = struct {
         const size = @sizeOf(T) * count;
         const align_bytes = @alignOf(T);
         const aligned_pos = (self.pos + align_bytes - 1) / align_bytes * align_bytes;
-        const result = @as([*]T, @ptrCast(@alignCast(self.buf[aligned_pos .. aligned_pos + size])));
-        self.pos = aligned_pos + size;
+        if (aligned_pos + size <= self.buf.len) {
+            const result = @as([*]T, @ptrCast(@alignCast(self.buf[aligned_pos .. aligned_pos + size])));
+            self.pos = aligned_pos + size;
+            return result[0..count];
+        }
+        // Slow path: the inline buffer is exhausted — bump through the
+        // overflow chain, allocating a fresh 64KiB chunk on demand.
+        var chunk = self.overflow;
+        while (chunk) |c| {
+            const c_pos = (c.pos + align_bytes - 1) / align_bytes * align_bytes;
+            if (c_pos + size <= c.buf.len) {
+                const result = @as([*]T, @ptrCast(@alignCast(c.buf[c_pos .. c_pos + size])));
+                c.pos = c_pos + size;
+                return result[0..count];
+            }
+            chunk = c.next;
+        }
+        const fresh = std.heap.page_allocator.create(OverflowChunk) catch @panic("parser arena exhausted");
+        fresh.* = .{ .next = self.overflow, .buf = undefined, .pos = 0 };
+        self.overflow = fresh;
+        const result = @as([*]T, @ptrCast(@alignCast(fresh.buf[0..size])));
+        fresh.pos = size;
         return result[0..count];
     }
 

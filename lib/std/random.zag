@@ -1,0 +1,76 @@
+## std.random — deterministic pseudo-random generation.
+##
+##   import std.random.{XorShift64Star}
+##
+##   let rng: XorShift64Star = XorShift64Star.new();
+##   let r: u64 = rng.next_u64();
+##   let f: f64 = rng.next_f64();
+##
+## `new()` seeds from /dev/urandom (8 bytes); the seed can be
+## overridden with `seed_from(entropy: u64)` for reproducibility.
+## Not cryptographically secure — use for tests, shuffles, jitter.
+
+pub struct XorShift64Star {
+    state: u64,
+}
+
+impl XorShift64Star {
+    pub fun new() -> XorShift64Star {
+        let ent: u64 = urandom_u64();
+        return XorShift64Star { state: ent };
+    }
+
+    pub fun seed_from(entropy: u64) -> XorShift64Star {
+        return XorShift64Star { state: entropy };
+    }
+
+    pub fun next_u64(self: *XorShift64Star) -> u64 {
+        var s: u64 = self.state;
+        s = s ^ (s >> 12);
+        # `s << 25` wraps mod 2^64 in the xorshift — zig's checked
+        # shl panics when bits shift out, so shift in u128 and fold.
+        let up: u128 = (s as u128) << 25;
+        s = s ^ ((up % 18446744073709551616) as u64);
+        s = s ^ (s >> 27);
+        self.state = s;
+        # Final multiply wraps mod 2^64 (checked `*` would overflow):
+        # 128-bit product, then explicit fold.
+        let mul: u128 = (s as u128) * 2685821657736338717;
+        return (mul % 18446744073709551616) as u64;
+    }
+
+    pub fun next_u32(self: *XorShift64Star) -> u32 {
+        # Low 32 bits of the u64 stream — explicit fold (checked
+        # @intCast would panic on values above 2^32).
+        let v: u64 = self.next_u64();
+        return (v % 4294967296) as u32;
+    }
+
+    pub fun next_f64(self: *XorShift64Star) -> f64 {
+        let top: u64 = self.next_u64() >> 11;
+        return (top as f64) / 9007199254740992.0;
+    }
+}
+
+fun urandom_u64() -> u64 {
+    var buf: [8]u8 = undefined;
+    const fd: usize = __zag_openat(std.posix.AT.FDCWD, "/dev/urandom", 0, 0);
+    let n: isize = __zag_read(fd as i32, buf[0..], 8);
+    if (n < 8) {
+        return 0x9E3779B97F4A7C15;
+    }
+    var out: u64 = 0;
+    # Build little-endian via a running byte weight: zig 0.16 requires
+    # shift amounts to be Log2Int (u6), so `<< (i * 8)` is rejected —
+    # multiply-accumulate instead (weights stay < 2^56, no overflow).
+    var place: u64 = 1;
+    var i: usize = 0;
+    while (i < 8) {
+        let byte: u64 = buf[i] as u64;
+        out = out | (byte * place);
+        if (i < 7) { place = place * 256; }
+        i = i + 1;
+    }
+    _ = std.os.linux.close(fd as i32);
+    return out;
+}

@@ -34,7 +34,14 @@ const BindingTypeInfo = struct {
 };
 
 pub const Codegen = struct {
-    out_buf: [65536]u8,
+    /// Generated-zig output buffer. Grows on demand from the page
+    /// allocator — large hybrid stdlib imports (base64 tables,
+    /// SHA-256 K arrays, …) push the emitted module past 64KiB,
+    /// which the historical fixed inline buffer could not hold
+    /// (out-of-bounds panic in `write`). The slice is owned for the
+    /// process lifetime (no deinit — the compiler exits after one
+    /// generate pass).
+    out_buf: []u8 = &[_]u8{},
     out_len: usize,
     /// Reference to the parsed `ast.Program` this codegen pass
     /// operates on. `init()` leaves it undefined; `generate()`
@@ -400,7 +407,7 @@ pub const MapEntry = struct {
 
     pub fn init() Codegen {
         return .{
-            .out_buf = undefined,
+            .out_buf = &[_]u8{},
             .out_len = 0,
             .destructure_counter = 0,
             .type_info_buf = undefined,
@@ -454,6 +461,14 @@ pub const MapEntry = struct {
     }
 
     pub     fn write(self: *Codegen, s: []const u8) void {
+        const needed = self.out_len + s.len;
+        if (needed > self.out_buf.len) {
+            var new_cap = if (self.out_buf.len == 0) 65536 else self.out_buf.len * 2;
+            while (new_cap < needed) new_cap *= 2;
+            const grown = std.heap.page_allocator.alloc(u8, new_cap) catch @panic("codegen output buffer OOM");
+            @memcpy(grown[0..self.out_len], self.out_buf[0..self.out_len]);
+            self.out_buf = grown;
+        }
         @memcpy(self.out_buf[self.out_len .. self.out_len + s.len], s);
         for (s) |c| {
             if (c == '\n') self.current_zig_line += 1;
@@ -2097,17 +2112,21 @@ pub const MapEntry = struct {
 
     pub     fn isIntTypeName(type_name: []const u8) bool {
         // zig int-family type names. `usize` / `isize` are arch-sized
-        // ints; `i8..i64` / `u8..u64` are the fixed-width families.
+        // ints; `i8..i128` / `u8..u128` are the fixed-width families.
+        // `u128`/`i128` (stdlib fnv1a64's wrapping-accumulator type)
+        // were added alongside the pure-.zag stdlib batch.
         return std.mem.eql(u8, type_name, "usize") or
             std.mem.eql(u8, type_name, "isize") or
             std.mem.eql(u8, type_name, "i8") or
             std.mem.eql(u8, type_name, "i16") or
             std.mem.eql(u8, type_name, "i32") or
             std.mem.eql(u8, type_name, "i64") or
+            std.mem.eql(u8, type_name, "i128") or
             std.mem.eql(u8, type_name, "u8") or
             std.mem.eql(u8, type_name, "u16") or
             std.mem.eql(u8, type_name, "u32") or
-            std.mem.eql(u8, type_name, "u64");
+            std.mem.eql(u8, type_name, "u64") or
+            std.mem.eql(u8, type_name, "u128");
     }
 
     pub     fn isClosureBound(self: *Codegen, name: []const u8) bool {

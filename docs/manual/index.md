@@ -71,6 +71,10 @@ A comprehensive guide to the Zag programming language.
 - [Project Layout & Dependencies](34-project-layout.md) — Directory structure, `zag install / add / vendor` workflow, build/test/bench CLI
 - [`zag.toml` Schema](35-zag-toml-schema.md) — Formal reference for the package manifest
 
+## Standard Library
+
+- [Standard Library](37-stdlib.md) — Module index, generic fns, heap-returning fns, hash arithmetic
+
 ## Memory Allocation Quick Reference
 
 | Type | Storage | Allocation | Deallocation |

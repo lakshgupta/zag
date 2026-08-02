@@ -446,6 +446,37 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         }
                     }
                 }
+                // Int-source → float-target carve-out (`top as f64`
+                // where top: u64, stdlib random next_f64): zig 0.16's
+                // `@as(f64, u64_var)` is rejected ("expected type
+                // 'f64', found 'u64'") — the canonical form is
+                // `@as(T, @floatFromInt(value))`, which is safe for
+                // every int width (widening only, IEEE rounding).
+                // Ident sources route through the tracked-type check
+                // (float idents are caught by the @floatCast branch
+                // above); the bit-twiddle expression forms are
+                // int-by-construction in the stdlib surface.
+                if (core.isFloatTypeName(target_zig)) {
+                    const is_int_source = switch (c.expr.payload) {
+                        .ident => blk: {
+                            const op_ident = c.expr.payload.ident;
+                            if (self.getSourceTypeName(op_ident)) |source_type| {
+                                break :blk core.isIntTypeName(source_type);
+                            }
+                            break :blk false;
+                        },
+                        .binary, .unary, .index, .call, .method_call => true,
+                        else => false,
+                    };
+                    if (is_int_source) {
+                        self.write("@as(");
+                        self.writeType(c.type_text);
+                        self.write(", @floatFromInt(");
+                        self.genExpr(c.expr.*);
+                        self.write("))");
+                        return;
+                    }
+                }
                 // Int-family narrowing carve-out (`fd_raw as i32` where
                 // fd_raw: usize): zig 0.16's `@as(i32, usize_var)` is
                 // rejected ("signed 32-bit int cannot represent all
@@ -456,17 +487,39 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // positions like `pos + n_signed` don't provide).
                 // Surfaced by lib/std/fs.zag's fd + write-loop casts
                 // (Tier-1 migration).
-                if (core.isIntTypeName(target_zig) and c.expr.payload == .ident) {
-                    const op_ident = c.expr.payload.ident;
-                    if (self.getSourceTypeName(op_ident)) |source_type| {
-                        if (core.isIntTypeName(source_type) and !std.mem.eql(u8, source_type, target_zig)) {
-                            self.write("@as(");
-                            self.writeType(c.type_text);
-                            self.write(", @intCast(");
-                            self.genExpr(c.expr.*);
-                            self.write("))");
-                            return;
-                        }
+                //
+                // v2 widening (stdlib batch): the `.ident`-only guard
+                // rejected the shift/bit-twiddle shapes the pure-.zag
+                // stdlib needs — `(b0 >> 2) as usize`,
+                // `(triple >> 16) as u8`, `(26 + c - 'a') as u32` all
+                // carry binary/unary/index operands whose result type
+                // is int-by-construction (bit-ops on tracked uN idents).
+                // These now route to `@as(T, @intCast(expr))` too;
+                // `@intCast` is a no-op for widening and truncates for
+                // narrowing, matching the wrapping intent of hash
+                // arithmetic. Float-typed binary operands under an
+                // int-target cast would be rejected by zig at compile
+                // time (loud, not silent) — no such shape exists in
+                // the stdlib surface.
+                if (core.isIntTypeName(target_zig)) {
+                    const is_ident_int = switch (c.expr.payload) {
+                        .ident => blk: {
+                            const op_ident = c.expr.payload.ident;
+                            if (self.getSourceTypeName(op_ident)) |source_type| {
+                                break :blk core.isIntTypeName(source_type) and !std.mem.eql(u8, source_type, target_zig);
+                            }
+                            break :blk false;
+                        },
+                        .binary, .unary, .index, .call, .method_call => true,
+                        else => false,
+                    };
+                    if (is_ident_int) {
+                        self.write("@as(");
+                        self.writeType(c.type_text);
+                        self.write(", @intCast(");
+                        self.genExpr(c.expr.*);
+                        self.write("))");
+                        return;
                     }
                 }
                 self.write("@as(");
