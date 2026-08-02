@@ -1241,49 +1241,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     // when-reached intent without the compile-time false positive.
     pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr, loc: ast.Loc, receiver: ?[]const u8) void {
         switch (dispatch) {
-            .process_exec => {
-                // Phase 3 (CLI migration) router: per-call (blk: { ... })
-                // that does fork+execve+waitpid with env read from
-                // /proc/self/environ on every invocation. Returns the
-                // child's exit code (255 on parent fork failure, 127 on
-                // child execve failure, otherwise W.EXITSTATUS).
-                // Phase 3 (CLI migration) router: per-call (blk: { ... })
-                // wrapper. The opening `{` is REQUIRED — every other dispatch
-                // helper in this switch (argv_get, env_var,
-                // fs_write_file, fs_mkdir) emits `blk: { ... }` with the brace;
-                // .process_exec is the only one that emitted `blk:\n` (no
-                // brace), causing zig to parse the body's `var __exec_0_arg_bufs`
-                // line as a malformed statement after a label-named `blk:`
-                // (the `expected 'var' or 'const' before variable declaration`
-                // error seen on the bootstrap). Adding `{` here restores
-                // consistency with the other dispatch-helper shapes.
-                // zig 0.16: std.posix.fork, std.posix.execve, std.posix.waitpid,
-                // std.posix.openat, std.posix.close, and the /proc/self/environ
-                // scanning were all retired. std.process.Child is the canonical
-                // replacement — takes []const []const u8 argv, inherits the
-                // parent environment automatically, and spawnAndWait returns
-                // a Term enum with .Exited(code) for normal exit. The catch
-                // handles spawn failure (255), and the else arm covers
-                // signal/stop/abort exits (also 255).
-                // zig 0.16 STUB: std.process.Child no longer has .allocator
-                // or .argv fields. The real API is std.process.spawn(io,
-                // SpawnOptions) returning a Child, or std.process.run(gpa,
-                // io, RunOptions) returning a RunResult. Both require an
-                // Io event-loop handle. Deferred to a followup commit.
-                // 255 (not -1) matches the shell convention for exec failure
-                // ("command not found"). The .len reference consumes args[0]
-                // so zig doesn't flag it as unused in the caller.
-                // zig 0.16: std.process.run(gpa, io, RunOptions) wraps spawn+wait
-                // and returns a RunResult with .term (a Term union: .Exited(code)
-                // for normal exit, .Signal/.Stopped/.Aborted for the else arm).
-                // 255 (not -1) matches the shell convention for exec failure.
-                // The page_allocator is used for the run's internal scratch
-                // (stdout/stderr capture buffers); the call returns when the
-                // child exits so the leak is bounded to the run duration.
-                self.write("blk: { var __child = std.process.spawn(__zag_io, .{ .argv = ");
-                self.genExpr(args[0]);
-                self.write(" }) catch break :blk 255; defer __child.kill(__zag_io); const __term = __child.wait(__zag_io) catch break :blk 255; switch (__term) { .exited => |__c| break :blk @as(i32, __c), else => break :blk 255, } }");
-            },
             .builtin_size_of => {
                 self.write("@sizeOf(");
                 self.genExpr(args[0]);

@@ -2148,6 +2148,40 @@ test "codegen: get routes through __zag_argv-backed real impl (no argv_get route
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
 }
 
+test "codegen: process exec resolves via @import+alias (no process_exec router)" {
+    // v0.1 Tier-1 migration of std.process.exec from the process_exec
+    // codegen-router inline emit (per-call `blk: { var __child =
+    // std.process.spawn(__zag_io, .{ .argv = ... }) ... }` shape) to
+    // the real lib/std/process.zag impl `return __zag_process_spawn(
+    // argv);` — the always-emitted preamble helper wraps spawn+kill+
+    // wait and maps the .exited term to the child's exit code (else
+    // 255). The call site is now VERBATIM through the @import+alias
+    // fallthrough (Option A pass-through).
+    const src =
+        \\pub import std.process.{exec}
+        \\fun f(argv: []const []const u8) -> i32 {
+        \\    return exec(argv);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Positive: verbatim call site + the @import alias bridge.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return exec(argv);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const exec = __zag_imported_") != null);
+    // Positive: the preamble helper that the real impl forwards to.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_process_spawn(argv: []const []const u8) i32") != null);
+    // Negative: the retired per-call router blk shape must not appear
+    // at the user's call site (the preamble helper's own body starts
+    // with a plain `var __child` on its own line, not `blk: { var`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: { var __child = std.process.spawn") == null);
+}
+
 test "codegen: get_env routes through @import+alias fallthrough (no env_var router)" {
     // v0.1 Tier-1 migration of std.env.get_env from the env_var
     // codegen-router inline emit to a real lib/std/env.zag backed
@@ -3387,9 +3421,10 @@ test "codegen: while let Option.Some(val) emits while (expr) |val| capture" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "while (opt) |val| {") != null);
 }
 
-test "codegen: __zag_posix preamble pins all 11 helpers + locks out steered-around substrings" {
+test "codegen: __zag_posix preamble pins all 13 helpers + locks out steered-around substrings" {
     // The __zag_posix family (openat/read/write/close/getdents64/
-    // clock_gettime/getcwd/getenv/exit/posix_spawn/waitpid) is emitted
+    // clock_gettime/getcwd/getenv/exit/posix_spawn/waitpid) plus
+    // mkdirat (fs.mkdir) and process_spawn (process.exec) is emitted
     // verbatim into the `generate()` preamble in src/codegen/core.zig.
     // Trivia zag source (no call sites) exercises the preamble alone,
     // so any per-helper drop shows up as a missing substring.
@@ -3416,13 +3451,14 @@ test "codegen: __zag_posix preamble pins all 11 helpers + locks out steered-arou
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    // Positive: each of the 11 __zag_posix helpers must appear in the
+    // Positive: each of the 13 __zag_posix helpers must appear in the
     // preamble (verbatim, with fn-name intact).
     const __zag_posix_names = [_][]const u8{
         "__zag_openat",
         "__zag_read",
         "__zag_write",
         "__zag_close",
+        "__zag_mkdirat",
         "__zag_getdents64",
         "__zag_clock_gettime",
         "__zag_getcwd",
@@ -3430,6 +3466,7 @@ test "codegen: __zag_posix preamble pins all 11 helpers + locks out steered-arou
         "__zag_exit",
         "__zag_posix_spawn",
         "__zag_waitpid",
+        "__zag_process_spawn",
     };
     inline for (__zag_posix_names) |name| {
         try std.testing.expect(std.mem.indexOf(u8, zig, name) != null);

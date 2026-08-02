@@ -49,7 +49,10 @@ pub import std.bench.{Counters}
 #   `pub import std.fs.{mkdir}`        → REAL impl in lib/std/fs.zag (__zag_mkdirat,
 #                                         EEXIST coalesced to 0 for mkdir -p semantics);
 #                                         fs_mkdir router row retired.
-#   `pub import std.process.{exec}`    → STILL router-only (process_exec).
+#   `pub import std.process.{exec}`   → REAL impl in lib/std/process.zag
+#                                         (__zag_process_spawn: std.process.spawn+
+#                                         wait, .exited→exit code, else→255);
+#                                         process_exec router row retired.
 pub import std.argv.{get}
 pub import std.env.{get_env}
 pub import std.fs.{read_file}

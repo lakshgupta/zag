@@ -1079,6 +1079,26 @@ pub const MapEntry = struct {
             \\    }
             \\    return -1;
             \\}
+            \\// __zag_process_spawn — zig 0.16 spawn+wait wrapper for
+            \\// lib/std/process.zag's exec. std.process.spawn(io,
+            \\// SpawnOptions{ .argv }) inherits the parent environment;
+            \\// kill+wait(io) reap the child; the .exited term maps to
+            \\// the child's exit code, any other term (signal / stop /
+            \\// abort) or a spawn/wait failure maps to 255 (shell
+            \\// convention for exec failure). The options literal + term
+            \\// union switch live here in zig because zag source cannot
+            \\// express anonymous struct literals or union switches —
+            \\// the same reason the pre-migration process_exec router
+            \\// emitted this block inline.
+            \\fn __zag_process_spawn(argv: []const []const u8) i32 {
+            \\    var __child = std.process.spawn(__zag_io, .{ .argv = argv }) catch return 255;
+            \\    defer __child.kill(__zag_io);
+            \\    const __term = __child.wait(__zag_io) catch return 255;
+            \\    switch (__term) {
+            \\        .exited => |__c| return @as(i32, __c),
+            \\        else => return 255,
+            \\    }
+            \\}
             \\
         );
 

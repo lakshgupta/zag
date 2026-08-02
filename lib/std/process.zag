@@ -8,26 +8,21 @@
 ## preamble helper takes `i32` directly so the .zag body is the
 ## 1-line canonical form. Router row retired in the Tier-1 migration.
 ##
-## `exec` is STILL a codegen-router-only builtin (process_exec in
-## src/codegen/builtins.zig) — its stub body below is never executed
-## because the router REWRITES its call site before runtime (see
-## src/codegen/expr.zig's .process_exec arm). Do NOT delete the stub:
-## `pub import std.process.{exec}` resolves to it through the
-## @import+alias fallthrough and a missing `pub fun` would
-## compile-fail at the user's call site.
-##
-## exec emits a per-call (blk: { ... }) wrapper containing:
-##   - per-arg [:0]u8 allocations via page_allocator
-##   - /proc/self/environ read into envp_z
-##   - fork+execve+waitpid with the caller's argv
-## It returns the child's i32 exit code (or 255 on parent
-## fork failure / 127 on child exec failure).
+## `exec` — REAL impl (same migration): backed by the always-emitted
+## `__zag_process_spawn` preamble helper — zig 0.16's
+## std.process.spawn(io, .{ .argv = ... }) + kill + wait, with the
+## .exited term mapped to the child's exit code and any other term
+## (signal/stop/abort) or spawn/wait failure mapped to 255. The
+## anonymous-struct options literal and the term-union switch live in
+## the zig helper because zag source cannot express those shapes; the
+## pre-migration `process_exec` router row emitted the same block
+## inline and is retired. Call sites resolve through the @import +
+## per-selector alias (`const exec = __zag_imported_<i>.exec;`).
 
 pub fun exit(code: i32) {
     __zag_exit(code);
 }
 
 pub fun exec(argv: []const []const u8) -> i32 {
-    _ = argv;
-    return 255;
+    return __zag_process_spawn(argv);
 }

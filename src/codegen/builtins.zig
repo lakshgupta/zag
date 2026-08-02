@@ -63,15 +63,6 @@ const std = @import("std");
 /// compile time, so a future addition that's missing its case would
 /// fail to compile.
 pub const BuiltinDispatch = enum {
-    /// `process_exec` -- Phase 3 (CLI migration). The cli.zag-run,
-    /// cli.zag-build, cli.zag-check subcommands use this fork+execve
-    /// to recursively invoke zag in `--leaf-process` mode (which is
-    /// the only mode that touches the lex/parse/codegen surface —
-    /// keeping the bootstrap's zig-side transpile lifecycle in
-    /// place rather than re-implementing it in zag source).
-    /// docblock mirrored in the table row below.
-    process_exec,
-
     /// `builtin_size_of` — emit zig's `@sizeOf(T)` for compile-time
     /// type-size reflection. The single argument must be a type ident;
     /// codegen emits the type verbatim. No per-call counter needed.
@@ -221,16 +212,22 @@ pub const builtin_table = [_]BuiltinRoute{
     // rows are untouched. arity is exact-match per Phase 0's
     // footgun note.
     //
-    //   `read_file` / `write_file` / `mkdir` / `exit` / `alloc` /
-    //   `panic` / `now` / `getEnv`(→get_env) were retired as builtin
-    //   rows in the v0.1 Tier-1 migration in favour of real lib/std
-    //   .zag impls backed by the __zag_posix preamble family (see
-    //   lib/std/{fs,env,process,time,mem,debug}.zag). Their call
-    //   sites now resolve through the @import+alias fallthrough in
-    //   src/codegen/core.zig's imports loop (Option A pass-through).
+    //   `read_file` / `write_file` / `mkdir` / `exit` / `exec` /
+    //   `alloc` / `panic` / `now` / `getEnv`(→get_env) / `get`(argv)
+    //   were retired as builtin rows in the v0.1 Tier-1 migration in
+    //   favour of real lib/std .zag impls backed by the __zag_posix /
+    //   __zag_process_spawn preamble family (see lib/std/{fs,env,
+    //   process,time,mem,debug,argv}.zag). Their call sites now
+    //   resolve through the @import+alias fallthrough in
+    //   src/codegen/core.zig's imports loop (Option A pass-through),
+    //   except argv.get which binds preamble-side (__zag_argv lives
+    //   in the user module — see stdlibPreambleName).
     //
-    //   `exec`        arity=1  -> process_exec  (argv []const []const u8)
-    //                                          fork + execve + waitpid
+    //   Remaining rows below are compiler INTRINSICS (size_of /
+    //   align_of / volatile_* / atomic_* / thread_* / mutex_* /
+    //   type_name) and the String/Writer receiver-routed arms — zag
+    //   source cannot express their zig builtin call shapes, so they
+    //   stay router-emitted by design.
     .{ .name = "size_of", .arity = 1, .receiver = null, .dispatch = .builtin_size_of },
     .{ .name = "align_of", .arity = 1, .receiver = null, .dispatch = .builtin_align_of },
     .{ .name = "volatile_store", .arity = 2, .receiver = null, .dispatch = .builtin_volatile_store },
