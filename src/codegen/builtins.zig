@@ -63,15 +63,6 @@ const std = @import("std");
 /// compile time, so a future addition that's missing its case would
 /// fail to compile.
 pub const BuiltinDispatch = enum {
-    /// `argv_get` -- emit a per-call `(blk: { ... })` that walks
-    /// `std.os.argv` (zippty-terminated sentinel slice of optional
-    /// *u8) into a stack-allocated `__argv_<N>: [32][]const u8` slice
-    /// and yields that slice. Intentionally NOT heap-allocating
-    /// because argv slicing is on the CLI hot path; the [32] cap
-    /// matches the conventional `argc <= 32` working case and
-    /// the loop is bounded.
-    argv_get,
-
     /// `process_exec` -- Phase 3 (CLI migration). The cli.zag-run,
     /// cli.zag-build, cli.zag-check subcommands use this fork+execve
     /// to recursively invoke zag in `--leaf-process` mode (which is
@@ -216,17 +207,14 @@ pub const BuiltinRoute = struct {
 /// first-call time. sentinel for over-N is the linear scan itself (no
 /// upper bound needed for v1).
 pub const builtin_table = [_]BuiltinRoute{
-    // Phase 0 first entry: `get` (no-receiver free-fn form after
-    // `pub import std.argv.{get}` selective import) routes to the
-    // argv_get dispatch which emits a per-call blk wrapper that
-    // walks `std.os.argv` into a stack-allocated [32][]const u8.
-    // arity = 0 is EXACT-match (zero-arg call sites only) per the
-    // pin-test `argv_get counter increments across multiple calls
-    // in the same body`. The wildcard-design was abandoned after
-    // a code-review flagged the footgun (`get(1, 2)` would have
-    // silently routed to argv_get's emit shape and burned the
-    // user's args).
-    .{ .name = "get", .arity = 0, .receiver = null, .dispatch = .argv_get },
+    // v0.1 Tier-1 stdlib migration: the Phase 0 `get` (argv) row was
+    // RETIRED — `pub import std.argv.{get}` now resolves to the real
+    // lib/std/argv.zag impl (`return __zag_argv;`) through the
+    // @import+alias fallthrough, mirroring get_env/read_file/
+    // write_file/mkdir. The pre-migration emit (per-call blk walker
+    // over std.os.argv into a stack-allocated [32][]const u8) is
+    // history; zig 0.16 removed std.os.argv entirely.
+    //
     // Phase 3 (CLI migration): additions that close the loop for
     // cli.zag as the canonical CLI dispatcher. Each is additive —
     // prior tests stay byte-identical because the existing argv_get

@@ -2135,6 +2135,18 @@ fn stdlibPreambleName(name: []const u8) []const u8 {
     // that on the moved types.
     if (std.mem.eql(u8, name, "String")) return "__zag_String";
     if (std.mem.eql(u8, name, "Writer")) return "__zag_Writer";
+    // std.argv.get (v0.1 Tier-1 migration): `pub import std.argv.{get}`
+    // aliases DIRECTLY to the module-level `__zag_argv` global (the
+    // fast path in the imports loop emits `const get = __zag_argv;`).
+    // This must NOT go through the @import + alias slow path: the
+    // materialized std/argv.zig is a separate zig module with its OWN
+    // self-contained preamble (use_hybrid = false), so its `__zag_argv`
+    // copy is never assigned — genFun's is_main special case captures
+    // argv into the USER module's global at main entry. lib/std/argv.zag
+    // keeps the reference body for documentation + scaffold parsing,
+    // but the binding is preamble-side, mirroring the String/Writer
+    // hardcoded-coupling rationale above.
+    if (std.mem.eql(u8, name, "get")) return "__zag_argv";
     if (std.mem.eql(u8, name, "Display")) return "";
     if (std.mem.eql(u8, name, "ErrorExt")) return "";
     if (std.mem.eql(u8, name, "Error")) return "__zag_Error";

@@ -2097,10 +2097,11 @@ test "codegen: builtin router preserves non-builtin call verbatim" {
 test "codegen: builtin router does NOT fire on user helpers with builtin-like names" {
     // Defensive pin: a user-defined helper named `process` (which is
     // also a potential Phase 2 `std.process` entry) must not trigger
-    // the router. argv_get is the only Phase 0 entry; any other name
-    // falls through to the verbatim fallback. This guards against an
-    // over-broad match that would corrupt unrelated call sites when
-    // a future Phase adds more entries.
+    // the router. Any name outside builtin_table falls through to the
+    // verbatim fallback. This guards against an over-broad match that
+    // would corrupt unrelated call sites when a future Phase adds
+    // more entries. (The Phase 0 `get`/argv row was retired in the
+    // v0.1 Tier-1 migration — lib/std/argv.zag owns that surface now.)
     const src = "fun f() {\n    let r: i32 = process(data);\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -2113,13 +2114,23 @@ test "codegen: builtin router does NOT fire on user helpers with builtin-like na
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
 }
 
-test "codegen: argv_get builtin routes through __zag_argv module-level global" {
-    // zig 0.16 retired `std.os.argv` / `std.posix.argv`. The new
-    // architecture: genFun's `is_main` special case captures
-    // `init.minimal.args.toSlice(...)` into the module-level
-    // `__zag_argv` global at main entry, and the `.argv_get` dispatch
-    // is now a single reference to that global.
-    const src = "fun f() {\n    let args: []const []const u8 = get();\n}\n";
+test "codegen: get routes through __zag_argv-backed real impl (no argv_get router)" {
+    // v0.1 Tier-1 migration of std.argv.get from the argv_get
+    // codegen-router inline emit. The router row is retired; the
+    // imports loop's FAST path now binds the selector DIRECTLY to
+    // the user module's `__zag_argv` global via stdlibPreambleName
+    // (`const get = __zag_argv;`). The binding must NOT go through
+    // the @import + alias slow path: the materialized std/argv.zig
+    // is a separate zig module with its own preamble copy of
+    // `__zag_argv`, which is never assigned (genFun's is_main
+    // special case captures argv into the USER module's global).
+    const src =
+        \\pub import std.argv.{get}
+        \\fun f() {
+        \\    let args: []const []const u8 = get();
+        \\}
+        \\
+    ;
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2127,14 +2138,14 @@ test "codegen: argv_get builtin routes through __zag_argv module-level global" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Positive: the router routes to the module-level __zag_argv global.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_argv") != null);
-    // Negative: the verbatim `get()` form must NOT appear (proves the
-    // builtin_table router fired rather than falling through).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "= get()") == null);
-    // Negative: the legacy per-call blk walker surface is retired.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
+    // Positive: verbatim call site + the preamble-side binding.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= get();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const get = __zag_argv;") != null);
+    // Negative: no @import alias for get (the broken cross-module
+    // global path) and no retired per-call blk walker surface.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const get = __zag_imported_") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "[32][]const u8") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
 }
 
 test "codegen: get_env routes through @import+alias fallthrough (no env_var router)" {

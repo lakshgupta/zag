@@ -2,20 +2,28 @@
 ##
 ## From docs/spec.md §6.4 (System Surfaces): argv is exposed as a
 ## free-fn form after the user writes `pub import std.argv.{get}`.
-## The router in src/codegen/builtins.zig fires on a `get()` call and
-## emits a per-call `(blk: { var __argv_<N>: [32][]const u8 = undefined;
-## ...; break :blk __argv_<N>[0..__argv_<N>_n]; })` wrapper that captures
-## `std.os.argv` into a stack-allocated 32-slot slice bounded by the
-## walk count `__argv_<N>_n`. The emit uses `std.mem.span(a)` directly
-## (no `orelse ""` wrapper) because `std.os.argv` on Linux stores
-## non-optional sentinel-terminated pointers — `orelse` would have
-## hard-errored at compile time per Phase 0's Linux-correctness work.
 ##
-## Stub: throwaway body so the .zag file parses through the existing
-## stub convention; the genBuiltinCall arm REWRITES the call site
-## before any reader sees the verbatim form.
+## v0.1 Tier-1 migration: REAL impl — with one architectural caveat.
+## The reference body below is `return __zag_argv;` (the module-level
+## global captured by genFun's `is_main` special case via
+## `init.minimal.args.toSlice(allocator)` at main entry, because zig
+## 0.16 retired `std.os.argv` / `std.posix.argv` entirely).
+##
+## The body lives here for documentation + scaffold parsing, but the
+## actual binding is PREAMBLE-side: `stdlibPreambleName("get")`
+## returns `__zag_argv` (src/codegen/core.zig), so the imports loop's
+## fast path emits `const get = __zag_argv;` IN THE USER MODULE —
+## the @import + per-selector-alias slow path would resolve `get` to
+## this file's materialized std/argv.zig, a separate zig module whose
+## OWN self-contained preamble copy of `__zag_argv` is never assigned
+## (only the user module's global gets captured at main entry).
+## Mirrors the String/Writer hardcoded-coupling rationale; the
+## pre-migration `argv_get` router row emitted the same `__zag_argv`
+## reference inline and is retired.
+##
+## The slice is bounded by the actual argc (toSlice returns exactly
+## argc entries), so no 32-slot cap or per-call blk walker is needed.
 
 pub fun get() -> []const []const u8 {
-    var empty: [0][]const u8 = undefined;
-    return empty[0..0];
+    return __zag_argv;
 }

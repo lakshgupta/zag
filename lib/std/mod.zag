@@ -20,7 +20,11 @@ pub import std.bench.{Counters}
 # separate modules so the codegen-router path can be selectively widened
 # without dragging unrelated surface into the gzip-installed executable.
 #
-# Phase 0 entry: `pub import std.argv.{get}` → builtin argv_get (Phase 0 wired).
+# Phase 0 entry (migrated): `pub import std.argv.{get}` → REAL impl in
+# lib/std/argv.zag (`return __zag_argv;` — the module-level global captured
+# at main entry). The argv_get router row was RETIRED in the v0.1 Tier-1
+# migration; the call site resolves verbatim via the @import+alias
+# fallthrough.
 # Phase 1 entries:
 #   `pub import std.env.{get_env}`     → REAL impl in lib/std/env.zag backed by
 #                                         __zag_getenv (Tier-1 migration;

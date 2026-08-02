@@ -1241,28 +1241,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     // when-reached intent without the compile-time false positive.
     pub     fn genBuiltinCall(self: *Codegen, dispatch: builtins.BuiltinDispatch, args: []const ast.Expr, loc: ast.Loc, receiver: ?[]const u8) void {
         switch (dispatch) {
-            .argv_get => {
-                // zig 0.16 main-signature migration: argv is no
-                // longer accessible at runtime via a raw slice
-                // (`std.os.argv` and `std.posix.argv` were both
-                // removed). The canonical idiom is to capture
-                // `init.minimal.args.toSlice(allocator)` at main
-                // entry (see `genFun` in decl.zig, which special-
-                // cases the main function to accept
-                // `init: std.process.Init` and store the result in
-                // the module-level `__zag_argv` global). The
-                // `.argv_get` dispatch is now a simple reference
-                // to that global -- no per-call blk wrapper, no
-                // 32-slot cap (the slice is already bounded by the
-                // actual argc), no `std.mem.span` coercion
-                // (toSlice already returns the right type). The
-                // `argv_counter` field and per-call `__argv_<N>`
-                // temps have been retired (this commit completes
-                // the dead-counter cleanup alongside env_counter,
-                // write_file_counter, mkdir_counter, and
-                // exec_counter).
-                self.write("__zag_argv");
-            },
             .process_exec => {
                 // Phase 3 (CLI migration) router: per-call (blk: { ... })
                 // that does fork+execve+waitpid with env read from
