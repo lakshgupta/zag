@@ -413,6 +413,7 @@ pub fn build(b: *std.Build) void {
     const scaffold_options = b.addOptions();
     scaffold_options.addOption([]const u8, "stub_mod", readStubFile(b, "lib/std/mod.zag"));
     scaffold_options.addOption([]const u8, "stub_string", readStubFile(b, "lib/std/string.zag"));
+    scaffold_options.addOption([]const u8, "stub_types", readStubFile(b, "lib/std/types.zag"));
     scaffold_options.addOption([]const u8, "stub_error", readStubFile(b, "lib/std/error.zag"));
     scaffold_options.addOption([]const u8, "stub_fmt", readStubFile(b, "lib/std/fmt.zag"));
     scaffold_options.addOption([]const u8, "stub_time", readStubFile(b, "lib/std/time.zag"));

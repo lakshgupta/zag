@@ -78,13 +78,14 @@ fn parseStub(_name: []const u8, src: []const u8) !ast.Program {
 // trait/fun decls. The barrel imports track the canonical surface
 // listed in docs/manual/22-modules.md "Adding a new std module".
 // ---------------------------------------------------------------
-test "scaffold: std.mod parses with 16 selective-import decls" {
+test "scaffold: std.mod parses with 17 selective-import decls" {
     const prog = try parseStub("std.mod", build_options.stub_mod);
-    try std.testing.expectEqual(@as(usize, 16), prog.imports.len);
+    try std.testing.expectEqual(@as(usize, 17), prog.imports.len);
     // Each line is `pub import std.X.{A, B, …}` so is_pub=true on
     // every entry and selectors.len >= 2.
     const expected_paths = [_][]const u8{
         "std.error",
+        "std.types",
         "std.string",
         "std.fmt",
         "std.time",
@@ -128,11 +129,13 @@ test "scaffold: std.mod parses with 16 selective-import decls" {
         // Each line has at least 1 selector
         try std.testing.expect(imp.selectors.len >= 1);
     }
-    // Pin the alias on the second line (`Display as StringDisplay`)
-    // so the `as` rename is exercised end-to-end through parseImportDecl.
-    try std.testing.expectEqualStrings("Display", prog.imports[1].selectors[1].name);
-    try std.testing.expect(prog.imports[1].selectors[1].alias != null);
-    try std.testing.expectEqualStrings("StringDisplay", prog.imports[1].selectors[1].alias.?);
+    // Pin the alias on the std.string line (`Display as
+    // StringDisplay` — imports[2] because std.types now precedes it)
+    // so the `as` rename is exercised end-to-end through
+    // parseImportDecl.
+    try std.testing.expectEqualStrings("Display", prog.imports[2].selectors[0].name);
+    try std.testing.expect(prog.imports[2].selectors[0].alias != null);
+    try std.testing.expectEqualStrings("StringDisplay", prog.imports[2].selectors[0].alias.?);
     // The barrel has only imports — no struct/enum/fun/trait decls.
     try std.testing.expectEqual(@as(usize, 0), prog.structs.len);
     try std.testing.expectEqual(@as(usize, 0), prog.enums.len);
@@ -142,10 +145,11 @@ test "scaffold: std.mod parses with 16 selective-import decls" {
 }
 
 // ---------------------------------------------------------------
-// std.string — `pub struct String { _opaque: i32 }` + impl methods.
+// std.types — canonical home of `pub struct String` + impl methods
+// (moved from std.string; the string.zag barrel now re-exports).
 // ---------------------------------------------------------------
-test "scaffold: std.string parses with String struct + impl methods" {
-    const prog = try parseStub("std.string", build_options.stub_string);
+test "scaffold: std.types parses with String struct + impl methods" {
+    const prog = try parseStub("std.types", build_options.stub_types);
     try std.testing.expectEqual(@as(usize, 1), prog.structs.len);
     try std.testing.expectEqualStrings("String", prog.structs[0].name);
     try std.testing.expectEqual(@as(usize, 3), prog.structs[0].fields.len);
@@ -161,6 +165,21 @@ test "scaffold: std.string parses with String struct + impl methods" {
     try std.testing.expectEqualStrings("as_str", prog.impls[0].methods[1].name);
     try std.testing.expectEqualStrings("push_str", prog.impls[0].methods[2].name);
     try std.testing.expectEqualStrings("push_ch", prog.impls[0].methods[3].name);
+}
+
+// ---------------------------------------------------------------
+// std.string — re-export barrel: `pub import std.types.{String}`
+// (no structs/impls of its own — the String type lives in
+// std.types). The parse must surface exactly the import.
+// ---------------------------------------------------------------
+test "scaffold: std.string barrel re-exports String via pub import" {
+    const prog = try parseStub("std.string", build_options.stub_string);
+    try std.testing.expectEqual(@as(usize, 0), prog.structs.len);
+    try std.testing.expectEqual(@as(usize, 0), prog.impls.len);
+    try std.testing.expectEqual(@as(usize, 1), prog.imports.len);
+    try std.testing.expect(prog.imports[0].is_pub);
+    try std.testing.expectEqual(@as(usize, 1), prog.imports[0].selectors.len);
+    try std.testing.expectEqualStrings("String", prog.imports[0].selectors[0].name);
 }
 
 // ---------------------------------------------------------------

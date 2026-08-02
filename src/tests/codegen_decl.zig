@@ -3705,3 +3705,47 @@ test "codegen: await lowers to the inline-drive form" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __fut_0.value.?;") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "const x: i32 = (blk: { var __fut_1 = h(); __zag_future_drive(@TypeOf(__fut_1), &__fut_1); break :blk __fut_1.value.?; });") != null);
 }
+
+test "codegen: import std.types.{String} binds the preamble String type" {
+    // std.types is the canonical home of the String type (moved from
+    // std.string; string.zag is now a re-export barrel). In the user
+    // module the selector takes the fast path: `pub const String =
+    // __zag_String;` — same preamble type as std.string.
+    const src =
+        \\import std.types.{String}
+        \\fun f() {
+        \\    let s: String = String.with_capacity(8);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const String = __zag_String;") != null);
+}
+
+test "codegen: pub import emits pub const (cross-module re-export)" {
+    // The std.types move depends on `pub import` emitting
+    // `pub const NAME = __zag_imported_<i>.NAME;` so a re-export
+    // barrel (std.string → std.types) is visible across modules —
+    // a plain `const` fails with zig's "decl is not pub".
+    const src =
+        \\pub import std.types.{String}
+        \\fun f() {
+        \\    let s: String = String.with_capacity(8);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const String = __zag_String;") != null);
+}

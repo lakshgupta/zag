@@ -726,6 +726,7 @@ pub const Parser = struct {
     }{
         .{ .name = "std", .path = "lib/std/mod.zag" },
         .{ .name = "std.string", .path = "lib/std/string.zag" },
+        .{ .name = "std.types", .path = "lib/std/types.zag" },
         .{ .name = "std.error", .path = "lib/std/error.zag" },
         .{ .name = "std.env", .path = "lib/std/env.zag" },
         .{ .name = "std.argv", .path = "lib/std/argv.zag" },

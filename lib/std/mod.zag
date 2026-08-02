@@ -9,7 +9,8 @@
 ## namespace indirection.
 
 pub import std.error.{Error, Context, ErrorExt}
-pub import std.string.{String, Display as StringDisplay}
+pub import std.types.{String}
+pub import std.string.{Display as StringDisplay}
 pub import std.fmt.{Display, Writer, FmtError}
 pub import std.time.{Duration, Timer}
 pub import std.time.{now}

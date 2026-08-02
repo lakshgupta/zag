@@ -1342,6 +1342,10 @@ pub const MapEntry = struct {
                             for (imp.selectors) |sel| {
                                 const preamble_name = stdlibPreambleName(sel.name);
                                 const user_name = sel.alias orelse sel.name;
+                                // `pub import` → `pub const` (cross-
+                                // module re-export; see the slow-path
+                                // docblock below).
+                                if (imp.is_pub) self.write("pub ");
                                 self.write("const ");
                                 self.write(user_name);
                                 self.write(" = ");
@@ -1399,6 +1403,7 @@ pub const MapEntry = struct {
                                 // cross-module type identity (see the
                                 // fast-path docblock above); those
                                 // files alias through the @import.
+                                if (imp.is_pub) self.write("pub ");
                                 self.write("const ");
                                 self.write(user_name);
                                 self.write(" = ");
@@ -1408,6 +1413,7 @@ pub const MapEntry = struct {
                                 // .zag-source-backed: forward through
                                 // the @import alias so zig sees
                                 // `__zag_imported_<i>.<canonical>`.
+                                if (imp.is_pub) self.write("pub ");
                                 self.write("const ");
                                 self.write(user_name);
                                 self.write(" = __zag_imported_");
@@ -1470,15 +1476,22 @@ pub const MapEntry = struct {
                     // through `self.write`, which copies them into
                     // `out_buf` immediately.
                     //
-                    // `is_pub` is NOT honored at v1: the alias emit
-                    // is unconditionally `const`, not `pub const`,
-                    // matching the preamble's "module-local binding"
-                    // contract. Re-exporting aliases via `pub const
-                    // MyStr = ...` is a Phase 2+ widening that the
-                    // user can opt into once `pub fun` / `pub
-                    // struct` re-exports are wired the same way.
+                    // `is_pub` IS honored at v1: `pub import` emits
+                    // `pub const <name> = __zag_imported_<i>.<sel>;`
+                    // (a cross-module-visible re-export), while a
+                    // plain `import` keeps the module-local `const`.
+                    // This is what makes `std.types`-style re-export
+                    // barrels work: lib/std/string.zag's
+                    // `pub import std.types.{String}` emits
+                    // `pub const String = @import("types.zig").String;`
+                    // so `import std.string.{String}` resolves the
+                    // SAME type across modules (without pub, zig
+                    // rejects "decl is not pub" at the cross-module
+                    // use site). The pre-Phase-2 shape ("is_pub NOT
+                    // honored") predates the std.types move.
                     for (imp.selectors) |sel| {
                         const user_name = sel.alias orelse sel.name;
+                        if (imp.is_pub) self.write("pub ");
                         self.write("const ");
                         self.write(user_name);
                         self.write(" = __zag_imported_");

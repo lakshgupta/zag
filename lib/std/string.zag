@@ -1,104 +1,15 @@
-## std.string — heap-allocated mutable UTF-8 string.
+## std.string — strings (re-export barrel).
 ##
-## Real impl — methods compose against the always-emitted
-## `__zag_page_alloc` / `__zag_page_realloc` / `__zag_page_free`
-## / `__zag_memcpy` / `__zag_panic` family primitives in the
-## generated zig preamble (see src/codegen/core.zig's preamble block).
-## After zag's transpile pass, build/gen/std/string.zig is the
-## source of truth at runtime — this .zag surface matches its
-## emitted zig shape 1:1, with method names in snake_case (the
-## codegen router arms in src/codegen/expr.zig emit
-## `__zag_String.with_capacity(N)` as the migrated call site, so
-## impl-block method names must match).
+## The `String` type's canonical home moved to `std.types` (see
+## lib/std/types.zag) so it can be imported as:
 ##
-## File-mode fallback (src/codegen/core.zig's `__zag_String_inline`
-## struct) would have its method bodies carried in lockstep with
-## this file; the inline-vs-@imported split is selected at codegen
-## time by the `use_hybrid_stdlib` flag. The inline struct's
-## closures are kept aligned with this file so both forms
-## zig-compile to identical runtime behaviour.
+##   import std.types.{String}
 ##
-## Layout { ptr: [*]u8, len: usize, cap: usize }. The `*u8` raw
-## pointer shape rewrites through zagTypeToZig's `*raw T` rule
-## to zig `[*]u8` (many-pointer) — see
-## src/codegen/decl.zig::zagTypeToZig's v1.5 raw-pointer block.
-##
-## Parser rules captured during scaffold_tests iterations:
-## 1. zag requires explicit type annotations on BOTH `let` AND
-##    `var` bindings (scaffold round 1+2).
-## 2. zag REQUIRES `{ ... }` braces around if/while bodies — bare
-##    `if (cond) stmt;` and `while (cond) stmt;` are rejected at
-##    parse time with "expected lbrace, got '<ident>'" (scaffold
-##    round 3 surfaced this at lib/std/string.zag:52:31).
+## This file keeps the legacy `std.string.{String}` path working for
+## existing callers (docs, examples, and lib/std internal imports all
+## use it) by re-exporting the type. The re-export is `pub import`,
+## which the imports loop emits as `pub const String =
+## @import("types.zig").String;` — visible across modules, so both
+## paths bind to the SAME zig type.
 
-pub struct String {
-    ptr: *raw u8,
-    len: usize,
-    cap: usize,
-}
-
-impl String {
-    pub fun with_capacity(cap: usize) -> String {
-        let p: *raw u8 = __zag_page_alloc(cap);
-        return String { ptr: p, len: 0, cap: cap };
-    }
-
-    pub fun as_str(self: *const String) -> []const u8 {
-        return self.ptr[0..self.len];
-    }
-
-    pub fun push_str(self: *String, s: []const u8) -> void {
-        let needed: usize = self.len + s.len;
-        if (needed > self.cap) {
-            var new_cap: usize = self.cap;
-            if (new_cap == 0) { new_cap = 16; }
-            while (new_cap < needed) { new_cap = new_cap * 2; }
-            self.ptr = __zag_page_realloc(self.ptr, self.cap, new_cap);
-            self.cap = new_cap;
-        }
-        __zag_memcpy(self.ptr[self.len..self.len + s.len], s, s.len);
-        self.len = needed;
-    }
-
-    pub fun push_ch(self: *String, ch: u8) -> void {
-        let needed: usize = self.len + 1;
-        if (needed > self.cap) {
-            var new_cap: usize = self.cap;
-            if (new_cap == 0) { new_cap = 16; }
-            while (new_cap < needed) { new_cap = new_cap * 2; }
-            self.ptr = __zag_page_realloc(self.ptr, self.cap, new_cap);
-            self.cap = new_cap;
-        }
-        self.ptr[self.len] = ch;
-        self.len = needed;
-    }
-
-    pub fun pop_ch(self: *String) -> ?u8 {
-        if (self.len == 0) { return null; }
-        self.len = self.len - 1;
-        return self.ptr[self.len];
-    }
-
-    pub fun clear(self: *String) -> void {
-        self.len = 0;
-    }
-
-    pub fun insert_ch(self: *String, pos: usize, ch: u8) -> void {
-        if (pos > self.len) { __zag_panic("String.insert_ch: position out of bounds"); }
-        let needed: usize = self.len + 1;
-        if (needed > self.cap) {
-            var new_cap: usize = self.cap;
-            if (new_cap == 0) { new_cap = 16; }
-            while (new_cap < needed) { new_cap = new_cap * 2; }
-            self.ptr = __zag_page_realloc(self.ptr, self.cap, new_cap);
-            self.cap = new_cap;
-        }
-        var i: usize = self.len;
-        while (i > pos) {
-            self.ptr[i] = self.ptr[i - 1];
-            i = i - 1;
-        }
-        self.ptr[pos] = ch;
-        self.len = needed;
-    }
-}
+pub import std.types.{String}
