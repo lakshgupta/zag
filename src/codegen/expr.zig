@@ -1263,37 +1263,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // exec_counter).
                 self.write("__zag_argv");
             },
-            .fs_mkdir => {
-                // Phase 3 (CLI migration) router: per-call (blk: { ... })
-                // via toPosixPath + std.posix.mkdir. EEXIST silently
-                // coalesced (matches cli.zag init's "mkdir -p" semantics);
-                // other failures surface as -1.
-                // zig 0.16: `std.posix.mkdir` and `std.posix.mkdirat` were
-                // both retired. `std.fs.cwd().makeDir` is the canonical
-                // replacement — takes a `[]const u8` path, returns
-                // `PathAlreadyExists` on duplicate (which we silently
-                // coalesce to match cli.zag's `mkdir -p` semantics). Other
-                // failures (permission denied, ENOSPC) surface as -1.
-                // zig 0.16 STUB: see .fs_write_file above for the full
-                // rationale. The real implementation needs std.Io.Dir.makeDir
-                // or std.posix.mkdir with null-terminated path. Deferred.
-                // zig 0.16: std.Io.Dir.cwd().createDir(io, sub_path, permissions)
-                // creates a directory. PathAlreadyExists is silently coalesced
-                // to 0 (cli.zag init's "mkdir -p" semantics); other failures
-                // surface as -1. Permissions default to .{} (0o755 via the
-                // std.Io.Dir.createDir default).
-                self.write("blk: { std.Io.Dir.cwd().createDir(__zag_io, ");
-                self.genExpr(args[0]);
-                // zig 0.16: std.Io.File.Permissions is an enum (not a
-                // raw integer) on POSIX, with two named variants:
-                // .default_file = 0o666 and .default_dir = 0o777. The
-                // enum has a `_ =>` catch-all for any other mode_t
-                // value, so @enumFromInt(0o755) would also work, but
-                // .default_dir is the idiomatic stdlib choice for
-                // directory creation (rwxrwxrwx; the owner's write
-                // bit is implicit since they just created the dir).
-                self.write(", .default_dir) catch |e| { if (e != error.PathAlreadyExists) break :blk -1; }; break :blk @as(i32, 0); }");
-            },
             .process_exec => {
                 // Phase 3 (CLI migration) router: per-call (blk: { ... })
                 // that does fork+execve+waitpid with env read from

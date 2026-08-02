@@ -42,7 +42,9 @@ pub import std.bench.{Counters}
 #                                         builtin_alloc router row retired.
 #   `pub import std.debug.{panic}`     → REAL impl in lib/std/debug.zag (__zag_panic);
 #                                         builtin_panic router row retired.
-#   `pub import std.fs.{mkdir}`        → STILL router-only (fs_mkdir).
+#   `pub import std.fs.{mkdir}`        → REAL impl in lib/std/fs.zag (__zag_mkdirat,
+#                                         EEXIST coalesced to 0 for mkdir -p semantics);
+#                                         fs_mkdir router row retired.
 #   `pub import std.process.{exec}`    → STILL router-only (process_exec).
 pub import std.argv.{get}
 pub import std.env.{get_env}

@@ -969,6 +969,15 @@ pub const MapEntry = struct {
             \\fn __zag_close(fd: i32) usize {
             \\    return std.os.linux.close(fd);
             \\}
+            \\// __zag_mkdirat — raw `mkdirat(2)`. Returns 0 on
+            \\// success, errno-encoded usize on failure (high-bit
+            \\// set; EEXIST = 17, which lib/std/fs.zag's mkdir
+            \\// coalesces to 0 for "mkdir -p" semantics). The
+            \\// `mode_t` param is u32 on Linux so it passes
+            \\// through directly.
+            \\fn __zag_mkdirat(dirfd: i32, path: [*:0]const u8, mode: u32) usize {
+            \\    return std.os.linux.mkdirat(dirfd, path, mode);
+            \\}
             \\// __zag_getdents64 — raw `getdents64(2)`. Returns
             \\// bytes written into `buf` (0 = EOF). Caller walks
             \\// entries via the canonical `d_reclen` offset walk

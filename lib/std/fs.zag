@@ -14,7 +14,6 @@
 ##   emits `const __zag_imported_<i> = @import("lib/std/fs.zag")`
 ##   plus `const read_file = __zag_imported_<i>.read_file` rather than
 ##   dropping the selector silently).
-##
 ##   Chunked-read approach (v0.1): no __zag_fstat / __zag_lseek exist
 ##   in the landed preamble, so we don't precompute total size. Each
 ##   read loop iterates 4 KiB at a time and `push_str`-es into a heap
@@ -30,13 +29,13 @@
 ##   to `?String` or `!String`) once the docs/19 error-propagation
 ##   zig-side codegen is wired.
 ##
-##   `write_file` + `mkdir` — STILL codegen-router-only builtins
-##   (fs_write_file / fs_mkdir in src/codegen/builtins.zig). Their
-##   stub bodies below are never executed because the router REWRITES
-##   their call sites before runtime (see src/codegen/expr.zig's
-##   .fs_write_file + .fs_mkdir arms). They follow the same throwaway-
-##   stub-convention the pre-migration lib/std/fs.zag documented.
-##   Future migration: lift them to __zag_openat / __zag_write /## __zag_mkdirat real impls, mirroring read_file's path here.
+##   `write_file` + `mkdir` — REAL impls (v0.1 Tier-1 migration).
+##   write_file is backed by __zag_openat / __zag_write /
+##   __zag_close; mkdir is backed by __zag_mkdirat. The former
+##   `fs_write_file` / `fs_mkdir` codegen-router rows (which REWROTE
+##   call sites into per-call `blk: { ... }` shapes) were retired —
+##   call sites now resolve through the imports-loop alias to these
+##   real functions, mirroring read_file's path.
 ##
 ## String import: see the inline `pub import std.string.{String}`
 ## just below -- needed so project-mode `zag generate` parses
@@ -53,17 +52,14 @@
 ## union nor an optional. The examples/stdlib/fs.zag fixture was
 ## updated to demonstrate the new contract.
 ##
-## Zombie-alias note: the imports-loop Option A fallthrough emits
-## `const write_file = __zag_imported_<i>.write_file;` and
-## `const mkdir = __zag_imported_<i>.mkdir;` whenever any selector
-## of a lib/std/fs.zag import lacks a preamble-equivalent name. The
-## fs_write_file / fs_mkdir routers still rewrite all call sites
-## into per-call `blk: { ... }` shapes that never reference the
-## alias, so the const aliases compile but are never invoked --
-## harmless dead bindings today, but the stub bodies for write_file
-## / mkdir MUST remain parseable so the alias resolution succeeds.
-## Removing the stubs while any caller still imports fs.{write_file}
-## / fs.{mkdir} would compile-fail at the user's call site.
+## Zombie-alias note (historical): the imports-loop Option A
+## fallthrough emits `const write_file = __zag_imported_<i>.write_file;`
+## and `const mkdir = __zag_imported_<i>.mkdir;` whenever any selector
+## of a lib/std/fs.zag import lacks a preamble-equivalent name. During
+## the router-only era these aliases compiled but were never invoked
+## (the router rewrote call sites into per-call `blk: { ... }` shapes).
+## With write_file + mkdir now REAL impls, the aliases are live call
+## targets — the migration made the dead bindings load-bearing.
 
 ## Bring String into scope for fs.zag's body. Without this
 ## explicit import, project-mode `zag generate` parses fs.zag in
@@ -145,16 +141,32 @@ pub fun write_file(path: str, content: []const u8) -> i32 {
     return 0;
 }
 
-## mkdir: STILL codegen-router-only (fs_mkdir in
-## src/codegen/builtins.zig) — its stub body below is never executed
-## because the router REWRITES its call site before runtime (see
-## src/codegen/expr.zig's .fs_mkdir arm). Do NOT delete the stub (a
-## `pub fun` declared in lib/std/mod.zag's selective-import list must
-## resolve to a `pub fun` in this .zag file). Future migration:
-## lift to __zag_openat / __zag_mkdirat real impls, mirroring
-## write_file's path here.
+## mkdir: v0.1 Tier-1 migration — real impl, backed by the
+## always-emitted __zag_mkdirat preamble helper (raw `mkdirat(2)`).
+## Mirrors read_file/write_file's path handling: sentinel-terminated
+## stack copy of the path, then a single mkdirat(2) with mode 0o755.
+## EEXIST (errno 17) is silently coalesced to 0 — cli.zag init's
+## "mkdir -p" semantics; any other errno returns -1. The pre-migration
+## `fs_mkdir` router row emitted
+## `std.Io.Dir.cwd().createDir(__zag_io, ...)`; retired here.
 
 pub fun mkdir(path: str) -> i32 {
-    _ = path;
-    return -1;
+    var path_z: [1024]u8 = undefined;
+    let n: usize = path.len;
+    if (n + 1 > path_z.len) {
+        return -1;
+    }
+    __zag_memcpy(path_z[0..n], path, n);
+    path_z[n] = 0;
+
+    const rc: usize = __zag_mkdirat(std.posix.AT.FDCWD, &path_z[0] as [*:0]const u8, 0o755);
+    if ((rc & 0x8000000000000000) != 0) {
+        let err_i64: i64 = rc as i64;
+        let errno_val: i64 = 0 - err_i64;
+        if (errno_val == 17) {
+            return 0;
+        }
+        return -1;
+    }
+    return 0;
 }

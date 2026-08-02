@@ -2349,21 +2349,43 @@ test "codegen: read_file no longer routes through fs_read_file builtin router" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.Io.Threaded.init") == null);
 }
 
-// Fixture note: a 4th mixed-selector test exercising
-// `pub import std.fs.{read_file, write_file, mkdir}` was attempted
-// here but deferred — as of the v0.1 Tier-1 migration, write_file is
-// a REAL impl in lib/std/fs.zag (call sites verbatim), but mkdir is
-// still on the codegen-router (fs_mkdir in expr.zig), so ITS call
-// sites are REWRITTEN by the router into per-call `blk: { ... }`
-// shapes (not verbatim). The mixed-selector test would need either:
-//   (a) drop mkdir from the source (degenerates to the
-//       verbatim-only selectors — a superset of the coverage
-//       above: read_file + write_file), or
-//   (b) migrate mkdir too — out-of-scope for this turn.
-// Future migration of fs.mkdir is described in lib/std/fs.zag's
-// docblock and is the next .zag-file-to-real-impl target. Reserved
-// as a follow-up: when it lands, the mixed-selector test re-emits
-// with all-three-verbatim coverage.
+// Fixture note (resolved): the 4th mixed-selector test exercising
+// `pub import std.fs.{read_file, write_file, mkdir}` was deferred
+// because mkdir was still on the codegen-router (fs_mkdir in
+// expr.zig). The v0.1 mkdir migration (real .zag impl backed by the
+// __zag_mkdirat preamble helper; fs_mkdir row retired) closes that
+// gap — all three selectors now resolve verbatim through the
+// imports-loop aliases, and the test below pins all-three coverage.
+
+test "codegen: mixed fs selectors {read_file, write_file, mkdir} all emit verbatim (mkdir migrated)" {
+    const src =
+        \\pub import std.fs.{read_file, write_file, mkdir}
+        \\fun f() {
+        \\    let d: String = read_file("foo");
+        \\    let w: i32 = write_file("bar", "x");
+        \\    let m: i32 = mkdir("baz");
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    // All three call sites verbatim, in source order.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "read_file(\"foo\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "write_file(\"bar\", \"x\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "mkdir(\"baz\")") != null);
+    // Alias bridges for all three selectors.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const read_file = __zag_imported_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const write_file = __zag_imported_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const mkdir = __zag_imported_") != null);
+    // Negative: no router-emit substrings (createDir blk shapes).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "createDir") == null);
+}
 
 test "codegen: raw pointer .add(N) emits zig-fallback @ptrFromInt + @sizeOf(@typeInfo(@TypeOf(...)).pointer.child)" {
     // Closes the BLOCKER finding from the §09 Pointers audit review:

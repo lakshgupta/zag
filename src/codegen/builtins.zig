@@ -72,12 +72,6 @@ pub const BuiltinDispatch = enum {
     /// the loop is bounded.
     argv_get,
 
-    /// `fs_mkdir` -- Phase 3 (CLI migration). Single-arg mkdir patterns
-    /// the cli.zag `init <name>` semantics (mkdir -p: EEXIST silent,
-    /// other errors surface as -1 from the call). docblock mirrored
-    /// in the table row below.
-    fs_mkdir,
-
     /// `process_exec` -- Phase 3 (CLI migration). The cli.zag-run,
     /// cli.zag-build, cli.zag-check subcommands use this fork+execve
     /// to recursively invoke zag in `--leaf-process` mode (which is
@@ -239,20 +233,16 @@ pub const builtin_table = [_]BuiltinRoute{
     // rows are untouched. arity is exact-match per Phase 0's
     // footgun note.
     //
-    //   `read_file` / `write_file` / `exit` / `alloc` / `panic` /
-    //   `now` / `getEnv`(→get_env) were retired as builtin rows in
-    //   the v0.1 Tier-1 migration in favour of real lib/std .zag
-    //   impls backed by the __zag_posix preamble family (see
+    //   `read_file` / `write_file` / `mkdir` / `exit` / `alloc` /
+    //   `panic` / `now` / `getEnv`(→get_env) were retired as builtin
+    //   rows in the v0.1 Tier-1 migration in favour of real lib/std
+    //   .zag impls backed by the __zag_posix preamble family (see
     //   lib/std/{fs,env,process,time,mem,debug}.zag). Their call
     //   sites now resolve through the @import+alias fallthrough in
     //   src/codegen/core.zig's imports loop (Option A pass-through).
     //
-    //   `mkdir`       arity=1  -> fs_mkdir      (path)
-    //                                          std.os.linux.mkdir via toPosixPath
     //   `exec`        arity=1  -> process_exec  (argv []const []const u8)
     //                                          fork + execve + waitpid
-    .{ .name = "mkdir", .arity = 1, .receiver = null, .dispatch = .fs_mkdir },
-    .{ .name = "exec", .arity = 1, .receiver = null, .dispatch = .process_exec },
     .{ .name = "size_of", .arity = 1, .receiver = null, .dispatch = .builtin_size_of },
     .{ .name = "align_of", .arity = 1, .receiver = null, .dispatch = .builtin_align_of },
     .{ .name = "volatile_store", .arity = 2, .receiver = null, .dispatch = .builtin_volatile_store },
