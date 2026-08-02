@@ -34,6 +34,7 @@ __pycache__/
 # being adopted by a Zag maintainer.
 .codebuff/
 .claude/
+.opencode/
 
 # ─── Editor / IDE ─────────────────────────────────────────────────────────
 .vscode/
@@ -64,3 +65,10 @@ desktop.ini
 
 # ─── Loose build outputs ──────────────────────────────────────────────────
 *.out
+
+# --- Temporary files / scratch / backup ─────────────────────────────────────────────
+# These are all local-only, per-developer, and not part of the source tree.
+*.tmp
+*.bak
+.tmp_proj
+

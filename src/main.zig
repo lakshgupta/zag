@@ -317,7 +317,12 @@ fn cmdDebug(args: []const []const u8) !void {
     }
     const mode = parseBuildMode(args, 2, args.len);
 
-    // Binary to debug — default to project's build/bin/<name>
+    // Binary to debug — file mode debugs the leaf output; project
+    // mode builds via `zig build --build-file build/gen/build.zig`,
+    // whose install prefix is RELATIVE TO THE BUILD FILE's directory
+    // — the binary lands at `build/gen/zig-out/bin/<name>`, NOT
+    // `zig-out/bin/<name>` (a stale path silently skipped the DWARF
+    // patch + gdb launch in project mode).
     var binary_path: [512]u8 = undefined;
     var bin: []const u8 = "zig-out/bin/main";
 
@@ -333,7 +338,7 @@ fn cmdDebug(args: []const []const u8) !void {
         if (zig_install_path.len == 0) return needZig();
         // Write map files and build
         try projectCmd("build", cfg, &.{}, false, mode);
-        bin = try std.fmt.bufPrint(&binary_path, "zig-out/bin/{s}", .{cfg.name});
+        bin = try std.fmt.bufPrint(&binary_path, "build/gen/zig-out/bin/{s}", .{cfg.name});
     }
 
     // Write gdbinit file
@@ -376,7 +381,17 @@ fn writeGdbInit() !void {
         \\# Zag gdb init — maps zig source locations to zag source
         \\python
         \\import sys, os
-        \\sys.path.insert(0, os.path.join(os.getcwd(), 'tools'))
+        \\# The Python assistant ships with zag (tools/zag_gdb.py), NOT
+        \\# with the user's project. Search the usual spots: the project
+        \\# root (repo layout / copied tools/), a ZAG_TOOLS_DIR override,
+        \\# and the ~/.zag install layout (install-local.sh). The first
+        \\# hit wins; the import below fails loudly if none matches.
+        \\for _cand in [os.path.join(os.getcwd(), 'tools'),
+        \\              os.environ.get('ZAG_TOOLS_DIR', ''),
+        \\              os.path.expanduser('~/.zag/tools')]:
+        \\    if _cand and os.path.isdir(_cand):
+        \\        sys.path.insert(0, _cand)
+        \\        break
         \\import zag_gdb
         \\zag_gdb.load_map_files(os.path.join(os.getcwd(), 'build/gen'))
         \\try:
@@ -1163,7 +1178,14 @@ fn collectRemapMappings(map_dir: []const u8) RemapMappings {
     const map_dir_fd = posix.openat(posix.AT.FDCWD, map_dir, .{ .ACCMODE = .RDONLY }, 0) catch return result;
     defer _ = std.os.linux.close(map_dir_fd);
 
-    var buf: [4096]u8 = undefined;
+    // `align(8)` on the batch buffer: the getdents64 dirent stream is
+    // 8-byte-aligned, so every `d_reclen` offset stays aligned only if
+    // the BASE is. Without it, the @alignCast(&buf[pos]) below trips
+    // "incorrect alignment" in Debug when the stack happens to hand
+    // out a misaligned buffer — same discipline as materializeWalk's
+    // batch buffer (the `zag debug` DWARF-patch walker panicked on
+    // projects whose build/gen has entries).
+    var buf: [4096]u8 align(8) = undefined;
     var full = false;
     while (!full) {
         const nread = std.os.linux.getdents64(map_dir_fd, &buf, buf.len);

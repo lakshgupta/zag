@@ -16,10 +16,11 @@ Zag transpiles to zig, which compiles to native code with debug symbols. You can
 
 ```
 zag build                 # debug build (default, with symbols)
-gdb ./zig-out/bin/main    # start debugging
+gdb build/gen/zig-out/bin/<name>    # start debugging (project mode binary)
 
-# Or with lldb:
-lldb ./zig-out/bin/main
+# Or just use the one-command flow (builds, DWARF-patches, launches
+# gdb with the .zag assistant):
+zag debug
 ```
 
 Release builds strip debug symbols — use `--release` only for production:
@@ -51,13 +52,14 @@ Zag symbols follow a predictable naming convention in the generated zig:
 | `fun foo<T>(...)` | `pub fn foo(comptime T: type, ...)` |
 | `trait Drawable { fun draw(...) }` | `pub const Drawable = struct { ... }` |
 
-Set breakpoints on these symbols:
+In the binary these are module-qualified (`main.sum`, `main.main`) and
+impl-block methods stay `Target_method`:
 
 ```
-(gdb) break main
+(gdb) break main.sum
 (gdb) break Button_draw
-(gdb) break Drawable.draw
 ```
+
 
 ## Memory Debugging
 
@@ -104,11 +106,16 @@ zig build -Doptimize=ReleaseFast --debug-compile-log
 
 ## Walkthrough: Debugging a Zag Program
 
-This section walks through debugging a real zag application with gdb and lldb.
+This section walks through debugging a real zag application with gdb. The
+flow below is **verified end-to-end** (gdb 15 + zig 0.16 + the
+`tools/zag_gdb.py` assistant): breakpoints, variable inspection, memory
+allocation inspection, and a backtrace that shows **zag code only**.
 
 ### Example program
 
-Save this as `src/main.zag` in a zag project:
+Save this as `src/main.zag` in a zag project (note: bindings whose
+initializer is a call need an explicit `: T` annotation, and passing an
+array to a `[]i32` param uses `&nums`):
 
 ```zag
 fun sum(arr: []i32) -> i32 {
@@ -120,16 +127,22 @@ fun sum(arr: []i32) -> i32 {
 }
 
 fun main() {
-    let nums = [3]i32 { 10, 20, 30 };
-    let result = sum(nums);
-    print("{result}\n");
+    var nums: [3]i32 = [3]i32 { 10, 20, 30 };
+    let result: i32 = sum(&nums);
+    let p = new i32(42);          # heap allocation — inspected below
+    defer free(p);
+    print("{result} {p}\n");
     assert(result == 60);
 }
 ```
 
 ### gdb
 
-Build and launch with `zag debug`:
+Build and launch with `zag debug` (from the project root — the generated
+`build/gen/gdbinit` loads the Python assistant; if the assistant lives in
+the zag install rather than the project, point gdb at it once per shell
+with `export ZAG_TOOLS_DIR=<zag-install>/tools` or copy the `tools/`
+directory into the project):
 
 ```
 $ zag debug
@@ -137,105 +150,124 @@ build ok
 [zag] gdb with .zag source mapping ready
 ```
 
-This builds the project, writes a `.gdbinit`, patches DWARF file paths in
-the binary, and launches gdb.  The binary is auto-loaded and ready to run.
+This builds the project, writes `build/gen/gdbinit`, patches the binary's
+DWARF file paths so gdb speaks `.zag`, and launches gdb.
 
 #### Setting breakpoints
 
-Set breakpoints on zag source lines:
+Zag function names in the binary are module-qualified — `main.sum` /
+`main.main` (impl-block methods keep their `Target_method` names):
 
 ```
-(gdb) zag-break src/main.zag:2          # entry of sum()
-[zag] break build/gen/main.zig:94:2
-(gdb) zag-break src/main.zag:10         # the let nums line
-[zag] break build/gen/main.zig:110:10
+(gdb) break main.sum          # entry of sum()
+(gdb) break main.main         # entry of main()
 ```
 
-`zag-break` reads the `.zag.map` file, finds the corresponding zig lines,
-and sets breakpoints on them.  You can also use plain `break` on function
-names:
+For statement-level breakpoints on a zag source line, use `zag-addr`
+(available after `zag debug`; it resolves the `.zag` line through the
+`.zag.map` to a generated-zig line, then to a binary ADDRESS via
+`readelf`'s DWARF line dump, and sets `break *ADDRESS` — plain
+`break file:line` is unreliable on gdb 15 + zig 0.16 because gdb cannot
+resolve the user module's line table entries):
 
 ```
-(gdb) break sum
-(gdb) break main
+(gdb) zag-addr src/main.zag:14     # the print line
+[zag] break *0x11da353
 ```
 
 #### Running and stepping
 
 ```
 (gdb) run
-Breakpoint 2, main () at src/main.zag:10
-10      let nums = [3]i32 { 10, 20, 30 };
-(gdb) next
-11      let result = sum(nums);
-(gdb) step
-sum (arr=...) at src/main.zag:2
-2       var total: i32 = 0;
-(gdb) step
-3       for i in 0..arr.len {
-(gdb) print total
-$1 = 0
+Breakpoint 1, 0x00000000011da353 in main.main (init=...)
 ```
 
-DWARF patch makes `step`/`next` show the `.zag` file and line.  The
-Python frame filter is not needed for this — the binary itself has been
-rewired to reference `.zag` paths.
+`next`/`step` (statement stepping) requires gdb to resolve line info,
+which gdb 15 cannot do for the generated user module — use `nexti` /
+`stepi` (instruction stepping) to move statement by statement, or set
+breakpoints at several functions and `run` between them. `finish` runs
+to the end of the current function.
 
 #### Inspecting variables
 
 ```
-(gdb) print arr.len
-$2 = 3
-(gdb) print arr[0]
-$3 = 10
-(gdb) print total
-$4 = 0
+(gdb) print result            # $1 = 60
+(gdb) print nums              # $2 = {10, 20, 30}
+(gdb) print nums[0]           # $3 = 10
+(gdb) print total             # (inside main.sum) uninitialized at entry
+(gdb) info locals             # all locals of the current frame
 ```
 
 Variable names match the zag source directly.
 
+#### Inspecting memory allocations
+
+Heap allocations (`new`) and the always-on allocation counters make it
+easy to check what is live and where:
+
+```
+(gdb) print p                       # $4 = (i32 *) 0x7ffff7afe000   ← heap address
+(gdb) print *p                      # $5 = 42                        ← the pointee
+(gdb) x/dw p                        # 0x7ffff7afe000: 42             ← raw memory dump
+(gdb) print 'main.__zag_bench_bytes_live'      # $6 = 4              ← live heap bytes
+(gdb) print 'main.__zag_bench_allocations'     # $7 = 1              ← live allocations
+```
+
+The `__zag_bench_*` globals are the std.bench counters (emitted in every
+binary): after `new i32(42)` you see 4 live bytes / 1 allocation; after
+`free(p)` they drop back to 0. Compare with a stack value — `print &nums`
+shows a low stack address, while `p` (from `page_allocator`) is a fresh
+mmap region high in the address space. Freed allocations are returned to
+the OS — accessing `*p` after `free` faults instead of returning stale
+data.
+
 #### Backtrace
 
 ```
-(gdb) backtrace
-#0  sum (arr=...) at src/main.zag:4
-#1  main () at src/main.zag:11
+(gdb) bt
+#0  0x00000000011da353 in main.main () at src/main.zag:10
 ```
 
-With the DWARF patch, backtrace shows zag paths.  If gdb still shows
-`build/gen/*.zig` paths, source the Python assistant:
+The frame filter remaps every resolvable frame to `src/main.zag:line` —
+no `build/gen/*.zig` paths. Frames the map cannot resolve (deep stdlib
+internals) fall back to their raw zig locations.
+
+#### Leak check at compile time
+
+The escape analysis warns before you even run gdb:
 
 ```
-(gdb) source tools/zag_gdb.py
-[zag] loaded 6 map entries from build/gen
-(gdb) zag-bt
-#0  sum (arr=...) at src/main.zag:4
-#1  main () at src/main.zag:11
+$ zag build
+warning: `new i32` at src/main.zag:12:9 in main is never freed (leak) — add an explicit `free` or `defer free`
 ```
 
 #### Commands reference
 
-| Command | Purpose |
-|---------|---------|
-| `zag-break <file>:<line>` | Set breakpoint by zag source location |
-| `zag-list` | Show zag source at current frame |
-| `zag-bt` | Backtrace with zag locations |
-| `break <func>` | Break on function name (zig mangling) |
-| `print <var>` | Print variable value |
-| `step` / `next` | Step into / over |
-| `continue` | Resume execution |
+| Command | Description |
+|---------|-------------|
+| `zag debug` | Build + DWARF-patch + launch gdb with the .zag assistant |
+| `zag-addr src/main.zag:N` | Break at the address of a zag source line |
+| `zag-break src/main.zag:N` | Break via zig file:line (best-effort — see above) |
+| `zag-list` | Show the zag source around the current frame |
+| `bt` / `backtrace` | Zag-only backtrace (frame filter remaps) |
+| `print EXPR` | Inspect a variable (`*p`, `nums[0]`, ...) |
+| `x/dw ADDR` | Raw memory dump |
+| `nexti` / `stepi` | Instruction stepping (statement stepping is gdb-version dependent) |
 | `quit` | Exit gdb |
+
 
 ### lldb
 
-`zag debug` writes gdb-specific init.  For lldb, build separately then load
-the Python assistant:
+`zag debug` writes gdb-specific init.  For lldb, build separately then
+load the Python assistant (the project binary lands at
+`build/gen/zig-out/bin/<name>` — the generated build-file's install
+prefix — not `zig-out/bin/`):
 
 ```
 $ zag build
 build ok
 
-$ lldb ./zig-out/bin/main
+$ lldb build/gen/zig-out/bin/<name>
 (lldb) command script import tools/zag_lldb.py
 [zag] loaded 6 map entries from build/gen
 [zag] LLDB integration ready. Commands: zag-break, zag-bt, zag-where
@@ -263,12 +295,18 @@ Or source the Python assistant and use `zag-break` / `zag-where`.
 [zag] +breakpoint 2: src/main.zag:10 (zig main.zig:110)
 ```
 
-Or use plain lldb breakpoints on function names:
+Or use plain lldb breakpoints on the module-qualified function names:
 
 ```
-(lldb) breakpoint set -n sum
-(lldb) breakpoint set -n main
+(lldb) breakpoint set -n main.sum
+(lldb) breakpoint set -n main.main
 ```
+
+The same caveat as gdb applies to statement stepping: lldb must resolve
+line info for the generated user module, which the zig 0.16 DWARF5
+output makes unreliable — prefer function breakpoints + `frame variable`
++ `expression` inspection, and `thread step-inst` for instruction-level
+stepping.
 
 #### Running and stepping
 
@@ -349,28 +387,24 @@ The file, line, and column point to the zag source.  In release builds
 
 ### Debugging without `zag debug`
 
-If you built with `zag build` (not `zag debug`), the binary's DWARF still
-points at `build/gen/*.zig` files.  To work with this:
+If you built with `zag build` (not `zag debug`), the DWARF paths still
+point at `build/gen/*.zig` and the DWARF patch has not run. The Python
+assistant works either way (it reads the `.zag.map` files, which every
+build writes):
 
-**gdb — manual Python load:**
 ```
-$ gdb ./zig-out/bin/main
-(gdb) source tools/zag_gdb.py
-(gdb) zag-break src/main.zag:2
+$ gdb build/gen/zig-out/bin/<name>
+(gdb) source tools/zag_gdb.py        # or: the generated gdbinit handles
+                                     #     ZAG_TOOLS_DIR automatically
+(gdb) zag-addr src/main.zag:12       # line breakpoints via address
 (gdb) run
+(gdb) bt                             # frames remapped to src/main.zag
 ```
 
-**gdb — manual path fix:**
-```
-(gdb) dir src/           # add zag source directory
-(gdb) dir build/gen/     # add generated zig (for line numbers)
-(gdb) break main
-(gdb) run
-(gdb) list               # may show .zig or .zag depending on path resolution
-```
-
-If you see zig lines in the backtrace, compare `build/gen/main.zig` with
-the `.zag.map` file or your original source to map lines manually.
+`zag debug` additionally rewrites the binary's DWARF paths to `.zag`, so
+`list`/`frame` display zag files directly. If you see zig lines in a
+backtrace despite the assistant, compare `build/gen/main.zig` with the
+`.zag.map` side file to map lines manually.
 
 ## Common Issues
 
