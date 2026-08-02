@@ -1174,6 +1174,80 @@ pub fn parsePrimary(self: *Parser) Expr {
                 return Expr{ .payload = .{ .undefined_lit = {} }, .loc = tok.loc };
             },
             .lbrace => {
+                // `{ ... }` in expression position is either a BLOCK
+                // expression (statements) or a BARE ARRAY literal
+                // (docs/manual/10 §"Inferred-element arrays"): the
+                // element type comes from the expected type, so the
+                // LHS annotation is not repeated — `let numbers:
+                // [5]i32 = { 10, 20, 30, 40, 50 };` instead of
+                // `[5]i32 { ... }`. Codegen emits `.{ ... }` (zig's
+                // anonymous-struct literal) which coerces to the
+                // expected array/slice/tuple type. Disambiguation by
+                // pre-scan: between the braces, a top-level `;` or
+                // statement keyword means BLOCK; otherwise a
+                // top-level `,` means BARE ARRAY. A single expression
+                // with no comma (`{ expr }`) stays a block (the
+                // existing labeled-block value form).
+                const is_bare_array = blk: {
+                    var depth: usize = 0;
+                    var saw_comma = false;
+                    var i = self.pos + 1;
+                    while (i < self.tokens.len) : (i += 1) {
+                        const t = self.tokens[i].tag;
+                        if (t == .lbrace or t == .lparen or t == .lbracket) {
+                            depth += 1;
+                        } else if (t == .rbrace or t == .rparen or t == .rbracket) {
+                            if (depth == 0) break;
+                            depth -= 1;
+                        } else if (depth == 0) {
+                            if (t == .comma) {
+                                saw_comma = true;
+                            } else switch (t) {
+                                // Statement-leading keywords mean
+                                // BLOCK (note: `;` is not a token —
+                                // the lexer drops it — so keyword
+                                // detection is the discriminator).
+                                .let, .var_kw, .const_kw, .if_kw, .while_kw, .for_kw,
+                                .match_kw, .return_kw, .break_kw, .continue_kw,
+                                .unsafe_kw, .defer_kw, .errdefer_kw, .asm_kw,
+                                .doc_comment,
+                                => break :blk false,
+                                else => {},
+                            }
+                        }
+                    }
+                    break :blk saw_comma;
+                };
+                if (is_bare_array) {
+                    self.advance(); // consume `{`
+                    var elem_buf: [16]ast.Expr = undefined;
+                    var elem_count: usize = 0;
+                    while (self.peek().tag != .rbrace and !self.eof()) {
+                        if (self.peek().tag == .newline or self.peek().tag == .comma) {
+                            self.advance();
+                            continue;
+                        }
+                        if (elem_count < elem_buf.len) {
+                            elem_buf[elem_count] = self.parseExpr();
+                            elem_count += 1;
+                        } else {
+                            _ = self.parseExpr();
+                        }
+                    }
+                    self.expect(.rbrace);
+                    const elements = self.arena.alloc(ast.Expr, elem_count);
+                    @memcpy(elements, elem_buf[0..elem_count]);
+                    // Empty type_name marks the bare form; size 0
+                    // (unused — codegen emits `.{ ... }`).
+                    return Expr{ .payload = .{ .array_lit = .{
+                        .size = 0,
+                        .size_text = null,
+                        .type_name = "",
+                        .elements = elements,
+                        .fill = false,
+                        .progression = false,
+                    } }, .loc = tok.loc };
+                }
                 self.advance();
                 const body = self.parseStmtList();
                 self.expect(.rbrace);

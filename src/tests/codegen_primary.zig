@@ -333,3 +333,38 @@ test "codegen: inline asm clobbers map to the Clobbers struct" {
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, ": .{ .memory = true }))") != null);
 }
+
+test "codegen: bare { ... } array literal emits .{ ... } for expected-type coercion" {
+    // docs/manual/10 §"Inferred-element arrays": the element type
+    // comes from the LHS annotation, so it is not repeated —
+    // `let numbers: [5]i32 = { 10, 20, 30, 40, 50 };` emits
+    // `.{ 10, 20, 30, 40, 50 }` (zig's anonymous-struct literal,
+    // coerced to the expected array/slice/tuple type).
+    const src = "fun f() {\n    let numbers: [5]i32 = { 10, 20, 30, 40, 50 };\n    let s: i32 = take({ 1, 2, 3 });\n    let typed: [3]i32 = [3]i32 { 4, 5, 6 };\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const numbers: [5]i32 = .{ 10, 20, 30, 40, 50 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "take(.{ 1, 2, 3 })") != null);
+    // The typed form still works unchanged.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[3]i32{ 4, 5, 6 }") != null);
+}
+
+test "codegen: { ... } with statement keywords stays a block expression" {
+    // The bare-array pre-scan must not hijack blocks: statement-
+    // leading keywords (let, if, ...) keep the labeled-block emit.
+    const src = "fun f() {\n    let b: i32 = { let x: i32 = 7; x };\n    let c: i32 = { if true { 1 } else { 2 } };\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".{ 7 }") == null);
+}

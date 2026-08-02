@@ -513,6 +513,25 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         var size_buf: [16]u8 = undefined;
         const size_str = a.size_text orelse std.fmt.bufPrint(&size_buf, "{d}", .{a.size}) catch "0";
 
+        // Bare array literal `{ e1, e2, ... }` (docs/manual/10
+        // §"Inferred-element arrays"): the element type comes from
+        // the EXPECTED type, so the LHS annotation is not repeated —
+        // `let numbers: [5]i32 = { 10, 20, 30, 40, 50 };`. Emit
+        // zig's anonymous-struct literal `.{ ... }`, which coerces
+        // to the expected array/slice/tuple type at the binding or
+        // call-arg site. Fill (`...`) and progression need a size,
+        // which a bare literal cannot express — the typed
+        // `[N]T { ... }` form covers those.
+        if (a.type_name.len == 0) {
+            self.write(".{ ");
+            for (a.elements, 0..) |el, i| {
+                if (i > 0) self.write(", ");
+                self.genExpr(el);
+            }
+            self.write(" }");
+            return;
+        }
+
         if (a.fill) {
             // `[1]T{ v } ** N` — Zig's repeat operator. The leading element is
             // present by grammar whenever `fill` is true.

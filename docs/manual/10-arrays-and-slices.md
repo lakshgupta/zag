@@ -8,6 +8,23 @@ let zeros = [10]i32 { 0 ... };      # fill: [0, 0, ..., 0]
 let pattern = [4]i32 { 1, 2 ... };  # [1, 2, 1, 2]
 ```
 
+### Inferred-element arrays (shorthand)
+
+When the element type is already known from context — a typed binding
+LHS or a call argument — the type is not repeated:
+
+```
+let numbers: [5]i32 = { 10, 20, 30, 40, 50 };   # instead of [5]i32 { ... }
+let s: i32 = sum3({ 1, 2, 3 });                 # call-arg coercion
+let single: [1]i32 = { 5, };                    # trailing comma for one element
+```
+
+The `{ ... }` form compiles to zig's anonymous-struct literal `.{ ... }`,
+which coerces to the expected array, slice, or tuple type. `{ ... }` with
+statement keywords (`let`, `if`, `while`, ...) or a single expression with
+no comma stays a **block expression** (`{ let x = 5; x }`); fill (`...`)
+and progression need a size, so those keep the typed `[N]T { ... }` form.
+
 **Memory:** Arrays are value types, stack-allocated. `[5]i32` is 20 bytes on the stack. No heap allocation.
 
 ## Array Access
