@@ -186,6 +186,9 @@ const Codegen = core.Codegen;
         self.current_symbol = m.name;
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
+        // async is a top-level `async fun` surface (v1); methods are
+        // always synchronous — keep the future-wrap flag off.
+        self.fn_is_async = false;
         // v1.6 byte-slice widening: set the per-body method-receiver
         // struct-name so `print(self.byte_slice_field)` widens the
         // format spec to `{s}` (per typeAwareFmtSpecFromExpr in
@@ -487,6 +490,9 @@ const Codegen = core.Codegen;
         // for the method's own locals (not the enclosing pub fn's).
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
+        // async is a top-level `async fun` surface (v1); methods are
+        // always synchronous — keep the future-wrap flag off.
+        self.fn_is_async = false;
         // Phase 2 var-p name-isolation (zig 0.16 fix): for each
         // `is_var = true` param (renamed to `__zag_local_<name>` above),
         // inject `var <name> = __zag_local_<name>;` at body entry. The
@@ -1310,6 +1316,11 @@ const Codegen = core.Codegen;
         // explicit `return expr;` to yield a value, which zig's type
         // checker validates against the emitted `RET_TYPE` signature.
         self.fn_returns_value = false;
+        // async fun (docs/manual/18 §"Async Trait Methods"): the
+        // return_stmt arm wraps `return EXPR;` into
+        // `return .{ .done = true, .value = EXPR };` for the emitted
+        // Future(T). Reset per body (see the fn_is_async field doc).
+        self.fn_is_async = fun.is_async;
         // Phase 2 var-p name-isolation (zig 0.16 fix): for each
         // `is_var = true` param (renamed to `__zag_local_<name>` above),
         // inject `var <name> = __zag_local_<name>;` at body entry. The
@@ -1320,6 +1331,32 @@ const Codegen = core.Codegen;
         // local shadows nothing because the parameter has a different
         for (fun.body) |stmt| {
             self.collectTypedBindings(stmt);
+        }
+        // v1.7 param-type seeding: `print("hello, {name}")` on a
+        // function PARAMETER (e.g. `fun greet(name: str)`) previously
+        // widened to `{any}` — type_info_buf only recorded typed
+        // BINDINGS, so the template-literal/print `{s}` widening
+        // (typeAwareFmtSpec in primary.zig) missed params and printed
+        // byte lists. Seed each param's `: T` annotation into the
+        // buffer (skip names a binding already recorded — shadowing
+        // bindings win). Mirrors the free-fn/method side in
+        // genFreeMethod/genMethod when those receivers matter.
+        for (fun.params) |p| {
+            if (self.type_info_count >= self.type_info_buf.len) break;
+            var already = false;
+            for (self.type_info_buf[0..self.type_info_count]) |ti| {
+                if (std.mem.eql(u8, ti.name, p.name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            self.type_info_buf[self.type_info_count] = .{
+                .name = p.name,
+                .type_name = p.type_text,
+                .is_closure = false,
+            };
+            self.type_info_count += 1;
         }
         if (fun.doc) |d| self.genDocComment(d);
         // Phase 2 (docs/15 §"Declaration"): emit the FULL signature
@@ -1404,6 +1441,14 @@ const Codegen = core.Codegen;
             const already_err_union = if (fun.return_type) |rt| rt.len > 0 and rt[0] == '!' else false;
             if (!already_err_union) self.write("!");
             if (fun.return_type) |rt| self.writeType(rt) else self.write("void");
+        } else if (fun.is_async) {
+            // async fun: the emitted return type is `Future(T)`
+            // wrapping the declared `-> T` (void when omitted) — the
+            // docs/manual/18 §"Async Trait Methods" rewrite contract.
+            // `await` sites in the body drive the future and unwrap.
+            self.write("Future(");
+            if (fun.return_type) |rt| self.writeType(rt) else self.write("void");
+            self.write(")");
         } else if (fun.return_type) |rt| self.writeType(rt) else self.write("void");
         self.write(" {\n");
         // Trait-bounds guards (docs/16 §3): emit

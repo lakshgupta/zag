@@ -1,15 +1,19 @@
 ## Async/await basic example
 ##
+## v1 (synchronous driver): `async fun` returns Future(T); `await`
+## drives the awaited future inline — `after(ms)` busy-waits on
+## CLOCK_MONOTONIC inside the call, then completes its future.
+##
 ## Run: zag run async_basic.zag
 
-import std.time
+import std.time.{after}
 
 async fun delayed_greet(name: str) -> str {
-    await time.timer.after(time.Duration.from_millis(10));
+    await after(10);
     return "hello, {name}";
 }
 
 async fun main() {
-    let greeting = await delayed_greet("zag");
+    let greeting: str = await delayed_greet("zag");
     print("{greeting}\n");
 }

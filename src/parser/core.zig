@@ -262,6 +262,23 @@ pub fn parse(self: *Parser) ast.Program {
                 const_count += 1;
                 continue;
             }
+            // Async fns (docs/manual/18-traits.md §"Async Trait
+            // Methods" + the overview's "Zero-cost async" goal):
+            // `async fun NAME(...)` — the emitted zig fn wraps the
+            // return type in `Future(T)` and the body's `await`
+            // sites lower to the future-drive form (see
+            // codegen/expr.zig's .await_expr arm). v1 surface:
+            // top-level async funs; async impl methods parse-error
+            // (see genMethod's guard).
+            if (lead == .async_kw and self.peekAhead(1) == .fun) {
+                self.advance();
+                var afd = self.parseFunDecl();
+                afd.is_async = true;
+                afd.doc = doc;
+                functions_buf[fun_count] = afd;
+                fun_count += 1;
+                continue;
+            }
             var fd = self.parseFunDecl();
             fd.is_test = is_test;
             fd.doc = doc;
@@ -325,6 +342,23 @@ pub fn expect(self: *Parser, tag: TokenTag) void {
             std.process.exit(1);
         }
         self.advance();
+    }
+
+    /// Consume a `.string_literal` token and return its verbatim
+    /// text (the template/constraint/clobber slots of the inline-asm
+    /// spec use it — see parseAsmExpr in src/parser/primary.zig).
+    pub fn expectStringLiteral(self: *Parser) []const u8 {
+        const tok = self.peek();
+        if (tok.tag != .string_literal) {
+            std.debug.print("error:{d}:{d}: expected string literal, got '{s}'\n", .{
+                tok.loc.line,
+                tok.loc.col,
+                tok.text,
+            });
+            std.process.exit(1);
+        }
+        self.advance();
+        return tok.text;
     }
 
 
@@ -480,8 +514,13 @@ pub fn expectIdent(self: *Parser) []const u8 {
         // syntax. Same reasoning for `print` (already accepted) and
         // `free` (the docs/19 example `defer free(p)` uses `free` as
         // both a heap-op and a potential method name without clash).
+        // `async`/`await` join the carve-out because module path
+        // components are ordinary idents (`std.async.stream` in the
+        // KNOWN_STD_MODULES surface) and the keywords must still
+        // parse in dotted paths and as method names.
         if (tok.tag != .identifier and tok.tag != .print and
-            tok.tag != .new and tok.tag != .free)
+            tok.tag != .new and tok.tag != .free and
+            tok.tag != .async_kw and tok.tag != .await_kw)
         {
             std.debug.print("error:{d}:{d}: expected identifier, got '{s}'\n", .{
                 tok.loc.line, tok.loc.col, tok.text,
@@ -576,6 +615,7 @@ pub const Parser = struct {
     pub const expectIdent = @import("core.zig").expectIdent;
     pub const init = @import("core.zig").init;
     pub const expect = @import("core.zig").expect;
+    pub const expectStringLiteral = @import("core.zig").expectStringLiteral;
     pub const advance = @import("core.zig").advance;
     pub const peek = @import("core.zig").peek;
     pub const isLiteralInit = @import("core.zig").isLiteralInit;

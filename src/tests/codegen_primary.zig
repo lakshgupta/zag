@@ -284,3 +284,52 @@ test "codegen: dotted type annotations collect through collectCastType" {
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "const h: std.Thread = ") != null);
 }
+
+test "codegen: inline asm translates to zig asm with named operands" {
+    // docs/manual/24-simd.md §"Inline Assembly": the zag spec
+    // `("tpl" : {dst} = "=x"(out) : {src} = "x"(a) : )` translates
+    // to zig's asm expression — `{name}` → `%[name]`, bindings →
+    // `[name] "constraint" (expr)`, empty clobbers → `.{}`.
+    const src =
+        \\fun f() {
+        \\    var out: f32 = 0.0;
+        \\    let a: f32 = 1.0;
+        \\    asm {
+        \\        ("vfmadd231ps {dst}, {src}, {acc}"
+        \\         : {dst} = "=x"(out)
+        \\         : {src} = "x"(a), {acc} = "x"(a)
+        \\         :
+        \\        )
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "_ = (asm (\"vfmadd231ps %[dst], %[src], %[acc]\" : [dst] \"=x\" (out) : [src] \"x\" (a), [acc] \"x\" (a) : .{}))") != null);
+}
+
+test "codegen: inline asm clobbers map to the Clobbers struct" {
+    const src =
+        \\fun f() {
+        \\    var out: i32 = 0;
+        \\    asm {
+        \\        ("mov {dst}, 42" : {dst} = "=r"(out) : : "memory")
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": .{ .memory = true }))") != null);
+}

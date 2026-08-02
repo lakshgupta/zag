@@ -26,6 +26,14 @@ pub const Expr = ast_expr.Expr;
 pub const Pattern = ast_expr.Pattern;
 // MatchArm is a TOP-LEVEL type (in expr.zig, not nested in Expr).
 pub const MatchArm = ast_expr.MatchArm;
+// Inline assembly (docs/manual/24 §"Inline Assembly"): the asm
+// block expression + its named operand bindings, re-exported so
+// parser/primary.zig's parseAsmExpr can reference `ast.AsmOperand`.
+pub const AsmExpr = ast_expr.Expr.AsmExpr;
+pub const AsmOperand = ast_expr.Expr.AsmOperand;
+// Async/await (docs/manual/00-overview.md "Zero-cost async"):
+// `await EXPR` expression node.
+pub const AwaitExpr = ast_expr.Expr.AwaitExpr;
 
 // Stmt union + its nested type aliases stay on `ast.Stmt.*`.
 pub const Stmt = ast_stmt.Stmt;

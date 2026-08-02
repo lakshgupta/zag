@@ -142,6 +142,22 @@ pub const ExprPayload = union(enum) {
     /// Built by `Parser.parsePrimary` when `.const_kw` is encountered
     /// in an expression position.
     const_block: []const Stmt,
+    /// Inline assembly block (docs/manual/24-simd.md §"Inline
+    /// Assembly"): `asm { ("tpl" : {dst} = "=x"(out) : {src} =
+    /// "x"(a) : ) }`. `template` is the verbatim assembly text with
+    /// `{name}` operand placeholders; `outputs`/`inputs` are the
+    /// named operand bindings; `clobbers` are the register/memory
+    /// clobber strings. Codegen translates to zig's `asm`
+    /// expression: `{name}` → `%[name]`, bindings → `[name]
+    /// "constraint" (expr)`, clobbers → `.{ .name = true }`.
+    asm_expr: AsmExpr,
+    /// `await EXPR` — suspend until the awaited Future<T> completes
+    /// (docs/manual/00-overview.md "Zero-cost async"). v1 lowering:
+    /// the callee's async body runs eagerly, so the await drives the
+    /// returned future to completion inline and unwraps its value
+    /// (see the __zag_future_drive preamble helper + the .await_expr
+    /// arm in codegen/expr.zig).
+    await_expr: AwaitExpr,
 
     pub const BinaryExpr = struct {
         /// Operator tag. Stored as an enum so codegen can switch on the
@@ -511,6 +527,34 @@ pub const ExprPayload = union(enum) {
         handler: *Expr,
         err_binding: ?[]const u8 = null,
     };
+
+    /// One named operand binding inside an inline-asm spec:
+    /// `{name} = "constraint"(expr)`. `expr` is `*Expr` for the
+    /// standard cycle-breaking convention.
+    pub const AsmOperand = struct {
+        name: []const u8,
+        constraint: []const u8,
+        expr: *Expr,
+    };
+
+    /// Backing struct for `Expr.asm_expr` — the inline-asm block
+    /// (docs/manual/24-simd.md §"Inline Assembly"). `template` is the
+    /// verbatim assembly text; `outputs` and `inputs` are the named
+    /// bindings in source order; `clobbers` are the clobber strings
+    /// (e.g. `"memory"`, register names).
+    pub const AsmExpr = struct {
+        template: []const u8,
+        outputs: []const AsmOperand,
+        inputs: []const AsmOperand,
+        clobbers: []const []const u8,
+    };
+
+    /// Backing struct for `Expr.await_expr` — `await EXPR`. `expr`
+    /// is `*Expr` for the standard cycle-breaking convention; the
+    /// awaited expression must evaluate to a `Future(T)`.
+    pub const AwaitExpr = struct {
+        expr: *Expr,
+    };
 };
 
 pub const Expr = struct {
@@ -543,6 +587,9 @@ pub const Expr = struct {
     pub const ClosureExpr = ExprPayload.ClosureExpr;
     pub const TryOp = ExprPayload.TryOp;
     pub const CatchExpr = ExprPayload.CatchExpr;
+    pub const AsmExpr = ExprPayload.AsmExpr;
+    pub const AsmOperand = ExprPayload.AsmOperand;
+    pub const AwaitExpr = ExprPayload.AwaitExpr;
 };
 
 /// One arm of a `match` expression: a `Pattern`, an optional `if`-guard,

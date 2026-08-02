@@ -1149,6 +1149,105 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
                 self.write("    })");
             },
+            .await_expr => |ae| {
+                // `await EXPR` (docs/manual/00-overview.md "Zero-cost
+                // async"): v1 inline-drive lowering. The awaited
+                // expression produces a `Future(T)`; the callee's
+                // async body already ran eagerly, so the drive is the
+                // completion contract (see __zag_future_drive) and the
+                // value unwraps:
+                //   (blk: { var __fut_<N> = <expr>;
+                //          __zag_future_drive(@TypeOf(__fut_<N>), &__fut_<N>);
+                //          break :blk __fut_<N>.value.?; })
+                // The `.?` unwrap panics on a never-completed future —
+                // the v1 driver never produces one.
+                const id = self.blk_counter;
+                self.blk_counter += 1;
+                var name_buf: [16]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "__fut_{d}", .{id}) catch "__fut";
+                self.write("(blk: { var ");
+                self.write(name);
+                self.write(" = ");
+                self.genExpr(ae.expr.*);
+                self.write("; __zag_future_drive(@TypeOf(");
+                self.write(name);
+                self.write("), &");
+                self.write(name);
+                self.write("); break :blk ");
+                self.write(name);
+                self.write(".value.?; })");
+            },
+            .asm_expr => |a| {
+                // Inline assembly (docs/manual/24-simd.md §"Inline
+                // Assembly"): translate the zag spec into zig's asm
+                // expression. `{name}` placeholders in the template
+                // become `%[name]`; `{name} = "constraint"(expr)`
+                // bindings become `[name] "constraint" (expr)` in the
+                // outputs (first section) / inputs (second) slots;
+                // clobber strings become `.{ .<name> = true }` — zig
+                // 0.16's clobbers slot is the packed
+                // `std.builtin.assembly.Clobbers` struct (bare string
+                // lists were rejected: "expected type
+                // 'builtin.assembly.Clobbers__struct'"). The emitted
+                // form is `asm ("tpl" : outs : ins : clobbers)`.
+                self.write("(asm (\"");
+                // Template rewrite: `{ident}` → `%[ident]` (literal
+                // `%` passes through — zig templates use `%%` for a
+                // literal percent, which the user can write directly).
+                var i: usize = 0;
+                while (i < a.template.len) {
+                    if (a.template[i] == '{') {
+                        const close = std.mem.indexOfScalarPos(u8, a.template, i + 1, '}');
+                        if (close) |c| {
+                            self.write("%[");
+                            self.write(a.template[i + 1 .. c]);
+                            self.write("]");
+                            i = c + 1;
+                            continue;
+                        }
+                    }
+                    var seg_end = i;
+                    while (seg_end < a.template.len and a.template[seg_end] != '{') : (seg_end += 1) {}
+                    self.write(a.template[i..seg_end]);
+                    i = seg_end;
+                }
+                self.write("\" : ");
+                for (a.outputs, 0..) |op, oi| {
+                    if (oi > 0) self.write(", ");
+                    self.write("[");
+                    self.write(op.name);
+                    self.write("] \"");
+                    self.write(op.constraint);
+                    self.write("\" (");
+                    self.genExpr(op.expr.*);
+                    self.write(")");
+                }
+                self.write(" : ");
+                for (a.inputs, 0..) |op, ii| {
+                    if (ii > 0) self.write(", ");
+                    self.write("[");
+                    self.write(op.name);
+                    self.write("] \"");
+                    self.write(op.constraint);
+                    self.write("\" (");
+                    self.genExpr(op.expr.*);
+                    self.write(")");
+                }
+                self.write(" : ");
+                if (a.clobbers.len > 0) {
+                    self.write(".{ ");
+                    for (a.clobbers, 0..) |cl, ci| {
+                        if (ci > 0) self.write(", ");
+                        self.write(".");
+                        self.write(cl);
+                        self.write(" = true");
+                    }
+                    self.write(" }");
+                } else {
+                    self.write(".{}");
+                }
+                self.write("))");
+            },
             .try_op => |t| {
                 // `expr?` — postfix try/unwrap. Emit a labeled block +
                 // compile-time `@hasField` discriminators so the same

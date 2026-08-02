@@ -190,6 +190,72 @@ pub fn collectCastType(self: *Parser) []const u8 {
                 self.advance();
                 continue;
             }
+            // Generic-application paren group `(`...`)` — consume the
+            // balanced group verbatim so `Future(void)` / `Result(T, E)`
+            // round-trip through return-type annotations and binding
+            // annotations (the async `Future(T)` wrap is the first
+            // consumer — `pub fun after(ms: u64) -> Future(void)` in
+            // lib/std/time.zag). Without the carve-out the `(` hit the
+            // is_term `.rparen`-adjacent break and truncated the type
+            // text at the paren ("expected lbrace, got '('" at the fn
+            // decl). Parenthesised groups inside the buffer are depth-
+            // counted; unterminated groups bail to the is_term path.
+            if (tok.tag == .lparen) {
+                var depth: usize = 0;
+                var closed = false;
+                var p = self.pos;
+                while (p < self.tokens.len) : (p += 1) {
+                    const pt = self.tokens[p].tag;
+                    if (pt == .lparen) {
+                        depth += 1;
+                    } else if (pt == .rparen) {
+                        depth -= 1;
+                        if (depth == 0) {
+                            closed = true;
+                            break;
+                        }
+                    } else if (pt == .newline or pt == .eof) {
+                        break;
+                    }
+                }
+                if (closed) {
+                    // Copy the inner token texts joined with spaces
+                    // (`void` → `void`; `T, E` → `T, E`).
+                    const inner_start = self.pos + 1;
+                    const inner_end = p;
+                    if (len + 1 <= buf.len) {
+                        buf[len] = '(';
+                        len += 1;
+                    }
+                    var j = inner_start;
+                    while (j < inner_end) : (j += 1) {
+                        const it = self.tokens[j];
+                        if (it.tag == .comma) {
+                            if (len + 1 <= buf.len) {
+                                buf[len] = ',';
+                                len += 1;
+                            }
+                            continue;
+                        }
+                        if (len > 0 and buf[len - 1] != '(' and len + 1 <= buf.len) {
+                            buf[len] = ' ';
+                            len += 1;
+                        }
+                        if (len + it.text.len <= buf.len) {
+                            @memcpy(buf[len..][0..it.text.len], it.text);
+                            len += it.text.len;
+                        }
+                    }
+                    if (len + 1 <= buf.len) {
+                        buf[len] = ')';
+                        len += 1;
+                    }
+                    // Skip the whole group.
+                    while (self.pos <= p) self.advance();
+                    prev_was_ptr = false;
+                    continue;
+                }
+            }
             // Dotted member paths (`std.Thread`, `std.fs.File`) — join
             // the `.` and the following identifier so binding
             // annotations and cast destinations can name module-
@@ -307,7 +373,7 @@ pub fn collectCastType(self: *Parser) []const u8 {
 
 pub fn isExprStart(tag: TokenTag) bool {
         return switch (tag) {
-            .integer_literal, .float_literal, .string_literal, .byte_string_literal, .char_literal, .true_kw, .false_kw, .null_kw, .undefined_kw, .identifier, .print, .lparen, .lbracket, .lbrace, .const_kw, .minus, .amp, .plus, .tilde, .bang, .star, .new, .free, .if_kw, .match_kw, .catch_kw => true,
+            .integer_literal, .float_literal, .string_literal, .byte_string_literal, .char_literal, .true_kw, .false_kw, .null_kw, .undefined_kw, .identifier, .print, .lparen, .lbracket, .lbrace, .const_kw, .minus, .amp, .plus, .tilde, .bang, .star, .new, .free, .if_kw, .match_kw, .catch_kw, .await_kw, .asm_kw => true,
             else => false,
         };
     }

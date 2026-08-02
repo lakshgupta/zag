@@ -350,6 +350,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // signature isn't yet parsed, so zig's downstream type
                 // checker validates the type against the inferred
                 // `pub fn main() !void` body return shape.
+                // async fun (docs/manual/18 §"Async Trait Methods"):
+                // wrap the value into the emitted Future(T) —
+                // `return .{ .done = true, .value = EXPR };` (bare
+                // return → `return .{ .done = true };`).
+                if (self.fn_is_async) {
+                    if (r.value) |v| {
+                        self.write("    return .{ .done = true, .value = ");
+                        self.genExpr(v);
+                        self.write(" };\n");
+                    } else {
+                        self.write("    return .{ .done = true };\n");
+                    }
+                    return;
+                }
                 if (r.value) |v| {
                     self.write("    return ");
                     self.genExpr(v);
@@ -372,6 +386,18 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(";\n");
             },
             .expr_stmt => |e| {
+                // Inline-asm statements (docs/manual/24 §"Inline
+                // Assembly"): the asm expression is VALUE-typed when
+                // it has outputs, and zig rejects a discarded non-void
+                // expression at statement position — prefix the
+                // explicit `_ = ` discard (the outputs are still
+                // written; the block's own value is thrown away).
+                if (e.payload == .asm_expr) {
+                    self.write("    _ = ");
+                    self.genExpr(e);
+                    self.write(";\n");
+                    return;
+                }
                 self.write("    ");
                 self.genExpr(e);
                 self.write(";\n");

@@ -190,6 +190,14 @@ A fat pointer stores exactly one vtable pointer. Casting `obj as Drawable` const
 
 ## Async Trait Methods
 
+> **Implementation status:** v1 supports top-level `async fun` +
+> `await` (Future(T) wrap, `.{ .done = true, .value = ... }` returns,
+> inline-drive lowering — see docs/manual/00-overview.md "Zero-cost
+> async" for the status note). Async IMPL methods (the trait example
+> below) parse-error today ("expected fun, got 'async'"); the
+> `Future<*Response>` impl-side rewrite is a follow-up alongside
+> real suspension.
+
 Trait declarations are synchronous. Async impl uses `async fun` on the impl block's method — the compiler generates a state machine and wraps the return type in `Future<T>`:
 
 ```

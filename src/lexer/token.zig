@@ -17,6 +17,16 @@ pub const TokenTag = enum {
     free,
     print,
     as_kw,
+    /// `asm` keyword — inline assembly block expression
+    /// (docs/manual/24-simd.md §"Inline Assembly").
+    asm_kw,
+    /// `async` keyword — `async fun` declaration marker
+    /// (docs/manual/18-traits.md §"Async Trait Methods"; the
+    /// compiler wraps the return type in `Future<T>`).
+    async_kw,
+    /// `await` keyword — suspends until the awaited Future<T>
+    /// completes (docs/manual/00-overview.md "Zero-cost async").
+    await_kw,
     return_kw,
     /// `struct` keyword — introduces a struct declaration
     /// (`struct Vec3 { x: f64, … }`). Distinct from `.struct_lit` AST

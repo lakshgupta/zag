@@ -255,6 +255,12 @@ pub const Codegen = struct {
     /// clash with the override (the pre-Tier-1 FullPanic shim was
     /// retired for exactly this collision).
     suppress_panic_override: bool = false,
+    /// True while emitting the body of an `async fun` (docs/manual/18
+    /// §"Async Trait Methods"): the return_stmt arm wraps `return
+    /// EXPR;` into `return .{ .done = true, .value = EXPR };` so the
+    /// emitted Future(T) carries the value. Reset false at every
+    /// function-body entry (genFun/genMethod/genFreeMethod/genTestFun).
+    fn_is_async: bool = false,
 
     /// Source location map: zig output line → zag source location.
     /// Populated during codegen as expressions/statements are emitted.
@@ -475,6 +481,7 @@ pub const MapEntry = struct {
             // the only safe init (a stale true would suppress the
             // override for a Codegen instance reused across runs).
             .suppress_panic_override = false,
+            .fn_is_async = false,
             // `prog` is set by `generate()` immediately on entry
             // (see the `self.prog = &prog;` line at the top of
             // `generate`). Leaving it undefined here is intentional
@@ -1022,6 +1029,38 @@ pub const MapEntry = struct {
             \\            };
             \\        }
             \\    };
+            \\}
+            \\// Future(T) — async/await v1 (docs/manual/00-overview.md
+            \\// "Zero-cost async"): `async fun` returns `Future(T)`
+            \\// wrapping the declared return type; `await EXPR` drives
+            \\// the future to completion and unwraps `value`. The v1
+            \\// driver is SYNCHRONOUS: an awaited async call's body
+            \\// runs eagerly inside the call, so a future returned to
+            \\// an await site is already `done` (or is completed by
+            \\// its producer's own drive loop — e.g. a timer
+            \\// busy-wait); a future that never completes would block
+            \\// forever. Real suspension (resume-on-completion without
+            \\// a blocked thread) is the documented follow-up; the
+            \\// Future surface and the await lowering are stable
+            \\// across it.
+            \\fn Future(comptime T: type) type {
+            \\    return struct {
+            \\        done: bool = false,
+            \\        value: ?T = null,
+            \\    };
+            \\}
+            \\fn __zag_future_drive(comptime T: type, fut: *T) void {
+            \\    // v1 synchronous driver: the awaited future is
+            \\    // completed by its producer before the drive returns
+            \\    // (see the Future(T) docblock for the contract).
+            \\    // `f: *T` (not *Future(T)): Future is a per-module
+            \\    // preamble type, and a user-module await on a std
+            \\    // module's Future (e.g. std.time's `after`) must not
+            \\    // name the wrong module's Future in the signature.
+            \\    _ = fut;
+            \\}
+            \\fn __zag_future_ready_void() Future(void) {
+            \\    return .{ .done = true, .value = {} };
             \\}
             \\
             \\// __zag_err_to_result — bridge from zig error unions to zag's Result.

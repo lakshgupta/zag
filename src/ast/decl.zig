@@ -75,6 +75,12 @@ pub const FunDecl = struct {
     /// True when `@[test]` annotation precedes the function.
     /// Codegen emits `test "name" { ... }` instead of `pub fn name(...)`.
     is_test: bool = false,
+    /// True for `async fun NAME(...)` (docs/manual/18-traits.md
+    /// §"Async Trait Methods"): the emitted zig fn returns
+    /// `Future(T)` (the wrapped return type) and the body's `await`
+    /// sites drive their futures inline (v1 synchronous driver —
+    /// see __zag_future_drive in the preamble).
+    is_async: bool = false,
 };
 
 /// One field in a struct declaration. Two shapes:

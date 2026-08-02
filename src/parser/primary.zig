@@ -1064,6 +1064,111 @@ pub fn parsePrimary(self: *Parser) Expr {
                 self.expect(.rbrace);
                 return Expr{ .payload = .{ .const_block = body }, .loc = tok.loc };
             },
+            .await_kw => {
+                // `await EXPR` (docs/manual/00-overview.md "Zero-cost
+                // async"): suspends until the awaited Future<T>
+                // completes. v1 lowering is the inline-drive form
+                // (the callee's async body runs eagerly), so the
+                // operand is parsed as a normal expression and the
+                // codegen's .await_expr arm emits the drive + unwrap.
+                self.advance();
+                const operand = self.parseExpr();
+                const operand_buf = self.arena.alloc(Expr, 1);
+                operand_buf[0] = operand;
+                return Expr{ .payload = .{ .await_expr = .{ .expr = &operand_buf[0] } }, .loc = tok.loc };
+            },
+            .asm_kw => {
+                // Inline assembly (docs/manual/24-simd.md §"Inline
+                // Assembly"): `asm { ("tpl" : {dst} = "=x"(out) :
+                // {src} = "x"(a), {acc} = "x"(b) : ) }`. The
+                // parenthesised spec has up to four `:`-separated
+                // sections after the template string: outputs,
+                // inputs, clobbers (positional; empty sections are
+                // allowed and skipped). Output/input bindings are
+                // `{name} = "constraint"(expr)`; clobbers are bare
+                // `"memory"`-style strings. Sections beyond the
+                // third are rejected (zig's asm has no options
+                // section in v1 of this surface).
+                self.advance();
+                self.expect(.lbrace);
+                while (self.peek().tag == .newline) self.advance();
+                self.expect(.lparen);
+                while (self.peek().tag == .newline) self.advance();
+                const template = self.expectStringLiteral();
+                var outputs_buf: [8]ast.AsmOperand = undefined;
+                var outputs_count: usize = 0;
+                var inputs_buf: [8]ast.AsmOperand = undefined;
+                var inputs_count: usize = 0;
+                var clobbers_buf: [8][]const u8 = undefined;
+                var clobbers_count: usize = 0;
+                var section: usize = 0;
+                while (true) {
+                    while (self.peek().tag == .newline) self.advance();
+                    if (self.peek().tag != .colon) break;
+                    self.advance();
+                    section += 1;
+                    if (section > 3) {
+                        std.debug.print("error:{d}:{d}: asm: too many ':' sections (template : outputs : inputs : clobbers)\n", .{ tok.loc.line, tok.loc.col });
+                        std.process.exit(1);
+                    }
+                    // Empty section (`: :` adjacency or trailing `:`).
+                    if (self.peek().tag == .colon or self.peek().tag == .rparen) continue;
+                    while (self.peek().tag != .colon and self.peek().tag != .rparen and !self.eof()) {
+                        if (self.peek().tag == .newline or self.peek().tag == .comma) {
+                            self.advance();
+                            continue;
+                        }
+                        if (section <= 2) {
+                            // `{name} = "constraint"(expr)` binding.
+                            self.expect(.lbrace);
+                            const name = self.expectIdent();
+                            self.expect(.rbrace);
+                            self.expect(.equals);
+                            const constraint = self.expectStringLiteral();
+                            self.expect(.lparen);
+                            const value = self.parseExpr();
+                            self.expect(.rparen);
+                            const value_buf = self.arena.alloc(Expr, 1);
+                            value_buf[0] = value;
+                            const op = ast.AsmOperand{ .name = name, .constraint = constraint, .expr = &value_buf[0] };
+                            if (section == 1) {
+                                if (outputs_count < outputs_buf.len) {
+                                    outputs_buf[outputs_count] = op;
+                                    outputs_count += 1;
+                                }
+                            } else {
+                                if (inputs_count < inputs_buf.len) {
+                                    inputs_buf[inputs_count] = op;
+                                    inputs_count += 1;
+                                }
+                            }
+                        } else {
+                            // Clobber string.
+                            const clobber = self.expectStringLiteral();
+                            if (clobbers_count < clobbers_buf.len) {
+                                clobbers_buf[clobbers_count] = clobber;
+                                clobbers_count += 1;
+                            }
+                        }
+                    }
+                }
+                while (self.peek().tag == .newline) self.advance();
+                self.expect(.rparen);
+                while (self.peek().tag == .newline) self.advance();
+                self.expect(.rbrace);
+                const outputs = self.arena.alloc(ast.AsmOperand, outputs_count);
+                @memcpy(outputs, outputs_buf[0..outputs_count]);
+                const inputs = self.arena.alloc(ast.AsmOperand, inputs_count);
+                @memcpy(inputs, inputs_buf[0..inputs_count]);
+                const clobbers = self.arena.alloc([]const u8, clobbers_count);
+                @memcpy(clobbers, clobbers_buf[0..clobbers_count]);
+                return Expr{ .payload = .{ .asm_expr = .{
+                    .template = template,
+                    .outputs = outputs,
+                    .inputs = inputs,
+                    .clobbers = clobbers,
+                } }, .loc = tok.loc };
+            },
             .undefined_kw => {
                 self.advance();
                 return Expr{ .payload = .{ .undefined_lit = {} }, .loc = tok.loc };

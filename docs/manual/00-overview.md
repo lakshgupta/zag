@@ -83,6 +83,10 @@ Removes `~/.zag` and the `# Zag Language` / `# zag` PATH entry from your shell p
 - **Predictable performance** — no garbage collector, no surprise pauses
 - **Safety by tools** — the core language is unsafe by default; safety checks are opt-in
 - **Zero-cost async** — async/await compiles to state machines; no heap allocation per task
+  > v1 status: `async fun` + `await` land (Future(T) wrap + inline-drive
+  > lowering — the awaited call's body runs eagerly, so awaits block
+  > until the future completes). Real suspension (resume-on-completion)
+  > is the documented follow-up; the Future surface is stable across it.
 - **First-class SIMD** — vector types for AI kernels and game hot paths
 
 ## Memory Philosophy

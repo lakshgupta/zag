@@ -727,5 +727,24 @@ fn walkExpr(a: *Analyzer, e: ast.Expr, out: *u128) void {
             popScope(a);
             escapeRange(a, before, a.visit_count);
         },
+        .asm_expr => |ae| {
+            // Inline-asm operands are read/written by the assembly —
+            // their sites can escape through the asm block, so walk
+            // the operand expressions and treat them as escaping.
+            for (ae.outputs) |op| {
+                var scratch: u128 = 0;
+                walkExpr(a, op.expr.*, &scratch);
+                addEscapes(a, scratch);
+            }
+            for (ae.inputs) |op| {
+                var scratch: u128 = 0;
+                walkExpr(a, op.expr.*, &scratch);
+                addEscapes(a, scratch);
+            }
+        },
+        .await_expr => |ae| {
+            // The awaited future's value flows into the await result.
+            walkExpr(a, ae.expr.*, out);
+        },
     }
 }

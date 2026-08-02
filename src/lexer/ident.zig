@@ -40,6 +40,12 @@ pub     fn readIdent(self: *Lexer, start_loc: ast.Loc) void {
         .extern_kw
     else if (std.mem.eql(u8, text, "as"))
         .as_kw
+    else if (std.mem.eql(u8, text, "asm"))
+        .asm_kw
+    else if (std.mem.eql(u8, text, "async"))
+        .async_kw
+    else if (std.mem.eql(u8, text, "await"))
+        .await_kw
     else if (std.mem.eql(u8, text, "struct"))
         .struct_kw
     else if (std.mem.eql(u8, text, "impl"))

@@ -3659,3 +3659,49 @@ test "codegen: non-pub use emits module-local const binding" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "const fs = @import(\"std/fs.zig\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub const fs = @import") == null);
 }
+
+test "codegen: async fun emits Future(T) signature and done-wrapped return" {
+    // docs/manual/18-traits.md §"Async Trait Methods" + the overview's
+    // "Zero-cost async" goal: `async fun f() -> T { return EXPR; }`
+    // emits `pub fn f() Future(T)` with the return wrapped into
+    // `.{ .done = true, .value = EXPR }`.
+    const src =
+        \\async fun greet(name: str) -> str {
+        \\    return "hi";
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn greet(name: []const u8) Future([]const u8) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return .{ .done = true, .value = ") != null);
+    // The preamble Future(T) + drive helper.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn Future(comptime T: type) type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_future_drive(comptime T: type, fut: *T) void") != null);
+}
+
+test "codegen: await lowers to the inline-drive form" {
+    const src =
+        \\async fun f() {
+        \\    await g();
+        \\    let x: i32 = await h();
+        \\    return x;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_future_drive(@TypeOf(__fut_0), &__fut_0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __fut_0.value.?;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const x: i32 = (blk: { var __fut_1 = h(); __zag_future_drive(@TypeOf(__fut_1), &__fut_1); break :blk __fut_1.value.?; });") != null);
+}

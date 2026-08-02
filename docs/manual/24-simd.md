@@ -10,7 +10,7 @@
 | `as` conversions (array ↔ vector) | ✅ — zig coerces both directions |
 | `sum()` / `max()` / `min()` / `dot(x)` | ✅ — rewrite to `@reduce(.Add/.Max/.Min, ...)` (dot = element-wise product + horizontal add) |
 | `bf16x8` | ⚠️ maps to `@Vector(8, f16)` — zig 0.16 has no `bf16` type |
-| Inline assembly block | ⏸️ syntax not yet implemented (needs a zag-side `asm` design mapping to zig's asm) |
+| Inline assembly block | ✅ — `asm { ("tpl" : {dst} = "=x"(out) : {src} = "x"(a) : ) }` translates to zig's asm (`{name}` → `%[name]`, bindings → `[name] "constraint" (expr)`, clobbers → the packed `std.builtin.assembly.Clobbers` struct) |
 | `import std.arch.x86.avx2` intrinsics | ⏸️ zig 0.16 removed `std.arch.x86` entirely — the `_mm256_*` pass-through target no longer exists |
 
 ## SIMD Vector Types
