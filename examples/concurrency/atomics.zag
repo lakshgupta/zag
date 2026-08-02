@@ -33,6 +33,12 @@ fun main() {
     let old: i32 = fetch_add(ptr, 1);
     print("fetch_add old: {old}, new: {ptr}\n");
 
-    let cas: i32 = compare_exchange(ptr, old + 1, 99);
-    print("after cas: {ptr}\n");
+    # @cmpxchgStrong returns ?i32 — null when the CAS SUCCEEDED,
+    # Some(old_value) when it failed (zig's optional encodes the
+    # failure case). Bind the optional and read the new value via
+    # a load (or check `cas == null` for success).
+    let cas: ?i32 = compare_exchange(ptr, old + 1, 99);
+    if (cas == null) { print("cas succeeded\n"); }
+    let after: i32 = load(ptr);
+    print("after cas: {after}\n");
 }

@@ -970,7 +970,7 @@ pub fn parsePrimary(self: *Parser) Expr {
                     // through to `.struct_lit` as before.
                     return self.parseEnumVariantCtorBrace(name);
                 } else if (self.peek().tag == .lbrace and self.allow_struct_lit and
-                    name.len > 0 and name[0] >= 'A' and name[0] <= 'Z')
+                    ((name.len > 0 and name[0] >= 'A' and name[0] <= 'Z') or self.isSimdTypeName(name)))
                 {
                     // Struct-literal: `Type { name: value, ... }`. The
                     // lexer already gave us an identifier followed by `{`,
@@ -999,6 +999,12 @@ pub fn parsePrimary(self: *Parser) Expr {
                     //      `Type.new(...)` instead. Belt-and-suspenders so
                     //      an accidental flag flip can't regress the
                     //      parser's structural disambiguation.
+                    //   SIMD vector names (`f32x4 { ... }` —
+                    //      docs/manual/24 §"SIMD Literals") start
+                    //      lowercase but are first-class type spellings;
+                    //      `isSimdTypeName`'s digit-`x`-digit shape is
+                    //      the disambiguation contract (see its docblock
+                    //      in src/parser/core.zig).
                     return self.parseStructLit(name);
                 } else {
                     return Expr{ .payload = .{ .ident = name }, .loc = tok.loc };
@@ -1189,13 +1195,32 @@ pub fn parseStructLit(self: *Parser, type_name: []const u8) Expr {
                 self.advance();
                 continue;
             }
-            const field_name = self.expectIdent();
-            self.expect(.colon);
-            const value = self.parseExpr();
-            const value_buf = self.arena.alloc(Expr, 1);
-            value_buf[0] = value;
-            inits_buf[init_count] = .{ .name = field_name, .value = &value_buf[0] };
-            init_count += 1;
+            // Positional-value slots (`f32x4 { 1.0, 2.0, ... }` —
+            // docs/manual/24-simd.md §"SIMD Literals") vs the named
+            // `f: v` form. The field name is the empty string for
+            // positional slots; codegen emits the positional
+            // `Type{ v1, v2 }` shape when every slot is positional
+            // (a regular struct literal with positional values would
+            // emit invalid zig, but the shape only occurs for SIMD
+            // vector types today — the parser does not type-check).
+            // Detection: a `name:` pair has an identifier followed
+            // by a colon; anything else is a positional value.
+            const is_named = self.peek().tag == .identifier and self.peekAhead(1) == .colon;
+            if (is_named) {
+                const field_name = self.expectIdent();
+                self.expect(.colon);
+                const value = self.parseExpr();
+                const value_buf = self.arena.alloc(Expr, 1);
+                value_buf[0] = value;
+                inits_buf[init_count] = .{ .name = field_name, .value = &value_buf[0] };
+                init_count += 1;
+            } else {
+                const value = self.parseExpr();
+                const value_buf = self.arena.alloc(Expr, 1);
+                value_buf[0] = value;
+                inits_buf[init_count] = .{ .name = "", .value = &value_buf[0] };
+                init_count += 1;
+            }
         }
         self.expect(.rbrace);
         const inits = self.arena.alloc(ast.Expr.FieldInit, init_count);

@@ -575,6 +575,16 @@ pub const MapEntry = struct {
             self.write(" = try std.heap.page_allocator.create(");
             self.writeType(self.escape_site_types[i]);
             self.write(");\n");
+            // std.bench allocation counter: charge @sizeOf(T) at the
+            // hoisted alloc; the bench_free defer (below) runs LIFO
+            // after the destroy defer, so bytes_live tracks the live
+            // heap regardless of exit path.
+            self.write("    __zag_bench_alloc(@sizeOf(");
+            self.writeType(self.escape_site_types[i]);
+            self.write("));\n");
+            self.write("    defer __zag_bench_free(@sizeOf(");
+            self.writeType(self.escape_site_types[i]);
+            self.write("));\n");
             self.write("    defer std.heap.page_allocator.destroy(");
             self.write(name);
             self.write(");\n");
@@ -822,6 +832,48 @@ pub const MapEntry = struct {
             \\}
             \\fn __zag_page_free(p: [*]u8, cap: usize) void {
             \\    std.heap.page_allocator.free(p[0..cap]);
+            \\}
+            \\// __zag_bench_* — std.bench allocation counters. Every
+            \\// `new` / `alloc` site emits __zag_bench_alloc(@sizeOf(T));
+            \\// the matching destroy/free sites emit __zag_bench_free.
+            \\// bytes_live is the running delta; bytes_total and
+            \\// allocations are monotone. Read via lib/std/bench.zag's
+            \\// Counters.snapshot(). Overhead per allocation is two
+            \\// integer adds — negligible next to the syscall itself.
+            \\//
+            \\// Cross-module accounting: the state lives in every
+            \\// module's preamble copy, but only the COMPILATION
+            \\// ROOT's copies are ever mutated — the per-file wrappers
+            \\// forward to `@import("root")` (the root module always
+            \\// carries the preamble), so a `new` charged in the user
+            \\// module and an `alloc` charged inside std/mem.zag land
+            \\// in the SAME counters that the user's snapshot() reads
+            \\// (mirrors the __zag_panic_trace root-delegation design).
+            \\pub var __zag_bench_bytes_live: usize = 0;
+            \\pub var __zag_bench_bytes_total: usize = 0;
+            \\pub var __zag_bench_allocations: usize = 0;
+            \\pub fn __zag_bench_inc(n: usize) void {
+            \\    __zag_bench_bytes_live += n;
+            \\    __zag_bench_bytes_total += n;
+            \\    __zag_bench_allocations += 1;
+            \\}
+            \\pub fn __zag_bench_dec(n: usize) void {
+            \\    __zag_bench_bytes_live -= n;
+            \\}
+            \\fn __zag_bench_alloc(n: usize) void {
+            \\    @import("root").__zag_bench_inc(n);
+            \\}
+            \\fn __zag_bench_free(n: usize) void {
+            \\    @import("root").__zag_bench_dec(n);
+            \\}
+            \\pub fn __zag_bench_live() usize {
+            \\    return @import("root").__zag_bench_bytes_live;
+            \\}
+            \\pub fn __zag_bench_total() usize {
+            \\    return @import("root").__zag_bench_bytes_total;
+            \\}
+            \\pub fn __zag_bench_allocs() usize {
+            \\    return @import("root").__zag_bench_allocations;
             \\}
             \\// v0.1 stdlib migration follow-up: `__zag_memcpy` accepts a
             \\// slice (`[]u8`) for the destination rather than a
@@ -1518,6 +1570,34 @@ pub const MapEntry = struct {
                 matched_count += 1;
             }
             self.genEnumDecl(ed, prog.impls);
+        }
+        // Module re-exports (docs/manual/22 §Re-exports): `[pub] use
+        // <dotted-path> as <name>` emits `pub const <name> =
+        // @import("<resolved>.zig");` — a module-namespace binding so
+        // `<name>.member` resolves to the re-exported module's
+        // members. Path resolution mirrors the imports loop:
+        // KNOWN_STD_MODULES lookup + the materialized-mirror path
+        // rewrite (`<import_std_base><rel>.zig` — "std/" from the
+        // user module, same-dir "" inside the materialized mirror).
+        // Unresolvable paths are skipped silently (the imports loop's
+        // null-on-miss contract).
+        for (prog.uses) |use_decl| {
+            var use_scratch: [256]u8 = undefined;
+            const dotted = parser.Parser.joinDottedPath(&use_scratch, use_decl.path_nodes);
+            const resolved = parser.Parser.resolveStdImport(dotted) orelse continue;
+            if (resolved.len <= "lib/std/".len) continue;
+            const rel_path = resolved["lib/std/".len..];
+            const zig_ext_start = if (std.mem.endsWith(u8, rel_path, ".zag"))
+                rel_path.len - ".zag".len
+            else
+                rel_path.len;
+            if (use_decl.is_pub) self.write("pub ");
+            self.write("const ");
+            self.write(use_decl.name);
+            self.write(" = @import(\"");
+            self.write(self.import_std_base);
+            self.write(rel_path[0..zig_ext_start]);
+            self.write(".zig\");\n");
         }
         // Generics (§2 Generic Types + §5 Generic impl Blocks): when a
         // struct carries type params, its decl becomes a thunk form

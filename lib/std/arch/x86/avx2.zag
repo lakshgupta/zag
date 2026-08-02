@@ -1,15 +1,12 @@
 ## std.arch.x86.avx2 — AVX2 intrinsics for x86_64.
 ##
-## Pass-through entry point. Real impl lives in zig's std.arch.x86.avx2
-## (`_mm256_fmadd_ps`, `_mm256_load_ps`, `_mm256_store_ps`, …) and is
-## surface-stable on every supported target. When a user writes
-## `import std.arch.x86.avx2`, the resolver emits a one-line zig alias
-## block (`const __zag_std_arch_x86_avx2 = struct { const avx2 = @import("std").arch.x86.avx2; };`)
-## and call sites (`std.arch.x86.avx2._mm256_fmadd_ps(a, b, c)`) resolve
-## through that alias.
-##
-## Stub: this file exists so module discovery has a target. Once
-## KNOWN_STD_MODULES lands, this entry point is wired to the
-## pass-through path. Until then, calling `_mm256_*` from zag source
-## requires the compiler-emit primitive path (canonical keyword
-## routing in src/codegen/), not import resolution.
+## STATUS (zig 0.16): BLOCKED. The pass-through target
+## `zig's std.arch.x86.avx2` was REMOVED in zig 0.16 (the whole
+## `std.arch.x86` namespace is gone from the stdlib), so the
+## `_mm256_*` intrinsics surface has no zig-side implementation to
+## forward to. The SIMD story for zag v1 is the @Vector mapping in
+## docs/manual/24-simd.md (vector types, literals, element-wise ops,
+## @reduce-based reductions) — this file exists so module discovery
+## and the scaffold parse-regression have a target, and so a future
+## zig release restoring the intrinsics namespace can re-wire the
+## pass-through alias without touching the docs.

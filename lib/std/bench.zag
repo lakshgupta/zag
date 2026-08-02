@@ -1,10 +1,16 @@
 ## std.bench — runtime allocation counters + benchmark harness.
 ##
-## Stub: real impl lands via the runtime counters in src/codegen/
-## that emit `std.heap` allocation hooks at every `new` and `alloc`
-## call site, plus per-line benchmark scaffolding. Until then, the
-## Counters struct exposes the surface shape (bytes_live, bytes_total,
-## allocations) and a sync snapshot that returns zeros.
+## Real impl (v0.1): the counters are backed by the always-emitted
+## `__zag_bench_*` preamble family (src/codegen/core.zig). Every
+## `new` / `alloc` site emits `__zag_bench_alloc(@sizeOf(T))` and
+## the matching destroy/free sites emit `__zag_bench_free(<size>)`,
+## so `Counters.snapshot()` reports live heap bytes, cumulative
+## allocated bytes, and the allocation count — without touching the
+## allocator itself (no logging-allocator swap, no per-site call
+## overhead beyond two integer adds).
+##
+## Pre-migration state: the stub returned zeros. Per-line benchmark
+## scaffolding (timing + per-source-line counters) is a follow-up.
 
 pub struct Counters {
     bytes_live: usize,
@@ -13,8 +19,11 @@ pub struct Counters {
 }
 
 impl Counters {
-    pub fun snapshot(self: *Counters) -> Counters {
-        _ = self;
-        return Counters { bytes_live: 0, bytes_total: 0, allocations: 0 };
+    pub fun snapshot() -> Counters {
+        return Counters {
+            bytes_live: __zag_bench_live(),
+            bytes_total: __zag_bench_total(),
+            allocations: __zag_bench_allocs(),
+        };
     }
 }

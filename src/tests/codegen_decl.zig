@@ -3616,3 +3616,46 @@ test "codegen: Layer 3a machinery emitted even for a statement-free program" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_panic_trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub const panic = if (@import(\"builtin\").mode == .Debug)") != null);
 }
+
+test "codegen: pub use std.X as name emits module re-export @import" {
+    // docs/manual/22 §Re-exports: `pub use std.env as env` emits
+    // `pub const env = @import("std/env.zig");` so `env.get_env(...)`
+    // resolves through the re-exported module's namespace. The path
+    // rewrite mirrors the imports loop (materialized-mirror shape).
+    const src =
+        \\pub use std.env as env
+        \\fun main() {
+        \\    let home: ?str = env.get_env("HOME");
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const env = @import(\"std/env.zig\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "env.get_env(\"HOME\")") != null);
+}
+
+test "codegen: non-pub use emits module-local const binding" {
+    // `use std.fs as fs` (no pub) binds fs module-locally.
+    const src =
+        \\use std.fs as fs
+        \\fun f() {
+        \\    let d: String = fs.read_file("x");
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const fs = @import(\"std/fs.zig\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const fs = @import") == null);
+}

@@ -1,5 +1,18 @@
 # SIMD and Inline Assembly
 
+## Implementation status
+
+| Surface | Status |
+|---|---|
+| Vector types (`f32x4` … `u64x2`, sub-byte `i4x16` … `u8x64`) | ✅ — maps to zig's `@Vector(N, T)` via the transparent-alias table |
+| Vector literals `f32x4 { ... }` (positional) | ✅ — emits `@Vector(4, f32){ ... }` |
+| Element-wise `+ - * /` | ✅ — lowers to zig's native vector ops verbatim |
+| `as` conversions (array ↔ vector) | ✅ — zig coerces both directions |
+| `sum()` / `max()` / `min()` / `dot(x)` | ✅ — rewrite to `@reduce(.Add/.Max/.Min, ...)` (dot = element-wise product + horizontal add) |
+| `bf16x8` | ⚠️ maps to `@Vector(8, f16)` — zig 0.16 has no `bf16` type |
+| Inline assembly block | ⏸️ syntax not yet implemented (needs a zag-side `asm` design mapping to zig's asm) |
+| `import std.arch.x86.avx2` intrinsics | ⏸️ zig 0.16 removed `std.arch.x86` entirely — the `_mm256_*` pass-through target no longer exists |
+
 ## SIMD Vector Types
 
 First-class types that map to target ISA registers:

@@ -190,6 +190,24 @@ pub fn collectCastType(self: *Parser) []const u8 {
                 self.advance();
                 continue;
             }
+            // Dotted member paths (`std.Thread`, `std.fs.File`) — join
+            // the `.` and the following identifier so binding
+            // annotations and cast destinations can name module-
+            // qualified types (the std.concurrent.thread spawn handle
+            // is `std.Thread`). Without this carve-out the `.` fell
+            // through to the `else => break;` tail and truncated the
+            // captured type text at the first dot ("expected equals,
+            // got '.'" at the annotation site). `prev_was_ptr = true`
+            // glues the next ident onto the dot without a space.
+            if (tok.tag == .dot and self.peekAhead(1) == .identifier) {
+                if (len + 1 <= buf.len) {
+                    buf[len] = '.';
+                    len += 1;
+                }
+                prev_was_ptr = true;
+                self.advance();
+                continue;
+            }
             const is_term: bool = switch (tok.tag) {
                 .newline, .comma, .rparen, .rbracket, .rbrace, .colon, .equals, .plus_eq, .minus_eq, .slash_eq, .percent_eq, .amp_eq, .pipe_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .plus, .minus, .slash, .percent, .amp, .pipe, .caret, .tilde, .bang, .lt_lt, .gt_gt, .lt_eq, .gt_eq, .eq_eq, .bang_eq, .amp_amp, .pipe_pipe, .range, .ellipsis, .arrow, .doc_comment, .eof => true,
                 else => false,

@@ -56,6 +56,8 @@ pub     fn readIdent(self: *Lexer, start_loc: ast.Loc) void {
         .pub_kw
     else if (std.mem.eql(u8, text, "import"))
         .import_kw
+    else if (std.mem.eql(u8, text, "use"))
+        .use_kw
     else if (std.mem.eql(u8, text, "new"))
         .new
     else if (std.mem.eql(u8, text, "free"))

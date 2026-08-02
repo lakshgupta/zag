@@ -13,8 +13,13 @@
 ## @panic("OOM"))` inline. Retired — this real .zag body is the
 ## single source of truth. Callers must now `import std.mem.{alloc}`
 ## (the bare-name router no longer rewrites the call site).
+##
+## The body also charges the std.bench allocation counter
+## (__zag_bench_alloc) so `Counters.snapshot()` accounts for
+## `alloc(N)` buffers alongside `new T(v)` sites.
 
 pub fun alloc(n: usize) -> []u8 {
     let p: *raw u8 = __zag_page_alloc(n);
+    __zag_bench_alloc(n);
     return p[0..n];
 }

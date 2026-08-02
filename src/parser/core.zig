@@ -53,6 +53,8 @@ pub fn parse(self: *Parser) ast.Program {
         var trait_count: usize = 0;
         var imports_buf: [256]ast.ImportDecl = undefined;
         var import_count: usize = 0;
+        var uses_buf: [64]ast.UseDecl = undefined;
+        var use_count: usize = 0;
         var externs_buf: [256]ast.ExternDecl = undefined;
         var extern_count: usize = 0;
         var consts_buf: [256]ast.ConstDecl = undefined;
@@ -237,6 +239,19 @@ pub fn parse(self: *Parser) ast.Program {
                 import_count += 1;
                 continue;
             }
+            // Module re-exports (docs/manual/22 §Re-exports):
+            // `pub use std.string as string` / `use std.fs as fs`.
+            if (lead == .pub_kw and self.peekAhead(1) == .use_kw) {
+                self.advance();
+                uses_buf[use_count] = self.parseUseDecl(true);
+                use_count += 1;
+                continue;
+            }
+            if (lead == .use_kw) {
+                uses_buf[use_count] = self.parseUseDecl(false);
+                use_count += 1;
+                continue;
+            }
             if (lead == .extern_kw) {
                 externs_buf[extern_count] = self.parseExternDecl();
                 extern_count += 1;
@@ -266,11 +281,13 @@ pub fn parse(self: *Parser) ast.Program {
         @memcpy(traits, traits_buf[0..trait_count]);
         const imports = self.arena.alloc(ast.ImportDecl, import_count);
         @memcpy(imports, imports_buf[0..import_count]);
+        const uses = self.arena.alloc(ast.UseDecl, use_count);
+        @memcpy(uses, uses_buf[0..use_count]);
         const externs = self.arena.alloc(ast.ExternDecl, extern_count);
         @memcpy(externs, externs_buf[0..extern_count]);
         const consts = self.arena.alloc(ast.ConstDecl, const_count);
         @memcpy(consts, consts_buf[0..const_count]);
-        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits, .imports = imports, .externs = externs, .consts = consts };
+        return .{ .functions = functions, .structs = structs, .impls = impls, .enums = enums, .traits = traits, .imports = imports, .uses = uses, .externs = externs, .consts = consts };
     }
 
 
@@ -421,6 +438,35 @@ pub fn isKnownStruct(self: *Parser, name: []const u8) bool {
         return false;
     }
 
+    /// SIMD vector type names (docs/manual/24-simd.md §"SIMD Vector
+    /// Types"): the `{elem}{width}x{lanes}` spelling — `f32x4`,
+    /// `i8x16`, `bf16x8`, `u4x32`, ... Element = one or two lowercase
+    /// letters (f, i, u, b, bf, u4-style digit suffix), then the
+    /// `x`-separated lane count. Vector names start LOWERCASE, so
+    /// they fail the struct-literal uppercase gate in parsePrimary's
+    /// `.identifier` arm — this shape check is the disambiguation
+    /// contract that lets `f32x4 { 1.0, 2.0 }` route into
+    /// parseStructLit while bare lowercase locals stay idents.
+    pub fn isSimdTypeName(self: *Parser, name: []const u8) bool {
+        _ = self;
+        if (name.len < 4) return false;
+        const first = name[0];
+        if (!(first == 'f' or first == 'i' or first == 'u' or first == 'b')) return false;
+        var i: usize = 1;
+        // Element letters (max one more: `bf16`'s `f`).
+        if (i < name.len and (name[i] == 'f' or name[i] == 'i' or name[i] == 'u' or name[i] == 'b')) i += 1;
+        // Element width digits (at least one).
+        const width_start = i;
+        while (i < name.len and name[i] >= '0' and name[i] <= '9') : (i += 1) {}
+        if (i == width_start) return false;
+        // `x` separator + lane digits (at least one).
+        if (i >= name.len or name[i] != 'x') return false;
+        i += 1;
+        const lane_start = i;
+        while (i < name.len and name[i] >= '0' and name[i] <= '9') : (i += 1) {}
+        return i > lane_start and i == name.len;
+    }
+
 
 pub fn expectIdent(self: *Parser) []const u8 {
         const tok = self.peek();
@@ -551,6 +597,7 @@ pub const Parser = struct {
     // above. Without these bindings, zig surfaces a `no field or
     // member function named 'isKnownVariant' / 'parseEnumVariantCtorBrace'
     // in 'parser.core.Parser'` compile error at the call site.    pub const isKnownVariant = @import("core.zig").isKnownVariant;
+    pub const isSimdTypeName = @import("core.zig").isSimdTypeName;
     // Gap #2 closure helper re-export: parsePrimary's `.identifier` arm
     // (src/parser/primary.zig) calls `self.isKnownStruct(name)` (added by the
     // BLOCKING #2 fix) to decide whether to route to `parseStructLit` (when
@@ -560,7 +607,6 @@ pub const Parser = struct {
     // core.zig::isKnownStruct surfaced as `Parser.isKnownStruct` via this
     // const. Without this binding zig surfaces a `no field or member
     // function named 'isKnownStruct' in 'parser.core.Parser'` compile
-    // error at the parsePrimary call site.
     pub const isKnownVariant = @import("core.zig").isKnownVariant;
     pub const isKnownStruct = @import("core.zig").isKnownStruct;
     // --- decl.zig ---
@@ -592,6 +638,7 @@ pub const Parser = struct {
     // reaches the function registered in decl.zig without pulling the
     // decl.zig file's internals into a separate `@import` site.
     pub const parseImportDecl = @import("decl.zig").parseImportDecl;
+    pub const parseUseDecl = @import("decl.zig").parseUseDecl;
     // FFI (docs/24). parseExternDecl parses `extern fun NAME(...) -> RET;`
     // declarations at the top level.
     pub const parseExternDecl = @import("decl.zig").parseExternDecl;

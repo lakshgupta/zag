@@ -437,6 +437,23 @@ pub const ImportDecl = struct {
     loc: Loc,
 };
 
+/// One top-level `[pub] use <dotted-path> as <name>` module re-export
+/// (docs/manual/22-modules.md §Re-exports). The barrel
+/// `lib/std/mod.zag` docblock reserves this syntax for collapsing its
+/// selective-import list into `pub use std.string as string`-style
+/// surface once it lands. Codegen emits `pub const <name> =
+/// @import("<resolved>.zig");` — a module-namespace re-export (the
+/// user accesses members via `<name>.member`). `path_nodes` mirrors
+/// `ImportDecl.path_nodes` (verbatim dotted path components); `name`
+/// is the binding name after `as`. `is_pub` distinguishes `pub use`
+/// (exported) from `use` (module-local binding).
+pub const UseDecl = struct {
+    is_pub: bool,
+    path_nodes: []const []const u8,
+    name: []const u8,
+    loc: Loc,
+};
+
 /// One top-level `extern fun` declaration (docs/24 §"extern fun").
 /// `extern fun open(path: *raw u8, flags: i32) -> i32;` declares a C ABI
 /// function with no body. Codegen emits `extern fn` in zig output.

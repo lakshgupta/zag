@@ -1096,11 +1096,40 @@ pub fn parseConstDecl(self: *Parser) ast.ConstDecl {
     }
 
 
+    /// `[pub] use <dotted-path> as <name>` module re-export
+    /// (docs/manual/22-modules.md §Re-exports). The caller (the
+    /// top-level dispatch in core.zig) has already consumed the
+    /// leading `pub` (when present) and verified the next token is
+    /// `.use_kw`. Path components are verbatim idents separated by
+    /// `.`; the loop terminates when peek is `.as_kw` (the binding
+    /// name follows) or any other terminator (malformed source —
+    /// expectIdent surfaces the error). Resolution lives in
+    /// KNOWN_STD_MODULES at codegen time (mirrors ImportDecl's
+    /// contract).
+    pub fn parseUseDecl(self: *Parser, is_pub: bool) ast.UseDecl {
+        const start_loc = self.peek().loc;
+        self.expect(.use_kw);
+        var path_buf: [8][]const u8 = undefined;
+        var path_count: usize = 0;
+        path_buf[path_count] = self.expectIdent();
+        path_count += 1;
+        while (self.peek().tag == .dot) {
+            self.advance();
+            if (self.peek().tag == .as_kw) break;
+            path_buf[path_count] = self.expectIdent();
+            path_count += 1;
+        }
+        self.expect(.as_kw);
+        const name = self.expectIdent();
+        const path_nodes = self.arena.alloc([]const u8, path_count);
+        @memcpy(path_nodes, path_buf[0..path_count]);
+        return .{ .is_pub = is_pub, .path_nodes = path_nodes, .name = name, .loc = start_loc };
+    }
+
 pub fn parseExternDecl(self: *Parser) ast.ExternDecl {
         const start_loc = self.peek().loc;
         self.expect(.extern_kw);
-        self.expect(.fun);
-        const name = self.expectIdent();
+        self.expect(.fun);        const name = self.expectIdent();
         self.expect(.lparen);
         var params_buf: [16]ast.MethodParam = undefined;
         var param_count: usize = 0;

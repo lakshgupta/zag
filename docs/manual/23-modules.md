@@ -64,6 +64,22 @@ pub import math.mat4.{Mat4, Mat4::*};
 # quat not re-exported
 ```
 
+### Module re-exports (`pub use`)
+
+A whole module can be re-exported under a name with `pub use`:
+
+```
+pub use std.fs as fs      # emits pub const fs = @import("std/fs.zig");
+pub use std.env as env
+
+fun main() {
+    let home: ?str = env.get_env("HOME");   # fs.read_file(...) also resolves
+}
+```
+
+`use` (no `pub`) binds the module module-locally. Paths resolve against the
+known stdlib modules; unresolvable paths are skipped silently.
+
 ## Cyclic Detection
 
 The import resolver builds a module DAG and reports an error on cycles. This is a compile-time check.

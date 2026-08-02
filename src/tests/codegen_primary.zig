@@ -98,7 +98,10 @@ test "codegen: tuple emits anonymous struct" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, ".{ 10, 20 }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "= {};") != null);
+    // Empty tuple `()` emits `.{ }` (the canonical zig 0.16 empty
+    // tuple; bare `{}` is typed as `void` and rejected by
+    // `@call(.auto, f, args)` at std.Thread spawn sites).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= .{ };") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, ".{ 1, 2.5, true }") != null);
 }
 
@@ -221,4 +224,63 @@ test "codegen: stack-allocated fill array emits [1]T{val}**N on stack" {
         const code_start = std.mem.indexOf(u8, zig, "pub fn main") orelse zig.len;
         try std.testing.expect(std.mem.indexOf(u8, zig[code_start..], "page_allocator") == null);
     }
+}
+
+test "codegen: SIMD vector type + positional literal map to @Vector" {
+    // docs/manual/24-simd.md §"SIMD Vector Types" + §"SIMD
+    // Literals": `f32x4 { 1.0, 2.0, ... }` (lowercase type name,
+    // positional fields) maps onto zig 0.16's @Vector(4, f32)
+    // literal form.
+    const src = "fun f() {\n    let a: f32x4 = f32x4 { 1.0, 2.0, 3.0, 4.0 };\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const a: @Vector(4, f32) = @Vector(4, f32){ 1.0, 2.0, 3.0, 4.0 };") != null);
+}
+
+test "codegen: SIMD reductions rewrite to @reduce" {
+    // docs/manual/24-simd.md §"SIMD Methods (v1)": .sum()/.max()/
+    // .min()/.dot(x) on vector-typed receivers lower to @reduce
+    // (@Vector has no methods in zig).
+    const src =
+        \\fun f() {
+        \\    let c: f32x4 = f32x4 { 1.0, 2.0, 3.0, 4.0 };
+        \\    let s: f32 = c.sum();
+        \\    let m: f32 = c.max();
+        \\    let n: f32 = c.min();
+        \\    let d: f32 = c.dot(c);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= @reduce(.Add, c);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= @reduce(.Max, c);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= @reduce(.Min, c);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "= @reduce(.Add, c * c);") != null);
+}
+
+test "codegen: dotted type annotations collect through collectCastType" {
+    // Module-qualified types (`std.Thread` for the concurrent
+    // thread-spawn handle) must round-trip through binding
+    // annotations — the pre-fix collector truncated at the first
+    // `.` ("expected equals, got '.'").
+    const src = "fun f() {\n    let h: std.Thread = spawn(worker, ());\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const h: std.Thread = ") != null);
 }

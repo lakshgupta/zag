@@ -67,7 +67,12 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             },
             .tuple_lit => |elements| {
                 if (elements.len == 0) {
-                    self.write("{}");
+                    // Empty tuple `()` — zig 0.16 types bare `{}` as
+                    // `void`, which `@call(.auto, f, args)` rejects
+                    // ("expected a tuple, found 'void'") at std.Thread
+                    // spawn sites. `.{ }` is the canonical empty-tuple
+                    // literal (an anonymous struct with zero fields).
+                    self.write(".{ }");
                 } else {
                     self.write(".{ ");
                     for (elements, 0..) |el, i| {
@@ -299,6 +304,14 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
                 self.writeType(n.type_name);
                 self.write("); ");
+                // std.bench allocation counter (docs/manual/20 + the
+                // __zag_bench_* preamble helpers): every `new` site
+                // charges @sizeOf(T). The matching charge-back lands
+                // in the `.free_expr` arm / the escape-prologue
+                // defer, so Counters.snapshot() reports live bytes.
+                self.write("__zag_bench_alloc(@sizeOf(");
+                self.writeType(n.type_name);
+                self.write(")); ");
                 self.write(name);
                 self.write(".* = ");
                 self.genExpr(n.value.*);
@@ -536,6 +549,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     if (std.mem.eql(u8, tn, "str")) break :blk true;
                     break :blk false;
                 };
+                // std.bench allocation counter: ident targets (the only
+                // shape whose size is statically knowable without
+                // re-evaluating the target) wrap the dealloc in a blk
+                // and charge __zag_bench_free(<size>) — `p.len` for
+                // slices, @sizeOf(pointee) for pointers (via the same
+                // @typeInfo drill the `.add`/`.offset` arms use).
+                // Non-ident targets keep the plain emit — the target
+                // must not be evaluated twice (e.g. `free(getBox())`).
+                const is_ident = f.target.*.payload == .ident;
+                if (is_ident) self.write("({ ");
                 if (use_slice_free) {
                     self.write("std.heap.page_allocator.free(");
                 } else {
@@ -543,6 +566,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
                 self.genExpr(f.target.*);
                 self.write(")");
+                if (is_ident) {
+                    self.write("; __zag_bench_free(");
+                    if (use_slice_free) {
+                        // Slice: the allocation was `alloc(N)` with
+                        // len == capacity, so `.len` is the charge-back.
+                        self.genExpr(f.target.*);
+                        self.write(".len");
+                    } else {
+                        self.write("@sizeOf(@typeInfo(@TypeOf(");
+                        self.genExpr(f.target.*);
+                        self.write(")).pointer.child)");
+                    }
+                    self.write("); })");
+                }
             },
             .deref => |d| {
                 self.write("(&");
@@ -697,12 +734,27 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // are the user-visible type, not a type-param slot.
                 self.writeType(sl.type_name);
                 self.write("{ ");
-                for (sl.inits, 0..) |fi, i| {
-                    if (i > 0) self.write(", ");
-                    self.write(".");
-                    self.write(fi.name);
-                    self.write(" = ");
-                    self.genExpr(fi.value.*);
+                // Positional slots (SIMD vector literals —
+                // `f32x4 { 1.0, 2.0, ... }` from docs/manual/24):
+                // every field name is the empty string, so emit the
+                // positional `Type{ v1, v2, ... }` shape (zig's
+                // vector-literal form). Named slots emit the usual
+                // `Type{ .f = v }` struct form. The parser produces
+                // uniform slots (all-named or all-positional), so the
+                // first slot decides.
+                if (sl.inits.len > 0 and sl.inits[0].name.len == 0) {
+                    for (sl.inits, 0..) |fi, i| {
+                        if (i > 0) self.write(", ");
+                        self.genExpr(fi.value.*);
+                    }
+                } else {
+                    for (sl.inits, 0..) |fi, i| {
+                        if (i > 0) self.write(", ");
+                        self.write(".");
+                        self.write(fi.name);
+                        self.write(" = ");
+                        self.genExpr(fi.value.*);
+                    }
                 }
                 self.write(" }");
             },
@@ -861,6 +913,54 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(ma.name);
             },
             .method_call => |mc| {
+                // SIMD reductions (docs/manual/24-simd.md §"SIMD
+                // Methods"): `.sum()` / `.max()` / `.min()` /
+                // `.dot(other)` on a vector-typed receiver rewrite to
+                // zig's `@reduce` builtin — @Vector has no methods.
+                // The receiver must be an ident whose `: T`
+                // annotation expands to `@Vector(...)` via
+                // zagTypeToZig (typed bindings land in type_info_buf
+                // via collectTypedBindings). Un-annotated receivers
+                // fall through to the verbatim emit and zig surfaces
+                // "no field or member function named 'sum'" — the
+                // annotation rule makes that a source error, not a
+                // codegen one.
+                if (mc.target.payload == .ident) {
+                    if (self.getSourceTypeName(mc.target.payload.ident)) |tn| {
+                        if (std.mem.startsWith(u8, zagTypeToZig(tn), "@Vector(")) {
+                            if (std.mem.eql(u8, mc.name, "sum") and mc.args.len == 0) {
+                                self.write("@reduce(.Add, ");
+                                self.genExpr(mc.target.*);
+                                self.write(")");
+                                return;
+                            }
+                            if (std.mem.eql(u8, mc.name, "max") and mc.args.len == 0) {
+                                self.write("@reduce(.Max, ");
+                                self.genExpr(mc.target.*);
+                                self.write(")");
+                                return;
+                            }
+                            if (std.mem.eql(u8, mc.name, "min") and mc.args.len == 0) {
+                                self.write("@reduce(.Min, ");
+                                self.genExpr(mc.target.*);
+                                self.write(")");
+                                return;
+                            }
+                            if (std.mem.eql(u8, mc.name, "dot") and mc.args.len == 1) {
+                                // Dot product = element-wise product +
+                                // horizontal add (portable lowering;
+                                // sub-byte VNNI hardware dispatch is a
+                                // follow-up per the chapter's note).
+                                self.write("@reduce(.Add, ");
+                                self.genExpr(mc.target.*);
+                                self.write(" * ");
+                                self.genExpr(mc.args[0]);
+                                self.write(")");
+                                return;
+                            }
+                        }
+                    }
+                }
                 // Raw-pointer arithmetic methods (p.add(N) / q.offset(p))
                 // — zig-fallback emit because zig has no .add /
                 // .offset method on `*raw T`. Both forms re-emit the

@@ -20,6 +20,10 @@ const TraitDecl = decl.TraitDecl;
 // chain as the other decl-side types; default-empty preserves the
 // non-import source-shape compat (no pre-imports code existed).
 const ImportDecl = decl.ImportDecl;
+// Module re-exports (docs/manual/22 §Re-exports): `[pub] use
+// <dotted-path> as <name>`. Imported via the same `decl.ImportDecl`
+// chain; default-empty preserves the non-use source-shape compat.
+const UseDecl = decl.UseDecl;
 // FFI (docs/24). ExternDecl carries `extern fun` declarations so
 // parser can parse them at top-level and codegen can emit them.
 const ExternDecl = decl.ExternDecl;
@@ -83,6 +87,15 @@ pub const Program = struct {
     /// later parser pass). Codegen walks `imports` at generate() entry
     /// to emit one `@import("...")`-style pre-bind per resolved entry.
     imports: []const ImportDecl = &[_]ImportDecl{},
+    /// Module-level `[pub] use <path> as <name>` re-exports
+    /// (docs/manual/22 §Re-exports). Codegen walks `uses` at
+    /// generate() entry (right after the imports loop) and emits one
+    /// `pub const <name> = @import("<resolved>.zig");` per entry whose
+    /// dotted path resolves against KNOWN_STD_MODULES; unresolvable
+    /// paths are skipped silently (same null-on-miss contract as the
+    /// imports loop). Default-empty keeps pre-use source shapes
+    /// byte-compatible.
+    uses: []const UseDecl = &[_]UseDecl{},
     /// Top-level `extern fun` declarations (docs/24 §"extern fun").
     /// Codegen emits `extern fn` for each entry before any function
     /// bodies so zig's linker can resolve FFI symbols.

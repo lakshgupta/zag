@@ -14,18 +14,18 @@ fun worker_hello() {
 }
 
 fun worker_increment(ptr: *i32) {
-    fetch_add(ptr, 1);
+    _ = fetch_add(ptr, 1);
 }
 
 fun main() {
-    let h1 = spawn(worker_hello, ());
+    let h1: std.Thread = spawn(worker_hello, ());
     join(h1);
 
     let counter: *i32 = new i32(0);
     defer free(counter);
 
-    let h2 = spawn(worker_increment, (counter));
-    let h3 = spawn(worker_increment, (counter));
+    let h2: std.Thread = spawn(worker_increment, (counter,));
+    let h3: std.Thread = spawn(worker_increment, (counter,));
 
     join(h2);
     join(h3);
@@ -36,7 +36,7 @@ fun main() {
 
 @[test]
 fun test_thread_spawn_join() {
-    let h1 = spawn(worker_hello, ());
+    let h1: std.Thread = spawn(worker_hello, ());
     join(h1);
     assert(true);
 }
@@ -46,8 +46,8 @@ fun test_thread_increment() {
     let counter: *i32 = new i32(0);
     defer free(counter);
 
-    let h2 = spawn(worker_increment, (counter));
-    let h3 = spawn(worker_increment, (counter));
+    let h2: std.Thread = spawn(worker_increment, (counter,));
+    let h3: std.Thread = spawn(worker_increment, (counter,));
 
     join(h2);
     join(h3);

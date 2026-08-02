@@ -86,6 +86,10 @@ pub const TokenTag = enum {
     /// directory name) are a follow-up parser pass; v1 only resolves
     /// `std.*` paths.
     import_kw,
+    /// `use <dotted-path> as <name>` module re-export (docs/manual/22
+    /// §Re-exports): binds `<name>` to the resolved module namespace
+    /// (emitted as `pub const <name> = @import(...)`).
+    use_kw,
     /// Reserved with `_kw` suffix because `if`/`else`/`while`/`for`/`match`/
     /// `break`/`continue` are reserved words in the Zig backend (the lexer
     /// cannot name a TokenTag literal `if`/`else`/etc. without colliding

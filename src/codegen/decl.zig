@@ -694,6 +694,41 @@ const Codegen = core.Codegen;
         // `let c: char = '\u2764' surfaces both gap (a) and gap (c)
         // lanes together` both-fixed form arm.
         if (std.mem.eql(u8, text, "char")) return "u32";
+        // SIMD vector types (docs/manual/24-simd.md §"SIMD Vector
+        // Types"): the `{elem}{width}x{lanes}` spelling maps onto
+        // zig 0.16's `@Vector(N, T)` — zig has no f32x4-style type
+        // names, so the alias table carries the full documented
+        // surface (f32x4 → @Vector(4, f32), i8x16 → @Vector(16, i8),
+        // ...). `bf16x8` maps to f16 (zig 0.16 has no bf16 type; f16
+        // is the closest IEEE half-precision lane). The @Vector form
+        // is emitted wherever a type text appears (annotations,
+        // params, returns, casts, struct-literal heads), so literals
+        // `f32x4 { ... }` become `@Vector(4, f32){ ... }` and
+        // element-wise `+`/`-`/`*`/`/` lower to zig's native vector
+        // ops with zero codegen changes.
+        if (std.mem.eql(u8, text, "f32x4")) return "@Vector(4, f32)";
+        if (std.mem.eql(u8, text, "f32x8")) return "@Vector(8, f32)";
+        if (std.mem.eql(u8, text, "f64x2")) return "@Vector(2, f64)";
+        if (std.mem.eql(u8, text, "f64x4")) return "@Vector(4, f64)";
+        if (std.mem.eql(u8, text, "f16x8")) return "@Vector(8, f16)";
+        if (std.mem.eql(u8, text, "bf16x8")) return "@Vector(8, f16)";
+        if (std.mem.eql(u8, text, "i8x16")) return "@Vector(16, i8)";
+        if (std.mem.eql(u8, text, "i16x8")) return "@Vector(8, i16)";
+        if (std.mem.eql(u8, text, "i32x4")) return "@Vector(4, i32)";
+        if (std.mem.eql(u8, text, "i64x2")) return "@Vector(2, i64)";
+        if (std.mem.eql(u8, text, "u8x16")) return "@Vector(16, u8)";
+        if (std.mem.eql(u8, text, "u16x8")) return "@Vector(8, u16)";
+        if (std.mem.eql(u8, text, "u32x4")) return "@Vector(4, u32)";
+        if (std.mem.eql(u8, text, "u64x2")) return "@Vector(2, u64)";
+        if (std.mem.eql(u8, text, "i4x16")) return "@Vector(16, i4)";
+        if (std.mem.eql(u8, text, "u4x16")) return "@Vector(16, u4)";
+        if (std.mem.eql(u8, text, "i4x32")) return "@Vector(32, i4)";
+        if (std.mem.eql(u8, text, "u4x32")) return "@Vector(32, u4)";
+        if (std.mem.eql(u8, text, "i8x32")) return "@Vector(32, i8)";
+        if (std.mem.eql(u8, text, "i8x64")) return "@Vector(64, i8)";
+        if (std.mem.eql(u8, text, "u8x32")) return "@Vector(32, u8)";
+        if (std.mem.eql(u8, text, "u8x64")) return "@Vector(64, u8)";
+        if (std.mem.eql(u8, text, "i32x32")) return "@Vector(32, i32)";
         return text;
     }
 

@@ -482,3 +482,70 @@ test "codegen: String type annotation maps to __zag_String" {
     // And the initializer should call with_capacity
     try std.testing.expect(std.mem.indexOf(u8, zig, "with_capacity") != null);
 }
+
+test "codegen: bench hooks — new inline path charges __zag_bench_alloc(@sizeOf(T))" {
+    // std.bench allocation counters (docs/manual/20): the inline
+    // `new` emission charges @sizeOf(T) right after create; the
+    // free wrapper charges back via __zag_bench_free.
+    const src = "fun f() {\n    let p = new i32(42);\n    free(p);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Alloc charge after create, before the value store.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "try std.heap.page_allocator.create(i32); __zag_bench_alloc(@sizeOf(i32));") != null);
+    // Free wrapper: pointer pointee-size charge-back.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "({ std.heap.page_allocator.destroy(p); __zag_bench_free(@sizeOf(@typeInfo(@TypeOf(p)).pointer.child)); })") != null);
+    // Preamble: counters + root-forwarding wrappers.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub var __zag_bench_bytes_live: usize = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"root\").__zag_bench_inc(n);") != null);
+}
+
+test "codegen: bench hooks — auto-free prologue charges and defers the charge-back" {
+    // The escape-analysis hoisted prologue must charge the same
+    // counters: __zag_bench_alloc next to the hoisted create, and a
+    // __zag_bench_free defer next to the destroy defer (LIFO runs
+    // the charge-back after the destroy).
+    const src = "fun f() {\n    let p = new i32(42);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __p_0 = try std.heap.page_allocator.create(i32);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_bench_alloc(@sizeOf(i32));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "defer __zag_bench_free(@sizeOf(i32));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "defer std.heap.page_allocator.destroy(__p_0);") != null);
+}
+
+test "codegen: bench hooks — slice free charges back .len" {
+    const src = "fun f() {\n    let s: []u8 = alloc(10);\n    free(s);\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "({ std.heap.page_allocator.free(s); __zag_bench_free(s.len); })") != null);
+}
+
+test "codegen: bench hooks — non-ident free target keeps plain emit (no double-eval)" {
+    // `free getBox()` must not evaluate the target twice: the
+    // bench wrapper only wraps bare-ident targets.
+    const src = "fun f() {\n    free getBox();\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.destroy(getBox())") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "({ ") == null);
+}

@@ -1,10 +1,12 @@
 ## Top-level re-export barrel — `import std` brings the whole surface in.
 ##
-## This is a stub: the selective-import form on each line is the
-## canonical zag pattern (see docs/manual/22-modules.md §Imports and
-## §Re-exports). Bare re-exports (`pub use X as Y`) are deferred to a
-## later parser pass — when landed, this file collapses to a one-line
-## `pub use std.string as string` style surface.
+## Selective imports are the canonical form (docs/manual/22-modules.md
+## §Imports). `pub use <path> as <name>` module re-exports
+## (docs/manual/22 §Re-exports) are ALSO implemented (emitted as
+## `pub const <name> = @import(...)`), so this file could collapse to
+## `pub use std.string as string`-style surface — the selective-import
+## list stays because it pulls the exact names users expect without
+## namespace indirection.
 
 pub import std.error.{Error, Context, ErrorExt}
 pub import std.string.{String, Display as StringDisplay}

@@ -98,6 +98,11 @@ pub const TypeParam = ast_decl.TypeParam;
 // `Program.imports` via the top.zig aggregator.
 pub const ImportSelector = ast_decl.ImportSelector;
 pub const ImportDecl = ast_decl.ImportDecl;
+// Module re-exports (docs/manual/22-modules.md §Re-exports): the
+// `[pub] use <dotted-path> as <name>` decl. Codegen emits
+// `pub const <name> = @import(...)` so `<name>.member` resolves to
+// the re-exported module's namespace.
+pub const UseDecl = ast_decl.UseDecl;
 // FFI (docs/24). ExternDecl carries `extern fun` declarations.
 pub const ExternDecl = ast_decl.ExternDecl;
 // Compile-time (docs/26). ConstDecl carries `const NAME = EXPR` declarations.
