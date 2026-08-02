@@ -24,7 +24,7 @@ let buf: []u8 = alloc(1024);                       # heap buffer — returns []u
 
 **`Type.init()` is a convention, not a keyword.** It's a regular static method. Use it when construction needs logic (validation, defaults, computed fields). Use `Type { fields }` for simple direct construction.
 
-**`new` is the ONLY heap keyword.** It always returns `*T`. Every `new` that escapes the function must be paired with `free`; `new`s that stay local are freed automatically (see [Auto-free](#auto-free-escape-analysis)).
+**`new` is the ONLY heap keyword.** It always returns `*T`. Every `new` must be paired with `free` — the memory model is manually managed, zig-style (the compiler warns about unpaired `new`s; see [Manual management + leak warnings](#manual-management--leak-warnings-escape-analysis)).
 
 ## Deallocation
 
@@ -50,29 +50,40 @@ fun build() -> Result<Config, str> {
 }
 ```
 
-## Auto-free (escape analysis)
+## Manual management + leak warnings (escape analysis)
 
-The compiler runs a per-function **escape analysis** (June-language-style
-lifetime inference: *Local* / *Parameter* / *Return*, iterated to a fixed
-point) and classifies every `new` site:
+Zag's memory model is **manually managed, zig-style**: `new` allocates,
+`free` is the only deallocator, and the compiler never inserts frees.
+To help you keep every allocation paired, the compiler runs a
+per-function **escape analysis** (June-language-style lifetime
+inference: *Local* / *Parameter* / *Return*, iterated to a fixed
+point) and warns about the sites nothing will ever free:
 
-- **Local** — the value never leaves the function, isn't passed to a call,
-  and isn't explicitly `free`d. The compiler hoists the allocation to
-  function entry and pairs it with an automatic `defer free`:
+- **Leak warning** — a `new` whose value never leaves the function,
+  isn't passed to a call, and is never explicitly `free`d:
 
   ```
   fun main() {
-      let p = new i32(42);        # Local → auto-freed at function exit
-      print("value: {p}\n");
-      # no manual free needed — the compiler emits
-      #   const __p_0 = try std.heap.page_allocator.create(i32);
-      #   defer std.heap.page_allocator.destroy(__p_0);
+      let p = new i32(42);        # ⚠ warning: never freed (leak)
+      print("value: {p}\n");      # print(p) makes p escape → no warning
   }
   ```
 
-- **Escaping** — returned (directly or through a variable), stored into a
-  parameter, a field, a global, or passed to any call. The compiler does
-  NOT free these; the caller/owner is responsible:
+  The compiler prints `warning: \`new i32\` at src/main.zag:2:13 in
+  main is never freed (leak) — add an explicit \`free\` or \`defer
+  free\`` at compile time. Warnings are advisory — the emitted code is
+  unchanged, and the fix is always the user's explicit `free`:
+
+  ```
+  fun main() {
+      let p = new i32(42);
+      defer free(p);              # ✓ explicit ownership
+  }
+  ```
+
+- **Escaping** — returned (directly or through a variable), stored into
+  a parameter, a field, a global, or passed to any call. No warning;
+  the caller/owner is responsible:
 
   ```
   fun make() -> *i32 { return new i32(7); }   # escaped — caller frees
@@ -81,12 +92,13 @@ point) and classifies every `new` site:
 - **Explicitly freed** — the site keeps its manual `free`/`defer free`
   form unchanged (no double-free).
 
-- **Allocator-backed** — `new(arena, ...)` is never auto-freed; the arena
+- **Allocator-backed** — `new(arena, ...)` is never warned; the arena
   owns the lifecycle.
 
 The analysis is deliberately conservative: any path by which a value
-*could* escape suppresses auto-free (a missed auto-free only costs a
-leak, never a use-after-free). Values allocated inside closures or
+*could* escape suppresses the warning (a missed warning only means the
+user's explicit free still applies; a false warning would cry wolf on a
+legitimately-owned value). Values allocated inside closures or
 compile-time blocks always count as escaping.
 
 ## Custom Allocators

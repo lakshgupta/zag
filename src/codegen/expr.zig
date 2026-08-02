@@ -256,21 +256,18 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // counter so the synthetic `__p_<N>` names never collide
                 // when a body has multiple `new` expressions.
                 //
-                // June-style escape analysis (src/codegen/escape.zig):
-                // when the per-function pass classified THIS site as
-                // Local (auto-free eligible), the allocation + deferred
-                // destroy were already hoisted to function entry by
-                // emitEscapePrologue — the site only emits the value-
-                // store, so the eager allocation is filled at the
-                // original program point (evaluation order of the VALUE
-                // expression is preserved; only the allocation is eager).
-                // The site index is this `alloc_counter` id — the
-                // analysis numbered sites in the same AST walk order.
+                // Manual memory model (zig-style, docs/19-memory.md): the
+                // June-style escape analysis (src/codegen/escape.zig) is
+                // a DIAGNOSTIC pass — it reports leak warnings for
+                // never-freed Local sites but NEVER changes the emitted
+                // shape. Every `new` always emits the inline create form
+                // below; the user's explicit `free` / `defer free` is the
+                // only deallocation. (The pre-manual-model auto-free
+                // prologue was retired with the memory-model change.)
                 //
                 // The `try` propagates `OutOfMemory` through the enclosing
                 // `pub fn main() !void { … }` signature emitted by
-                // `genFun` — the hoisted prologue form shares the same
-                // fallibility constraint as the inline form. For the
+                // `genFun`. For the
                 // custom-allocator sugar `new(<arena>, T(value))` we route
                 // through `<arena>.create(T)` instead so per-request arena
                 // allocations land in the user-supplied arena (e.g.
@@ -281,18 +278,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.alloc_counter += 1;
                 var name_buf: [16]u8 = undefined;
                 const name = std.fmt.bufPrint(&name_buf, "__p_{d}", .{id}) catch "__p";
-                if (self.escape_ready and id < self.escape_site_count and
-                    (self.escape_autofree >> @intCast(id)) & 1 != 0)
-                {
-                    self.write("blk: { ");
-                    self.write(name);
-                    self.write(".* = ");
-                    self.genExpr(n.value.*);
-                    self.write("; break :blk ");
-                    self.write(name);
-                    self.write("; }");
-                    return;
-                }
                 self.write("blk: { const ");
                 self.write(name);
                 if (n.allocator) |alloc_name| {

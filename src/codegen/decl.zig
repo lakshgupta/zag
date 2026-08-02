@@ -28,14 +28,28 @@ const Codegen = core.Codegen;
     /// its indices align with the alloc_counter values the
     /// `.new_expr` arm will assign during emission.
     pub     fn runEscapeAnalysis(self: *Codegen, params: []const ast.MethodParam, body: []const ast.Stmt, tail_match_returns: bool) void {
+        // Manual memory model (zig-style, docs/19-memory.md): the
+        // escape analysis is a DIAGNOSTIC pass — it never changes the
+        // emitted code. Every LEAK-verdict site (never escapes the
+        // function, never explicitly freed, page allocator) gets a
+        // compile-time warning naming the site; freeing remains the
+        // user's explicit `free` / `defer free`. The .new_expr arm
+        // therefore always emits the inline create form (no hoisted
+        // prologue, no inserted defers).
         const er = escape.analyze(params, body, tail_match_returns);
-        self.escape_site_count = er.site_count;
-        self.escape_autofree = er.autofree;
-        self.escape_ready = true;
-        for (er.sites[0..er.site_count], 0..) |si, i| {
-            self.escape_site_types[i] = si.type_name;
+        var i: u32 = 0;
+        while (i < er.site_count) : (i += 1) {
+            if ((er.leaks >> @intCast(i)) & 1 == 0) continue;
+            const loc = er.site_locs[i];
+            const symbol = if (self.current_symbol.len > 0) self.current_symbol else "<top>";
+            std.debug.print("warning: `new {s}` at {s}:{d}:{d} in {s} is never freed (leak) — add an explicit `free` or `defer free`\n", .{
+                er.sites[i].type_name,
+                if (self.source_path.len > 0) self.source_path else "<source>",
+                loc.line,
+                loc.col,
+                symbol,
+            });
         }
-        self.emitEscapePrologue();
     }
 
     pub     fn rewriteReceiverType(self: *Codegen, text: []const u8, tps: []const ast.TypeParam) void {

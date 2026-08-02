@@ -20,11 +20,15 @@ const ast = @import("../ast.zig");
 // a `Return` lifetime even though no direct `return new A()` exists).
 //
 // Zag's v1 integration (docs/19-memory.md Pattern 1): `new T(v)`
-// allocates on the heap and today the USER must pair it with
-// `defer free(p)`. This pass classifies every `new` site in a
-// function body and lets codegen AUTO-INSERT the matching
-// `defer <alloc>.destroy(__p_N)` for Local sites — leak-free-by-
-// default without changing the manual-ownership surface.
+// allocates on the heap and the USER must pair it with
+// `defer free(p)` — zag's memory model is MANUALLY MANAGED, zig-
+// style (no compiler-inserted frees). This pass classifies every
+// `new` site in a function body and reports the LEAK set — sites
+// that never escape the function, are never explicitly freed, and
+// use the default page allocator — as compile-time warnings
+// ("new ... is never freed"). The verdicts deliberately do NOT
+// change the emitted code: freeing is always the user's explicit
+// `free` / `defer free`.
 //
 // June's data model is used directly: the pass produces a SIDE-
 // VECTOR of per-site info keyed by a stable site index (the Nth
@@ -40,15 +44,18 @@ const ast = @import("../ast.zig");
 // Soundness contract: the analysis errs CONSERVATIVELY toward
 // "escapes" — any site that might escape (returned, passed to a
 // call, stored through a pointer, assigned to a parameter or
-// global, allocated inside a closure) is excluded from auto-free.
-// A false "escape" only costs a leak (status quo); a false
-// "Local" would cost a use-after-free, and the rules below never
-// produce one: every syntactic route by which a `new` value can
-// leave the function walks its bit into `escapes` before the
-// verdict is computed.
+// global, allocated inside a closure) is excluded from the leak
+// set. A false "escape" only misses a leak warning (the site stays
+// manual-owned — the user's explicit free still handles it); a
+// false "leak" would cry wolf on a legitimately-owned value, and
+// the rules below never produce one: every syntactic route by
+// which a `new` value can leave the function walks its bit into
+// `escapes` before the verdict is computed. Warnings are advisory
+// — no emitted code changes, so a mis-verdict can never corrupt
+// runtime behavior.
 
 /// Max tracked `new` sites per function body. Sites beyond this are
-/// treated as escaping (no auto-free) via the `overflow` flag.
+/// treated as escaping (no leak warning) via the `overflow` flag.
 pub const MAX_SITES = 128;
 /// Max tracked variable slots (per-scope name slots are reused
 /// across fixpoint iterations by construction — see `defineVar`).
@@ -72,12 +79,17 @@ pub const SiteInfo = struct {
 /// Per-function verdict table (the June-style side-vector).
 pub const Result = struct {
     site_count: u32 = 0,
-    /// Bit `i` set → site `i` is LOCAL (auto-free eligible): it
-    /// never escapes the function, is not explicitly freed, and
-    /// uses the default page allocator.
-    autofree: u128 = 0,
+    /// Bit `i` set → site `i` is a LEAK: it never escapes the
+    /// function, is not explicitly freed, and uses the default page
+    /// allocator — under zag's MANUAL memory model (zig-style,
+    /// docs/manual/20-memory.md) nothing deallocates it. Codegen
+    /// surfaces these as compile-time warnings ("new ... is never
+    /// freed"); no free is auto-inserted.
+    leaks: u128 = 0,
     /// Site info by index; valid up to `site_count`.
     sites: [MAX_SITES]SiteInfo = undefined,
+    /// Source locations per site (for the leak-warning diagnostics).
+    site_locs: [MAX_SITES]ast.Loc = undefined,
 };
 
 /// One name→slot entry in a scope frame. Slots index into
@@ -109,11 +121,11 @@ const Analyzer = struct {
     /// Parameter / call-arg / pointer-store / closure / global).
     escapes: u128 = 0,
     /// Union of site bits whose value is passed to an explicit
-    /// `free(...)` in the body (manual ownership — skip auto-free).
+    /// `free(...)` in the body (manual ownership — skip the leak verdict).
     freed: u128 = 0,
     /// Sites allocated through the allocator-sugar form
     /// `new(<arena>, T(v))` — the arena owns the lifecycle, never
-    /// auto-free these.
+    /// warn on these.
     arena_sites: u128 = 0,
     /// Set when a buffer overflows or a site count exceeds
     /// MAX_SITES — every site conservatively escapes.
@@ -179,16 +191,17 @@ pub fn analyze(
             break;
         }
     }
-    // Fold the side-vectors into the verdict mask: Local = tracked,
-    // not escaping, not explicitly freed, not arena-backed.
+    // Fold the side-vectors into the verdict mask: LEAK = tracked,
+    // not escaping, not explicitly freed, not arena-backed — the
+    // manual-model leak set (nothing deallocates these sites).
     var r = a.result;
     r.site_count = a.result.site_count;
     const all: u128 = if (a.result.site_count >= 128)
         ~@as(u128, 0)
     else
         (@as(u128, 1) << @intCast(a.result.site_count)) - 1;
-    r.autofree = all & ~(a.escapes | a.freed | a.arena_sites);
-    if (a.overflow) r.autofree = 0;
+    r.leaks = all & ~(a.escapes | a.freed | a.arena_sites);
+    if (a.overflow) r.leaks = 0;
     return r;
 }
 
@@ -294,8 +307,8 @@ fn addArena(a: *Analyzer, idx: u32) void {
 /// position in the current (deterministic) walk. Site records are
 /// appended only on the first fixpoint pass so re-walked nodes keep
 /// their id; overflow sites (id >= MAX_SITES) mark the whole result
-/// conservative (no auto-free).
-fn newSite(a: *Analyzer, n: ast.Expr.NewExpr) u32 {
+/// conservative (no leak warnings).
+fn newSite(a: *Analyzer, n: ast.Expr.NewExpr, loc: ast.Loc) u32 {
     const id = a.visit_count;
     a.visit_count += 1;
     if (id >= MAX_SITES) {
@@ -304,6 +317,7 @@ fn newSite(a: *Analyzer, n: ast.Expr.NewExpr) u32 {
     }
     if (a.first_pass) {
         a.result.sites[id] = .{ .type_name = n.type_name, .allocator = n.allocator };
+        a.result.site_locs[id] = loc;
         a.result.site_count = id + 1;
     }
     return id;
@@ -596,7 +610,7 @@ fn walkExpr(a: *Analyzer, e: ast.Expr, out: *u128) void {
         .new_expr => |n| {
             // Number BEFORE walking the value — codegen's arm also
             // captures `id` before genExpr(value).
-            const id = newSite(a, n);
+            const id = newSite(a, n, e.loc);
             if (n.allocator != null) addArena(a, id);
             walkExpr(a, n.value.*, out);
             if (id < 128) out.* |= @as(u128, 1) << @intCast(id);

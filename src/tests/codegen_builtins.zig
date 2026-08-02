@@ -504,24 +504,26 @@ test "codegen: bench hooks — new inline path charges __zag_bench_alloc(@sizeOf
     try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"root\").__zag_bench_inc(n);") != null);
 }
 
-test "codegen: bench hooks — auto-free prologue charges and defers the charge-back" {
-    // The escape-analysis hoisted prologue must charge the same
-    // counters: __zag_bench_alloc next to the hoisted create, and a
-    // __zag_bench_free defer next to the destroy defer (LIFO runs
-    // the charge-back after the destroy).
-    const src = "fun f() {\n    let p = new i32(42);\n}\n";
-    var l = lexer_mod.Lexer.init(src);
-    const tokens = l.tokenize();
-    var arena = ast.Arena.init();
-    var p = parser_mod.Parser.init(tokens, &arena);
-    const prog = p.parse();
-    var cg = codegen_mod.Codegen.init();
-    const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const __p_0 = try std.heap.page_allocator.create(i32);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_bench_alloc(@sizeOf(i32));") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "defer __zag_bench_free(@sizeOf(i32));") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "defer std.heap.page_allocator.destroy(__p_0);") != null);
-}
+ test "codegen: bench hooks — inline new charges @sizeOf(T), no auto-free prologue" {
+     // Manual memory model (docs/19-memory.md): every `new` emits the
+     // inline create form with the __zag_bench_alloc charge. The
+     // pre-manual-model hoisted prologue (alloc + bench_free defer +
+     // destroy defer) is gone — an unfreed local `new` is now a LEAK
+     // (flagged by the escape analysis warning), and the counter
+     // stays elevated until the user's explicit free.
+     const src = "fun f() {\n    let p = new i32(42);\n}\n";
+     var l = lexer_mod.Lexer.init(src);
+     const tokens = l.tokenize();
+     var arena = ast.Arena.init();
+     var p = parser_mod.Parser.init(tokens, &arena);
+     const prog = p.parse();
+     var cg = codegen_mod.Codegen.init();
+     const zig = cg.generate(prog);
+     try std.testing.expect(std.mem.indexOf(u8, zig, "blk: { const __p_0 = try std.heap.page_allocator.create(i32); __zag_bench_alloc(@sizeOf(i32));") != null);
+     // Negative: no hoisted prologue, no inserted charge-back defer.
+     try std.testing.expect(std.mem.indexOf(u8, zig, "defer __zag_bench_free(@sizeOf(i32));") == null);
+     try std.testing.expect(std.mem.indexOf(u8, zig, "defer std.heap.page_allocator.destroy(__p_0);") == null);
+ }
 
 test "codegen: bench hooks — slice free charges back .len" {
     const src = "fun f() {\n    let s: []u8 = alloc(10);\n    free(s);\n}\n";

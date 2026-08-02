@@ -226,27 +226,6 @@ pub const Codegen = struct {
     /// let-binding invariant clean and the per-body "what struct
     /// am I receiving" lookup cost-free (no map scan).
     current_receiver_struct_name: ?[]const u8 = null,
-    /// June-style escape analysis (src/codegen/escape.zig) verdict
-    /// side-channel, populated per function body at genFun /
-    /// genMethod / genFreeMethod / genTestFun entry. The `.new_expr`
-    /// arm in expr.zig consults `escape_autofree` (bit `i` set →
-    /// site `i` is Local and auto-free eligible) and emitEscapePrologue
-    /// hoists the eligible allocations + deferred destroys to function
-    /// entry. The site index IS the alloc_counter value at the
-    /// corresponding `.new_expr` visit, so numbering parity between
-    /// the analysis pass and the emission pass is structural (both
-    /// walk the AST left-to-right; the one divergence — the
-    /// `.add`/`.offset` method-call re-emission — is mirrored in
-    /// the analysis). See the escape.zig header for the June
-    /// "Lifetime Checker" analogy and the conservatism contract.
-    escape_ready: bool = false,
-    escape_autofree: u128 = 0,
-    escape_site_count: u32 = 0,
-    /// Per-site verbatim type text for the hoisted
-    /// `const __p_N = try ...create(<type>);` prologue lines.
-    /// Valid up to `escape_site_count`; slices live in the AST
-    /// arena (same lifetime as the prog the codegen pass walks).
-    escape_site_types: [128][]const u8 = undefined,
     /// Layer 3a panic-override guard (docs/manual/33-debugging.md):
     /// set by generate() when the program imports a `panic` selector.
     /// The root `pub const panic = std.debug.FullPanic(...)` override
@@ -324,10 +303,10 @@ pub const MapEntry = struct {
     pub const genFreeMethod = @import("decl.zig").genFreeMethod;
     pub const genFun = @import("decl.zig").genFun;
     pub const genTestFun = @import("decl.zig").genTestFun;
-    // June-style escape-analysis wiring (src/codegen/escape.zig +
-    // emitEscapePrologue): called at every function-body emitter
-    // entry so the per-body verdict side-vector lands on `self`
-    // before any statement emits. Without this re-export, decl.zig's
+    // June-style escape-analysis wiring (src/codegen/escape.zig):
+    // called at every function-body emitter entry; under the manual
+    // memory model it emits LEAK WARNINGS for never-freed Local
+    // sites (no code changes). Without this re-export, decl.zig's
     // genFun/genMethod/genFreeMethod/genTestFun calls to
     // `self.runEscapeAnalysis(...)` would compile-error with
     // `no field or member function named 'runEscapeAnalysis'`.
@@ -410,13 +389,6 @@ pub const MapEntry = struct {
     pub const writeInt = @import("core.zig").writeInt;
     pub const recordLoc = @import("core.zig").recordLoc;
     pub const nextBlkLabel = @import("core.zig").nextBlkLabel;
-    // June-style escape-analysis prologue (docs/19 auto-free): hoists
-    // Local-site allocations + their `defer destroy` to function
-    // entry. Re-exported so decl.zig's runEscapeAnalysis can invoke
-    // `self.emitEscapePrologue()` — without this binding zig
-    // compile-errors with `no field or member function named
-    // 'emitEscapePrologue' in 'codegen.core.Codegen'`.
-    pub const emitEscapePrologue = @import("core.zig").emitEscapePrologue;
     pub const buildMapText = @import("core.zig").buildMapText;
     pub const getMapText = @import("core.zig").getMapText;
     pub const stdlibPreambleName = @import("core.zig").stdlibPreambleName;
@@ -466,16 +438,6 @@ pub const MapEntry = struct {
             // genFun-resets-at-body-entry contract (see the field's
             // docblock above).
             .current_receiver_struct_name = null,
-            // June-style escape analysis: verdicts are (re)computed
-            // at every genFun/genMethod/genFreeMethod/genTestFun
-            // body entry, so init-time `ready = false` is the only
-            // safe default — a body emitted without a fresh analysis
-            // (a future caller forgetting the wiring) would silently
-            // consult stale masks otherwise.
-            .escape_ready = false,
-            .escape_autofree = 0,
-            .escape_site_count = 0,
-            .escape_site_types = undefined,
             // Layer 3a panic-override guard: recomputed at every
             // generate() entry from prog.imports; false default is
             // the only safe init (a stale true would suppress the
@@ -556,46 +518,6 @@ pub const MapEntry = struct {
         const id = self.blk_counter;
         self.blk_counter += 1;
         return std.fmt.bufPrint(buf, "__blk_{d}", .{id}) catch "__blk_0";
-    }
-
-    /// Hoist auto-free-eligible `new` allocations to function entry
-    /// (June-style escape analysis, docs/19 auto-free). Emitted at
-    /// body start — BEFORE the first user statement — so the
-    /// function-scope `defer` frees the Local site on every exit
-    /// path (fallthrough, `return`, `?`-propagation, `panic`). The
-    /// `.new_expr` arm in expr.zig then emits only the value-store
-    /// (`blk: { __p_N.* = <value>; break :blk __p_N; }`) at the
-    /// original program point, preserving evaluation order for the
-    /// VALUE expression while making the allocation itself eager.
-    /// Defers run LIFO so multi-site bodies free in reverse site
-    /// order — the exact mirror of the creation order, which keeps
-    /// dependent allocations (a `new` whose initializer references
-    /// an earlier `new`) alive until their last use.
-    pub fn emitEscapePrologue(self: *Codegen) void {
-        var i: u32 = 0;
-        while (i < self.escape_site_count) : (i += 1) {
-            if ((self.escape_autofree >> @intCast(i)) & 1 == 0) continue;
-            var name_buf: [16]u8 = undefined;
-            const name = std.fmt.bufPrint(&name_buf, "__p_{d}", .{i}) catch "__p";
-            self.write("    const ");
-            self.write(name);
-            self.write(" = try std.heap.page_allocator.create(");
-            self.writeType(self.escape_site_types[i]);
-            self.write(");\n");
-            // std.bench allocation counter: charge @sizeOf(T) at the
-            // hoisted alloc; the bench_free defer (below) runs LIFO
-            // after the destroy defer, so bytes_live tracks the live
-            // heap regardless of exit path.
-            self.write("    __zag_bench_alloc(@sizeOf(");
-            self.writeType(self.escape_site_types[i]);
-            self.write("));\n");
-            self.write("    defer __zag_bench_free(@sizeOf(");
-            self.writeType(self.escape_site_types[i]);
-            self.write("));\n");
-            self.write("    defer std.heap.page_allocator.destroy(");
-            self.write(name);
-            self.write(");\n");
-        }
     }
 
     /// Write a u32 integer into a caller-provided buffer. Returns the number
