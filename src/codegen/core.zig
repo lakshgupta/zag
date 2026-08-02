@@ -247,6 +247,14 @@ pub const Codegen = struct {
     /// Valid up to `escape_site_count`; slices live in the AST
     /// arena (same lifetime as the prog the codegen pass walks).
     escape_site_types: [128][]const u8 = undefined,
+    /// Layer 3a panic-override guard (docs/manual/33-debugging.md):
+    /// set by generate() when the program imports a `panic` selector.
+    /// The root `pub const panic = std.debug.FullPanic(...)` override
+    /// must NOT be emitted in that case — the imports loop would emit
+    /// `const panic = __zag_imported_<N>.panic;` at module scope and
+    /// clash with the override (the pre-Tier-1 FullPanic shim was
+    /// retired for exactly this collision).
+    suppress_panic_override: bool = false,
 
     /// Source location map: zig output line → zag source location.
     /// Populated during codegen as expressions/statements are emitted.
@@ -462,6 +470,11 @@ pub const MapEntry = struct {
             .escape_autofree = 0,
             .escape_site_count = 0,
             .escape_site_types = undefined,
+            // Layer 3a panic-override guard: recomputed at every
+            // generate() entry from prog.imports; false default is
+            // the only safe init (a stale true would suppress the
+            // override for a Codegen instance reused across runs).
+            .suppress_panic_override = false,
             // `prog` is set by `generate()` immediately on entry
             // (see the `self.prog = &prog;` line at the top of
             // `generate`). Leaving it undefined here is intentional
@@ -616,6 +629,38 @@ pub const MapEntry = struct {
         // the duration of this call because `prog` is a by-value
         // parameter on a fixed stack frame.
         self.prog = &prog;
+        // Layer 3a collision guard: the root `pub const panic =
+        // std.debug.FullPanic(...)` override must not be emitted when
+        // the generated module would ALSO declare a `panic` binding —
+        // either via an import selector (`const panic =
+        // __zag_imported_<N>.panic;` from the imports loop) or via a
+        // top-level .zag decl. The latter covers the materialized
+        // lib/std/debug.zag itself, which DEFINES `pub fun panic` —
+        // its transpiled file would otherwise collide with the
+        // override (the pre-Tier-1 FullPanic shim was retired for
+        // exactly this collision). Suppressed programs keep the
+        // exact-site __zag_panic_at path.
+        self.suppress_panic_override = false;
+        for (prog.imports) |imp| {
+            for (imp.selectors) |sel| {
+                if (std.mem.eql(u8, sel.name, "panic")) {
+                    self.suppress_panic_override = true;
+                    break;
+                }
+            }
+        }
+        for (prog.functions) |f| {
+            if (std.mem.eql(u8, f.name, "panic")) {
+                self.suppress_panic_override = true;
+                break;
+            }
+        }
+        for (prog.consts) |c| {
+            if (std.mem.eql(u8, c.name, "panic")) {
+                self.suppress_panic_override = true;
+                break;
+            }
+        }
         // Brace-named-field variant side-table (gap #2 fix): reset
         // at generate() entry so the table is fresh per
         // codegen-pass. genEnumDecl pushes one entry per
@@ -696,9 +741,14 @@ pub const MapEntry = struct {
             \\
             \\// Zig safety checks (OOB, overflow, etc.) use zig's default
             \\// panic handler (no explicit `pub const panic` override — the
-            \\// pre-Tier-1 `pub const panic = std.debug.FullPanic(...)` shim
-            \\// was retired because it collides with the migrated
-            \\// `import std.debug.{panic}` alias at user-module scope).
+            \\// The Layer-3a panic override (see the end of generate():
+            \\// `pub const panic = std.debug.FullPanic(...)`) was RE-LANDED
+            \\// with a collision guard — the pre-Tier-1 FullPanic shim was
+            \\// retired because it clashed with the migrated
+            \\// `import std.debug.{panic}` alias at user-module scope; the
+            \\// override is now suppressed whenever the generated module
+            \\// would also declare a `panic` binding (import selector or
+            \\// top-level .zag decl — e.g. materialized lib/std/debug.zag).
             \\// Explicit `panic(msg)` calls in zag source route through
             \\// lib/std/debug.zag → __zag_panic below for zag-source
             \\// file:line:col locations.
@@ -706,6 +756,29 @@ pub const MapEntry = struct {
             \\// Zag panic helper — prints a panic message with zag source location.
             \\// Called by `panic(msg)` builtin. Writes to stderr and calls @trap().
             \\fn __zag_panic_at(msg: []const u8, file: []const u8, line: u32, col: u32) noreturn {
+            \\    // Layer 3a (docs/manual/33-debugging.md): in Debug
+            \\    // builds, record the exact panic site and delegate to
+            \\    // the COMPILATION ROOT's trace handler (`@import("root")`
+            \\    // is the user module in a real build; a materialized
+            \\    // std file compiled standalone resolves to itself).
+            \\    // Delegating to the root matters: the root's
+            \\    // stack-resolver resolves frames across EVERY module
+            \\    // (user main + std), while a std module's own
+            \\    // resolver can only map its own code — a trace run
+            \\    // from a std file's machinery would silently skip
+            \\    // the user's frames. The machinery is emitted into
+            \\    // every module, so the @hasDecl guard and the field
+            \\    // accesses always resolve; only the root's copies
+            \\    // ever execute.
+            \\    // `@returnAddress()` makes the trace skip the panic
+            \\    // machinery frames and start at the caller of this
+            \\    // function.
+            \\    if (@import("builtin").mode == .Debug and @hasDecl(@import("root"), "__zag_panic_trace")) {
+            \\        @import("root").__zag_panic_site_file = file;
+            \\        @import("root").__zag_panic_site_line = line;
+            \\        @import("root").__zag_panic_site_col = col;
+            \\        @import("root").__zag_panic_trace(msg, @returnAddress());
+            \\    }
             \\    const stderr_writer = &std.debug.lockStderr(&.{}).file_writer.interface;
             \\    stderr_writer.print("panic: {s}\n", .{msg}) catch {};
             \\    if (@import("builtin").mode == .Debug) {
@@ -1752,19 +1825,23 @@ pub const MapEntry = struct {
             self.genFun(fun);
         }
 
-        // Emit the zig→zag source location map table.
-        // Only included in debug builds (stripped by @compileIf in release).
-        if (self.map_count > 0) {
-            self.write(
-                \\
-                \\const __ZagMapEntry = struct {
-                \\    zig_line: u32,
-                \\    zag_line: u32,
-                \\    zag_col: u32,
-                \\    file: []const u8,
-                \\    symbol: []const u8,
-                \\};
-                \\const __zag_map = if (@import("builtin").mode == .Debug)
+        // Emit the zig→zag source location map table. ALWAYS emitted
+        // (empty entry list when map_count == 0): the Layer-3a panic
+        // machinery below references __zag_map by name, and zig 0.16
+        // name-resolves identifiers inside comptime-pruned `if`
+        // branches — a conditionally-absent table would fail every
+        // __zag_panic_at that guards on it. Only included in debug
+        // builds (stripped by @compileIf in release).
+        self.write(
+            \\
+            \\const __ZagMapEntry = struct {
+            \\    zig_line: u32,
+            \\    zag_line: u32,
+            \\    zag_col: u32,
+            \\    file: []const u8,
+            \\    symbol: []const u8,
+            \\};
+            \\const __zag_map = if (@import("builtin").mode == .Debug)
                 \\    [_]__ZagMapEntry{
                 \\
             );
@@ -1788,7 +1865,160 @@ pub const MapEntry = struct {
                 \\;
                 \\
             );
-        }
+            // resolves each frame to its GENERATED zig file:line via
+            // std.debug, then maps it back to the original .zag
+            // file:line:col through the embedded __zag_map table
+            // (binary search by zig_line — map_entries are appended
+            // in ascending zig_line order because current_zig_line
+            // only grows) and prints the zag source line + caret
+            // marker. Explicit `panic(msg)` calls route through
+            // __zag_panic_at (preamble above), which records the
+            // exact site so the trace's top line is precise even when
+            // DWARF resolution is fuzzy. Release builds fall back to
+            // zig's defaultPanic (the map table is compiled out by the
+            // mode guard) and __zag_panic_at keeps its slim
+            // print+@trap path.
+            //
+            // The override is SKIPPED when the program imports a
+            // `panic` selector: the imports loop would emit
+            // `const panic = __zag_imported_<N>.panic;` at module
+            // scope and clash with the root override (the pre-Tier-1
+            // FullPanic shim was retired for exactly this collision);
+            // such programs keep the exact-site panic path. The
+            // machinery below is emitted unconditionally regardless —
+            // __zag_panic_at references it by name and zig 0.16
+            // name-resolves identifiers in comptime-pruned branches.
+            self.write(
+                \\pub var __zag_panic_site_file: []const u8 = "";
+                \\pub var __zag_panic_site_line: u32 = 0;
+                \\pub var __zag_panic_site_col: u32 = 0;
+                \\
+                    \\fn __zag_panic_map_lookup(zig_line: u32) ?__ZagMapEntry {
+                    \\    if (__zag_map.len == 0) return null;
+                    \\    const S = struct {
+                    \\        fn cmp(target: u32, item: __ZagMapEntry) std.math.Order {
+                    \\            return std.math.order(target, item.zig_line);
+                    \\        }
+                    \\    };
+                    \\    const i = std.sort.lowerBound(__ZagMapEntry, &__zag_map, zig_line, S.cmp);
+                    \\    if (i == 0) return null;
+                    \\    return __zag_map[i - 1];
+                    \\}
+                    \\
+                    \\fn __zag_panic_print_source_line(file: []const u8, line: u32, col: u32) void {
+                    \\    var path_z: [1024]u8 = undefined;
+                    \\    const n = file.len;
+                    \\    if (n + 1 > path_z.len) return;
+                    \\    @memcpy(path_z[0..n], file);
+                    \\    path_z[n] = 0;
+                    \\    const fd_raw = __zag_openat(std.posix.AT.FDCWD, @as([*:0]const u8, @ptrCast(&path_z[0])), 0, 0);
+                    \\    if ((fd_raw & 0x8000000000000000) != 0) return;
+                    \\    const fd: i32 = @as(i32, @intCast(fd_raw));
+                    \\    defer _ = __zag_close(fd);
+                    \\    var buf: [8192]u8 = undefined;
+                    \\    var total: usize = 0;
+                    \\    while (total < buf.len) {
+                    \\        const n_signed = __zag_read(fd, buf[total..], buf.len - total);
+                    \\        if (n_signed <= 0) break;
+                    \\        total += @as(usize, @intCast(n_signed));
+                    \\    }
+                    \\    var cur: usize = 1;
+                    \\    var start: usize = 0;
+                    \\    var i: usize = 0;
+                    \\    var found = false;
+                    \\    const stderr_writer = &std.debug.lockStderr(&.{}).file_writer.interface;
+                    \\    while (i < total) : (i += 1) {
+                    \\        if (buf[i] == '\n') {
+                    \\            if (cur == line) {
+                    \\                stderr_writer.print("      {s}\n", .{buf[start..i]}) catch {};
+                    \\                found = true;
+                    \\                break;
+                    \\            }
+                    \\            cur += 1;
+                    \\            start = i + 1;
+                    \\        }
+                    \\    }
+                    \\    if (!found and cur == line and start < total) {
+                    \\        stderr_writer.print("      {s}\n", .{buf[start..total]}) catch {};
+                    \\    }
+                    \\    if (col > 0) {
+                    \\        var caret_buf: [256]u8 = undefined;
+                    \\        const spaces = @min(col - 1, caret_buf.len - 1);
+                    \\        @memset(caret_buf[0..spaces], ' ');
+                    \\        caret_buf[spaces] = '^';
+                    \\        stderr_writer.print("      {s}\n", .{caret_buf[0 .. spaces + 1]}) catch {};
+                    \\    }
+                    \\}
+                    \\
+                    \\pub fn __zag_panic_trace(msg: []const u8, first_trace_addr: ?usize) noreturn {
+                    \\    const stderr_writer = &std.debug.lockStderr(&.{}).file_writer.interface;
+                    \\    stderr_writer.print("panic: {s}\n", .{msg}) catch {};
+                    \\    if (__zag_panic_site_line > 0) {
+                    \\        stderr_writer.print("  at {s}:{d}:{d}\n", .{ __zag_panic_site_file, __zag_panic_site_line, __zag_panic_site_col }) catch {};
+                    \\        __zag_panic_print_source_line(__zag_panic_site_file, __zag_panic_site_line, __zag_panic_site_col);
+                    \\    }
+                    \\    stderr_writer.print("stack trace:\n", .{}) catch {};
+                    \\    const di = std.debug.getSelfDebugInfo() catch {
+                    \\        stderr_writer.print("  (debug info unavailable)\n", .{}) catch {};
+                    \\        @trap();
+                    \\    };
+                    \\    // Public unwind surface (zig 0.16 keeps StackIterator
+                    \\    // itself private): captureCurrentStackTrace returns the
+                    \\    // raw return addresses, then getSymbols resolves each —
+                    \\    // the same pair writeStackTrace uses internally.
+                    \\    // `first_trace_addr` (from the panic machinery or
+                    \\    // __zag_panic_at) skips the handler frames. The -1
+                    \\    // mirrors StackIterator.ra_call_offset so the resolved
+                    \\    // address lands IN the call instruction, not after it.
+                    \\    const ra_call_offset: usize = if (@import("builtin").cpu.arch.isSPARC()) 0 else 1;
+                    \\    var addr_buf: [128]usize = undefined;
+                    \\    const trace = std.debug.captureCurrentStackTrace(.{ .first_address = first_trace_addr }, &addr_buf);
+                    \\    var text_arena: std.heap.ArenaAllocator = .init(std.debug.getDebugInfoAllocator());
+                    \\    defer text_arena.deinit();
+                    \\    const io = std.Options.debug_io;
+                    \\    for (trace.return_addresses) |addr| {
+                    \\        var symbol_fallback_allocator = std.heap.stackFallback(@sizeOf(std.debug.Symbol) + @alignOf(std.debug.Symbol) - 1, std.debug.getDebugInfoAllocator());
+                    \\        const symbol_allocator = symbol_fallback_allocator.get();
+                    \\        var symbols = std.ArrayList(std.debug.Symbol).initCapacity(symbol_allocator, 1) catch continue;
+                    \\        defer symbols.deinit(symbol_allocator);
+                    \\        di.getSymbols(io, symbol_allocator, text_arena.allocator(), addr -| ra_call_offset, true, &symbols) catch continue;
+                    \\        var printed = false;
+                    \\        for (symbols.items) |sym| {
+                    \\            if (sym.source_location) |sl| {
+                    \\                if (__zag_panic_map_lookup(@intCast(sl.line))) |e| {
+                    \\                    stderr_writer.print("  at {s}:{d}:{d} in {s}\n", .{ e.file, e.zag_line, e.zag_col, e.symbol }) catch {};
+                    \\                    __zag_panic_print_source_line(e.file, e.zag_line, e.zag_col);
+                    \\                    printed = true;
+                    \\                    break;
+                    \\                }
+                    \\            }
+                    \\        }
+                    \\        if (!printed) {
+                    \\            for (symbols.items) |sym| {
+                    \\                if (sym.source_location) |sl| {
+                    \\                    stderr_writer.print("  at {s}:{d}:{d} (generated zig)\n", .{ sl.file_name, sl.line, sl.column }) catch {};
+                    \\                    printed = true;
+                    \\                    break;
+                    \\                }
+                    \\            }
+                    \\        }
+                    \\        if (!printed) {
+                    \\            stderr_writer.print("  at 0x{x} (unknown)\n", .{addr}) catch {};
+                    \\        }
+                    \\    }
+                    \\    @trap();
+                    \\}
+                    \\
+                );
+            if (!self.suppress_panic_override) {
+                self.write(
+                    \\pub const panic = if (@import("builtin").mode == .Debug)
+                    \\    std.debug.FullPanic(__zag_panic_trace)
+                    \\else
+                    \\    std.debug.FullPanic(std.debug.defaultPanic);
+                    \\
+                );
+            }
 
         return self.out_buf[0..self.out_len];
     }

@@ -2,6 +2,16 @@
 
 Zag transpiles to zig, which compiles to native code with debug symbols. You can debug zag programs with **gdb** or **lldb** just like any C/zig program.
 
+## Implementation status
+
+| Layer | Status |
+|---|---|
+| L1 — expression-level `loc` + source path through codegen | ✅ |
+| L2 — `.zag.map` side files + embedded `__zag_map` (Debug-only) | ✅ |
+| L3a — runtime panic stack remapping (zag-native backtraces) | ✅ — `pub const panic = std.debug.FullPanic(...)` override; every frame resolves zig line → `__zag_map` → `src/main.zag:line:col` + source line + caret; explicit `panic(msg)` records the exact site; suppressed when the module imports or defines a `panic` binding |
+| L3b B1 — `zag debug` + `tools/zag_gdb.py` / `zag_lldb.py` | ✅ |
+| L3b B2 — DWARF path patch (`remapDwarfElf`) | ✅ |
+
 ## Quick Start
 
 ```

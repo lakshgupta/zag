@@ -1740,8 +1740,12 @@ test "codegen: trait method with *Self arg + i32 arg + *Self return — Self→a
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn greet(self: Greeter, other: *anyopaque, n: i32) *anyopaque {") != null);
     // Body forwards self.ptr, other, n to the vtable slot.
     try std.testing.expect(std.mem.indexOf(u8, zig, "return self.vtable.greet(self.ptr, other, n);") != null);
-    // Sanity: no bare `Self` survived.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "Self") == null);
+    // Sanity: no bare `Self` survived. Scoped to the user-code region
+    // (everything before the Layer-3a map table): the panic-trace
+    // machinery at the end of the generated module legitimately
+    // contains "Self" inside std.debug.getSelfDebugInfo.
+    const trait_map_at = std.mem.indexOf(u8, zig, "__ZagMapEntry") orelse zig.len;
+    try std.testing.expect(std.mem.indexOf(u8, zig[0..trait_map_at], "Self") == null);
 }
 
 test "codegen: trait-method impl emits <Target>_<Trait>_<Method> free fn (rename)" {
@@ -1957,9 +1961,13 @@ test "codegen: non-trait cast `x as i32` preserves @as(T, x) emit unchanged" {
     // Sanity: the trait-cast fat-pointer form must NOT appear in
     // this (unrelated) cast surface — neither the `_VTable_for_'
     // registration reference nor `@ptrCast(&...` (the value-typed
-    // trait-cast address-of path).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "_VTable_for_") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrCast(&") == null);
+    // trait-cast address-of path). Scoped to the user-code region
+    // (everything before the Layer-3a map table): the panic-trace
+    // machinery at the end of the generated module legitimately
+    // contains `@ptrCast(&path_z[0])` in its source-line reader.
+    const cast_map_at = std.mem.indexOf(u8, zig, "__ZagMapEntry") orelse zig.len;
+    try std.testing.expect(std.mem.indexOf(u8, zig[0..cast_map_at], "_VTable_for_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[0..cast_map_at], "@ptrCast(&") == null);
 }
 
 test "codegen: pub import std.string.{String as MyStr, Display} emits preamble + aliases" {
@@ -3512,4 +3520,99 @@ test "codegen: __zag_posix preamble pins all 13 helpers + locks out steered-arou
     inline for (forbidden) |substr| {
         try std.testing.expect(std.mem.indexOf(u8, zig, substr) == null);
     }
+}
+
+test "codegen: Layer 3a panic-trace machinery emitted after the map table" {
+    // docs/manual/33-debugging.md Layer 3a: the root panic override
+    // (std.debug.FullPanic) + the zag-native trace handler are
+    // emitted at the end of generate(), right after the embedded
+    // __zag_map table. Debug builds route panics through it; release
+    // builds keep zig's defaultPanic via the mode-gated const.
+    const src = "fun f() {\n    let p = new i32(42);\n    print(\"{p}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Root override: FullPanic(__zag_panic_trace) in Debug,
+    // FullPanic(std.debug.defaultPanic) in release.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const panic = if (@import(\"builtin\").mode == .Debug)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.debug.FullPanic(__zag_panic_trace)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.debug.FullPanic(std.debug.defaultPanic)") != null);
+    // Trace machinery: exact-site globals, map binary search, source-
+    // line reader, and the public-unwind walk (captureCurrentStackTrace
+    // + getSymbols — StackIterator itself is private in zig 0.16).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub var __zag_panic_site_file: []const u8 = \"\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_panic_map_lookup(zig_line: u32) ?__ZagMapEntry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_panic_print_source_line(file: []const u8, line: u32, col: u32) void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn __zag_panic_trace(msg: []const u8, first_trace_addr: ?usize) noreturn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.debug.captureCurrentStackTrace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "di.getSymbols") != null);
+    // The exact-site delegation in the preamble __zag_panic_at.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"root\").__zag_panic_trace(msg, @returnAddress());") != null);
+    // Ordering: the machinery must land AFTER the map table (both at
+    // the end of the module, after the last user fn).
+    const map_at = std.mem.indexOf(u8, zig, "const __ZagMapEntry = struct") orelse return error.TestUnexpectedResult;
+    const last_fn = std.mem.lastIndexOf(u8, zig, "pub fn f()") orelse return error.TestUnexpectedResult;
+    const trace_at = std.mem.indexOf(u8, zig, "fn __zag_panic_map_lookup") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(last_fn < map_at);
+    try std.testing.expect(map_at < trace_at);
+}
+
+test "codegen: Layer 3a override suppressed when program imports a panic selector" {
+    // Collision guard: `pub import std.debug.{panic}` emits
+    // `const panic = __zag_imported_<N>.panic;` at module scope,
+    // which would clash with the root `pub const panic` override
+    // (the pre-Tier-1 FullPanic shim was retired for exactly this).
+    // The machinery itself is still emitted (the preamble's
+    // __zag_panic_at delegates to it by name).
+    const src = "pub import std.debug.{panic}\nfun f() {\n    panic(\"x\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const panic = __zag_imported_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const panic = if (@import(\"builtin\").mode == .Debug)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_panic_trace") != null);
+}
+
+test "codegen: Layer 3a override suppressed when the module itself defines panic" {
+    // Collision guard, second arm: the materialized lib/std/debug.zag
+    // DEFINES `pub fun panic` — a transpiled file with that decl must
+    // not also carry the override (duplicate struct member `panic`).
+    const src = "fun panic(msg: str) {\n    print(\"{msg}\\n\");\n}\nfun f() {}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const panic = if (@import(\"builtin\").mode == .Debug)") == null);
+    // Machinery still present for the delegation path.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_panic_trace") != null);
+}
+
+test "codegen: Layer 3a machinery emitted even for a statement-free program" {
+    // The map table + machinery are always emitted (empty entry list
+    // when map_count == 0) so every module's __zag_panic_at delegation
+    // resolves by name — zig 0.16 name-resolves identifiers inside
+    // comptime-pruned `if` branches, so a conditionally-absent table
+    // would fail to compile in any file whose preamble guards on it.
+    const src = "fun f() {}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __ZagMapEntry = struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_panic_trace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const panic = if (@import(\"builtin\").mode == .Debug)") != null);
 }
