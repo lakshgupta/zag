@@ -1,6 +1,13 @@
 const std = @import("std");
 const ast = @import("../ast.zig");
 const core = @import("core.zig");
+// June-style escape analysis (src/codegen/escape.zig): classifies
+// every `new` site in a function body as Local / escaping / freed /
+// arena-backed via fixed-point use-def flow; genFun & co. consume
+// the verdict side-vector to auto-insert `defer destroy` for Local
+// sites (see emitEscapePrologue in core.zig + the `.new_expr` arm
+// in expr.zig). Mirrors June's "Lifetime Checker" pass shape.
+const escape = @import("escape.zig");
 
 // Cross-bucket file-scope aliases. See CROSS_BUCKET_REEXPORTS in
 // the extraction script for rationale.
@@ -9,6 +16,27 @@ const Codegen = core.Codegen;
 // ============================================================
 // FILE-SCOPE methods (DECL bucket)
 // ============================================================
+
+    /// June-style escape-analysis wiring shared by every function-
+    /// body emitter (genFun / genMethod / genFreeMethod / genTestFun):
+    /// run the fixed-point pass over the body, stash the verdict
+    /// side-vector on `self` (the `.new_expr` arm in expr.zig
+    /// consumes `escape_autofree`), then emit the hoisted
+    /// allocation+defer prologue for the Local sites. Must run
+    /// BEFORE any body statement emits — alloc_counter is still 0
+    /// here, and the analysis numbers sites in AST walk order so
+    /// its indices align with the alloc_counter values the
+    /// `.new_expr` arm will assign during emission.
+    pub     fn runEscapeAnalysis(self: *Codegen, params: []const ast.MethodParam, body: []const ast.Stmt, tail_match_returns: bool) void {
+        const er = escape.analyze(params, body, tail_match_returns);
+        self.escape_site_count = er.site_count;
+        self.escape_autofree = er.autofree;
+        self.escape_ready = true;
+        for (er.sites[0..er.site_count], 0..) |si, i| {
+            self.escape_site_types[i] = si.type_name;
+        }
+        self.emitEscapePrologue();
+    }
 
     pub     fn rewriteReceiverType(self: *Codegen, text: []const u8, tps: []const ast.TypeParam) void {
         // Generics (§5 Generic impl Blocks): inside an
@@ -92,8 +120,7 @@ const Codegen = core.Codegen;
         }
     }
 
-    pub     fn genFreeMethod(self: *Codegen, target_type: []const u8, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
-        // Trait-method rename (docs/17 §"Implementing"): when `m.trait_name`
+    pub     fn genFreeMethod(self: *Codegen, target_type: []const u8, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {        // Trait-method rename (docs/17 §"Implementing"): when `m.trait_name`
         // is set (the `Trait.method` source shape), the emitted free-fn name
         // becomes `<TargetType>_<TraitName>_<MethodName>` so the vtable
         // registration can reference the implementation by exact-name. The
@@ -189,6 +216,8 @@ const Codegen = core.Codegen;
             }
         }
         for (m.body) |s| self.collectTypedBindings(s);
+        // June-style escape analysis (see runEscapeAnalysis doc).
+        self.runEscapeAnalysis(m.params, m.body, m.return_type != null);
         for (m.body, 0..) |s, i| self.genStmt(s, self.fn_returns_value and i == m.body.len - 1);
         // Reset ONLY the receiver-tracking field at body end —
         // `fn_returns_value` is set per-body by every genFun/
@@ -477,6 +506,11 @@ const Codegen = core.Codegen;
             }
         }
         for (m.body) |s| self.collectTypedBindings(s);
+        // June-style escape analysis (see runEscapeAnalysis doc).
+        // Methods: the last body statement's match value is RETURNED
+        // when the method has a return type (fn_returns_value), so
+        // tail-position match arm flows escape in that shape.
+        self.runEscapeAnalysis(m.params, m.body, m.return_type != null);
         for (m.body, 0..) |s, i| self.genStmt(s, self.fn_returns_value and i == m.body.len - 1);
         self.write("    }\n");
     }
@@ -1395,6 +1429,13 @@ const Codegen = core.Codegen;
                 self.write(";\n");
             }
         }
+        // June-style escape analysis: classify every `new` site in
+        // this body (Local → hoisted alloc + `defer destroy` in the
+        // prologue below; escaping/freed/arena → inline as before).
+        // Top-level funs never return their last-stmt match value
+        // (genStmt gets is_tail_pos = false), so tail_match_returns
+        // is always false here — methods pass their actual gate.
+        self.runEscapeAnalysis(fun.params, fun.body, false);
         for (fun.body) |stmt| {
             self.genStmt(stmt, false);
         }
@@ -1443,6 +1484,10 @@ const Codegen = core.Codegen;
 
         // Trait-bounds guards (if generics present)
         self.genBoundsGuards(fun.type_params);
+
+        // June-style escape analysis (see runEscapeAnalysis doc).
+        // Test bodies never return their last-stmt value.
+        self.runEscapeAnalysis(&[_]ast.MethodParam{}, fun.body, false);
 
         for (fun.body) |s| self.genStmt(s, false);
 

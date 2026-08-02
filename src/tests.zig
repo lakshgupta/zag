@@ -57,4 +57,8 @@ comptime {
     _ = @import("tests/codegen_decl.zig");
     _ = @import("tests/codegen_stmt.zig");
     _ = @import("tests/codegen_builtins.zig");
+    // June-style escape analysis (src/codegen/escape.zig) — the
+    // auto-free/hoisting contract pinned separately from the
+    // builtin/expr buckets so its tests stay greppable.
+    _ = @import("tests/codegen_escape.zig");
 }
