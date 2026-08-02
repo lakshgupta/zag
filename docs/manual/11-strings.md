@@ -28,12 +28,12 @@ let byte = s[0];         # 'h' as u8
 
 ## Owned Strings
 
-The `String` type lives in `std.types` (its canonical home; `std.string`
-re-exports it, so both paths work):
+The `String` type lives in `std.types` — its ONLY import path (the
+legacy `std.string` module was removed, so a stray
+`import std.string.{String}` fails instead of binding a second path):
 
 ```
-import std.types.{String}        # canonical
-import std.string.{String}       # legacy path — same type
+import std.types.{String}
 
 let s = new String("hello");
 defer free(s);

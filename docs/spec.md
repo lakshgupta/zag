@@ -300,10 +300,10 @@ print(point.0);     # positional access (same value)
 
 A `(min: i32, max: i32)` and an `(i32, i32)` are identical in memory and interchangeable.
 
-**String** — a mutable, growable, heap-allocated UTF-8 string provided by `std.string` (not a compiler-builtin type). Layout `{ ptr: *u8, len: usize, cap: usize }` — the compiler knows the layout for interop, but `String` is a library type.
+**String** — a mutable, growable, heap-allocated UTF-8 string provided by `std.types` (not a compiler-builtin type). Layout `{ ptr: *u8, len: usize, cap: usize }` — the compiler knows the layout for interop, but `String` is a library type.
 
 ```
-import std.string
+import std.types
 
 let s: String = new String("hello");
 let view: []const u8 = s.as_str();   # borrow as []const u8
@@ -2384,7 +2384,7 @@ Packages the bootstrap stdlib must provide:
 - `std.time` — `Duration`, `Instant`, `timer.after`, `timer.interval`, `timer.deadline`
 - `std.unicode` — codepoint/UTF-8 encoding operations
 - `std.source` — `Location { file: str, line: u32, column: u32 }`, `Function { name: str }`. Users obtain a `Location` via the magic identifier `#location` (resolves at the call site to the current source location). `Function` is populated by the compiler and can be retrieved via `std.source.caller()` for the enclosing function name. Both are passed implicitly to `panic` and `assert`
-- `std.string` — `String` (growable UTF-8, layout `{ ptr: *u8, len: usize, cap: usize }`), `push`, `push_str`, `reserve`, `clear`, `as_str`, `as_writer`, `with_writer` (§3.3)
+- `std.types` — `String` (growable UTF-8, layout `{ ptr: *u8, len: usize, cap: usize }`), `push`, `push_str`, `reserve`, `clear`, `as_str`, `as_writer`, `with_writer` (§3.3)
 - `std.error` — `Context` struct, `ErrorExt` trait (`context(msg: String) -> Context`, `context_str(msg: str) -> Context`) for adding context to any error type (§3.3)
 - `std.traits` — compiler-known structural traits: `Ordered` (requires `__lt__`, `__le__`, `__gt__`, `__ge__`), `Clone`, `Default`, `Zero`, `Display`, `Iterator<T>`, `AsyncStream<T>`. These are auto-implemented when a type defines the required methods (§4.1).
 - `std.default` — `Default` trait and `Zero` trait:

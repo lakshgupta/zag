@@ -240,7 +240,7 @@ pub fn parse(self: *Parser) ast.Program {
                 continue;
             }
             // Module re-exports (docs/manual/22 §Re-exports):
-            // `pub use std.string as string` / `use std.fs as fs`.
+            // `pub use std.types as types` / `use std.fs as fs`.
             if (lead == .pub_kw and self.peekAhead(1) == .use_kw) {
                 self.advance();
                 uses_buf[use_count] = self.parseUseDecl(true);
@@ -700,23 +700,23 @@ pub const Parser = struct {
     // `resolveStdImport` are aliased-registered above.
 
     // KNOWN_STD_MODULES — Comptime-baked lookup table mapping the
-    // canonical dotted path (`std.string`) to the on-disk `.zag` source
-    // path that backs it (`lib/std/string.zag`). The 8 entries here
+    // canonical dotted path (`std.types`) to the on-disk `.zag` source
+    // path that backs it (`lib/std/types.zag`). The entries here
     // match the staged stub files at commit-of-landing; adding a new
     // `lib/std/X.zag` requires extending this slice and re-running
     // `zig build scaffold_tests` to confirm parseability.
     //
     // Lookup is `O(N)` linear-scan over the array (`path_to_path` walks
     // each entry's `name` field). The `name` slot is the canonical
-    // dotted form (`std.string`); the joined `path_nodes` slice from
+    // dotted form (`std.types`); the joined `path_nodes` slice from
     // `ast.ImportDecl` is rebuilt into the same dotted form on the
     // caller side via a `joinDottedPath` helper defined below so the
-    // comparison is shape-stable across both `import std.string` and
+    // comparison is shape-stable across both `import std.types` and
     // `import std.async.stream` (2-element and 3-element paths).
     //
     // No I/O at parse time — this is a pure comptime data table.
     // Codegen reads the resolved path and emits a `const X = @import(
-    // "lib/std/string.zag");` preamble line at the top of the produced
+    // "lib/std/types.zag");` preamble line at the top of the produced
     // zig module. The `lib/std/*.zag` files themselves are NOT
     // re-parsed at codegen time; v1 consumes only the type-name
     // surface (struct/enum/trait decl names) at the `import` use sites.
@@ -725,7 +725,6 @@ pub const Parser = struct {
         path: []const u8,
     }{
         .{ .name = "std", .path = "lib/std/mod.zag" },
-        .{ .name = "std.string", .path = "lib/std/string.zag" },
         .{ .name = "std.types", .path = "lib/std/types.zag" },
         .{ .name = "std.error", .path = "lib/std/error.zag" },
         .{ .name = "std.env", .path = "lib/std/env.zag" },
@@ -758,13 +757,13 @@ pub const Parser = struct {
     }
 
     /// Join path_components into the canonical dotted form
-    /// (`["std", "string"]` → `"std.string"`). Codegen-consumed so
+    /// (`["std", "types"]` → `"std.types"`). Codegen-consumed so
     /// the lookup into `KNOWN_STD_MODULES` always sees the SAME
     /// joined shape regardless of which call path produced the
     /// identifiers (parse-time `ImportDecl.path_nodes` preservation
     /// vs. any future codegen-side alternate path). Mirrors the
-    /// naming that users see in source (`import std.string` →
-    /// `"std.string"` lookup key) so the table and the lookup are
+    /// naming that users see in source (`import std.types` →
+    /// `"std.types"` lookup key) so the table and the lookup are
     /// round-trippable by-eye.
     ///
     /// The scratch buffer is caller-provided — `joinDottedPath`

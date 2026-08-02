@@ -19,7 +19,7 @@
 ##   read loop iterates 4 KiB at a time and `push_str`-es into a heap
 ##   `String` until __zag_read returns 0 (EOF) or negative (errno).
 ##   The `String` accumulator comes from `String.with_capacity` in
-##   lib/std/string.zag, which is itself backed by __zag_page_alloc
+##   lib/std/types.zag's String, itself backed by __zag_page_alloc
 ##   in the preamble — same heap ownership contract as before.
 ##
 ##   Error model: __zag_openat / __zag_read errno values (returned as
@@ -37,7 +37,7 @@
 ##   call sites now resolve through the imports-loop alias to these
 ##   real functions, mirroring read_file's path.
 ##
-## String import: see the inline `pub import std.string.{String}`
+## String import: see the inline `pub import std.types.{String}`
 ## just below -- needed so project-mode `zag generate` parses
 ## fs.zag in isolation without an ambient std namespace.
 ##
@@ -67,7 +67,7 @@
 ## undeclared identifier 'String'". The pre-migration stub worked
 ## because its throwaway body referenced String-OBLIVIOUS slice
 ## syntax; the post-migration real impl exercises String directly.
-pub import std.string.{String}
+pub import std.types.{String}
 
 pub fun read_file(path: str) -> String {
     var path_z: [1024]u8 = undefined;

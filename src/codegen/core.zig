@@ -838,7 +838,7 @@ pub const MapEntry = struct {
             \\// Used by `import std.string` and the `String` type in zag.
             \\// v0.1 follow-up: renamed to `__zag_String_inline` so the
             \\// canonical user-facing name `__zag_String` can be
-            \\// rebound to `@import("std/string.zig").String` in hybrid
+            \\// rebound to `@import("std/types.zig").String` in hybrid
             \\// mode (the hybrid-mode rebinding at the bottom of
             \\// this function shadows the inline decl at user-module
             \\// level; the inline decl survives as a file-mode
@@ -1245,7 +1245,10 @@ pub const MapEntry = struct {
             self.write("const __zag_std_time = @import(\"std/time.zig\");\n");
             self.write("const __zag_std_atomic = @import(\"std/atomic.zig\");\n");
             self.write("const __zag_std_bench = @import(\"std/bench.zig\");\n");
-            self.write("const __zag_std_string = @import(\"std/string.zig\");\n");
+            // std.types hosts the String type (the std.string module
+            // was removed — String is ONLY importable as
+            // std.types.{String}); the hybrid rebinding follows.
+            self.write("const __zag_std_types = @import(\"std/types.zig\");\n");
             // String/Writer rebindings (v0.1 follow-up): in hybrid
             // mode, the @imported module's exported type aliases to
             // `__zag_String` / `__zag_Writer` so call sites written
@@ -1258,7 +1261,7 @@ pub const MapEntry = struct {
             // shadowing is fine because `__zag_String_inline` is
             // only referenced from the inline struct's method bodies
             // (inside the struct), not from outside.
-            self.write("const __zag_String = __zag_std_string.String;\n");
+            self.write("const __zag_String = __zag_std_types.String;\n");
             self.write("const __zag_Writer = __zag_std_fmt.Writer;\n");
             self.write("const __zag_Error = __zag_std_error.Error;\n");
             self.write("const __zag_Context = __zag_std_error.Context;\n");
@@ -1328,7 +1331,7 @@ pub const MapEntry = struct {
                         // copies, so aliasing `String` to
                         // `__zag_String` would produce a DIFFERENT
                         // type than the user module's `String`
-                        // (rebound to `@import("std/string.zig").String`
+                        // (rebound to `@import("std/types.zig").String`
                         // in the hybrid block above) — read_file
                         // returning the inline String would fail the
                         // user's `let s: String = read_file(...)`

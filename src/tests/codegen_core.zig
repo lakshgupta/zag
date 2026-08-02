@@ -87,7 +87,7 @@ test "codegen: preamble emits exactly once and last preamble precedes last fun d
     // of `const __zag_imported_<i>` lines happens exactly at the
     // top, in a contiguous block, before any user fun decl appears.
     // Stdlib imports now skip __zag_imported_ and emit const alias = __zag_Type.
-    const src = "pub import std.string;\npub fun hello() -> void {\n    let unused: i32 = 1;\n}\n";
+    const src = "pub import std.types;\npub fun hello() -> void {\n    let unused: i32 = 1;\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();

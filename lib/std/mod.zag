@@ -4,13 +4,13 @@
 ## §Imports). `pub use <path> as <name>` module re-exports
 ## (docs/manual/22 §Re-exports) are ALSO implemented (emitted as
 ## `pub const <name> = @import(...)`), so this file could collapse to
-## `pub use std.string as string`-style surface — the selective-import
+## `pub use std.types as types`-style surface — the selective-import
 ## list stays because it pulls the exact names users expect without
 ## namespace indirection.
 
 pub import std.error.{Error, Context, ErrorExt}
 pub import std.types.{String}
-pub import std.string.{Display as StringDisplay}
+pub import std.fmt.{Display as StringDisplay}
 pub import std.fmt.{Display, Writer, FmtError}
 pub import std.time.{Duration, Timer}
 pub import std.time.{now}

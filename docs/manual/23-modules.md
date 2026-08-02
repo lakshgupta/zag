@@ -129,7 +129,7 @@ Three call patterns live under the `std.X` umbrella and reach zig's stdlib throu
 
 - **Compiler-emit primitives** — codegen routes source keywords like `print` (`src/codegen/primary.zig:65`), `new` (`src/codegen/expr.zig:223`), and `==` on `[]const u8` (`src/codegen/stmt.zig:673`) directly to zig stdlib. No `import` required from the user.
 - **Explicit-import pass-through** — the resolver emits a zig `@import("std").X` re-export alias when the user writes `import std.arch.x86.avx2`, `import std.Thread.Pool`, etc. The table below shows the planned alias shape.
-- **Zag-source library** — a normal `.zag` module under `<zag-install>/lib/std/<path>.zag`, parsed and type-checked like any user program. Examples: `std.types.String` (canonical — `std.string.String` re-exports the same type), `std.error.Error`, `std.async.stream.AsyncStream<T>`, `std.time.Duration`, `std.bench`.
+- **Zag-source library** — a normal `.zag` module under `<zag-install>/lib/std/<path>.zag`, parsed and type-checked like any user program. Examples: `std.types.String` (the type's ONLY import path — `std.string` was removed), `std.error.Error`, `std.async.stream.AsyncStream<T>`, `std.time.Duration`, `std.bench`.
 
 The mechanism-on-disk / user-action / examples breakdown for all three kinds lives one section below — see [Layering](#layering).
 
@@ -139,7 +139,7 @@ The mechanism-on-disk / user-action / examples breakdown for all three kinds liv
 
 Once the resolver lands (current predecessor: the import-DAG machinery already in place for user modules), it will route every `std.X` import through a `KNOWN_STD_MODULES` table in `src/parser/decl.zig`. The table maps each path to one of two forms:
 
-**Zag-source module** — path `std.string` resolves to `<zag-install>/lib/std/string.zag` (or `<zag-install>/lib/std/string/mod.zag` for a subtree). The parser produces the same AST, the type-checker adds it to the import DAG (inheriting cyclic-DAG detection above), and codegen emits alongside the user's program. The zag-source-library row above is the fully-wired shape.
+**Zag-source module** — path `std.types` resolves to `<zag-install>/lib/std/types.zag` (or `<zag-install>/lib/std/types/mod.zag` for a subtree). The parser produces the same AST, the type-checker adds it to the import DAG (inheriting cyclic-DAG detection above), and codegen emits alongside the user's program. The zag-source-library row above is the fully-wired shape.
 
 **Explicit-import pass-through** — path `std.arch.x86.avx2` (and the rest of the explicit-import row above) cannot yet be cleanly expressed in zag source until the bootstrap compiler is mature enough. The table records the path as a re-export of an underlying zig module; the resolver emits one alias per pass-through path at the top of the user's output:
 
@@ -159,7 +159,7 @@ The three kinds of access stay decoupled cleanly:
 |---|---|---|---|
 | Compiler-emit primitive | Codegen hand-emit paths in `src/codegen/{primary,expr,stmt}.zig | Just call the source keyword — no `import` needed | `print`, `new`, `==` on strings, string interpolation `fmt.Writer` calls |
 | Explicit-import pass-through | Resolver entry in `KNOWN_STD_MODULES` (planned for `src/parser/decl.zig`); pass-through `.zig` files at `<zag-install>/lib/std/<path>.zig` exposing `pub const X = @import("std").X;` aliases | `import std.arch.x86.avx2` once at file top; call `std.arch.x86.avx2._mm256_*(…)` thereafter | `std.arch.x86.avx2`, `std.arch.aarch64.asimd`, `std.event.loop`, `std.Thread.Pool` |
-| Zag-source library | `.zag` source files at `<zag-install>/lib/std/<path>.zag` or `<path>/mod.zag`; standard parser + type-checker + codegen pipeline | `import std.X` (or `import std.X.{Type}` selective, or `import std.X as s` aliased) | `std.types.String` (canonical; `std.string` re-exports it), `std.error.Error`, `std.error.Context`, `std.async.stream.AsyncStream<T>`, `std.time.Duration`, `std.bench` |
+| Zag-source library | `.zag` source files at `<zag-install>/lib/std/<path>.zag` or `<path>/mod.zag`; standard parser + type-checker + codegen pipeline | `import std.X` (or `import std.X.{Type}` selective, or `import std.X as s` aliased) | `std.types.String` (the only String path), `std.error.Error`, `std.error.Context`, `std.async.stream.AsyncStream<T>`, `std.time.Duration`, `std.bench` |
 
 The `KNOWN_STD_MODULES` table — once it lands — is the single source of truth for the explicit-import and zag-source rows. A path that doesn't resolve is a compile error pointing at the import site, so a typo (`import std.stirng`) fails fast rather than silently walking the file tree. New entries for compiler-emit primitives are added in `src/codegen/`, not in `KNOWN_STD_MODULES` — the two evolution sites stay decoupled (codegen additions don't need to touch the resolver, and vice versa).
 
@@ -168,9 +168,10 @@ The `KNOWN_STD_MODULES` table — once it lands — is the single source of trut
 From the program side, `import std.X` follows exactly the import rules above — same syntax, same visibility, same cyclic-DAG guarantees. Only the prefix differs. All three forms work:
 
 ```zag
-import std.string                  # whole namespace
-import std.string.{String, Display}  # selective import
-import std.string as s             # alias the namespace
+import std.types                   # whole namespace
+import std.types.{String}          # selective import
+import std.fmt.{Display}           # Display lives in std.fmt
+import std.types as t              # alias the namespace
 
 let greeting: String = new String("hello");
 s.push_str(greeting, ", world");
@@ -191,7 +192,7 @@ async fun greet(name: str) -> str {
 }
 ```
 
-For compiler-emit primitives, there's no import at all — the source-level keyword *is* the call. For explicit-import pass-through and zag-source paths, the user-side call site looks identical: `std.arch.x86.avx2._mm256_fmadd_ps(…)` vs `std.string.String.with_capacity(64)` differ only in the prefix and what the implementation does behind it.
+For compiler-emit primitives, there's no import at all — the source-level keyword *is* the call. For explicit-import pass-through and zag-source paths, the user-side call site looks identical: `std.arch.x86.avx2._mm256_fmadd_ps(…)` vs `std.types.String.with_capacity(64)` differ only in the prefix and what the implementation does behind it.
 
 ### Adding a new std module
 
@@ -217,7 +218,7 @@ The `std.` prefix is reserved — third-party packages use their own prefix (`js
 
 ```
 # src/main.zag
-import std.string
+import std.types
 import math.vec3
 import net.http.server
 

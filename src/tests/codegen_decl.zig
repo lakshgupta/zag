@@ -1970,11 +1970,13 @@ test "codegen: non-trait cast `x as i32` preserves @as(T, x) emit unchanged" {
     try std.testing.expect(std.mem.indexOf(u8, zig[0..cast_map_at], "@ptrCast(&") == null);
 }
 
-test "codegen: pub import std.string.{String as MyStr, Display} emits preamble + aliases" {
+test "codegen: pub import std.types.{String as MyStr} + std.fmt.{Display as MyDisp} emits aliases" {
     // Selective import shape: parser preserves each selector's name
     // AND its alias. Codegen must surface both into zig so that
-    // user-side bindings (MyStr, Display) are reachable names.
-    const src = "pub import std.string.{String as MyStr, Display};\n";
+    // user-side bindings (MyStr, MyDisp) are reachable names. The
+    // String type lives in std.types only;
+    // Display lives in std.fmt.
+    const src = "pub import std.types.{String as MyStr};\npub import std.fmt.{Display as MyDisp};\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -1983,24 +1985,21 @@ test "codegen: pub import std.string.{String as MyStr, Display} emits preamble +
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    // Mixed-selector stdlib import: `String as MyStr` is preamble-known
-    // (fast path emits `const MyStr = __zag_String;` directly); `Display`
-    // is .zag-source backed (slow path emits `const Display =
-    // __zag_imported_<i>.Display;` after the @import preamble line).
-    // v0.1 imports-loop Option A fallthrough: when ANY selector lacks a
-    // preamble-equivalent, the slow path fires for the whole import —
-    // emitting `@import("lib/std/string.zag")` BEFORE per-selector
-    // bridges (preamble shortcut for known types, import alias for
-    // others). Pre-migration, `Display` was silently dropped.
+    // `String as MyStr` is preamble-known (fast path emits
+    // `const MyStr = __zag_String;` directly); `Display as MyDisp`
+    // is .zag-source backed (slow path emits
+    // `const MyDisp = __zag_imported_<i>.Display;` after the @import
+    // preamble line) — the mixed-selector fast/slow split exercised
+    // across two modules.
     try std.testing.expect(std.mem.indexOf(u8, zig, "const MyStr = __zag_String") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_imported_0 = @import(\"std/string.zig\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const Display = __zag_imported_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"std/fmt.zig\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const MyDisp = __zag_imported_") != null);
 }
 
 test "codegen: whole-module import (no selectors) skips stdlib @import" {
     // Stdlib imports with no selectors: preamble types are always available.
     // No @import of .zag files should be emitted.
-    const src = "pub import std.string;\n";
+    const src = "pub import std.types;\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2033,7 +2032,7 @@ test "codegen: multiple std imports take distinct __zag_imported_<i> indices" {
     // two distinct std.X imports produce both __zag_imported_0 and
     // __zag_imported_1 lines (proves the idx counter is bumped per
     // import and not reset).
-    const src = "pub import std.string;\npub import std.fmt;\n";
+    const src = "pub import std.types;\npub import std.fmt;\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     var arena = ast.Arena.init();
@@ -2054,7 +2053,7 @@ test "codegen: all 12 KNOWN_STD_MODULES entries are recognized by the import rou
     // parser+codegen pipeline accepts all entries.
     const cases = [_]struct { name: []const u8, expected: []const u8 }{
         .{ .name = "std",               .expected = "lib/std/mod.zag" },
-        .{ .name = "std.string",        .expected = "lib/std/string.zag" },
+        .{ .name = "std.types",         .expected = "lib/std/types.zag" },
         .{ .name = "std.error",         .expected = "lib/std/error.zag" },
         .{ .name = "std.fmt",           .expected = "lib/std/fmt.zag" },
         .{ .name = "std.time",          .expected = "lib/std/time.zag" },
@@ -3708,9 +3707,9 @@ test "codegen: await lowers to the inline-drive form" {
 
 test "codegen: import std.types.{String} binds the preamble String type" {
     // std.types is the canonical home of the String type (moved from
-    // std.string; string.zag is now a re-export barrel). In the user
+    // (moved from std.string, which no longer exists). In the user
     // module the selector takes the fast path: `pub const String =
-    // __zag_String;` — same preamble type as std.string.
+    // __zag_String;`.
     const src =
         \\import std.types.{String}
         \\fun f() {
@@ -3729,10 +3728,10 @@ test "codegen: import std.types.{String} binds the preamble String type" {
 }
 
 test "codegen: pub import emits pub const (cross-module re-export)" {
-    // The std.types move depends on `pub import` emitting
-    // `pub const NAME = __zag_imported_<i>.NAME;` so a re-export
-    // barrel (std.string → std.types) is visible across modules —
-    // a plain `const` fails with zig's "decl is not pub".
+    // Cross-module re-exports (e.g. lib/std/mod.zag re-exporting
+    // std.types.{String}) depend on `pub import` emitting
+    // `pub const NAME = ...` — a plain `const` fails with zig's
+    // "decl is not pub" at the materialized-file use site.
     const src =
         \\pub import std.types.{String}
         \\fun f() {
@@ -3748,4 +3747,34 @@ test "codegen: pub import emits pub const (cross-module re-export)" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub const String = __zag_String;") != null);
+}
+
+test "codegen: std.string no longer resolves (String lives only in std.types)" {
+    // The legacy std.string module was removed: `import
+    // std.string.{String}` misses KNOWN_STD_MODULES and is skipped
+    // silently (null-on-miss contract), so the emitted module has
+    // no binding for it — the user's `String` use then fails at zig
+    // compile time with "undeclared identifier" instead of binding
+    // a second path to the type.
+    const src =
+        \\import std.string.{String}
+        \\fun f() {
+        \\    let s: String = String.with_capacity(8);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // No import binding, no alias for the missing module (the
+    // hybrid preamble imports std/types.zig, not std/string.zig).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_std_string = @import") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const String = __zag_imported_") == null);
+    // The binding's type annotation still references String — zig
+    // rejects it as undeclared (the intended "not allowed" signal).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const s: String =") != null);
 }

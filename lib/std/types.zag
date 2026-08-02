@@ -6,9 +6,10 @@
 ##
 ##   import std.types.{String}
 ##
-## `std.string` still re-exports it (`pub import std.types.{String}`)
-## so `import std.string.{String}` keeps working for existing
-## callers.
+## `std.string` no longer exists — the type is ONLY importable as
+## `std.types.{String}` (the legacy `std.string` module was removed
+## so a stray `import std.string.{String}` fails resolution instead
+## of binding a second path to the same type).
 ##
 ## Real impl — methods compose against the always-emitted
 ## `__zag_page_alloc` / `__zag_page_realloc` / `__zag_page_free`

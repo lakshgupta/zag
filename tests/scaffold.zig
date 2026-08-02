@@ -86,7 +86,7 @@ test "scaffold: std.mod parses with 17 selective-import decls" {
     const expected_paths = [_][]const u8{
         "std.error",
         "std.types",
-        "std.string",
+        "std.fmt",
         "std.fmt",
         "std.time",
         "std.time",
@@ -129,9 +129,9 @@ test "scaffold: std.mod parses with 17 selective-import decls" {
         // Each line has at least 1 selector
         try std.testing.expect(imp.selectors.len >= 1);
     }
-    // Pin the alias on the std.string line (`Display as
-    // StringDisplay` — imports[2] because std.types now precedes it)
-    // so the `as` rename is exercised end-to-end through
+    // Pin the alias on the second std.fmt line (`Display as
+    // StringDisplay` — imports[2], after std.error + std.types) so
+    // the `as` rename is exercised end-to-end through
     // parseImportDecl.
     try std.testing.expectEqualStrings("Display", prog.imports[2].selectors[0].name);
     try std.testing.expect(prog.imports[2].selectors[0].alias != null);
@@ -165,21 +165,6 @@ test "scaffold: std.types parses with String struct + impl methods" {
     try std.testing.expectEqualStrings("as_str", prog.impls[0].methods[1].name);
     try std.testing.expectEqualStrings("push_str", prog.impls[0].methods[2].name);
     try std.testing.expectEqualStrings("push_ch", prog.impls[0].methods[3].name);
-}
-
-// ---------------------------------------------------------------
-// std.string — re-export barrel: `pub import std.types.{String}`
-// (no structs/impls of its own — the String type lives in
-// std.types). The parse must surface exactly the import.
-// ---------------------------------------------------------------
-test "scaffold: std.string barrel re-exports String via pub import" {
-    const prog = try parseStub("std.string", build_options.stub_string);
-    try std.testing.expectEqual(@as(usize, 0), prog.structs.len);
-    try std.testing.expectEqual(@as(usize, 0), prog.impls.len);
-    try std.testing.expectEqual(@as(usize, 1), prog.imports.len);
-    try std.testing.expect(prog.imports[0].is_pub);
-    try std.testing.expectEqual(@as(usize, 1), prog.imports[0].selectors.len);
-    try std.testing.expectEqualStrings("String", prog.imports[0].selectors[0].name);
 }
 
 // ---------------------------------------------------------------
@@ -335,8 +320,8 @@ test "scaffold: std.arch.x86.avx2 parses as comment-only (no decls)" {
 // ---------------------------------------------------------------
 test "joinDottedPath: 2-element path joins with one dot" {
     var scratch: [256]u8 = undefined;
-    const got = parser_mod.Parser.joinDottedPath(&scratch, &[_][]const u8{ "std", "string" });
-    try std.testing.expectEqualStrings("std.string", got);
+    const got = parser_mod.Parser.joinDottedPath(&scratch, &[_][]const u8{ "std", "types" });
+    try std.testing.expectEqualStrings("std.types", got);
 }
 
 test "joinDottedPath: 3-element path joins with two dots" {
@@ -371,7 +356,7 @@ test "joinDottedPath: every joined form resolves via KNOWN_STD_MODULES" {
     var scratch: [256]u8 = undefined;
     const cases = [_]struct { nodes: []const []const u8, expected: []const u8 }{
         .{ .nodes = &[_][]const u8{ "std" }, .expected = "lib/std/mod.zag" },
-        .{ .nodes = &[_][]const u8{ "std", "string" }, .expected = "lib/std/string.zag" },
+        .{ .nodes = &[_][]const u8{ "std", "types" }, .expected = "lib/std/types.zag" },
         .{ .nodes = &[_][]const u8{ "std", "error" }, .expected = "lib/std/error.zag" },
         .{ .nodes = &[_][]const u8{ "std", "fmt" }, .expected = "lib/std/fmt.zag" },
         .{ .nodes = &[_][]const u8{ "std", "async", "stream" }, .expected = "lib/std/async/stream.zag" },
@@ -401,7 +386,7 @@ test "scaffold: KNOWN_STD_MODULES table entries all map to parseable stubs" {
     // at a real .zag file the parser accepts.
     const expected_minimum_paths = [_][]const u8{
         "lib/std/mod.zag",
-        "lib/std/string.zag",
+        "lib/std/types.zag",
         "lib/std/error.zag",
         "lib/std/fmt.zag",
         "lib/std/time.zag",
@@ -426,8 +411,10 @@ test "scaffold: KNOWN_STD_MODULES table entries all map to parseable stubs" {
     // Roundtrip: build the dotted form back from a sample entry
     // and confirm `resolveStdImport` reaches resolve.
     const resolved = parser_mod.Parser.resolveStdImport("std.string");
-    try std.testing.expect(resolved != null);
-    try std.testing.expectEqualStrings("lib/std/string.zag", resolved.?);
+    try std.testing.expect(resolved == null);
+    const resolved2 = parser_mod.Parser.resolveStdImport("std.types");
+    try std.testing.expect(resolved2 != null);
+    try std.testing.expectEqualStrings("lib/std/types.zag", resolved2.?);
     // Multi-segment path roundtrip:
     const resolved_async = parser_mod.Parser.resolveStdImport("std.async.stream");
     try std.testing.expect(resolved_async != null);
