@@ -69,6 +69,18 @@ cd examples
 | `--check` | Compile-check only (`zag check`), don't run |
 | `--verbose` | Show per-file compiler output |
 
+### Zig build-mode flags
+
+`zag run` / `zag build` / `zag debug` accept three optimization flags (file
+mode passes `-O<name>` to `zig build-exe`; project mode passes
+`-Doptimize=<name>` through the generated `build.zig`):
+
+| Flag | zig mode | Use for |
+|------|----------|---------|
+| `--release` | `ReleaseFast` | Max speed, safety checks off (legacy spelling) |
+| `--release-safe` | `ReleaseSafe` | Optimized but safety checks (OOB, overflow, unwrap) stay on |
+| `--release-small` | `ReleaseSmall` | Minimum binary size |
+
 ### Environment variables
 
 | Variable | Default | Description |

@@ -23,6 +23,36 @@ const project_mod = @import("project.zig");
 const toolchain = @import("toolchain.zig");
 const build_options = @import("build_options");
 
+/// Optimization mode for `zag run` / `zag build` / `zag debug`,
+/// mapped 1:1 onto zig's `-Doptimize=` values. Debug = no flag
+/// (the generated build.zig's standardOptimizeOption defaults to
+/// Debug). `--release` keeps its legacy spelling for ReleaseFast;
+/// `--release-safe` / `--release-small` expose the other two.
+const BuildMode = enum { debug, release_fast, release_safe, release_small };
+
+/// The zig optimization name for a BuildMode ("" = default Debug).
+fn optimizeName(m: BuildMode) []const u8 {
+    return switch (m) {
+        .debug => "",
+        .release_fast => "ReleaseFast",
+        .release_safe => "ReleaseSafe",
+        .release_small => "ReleaseSmall",
+    };
+}
+
+/// Scan args[from..to] (the pre-`--` region) for build-mode flags.
+/// Later flags win; `--release` is the legacy ReleaseFast spelling.
+fn parseBuildMode(args: []const []const u8, from: usize, to: usize) BuildMode {
+    var m: BuildMode = .debug;
+    var i = from;
+    while (i < to) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--release")) m = .release_fast;
+        if (std.mem.eql(u8, args[i], "--release-safe")) m = .release_safe;
+        if (std.mem.eql(u8, args[i], "--release-small")) m = .release_small;
+    }
+    return m;
+}
+
 var zig_install_buf: [512]u8 = undefined;
 var zig_install_len: usize = 0;
 
@@ -113,7 +143,7 @@ pub fn main() !void {
 
     if (args.len >= 2 and std.mem.startsWith(u8, args[1], "--leaf-process=")) {
         const flag = args[1]["--leaf-process=".len..];
-        try leafProcess(flag, if (args.len >= 3) args[2] else "", null, &.{});
+        try leafProcess(flag, if (args.len >= 3) args[2] else "", null, &.{}, .debug);
         return;
     }
 
@@ -168,11 +198,11 @@ pub fn main() !void {
         if (args.len >= 3 and hasZagExt(args[2])) {
             resolveZigPath(null);
             if (zig_install_path.len == 0) return needZig();
-            try leafProcess(cmd, args[2], null, &.{});
+            try leafProcess(cmd, args[2], null, &.{}, .debug);
         } else if (try project_mod.detectProject("")) |cfg| {
             resolveZigPath(cfg);
             if (zig_install_path.len == 0) return needZig();
-            try projectCmd(cmd, cfg, &.{}, false, false);
+            try projectCmd(cmd, cfg, &.{}, false, .debug);
         } else {
             std.debug.print("error: missing file argument\n\n", .{});
             usage();
@@ -198,11 +228,8 @@ fn cmdRun(args: []const []const u8) !void {
     // Extract extra args (after --)
     const extra_args = if (sep_idx < args.len) args[sep_idx + 1 ..] else &.{};
 
-    // Check for --release flag before --
-    var release_flag = false;
-    for (args[2..sep_idx]) |a| {
-        if (std.mem.eql(u8, a, "--release")) release_flag = true;
-    }
+    // Check for build-mode flags before --
+    const mode = parseBuildMode(args, 2, sep_idx);
 
     // Determine mode: file specified before -- or after?
     const zag_file = blk: {
@@ -220,11 +247,11 @@ fn cmdRun(args: []const []const u8) !void {
     if (zag_file) |file| {
         resolveZigPath(null);
         if (zig_install_path.len == 0) return needZig();
-        try leafProcess("run", file, null, extra_args);
+        try leafProcess("run", file, null, extra_args, mode);
     } else if (try project_mod.detectProject("")) |cfg| {
         resolveZigPath(cfg);
         if (zig_install_path.len == 0) return needZig();
-        try projectCmd("run", cfg, extra_args, false, release_flag);
+        try projectCmd("run", cfg, extra_args, false, mode);
     } else {
         std.debug.print("error: missing file argument. Provide a .zag file or run from a project directory.\n\n", .{});
         usage();
@@ -233,11 +260,10 @@ fn cmdRun(args: []const []const u8) !void {
 }
 
 fn cmdBuild(args: []const []const u8) !void {
-    // Parse -o / --output, -g / --generate, --release
+    // Parse -o / --output, -g / --generate, build-mode flags
     var output_path: ?[]const u8 = null;
     var file_arg: ?[]const u8 = null;
     var generate_flag = false;
-    var release_flag = false;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -252,22 +278,21 @@ fn cmdBuild(args: []const []const u8) !void {
             }
         } else if (std.mem.eql(u8, a, "-g") or std.mem.eql(u8, a, "--generate")) {
             generate_flag = true;
-        } else if (std.mem.eql(u8, a, "--release")) {
-            release_flag = true;
         } else if (hasZagExt(a)) {
             file_arg = a;
         }
     }
+    const mode = parseBuildMode(args, 2, args.len);
 
     if (file_arg) |file| {
         const out = output_path orelse file[0..file.len - ".zag".len];
         resolveZigPath(null);
         if (zig_install_path.len == 0) return needZig();
-        try leafProcess("build", file, out, &.{});
+        try leafProcess("build", file, out, &.{}, mode);
     } else if (try project_mod.detectProject("")) |cfg| {
         resolveZigPath(cfg);
         if (zig_install_path.len == 0) return needZig();
-        try projectCmd("build", cfg, &.{}, generate_flag, release_flag);
+        try projectCmd("build", cfg, &.{}, generate_flag, mode);
     } else {
         std.debug.print("error: missing file argument. Provide a .zag file or run from a project directory.\n\n", .{});
         usage();
@@ -290,6 +315,7 @@ fn cmdDebug(args: []const []const u8) !void {
             file_arg = a;
         }
     }
+    const mode = parseBuildMode(args, 2, args.len);
 
     // Binary to debug — default to project's build/bin/<name>
     var binary_path: [512]u8 = undefined;
@@ -300,13 +326,13 @@ fn cmdDebug(args: []const []const u8) !void {
         resolveZigPath(null);
         if (zig_install_path.len == 0) return needZig();
         const out = file[0..file.len - ".zag".len];
-        try leafProcess("build", file, out, &.{});
+        try leafProcess("build", file, out, &.{}, mode);
         bin = out;
     } else if (try project_mod.detectProject("")) |cfg| {
         resolveZigPath(cfg);
         if (zig_install_path.len == 0) return needZig();
         // Write map files and build
-        try projectCmd("build", cfg, &.{}, false, false);
+        try projectCmd("build", cfg, &.{}, false, mode);
         bin = try std.fmt.bufPrint(&binary_path, "zig-out/bin/{s}", .{cfg.name});
     }
 
@@ -400,7 +426,7 @@ fn cmdGenerate(args: []const []const u8) !void {
     std.process.exit(1);
 }
 
-fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8, generate: bool, release: bool) !void {
+fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8, generate: bool, build_mode: BuildMode) !void {
     _ = extra_args;
 
     // Ensure build/gen/ and build/bin/ exist
@@ -459,9 +485,16 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     // Use zig build system with the generated build.zig
     // run → `zig build run --build-file ...`
     // build → `zig build --build-file ...` (default install step)
+    // Build-mode flags pass `-Doptimize=<name>` through (the
+    // generated build.zig reads b.standardOptimizeOption).
+    var opt_flag_buf: [32]u8 = undefined;
+    const opt_flag = if (build_mode != .debug)
+        std.fmt.bufPrint(&opt_flag_buf, "-Doptimize={s}", .{optimizeName(build_mode)}) catch ""
+    else
+        "";
     if (std.mem.eql(u8, mode, "run")) {
-        const build_code = if (release)
-            try runCommand(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig", "-Doptimize=ReleaseFast" })
+        const build_code = if (build_mode != .debug)
+            try runCommand(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig", opt_flag })
         else
             try runCommand(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig" });
         if (build_code != 0) {
@@ -469,8 +502,8 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
             std.process.exit(build_code);
         }
     } else {
-        const build_code = if (release)
-            try runCommand(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig", "-Doptimize=ReleaseFast" })
+        const build_code = if (build_mode != .debug)
+            try runCommand(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig", opt_flag })
         else
             try runCommand(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig" });
         if (build_code != 0) {
@@ -672,11 +705,13 @@ fn usage() void {
     std.debug.print("  zag help                           Show this help message\n", .{});
     std.debug.print("\nFlags:\n", .{});
     std.debug.print("  --release          Optimize build (passes -Doptimize=ReleaseFast to zig)\n", .{});
+    std.debug.print("  --release-safe     Optimize build with safety checks kept on (ReleaseSafe)\n", .{});
+    std.debug.print("  --release-small    Optimize for binary size (ReleaseSmall)\n", .{});
     std.debug.print("  -g, --generate     Also emit .zig output in build/gen/\n", .{});
     std.debug.print("  -o, --output       Output path (binary for build, dir for generate)\n", .{});
 }
 
-fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extra_args: []const []const u8) !void {
+fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extra_args: []const []const u8, build_mode: BuildMode) !void {
     if (src.len == 0) {
         std.debug.print("error: --leaf-process=<mode> missing src argument\n", .{});
         std.process.exit(1);
@@ -738,7 +773,17 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
     const out_target = output_path orelse f_bin;
     const f_emit = std.fmt.bufPrint(&emit_buf, "-femit-bin={s}", .{out_target}) catch "-femit-bin=/tmp/zag_leaf_bin";
 
-    const build_argv: []const []const u8 = &.{ zig_install_path, "build-exe", f_emit, f_zig };
+    // Build-mode flags pass `-O <optimize-name>` through (file mode
+    // compiles with `zig build-exe` directly; Debug = no flag).
+    var opt_buf: [16]u8 = undefined;
+    const opt_arg = if (build_mode != .debug)
+        std.fmt.bufPrint(&opt_buf, "-O{s}", .{optimizeName(build_mode)}) catch "-OReleaseFast"
+    else
+        "";
+    const build_argv: []const []const u8 = if (build_mode != .debug)
+        &.{ zig_install_path, "build-exe", f_emit, f_zig, opt_arg }
+    else
+        &.{ zig_install_path, "build-exe", f_emit, f_zig };
     const build_code = try runCommand(null, build_argv);
     if (build_code != 0) {
         std.debug.print("error: zig build-exe failed for {s} (exit {d})\n", .{ src, build_code });
