@@ -6,8 +6,9 @@
 # For bounds-checked mode:  zag run -Dbounds-check examples/arrays/multi_dim.zag
 
 fun main() {
-    # 1. arr.len on a single-dim array
-    let numbers: [5]i32 = [5]i32 { 10, 20, 30, 40, 50 };
+    # 1. arr.len on a single-dim array (inferred-element shorthand:
+    # the element type comes from the LHS annotation)
+    let numbers: [5]i32 = { 10, 20, 30, 40, 50 };
     print("numbers.len = {numbers.len}\n");   # 5
 
     # 2. arr.len on a slice
@@ -15,10 +16,10 @@ fun main() {
     print("view.len = {view.len}\n");         # 3
 
     # 3. multi-dim [N][M] literal — the identity matrix from the docs example
-    let matrix: [3][3]i32 = [3][3]i32 {
-        [3]i32 { 1, 0, 0 },
-        [3]i32 { 0, 1, 0 },
-        [3]i32 { 0, 0, 1 },
+    let matrix: [3][3]i32 = {
+        { 1, 0, 0 },
+        { 0, 1, 0 },
+        { 0, 0, 1 },
     };
     print("matrix[1][2] = {matrix[1][2]}\n"); # 0  (matrix.len here = 3 rows)
 
@@ -34,9 +35,9 @@ fun main() {
 
 @[test]
 fun test_multi_dim() {
-    let m: [2][2]i32 = [2][2]i32 {
-        [2]i32 { 1, 2 },
-        [2]i32 { 3, 4 },
+    let m: [2][2]i32 = {
+        { 1, 2 },
+        { 3, 4 },
     };
     assert(m.len == 2);
     assert(m[0][0] == 1);

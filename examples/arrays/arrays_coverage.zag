@@ -29,11 +29,12 @@
 fun main() {
     # ── 1. Explicit-list literal ──────────────────────────────
     # Stack-allocated, value-typed aggregate. 20 bytes on the
-    # stack for `[5]i32` (no heap allocation). Codegen pin:
-    # `[5]i32 { 1, 2, 3, 4, 5 }` round-trips as the verbatim
-    # zig literal in src/codegen/primary.zig:266 (genArrayLit's
-    # explicit-list branch).
-    let arr: [5]i32 = [5]i32 { 1, 2, 3, 4, 5 };
+    # stack for `[5]i32` (no heap allocation). Inferred-element
+    # shorthand: the element type comes from the LHS annotation,
+    # so the literal does not repeat it (docs/10 §"Inferred-element
+    # arrays"); the typed `[5]i32 { 1, 2, 3, 4, 5 }` form is
+    # equivalent.
+    let arr: [5]i32 = { 1, 2, 3, 4, 5 };
     print("1. explicit = {arr[0]} {arr[1]} {arr[2]} {arr[3]} {arr[4]}\n");
     # → 1. explicit = 1 2 3 4 5
 
@@ -69,7 +70,7 @@ fun main() {
     # Per docs/10, `arr[0] = 10` mutates the storage aggregate.
     # The binding must be `var` for the LHS write to compile; `let`
     # binds reject LHS-write codegen.
-    var mut_arr: [5]i32 = [5]i32 { 1, 2, 3, 4, 5 };
+    var mut_arr: [5]i32 = { 1, 2, 3, 4, 5 };
     mut_arr[0] = 10;
     mut_arr[4] = 50;
     print("5. mut_arr[0]={mut_arr[0]} mut_arr[4]={mut_arr[4]}\n");
@@ -152,10 +153,10 @@ fun main() {
     # call, not via a template placeholder). The runtime / typed-array
     # surface is verified as a whole by running the multi_dim.zag
     # example alongside this audit file.
-    let matrix: [3][3]i32 = [3][3]i32 {
-        [3]i32 { 1, 0, 0 },
-        [3]i32 { 0, 1, 0 },
-        [3]i32 { 0, 0, 1 },
+    let matrix: [3][3]i32 = {
+        { 1, 0, 0 },
+        { 0, 1, 0 },
+        { 0, 0, 1 },
     };
     print("11. matrix.len={matrix.len} matrix[0].len={matrix[0].len} row1_sum={matrix[1][0] + matrix[1][1] + matrix[1][2]}\n");
     # → 11. matrix.len=3 matrix[0].len=3 row1_sum=1
@@ -171,7 +172,7 @@ fun main() {
     # the byte-equivalent memory transfer (16 bytes both sides).
     # The reverse `vec as [4]f32` roundtrips because `[4]f32` is
     # verbatim in zagTypeToZig.
-    let simd_in: [4]f32 = [4]f32 { 1.0, 2.0, 3.0, 4.0 };
+    let simd_in: [4]f32 = { 1.0, 2.0, 3.0, 4.0 };
     let simd_vec: f32x4 = simd_in as f32x4;
     let simd_out: [4]f32 = simd_vec as [4]f32;
     print("12. simd[0]={simd_out[0]:.2} simd[1]={simd_out[1]:.2} simd[2]={simd_out[2]:.2} simd[3]={simd_out[3]:.2}\n");
@@ -193,7 +194,7 @@ fun main() {
     # indexed-assign) and the values are pre-computed for the
     # documented `usize → i32` cross-platform click-through.
     var lut: [16]i32 = [16]i32 { 0 ... };
-    let values: [16]i32 = [16]i32 { 0, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105 };
+    let values: [16]i32 = { 0, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105 };
     for i in 0..16 {
         lut[i] = values[i];
     }
@@ -206,7 +207,7 @@ fun main() {
 
 @[test]
 fun test_arrays_coverage() {
-    let arr: [5]i32 = [5]i32 { 1, 2, 3, 4, 5 };
+    let arr: [5]i32 = { 1, 2, 3, 4, 5 };
     assert(arr.len == 5);
     assert(arr[0] == 1);
     assert(arr[4] == 5);

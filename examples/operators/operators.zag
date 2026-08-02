@@ -68,7 +68,7 @@ fun main() {
     # Indexing: read and write through arrays. Array type annotation
     # gives zig a concrete element type so `var arr = …` is not
     # comptime-only.
-    var arr: [3]i32 = [3]i32 { 10, 20, 30 };
+    var arr: [3]i32 = { 10, 20, 30 };
     let first: i32 = arr[0];
     let second: i32 = arr[1];
     arr[1] = 99;
@@ -134,7 +134,7 @@ fun test_operators() {
     assert(m == 2);
     let a: i32 = 0b1100 & 0b1010;
     assert(a == 8);
-    let arr: [3]i32 = [3]i32 { 10, 20, 30 };
+    let arr: [3]i32 = { 10, 20, 30 };
     assert(arr[0] == 10);
     assert(arr[2] == 30);
 }

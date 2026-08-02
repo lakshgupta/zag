@@ -30,7 +30,7 @@ fun main() {
     # `arr[a..b]` excludes index `b`; full-array view `arr[..]` covers
     # the entire array; `arr[a..]` runs from `a` to end; `arr[..b]`
     # runs from start to index `b - 1`.
-    let data: [5]i32 = [5]i32 { 10, 20, 30, 40, 50 };
+    let data: [5]i32 = { 10, 20, 30, 40, 50 };
     let middle: []const i32 = data[1..4];     # [20, 30, 40]
     let tail: []const i32 = data[3..];        # [40, 50]
     print("tail = {tail[0]} {tail[1]}\n");
@@ -160,7 +160,7 @@ fun test_pointer_deref() {
 
 @[test]
 fun test_slicing() {
-    let data: [5]i32 = [5]i32 { 10, 20, 30, 40, 50 };
+    let data: [5]i32 = { 10, 20, 30, 40, 50 };
     let middle: []const i32 = data[1..4];
     assert(middle[0] == 20);
     assert(middle[2] == 40);

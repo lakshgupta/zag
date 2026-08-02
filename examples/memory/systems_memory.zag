@@ -12,14 +12,14 @@ import std.mem.{alloc};
 fun main() {
     # ── Stack allocation (zero overhead) ─────────────────────────
     # Fixed array on stack — no heap, no allocator, just LEA/RSP
-    let buf: [8]u8 = [8]u8 { 0, 1, 2, 3, 4, 5, 6, 7 };
+    let buf: [8]u8 = { 0, 1, 2, 3, 4, 5, 6, 7 };
     print("stack buffer byte 0: {buf[0]}\n");
     print("stack buffer byte 4: {buf[4]}\n");
     print("sizeof([8]u8) = {size_of([8]u8)}\n");
 
     # Zero-filled stack buffer — use fill syntax for large arrays
     let zero_buf: [4096]u8 = [4096]u8 { 0 ... };
-    print("zeroed stack buffer (4096 bytes)\n");
+    print("zeroed stack buffer (4096 bytes, byte 4095 = {zero_buf[4095]})\n");
 
     # ── Heap allocation (explicit) ────────────────────────────────
     let heap_buf: []u8 = alloc(64);
@@ -36,7 +36,7 @@ fun main() {
 
 @[test]
 fun test_stack_array() {
-    let buf: [8]u8 = [8]u8 { 0, 1, 2, 3, 4, 5, 6, 7 };
+    let buf: [8]u8 = { 0, 1, 2, 3, 4, 5, 6, 7 };
     assert(buf[0] == 0);
     assert(buf[4] == 4);
 }
