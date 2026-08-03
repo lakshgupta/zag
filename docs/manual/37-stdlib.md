@@ -17,7 +17,7 @@ surface of the modules below.
 | Module | Surface | Allocation |
 |---|---|---|
 | `std.types` | `String` (owned mutable UTF-8 buffer) | heap |
-| `std.sort` | `sort<T>`, `binary_search<T>` | none |
+| `std.collections` | `ArrayList<T>`, `HashMap<K, V>` (generic structs, docs/17 §Generic Types) | heap |
 | `std.encoding` | `base64_encode/decode`, `hex_encode/decode`, `utf8_validate` | heap (encode/decode) |
 | `std.hash` | `fnv1a32/64`, `crc32`, `sha256` | none |
 | `std.random` | `XorShift64Star` (new / seed_from, next_u64/32/f64) | none |
@@ -32,11 +32,24 @@ surface of the modules below.
 | `std.process` | `exec`, `exit` | heap |
 | `std.debug` | `panic` | none |
 
+## Generic containers
+
+`std.collections` is built on generic *structs* (docs/17 §Generic
+Types): `struct ArrayList<T>` thunks to `fn ArrayList(comptime T:
+type) type`, impl methods become orphan free fns
+(`ArrayList_T_push(comptime T, self: *ArrayList(T), value: T)`), and
+call sites dispatch automatically — `list.push(5)` rewrites to
+`@import("std/collections.zig").ArrayList_push(i32, &list, 5)`.
+Value receivers get address-of at the call site; declare the binding
+`var` when methods mutate. `HashMap` hashes keys via FNV-1a over
+`size_of(K)` bytes with `==` equality (value keys are
+content-correct; `str` keys hash the slice descriptor — content-key
+equality is a follow-up).
+
 ## Generic functions (turbofish)
 
-Generic *functions* are the primary stdlib abstraction — generic
-*structs* are still on the compiler roadmap. Call sites name the type
-argument explicitly:
+Generic *functions* round out the stdlib — `sort<T>` and friends name
+the type argument explicitly at the call site:
 
 ```zag
 var arr: [5]i32 = { 5, 2, 4, 1, 3 };

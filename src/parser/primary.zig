@@ -143,7 +143,14 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                                 }
                             }
                         }
-                        if (arg_count > 0 and name_text.len > 0) {
+                        // Zero-arg calls (`{list.len()}`) build too —
+                        // the empty args slice keeps the `.call` shape
+                        // so the codegen's dotted-call dispatch can
+                        // route generic instances (`list.len()` →
+                        // ArrayList_len(i32, &list)). The `name_text`
+                        // guard alone separates `{x}` (no parens, stays
+                        // ident) from `{x()}`.
+                        if (name_text.len > 0) {
                             const args_arena = self.arena.alloc(ast.Expr, arg_count);
                             @memcpy(args_arena, args_buf[0..arg_count]);
                             build_expr = Expr{ .payload = .{ .call = .{ .name = name_text, .args = args_arena } }, .loc = start_loc };
@@ -438,10 +445,42 @@ pub fn parsePostfix(self: *Parser) Expr {
                     .gt => {
                         depth -= 1;
                         if (depth == 0) {
-                            // Verify turbofish shape: the token AFTER the
-                            // matching `.gt` is `.lparen`. If not, fall
-                            // back to non-turbofish path (the `a < b` form).
-                            if (idx + 1 < self.tokens.len - tps_start and self.tokens[tps_start + idx + 1].tag == .lparen) {
+                            // Verify generic shape: the token AFTER the
+                            // matching `.gt` is `.lparen` (a turbofish
+                            // call `name<T>(...)`), `.lbrace` (a
+                            // generic struct literal `Name<T> { ... }`,
+                            // docs/16 §2), or `.dot` (a turbofish
+                            // static-method call `Name<T>.method(...)` —
+                            // the postfix chain picks up the method
+                            // call on the turbofish-call lhs). If
+                            // none, fall back to the non-turbofish
+                            // path (the `a < b` form). The `.dot` case
+                            // is gated on type-ish args (every
+                            // identifier inside the brackets is
+                            // PascalCase or a builtin type name) so
+                            // `i < arr.len` keeps parsing as a
+                            // comparison — `arr` is lowercase.
+                            if (idx + 1 < self.tokens.len - tps_start) {
+                                const after_tag = self.tokens[tps_start + idx + 1].tag;
+                                var generic_ok = after_tag == .lparen or (after_tag == .lbrace and self.allow_struct_lit);
+                                if (!generic_ok and after_tag == .dot) {
+                                    generic_ok = true;
+                                    var s: u32 = 1;
+                                    while (s < idx) : (s += 1) {
+                                        const it = self.tokens[tps_start + s].tag;
+                                        if (it == .identifier) {
+                                            const itext = self.tokens[tps_start + s].text;
+                                            if (!self.isTypeishName(itext)) {
+                                                generic_ok = false;
+                                                break;
+                                            }
+                                        } else if (it != .integer_literal and it != .comma) {
+                                            generic_ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (generic_ok) {
                                 const name = lhs.payload.ident;
                                 // Generics turbofish chain followup (docs/16
                                 // §\"Turbofish\"): the OUTER while-loop above
@@ -479,6 +518,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                                 // token without re-scanning.
                                 self.advance();
                                 const tps_args = self.parseTurbofishArgs();
+                                if (after_tag == .lparen) {
                                 self.expect(.lparen);
                                 var call_args_buf: [16]Expr = undefined;
                                 var call_arg_count: usize = 0;
@@ -498,6 +538,22 @@ pub fn parsePostfix(self: *Parser) Expr {
                                 const args_arena = self.arena.alloc(Expr, call_arg_count);
                                 @memcpy(args_arena, call_args_buf[0..call_arg_count]);
                                 lhs = Expr{ .payload = .{ .call = .{ .name = name, .args = args_arena, .type_args = tps_args } }, .loc = start_loc };
+                                } else if (after_tag == .dot) {
+                                    // Turbofish static-method chain
+                                    // `Name<T>.method(...)`: build the
+                                    // argless turbofish call (type args
+                                    // only) and let the postfix chain
+                                    // pick up `.method(...)`.
+                                    const empty_args = self.arena.alloc(Expr, 0);
+                                    lhs = Expr{ .payload = .{ .call = .{ .name = name, .args = empty_args, .type_args = tps_args } }, .loc = start_loc };
+                                } else {
+                                    // Generic struct literal — the
+                                    // `<...>` slot is the type args; the
+                                    // `{...}` that follows is the field
+                                    // init list (parseStructLitWithArgs
+                                    // consumes the opening `{` itself).
+                                    lhs = self.parseStructLitWithArgs(name, tps_args);
+                                }
                                 // Continue the postfix chain so things like
                                 // `max<i32>(3,5)[0]` or `max<i32>(3,5).field`
                                 // continue parsing. The fragment below is
@@ -507,6 +563,7 @@ pub fn parsePostfix(self: *Parser) Expr {
                             }
                             break;
                         }
+                    }
                     },
                     else => {},
                 }
@@ -1361,6 +1418,10 @@ pub fn parsePrimary(self: *Parser) Expr {
 
 
 pub fn parseStructLit(self: *Parser, type_name: []const u8) Expr {
+        return self.parseStructLitWithArgs(type_name, &[_][]const u8{});
+    }
+
+pub fn parseStructLitWithArgs(self: *Parser, type_name: []const u8, type_args: []const []const u8) Expr {
         const start_loc = self.peek().loc;
         self.expect(.lbrace);
         var inits_buf: [16]ast.Expr.FieldInit = undefined;
@@ -1404,7 +1465,7 @@ pub fn parseStructLit(self: *Parser, type_name: []const u8) Expr {
         self.expect(.rbrace);
         const inits = self.arena.alloc(ast.Expr.FieldInit, init_count);
         @memcpy(inits, inits_buf[0..init_count]);
-        return Expr{ .payload = .{ .struct_lit = .{ .type_name = type_name, .inits = inits } }, .loc = start_loc };
+        return Expr{ .payload = .{ .struct_lit = .{ .type_name = type_name, .type_args = type_args, .inits = inits } }, .loc = start_loc };
     }
 
 

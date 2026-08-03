@@ -64,6 +64,7 @@ pub import std.fs.{mkdir}
 pub import std.process.{exec}
 pub import std.process.{exit}
 pub import std.mem.{alloc}
+pub import std.collections.{ArrayList, HashMap}
 pub import std.sort.{sort, binary_search}
 pub import std.encoding.{base64_encode, base64_decode, hex_encode, hex_decode, utf8_validate}
 pub import std.hash.{fnv1a32, fnv1a64, crc32, sha256}

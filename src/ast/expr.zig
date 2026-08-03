@@ -462,8 +462,15 @@ pub const ExprPayload = union(enum) {
     /// dotted-field form when the TypeName is a real declared struct
     /// and the field names match. `FieldInit.value` is `*Expr` for the
     /// same cycle-breaking reason as `BinaryExpr.lhs`.
+    ///
+    /// Generic struct literals — `Box<T> { f1: v1 }` — carry the
+    /// verbatim type-arg texts in `type_args` (e.g. `{"T"}`); codegen
+    /// emits `.Box(T) { .f1 = v1 }` — the thunk-form call parenthesizes
+    /// the type args. Empty `type_args` keeps the non-generic emit
+    /// byte-identical to the pre-generics baseline.
     pub const StructLitExpr = struct {
         type_name: []const u8,
+        type_args: []const []const u8 = &[_][]const u8{},
         inits: []const FieldInit,
     };
 

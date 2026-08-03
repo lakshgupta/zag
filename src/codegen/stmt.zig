@@ -104,8 +104,21 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         }
     }
 
-    pub     fn genDocComment(self: *Codegen, doc: []const u8) void {
-        var i: usize = 0;
+    /// Condition-paren wrapping for `if` / `while` / `else if` conds.
+    /// Binary and unary conds self-parenthesize in genExpr
+    /// (`(i < 10)`, `(!flag)`); every other payload (ident, index,
+    /// member access, call, bool literal) emits bare and zig 0.16
+    /// rejects `if x {` — so wrap those in explicit parens. Surfaced
+    /// by lib/std/collections.zag's `if (uslot[idx])` and fs.zag's
+    /// `while (true)`.
+    pub     fn writeCond(self: *Codegen, cond: ast.Expr) void {
+        const self_parens = cond.payload == .binary or cond.payload == .unary;
+        if (!self_parens) self.write("(");
+        self.genExpr(cond);
+        if (!self_parens) self.write(")");
+    }
+
+    pub     fn genDocComment(self: *Codegen, doc: []const u8) void {        var i: usize = 0;
         while (i < doc.len) {
             var j: usize = i;
             while (j < doc.len and doc[j] != '\n') : (j += 1) {}
@@ -215,7 +228,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     self.write("\n");
                 } else {
                     self.write("    if ");
-                    self.genExpr(ifs.cond);
+                    self.writeCond(ifs.cond);
                     self.write(" {\n");
                     for (ifs.then_body) |s| self.genStmt(s, false);
                     self.write("    }");
@@ -258,13 +271,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     // read_file's `while (true)` loop in the Tier-1
                     // migration).
                     self.write("    while ");
-                    if (ws.cond.payload == .binary or ws.cond.payload == .unary) {
-                        self.genExpr(ws.cond);
-                    } else {
-                        self.write("(");
-                        self.genExpr(ws.cond);
-                        self.write(")");
-                    }
+                    self.writeCond(ws.cond);
                     self.write(" {\n");
                     for (ws.body) |s| self.genStmt(s, false);
                     self.write("    }\n");
@@ -806,7 +813,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // yields the clean `else if a {` form. Either way the
                 // substring assertions in docs/06 pin tests match.
                 self.write(" else if ");
-                self.genExpr(ifs_ptr.cond);
+                self.writeCond(ifs_ptr.cond);
                 self.write(" {\n");
                 for (ifs_ptr.then_body) |s| self.genStmt(s, false);
                 self.write("    }");

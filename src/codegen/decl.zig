@@ -9,6 +9,13 @@ const core = @import("core.zig");
 // in expr.zig). Mirrors June's "Lifetime Checker" pass shape.
 const escape = @import("escape.zig");
 
+/// Module-level scratch for `zagTypeToZig`'s generic-instantiation
+/// rebuild (see the recursion branch in the helper) — a stack-local
+/// buffer would dangle past return; the returned slice is consumed
+/// by the next writeType before any subsequent call overwrites it
+/// (single-threaded compiler).
+var zag_type_zig_scratch: [256]u8 = undefined;
+
 // Cross-bucket file-scope aliases. See CROSS_BUCKET_REEXPORTS in
 // the extraction script for rationale.
 const Codegen = core.Codegen;
@@ -118,6 +125,54 @@ const Codegen = core.Codegen;
                     break;
                 }
             }
+            if (matched == null) {
+                // Multi-param segments — `Map<K, V>` (std.collections
+                // HashMap receiver): rewrite when EVERY comma-split
+                // element is a declared type param, so the thunk form
+                // gets `*HashMap(K, V)` rather than the invalid
+                // `*HashMap<K, V>`.
+                var all_params = true;
+                var any_split = false;
+                var start: usize = 0;
+                var s: usize = 0;
+                while (s <= trimmed.len) : (s += 1) {
+                    if (s == trimmed.len or trimmed[s] == ',') {
+                        if (s > start) any_split = true;
+                        const part = std.mem.trim(u8, trimmed[start..s], " ");
+                        var found = false;
+                        for (tps) |tp| {
+                            if (std.mem.eql(u8, tp.name, part)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) all_params = false;
+                        start = s + 1;
+                    }
+                }
+                if (any_split and all_params) {
+                    // Rewrite the comma list to paren form; the
+                    // trimmed contents are exactly the param names
+                    // (single-level, no nesting in the v1 surface).
+                    var rebuilt: [256]u8 = undefined;
+                    var rl: usize = 0;
+                    var rs: usize = 0;
+                    var w: usize = 0;
+                    while (w <= trimmed.len) : (w += 1) {
+                        if (w == trimmed.len or trimmed[w] == ',') {
+                            const part = std.mem.trim(u8, trimmed[rs..w], " ");
+                            if (rl > 0 and rl < rebuilt.len) {
+                                rebuilt[rl] = ',';
+                                rl += 1;
+                            }
+                            @memcpy(rebuilt[rl..][0..part.len], part);
+                            rl += part.len;
+                            rs = w + 1;
+                        }
+                    }
+                    matched = @constCast(rebuilt[0..rl]);
+                }
+            }
             if (matched) |name| {
                 self.write("(");
                 self.write(name);
@@ -199,6 +254,30 @@ const Codegen = core.Codegen;
         self.blk_counter = 0;
         self.current_symbol = m.name;
         self.type_info_count = 0;
+        // v1.7 param-type seeding (mirror of genFun's): the generic-
+        // dispatch path reads the receiver's tracked type to rewrite
+        // `self.grow()` → `ArrayList_grow(T, self)` — without seeding
+        // `self: *ArrayList(T)` the call stays verbatim and zig
+        // rejects it ("no field or member function named 'grow'",
+        // surfaced by std.collections grow/probe). Same for print
+        // placeholders on method params.
+        for (m.params) |p| {
+            if (self.type_info_count >= self.type_info_buf.len) break;
+            var already = false;
+            for (self.type_info_buf[0..self.type_info_count]) |ti| {
+                if (std.mem.eql(u8, ti.name, p.name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            self.type_info_buf[self.type_info_count] = .{
+                .name = p.name,
+                .type_name = p.type_text,
+                .is_closure = false,
+            };
+            self.type_info_count += 1;
+        }
         self.fn_returns_value = m.return_type != null;
         // async is a top-level `async fun` surface (v1); methods are
         // always synchronous — keep the future-wrap flag off.
@@ -600,8 +679,7 @@ const Codegen = core.Codegen;
         return emitted;
     }
 
-    pub     fn zagTypeToZig(text: []const u8) []const u8 {
-        // Type aliases (docs/07 "Type Aliases"): zag provides
+    pub     fn zagTypeToZig(text: []const u8) []const u8 {        // Type aliases (docs/07 "Type Aliases"): zag provides
         //     type str = []const u8;
         // and "Aliases are transparent" — the type and its alias are
         // the same type under the v1 type system. Codegen expands
@@ -630,6 +708,52 @@ const Codegen = core.Codegen;
         // return CANONICAL;` pattern; do NOT site-specialize the
         // alias to a single emit location.
         if (std.mem.eql(u8, text, "str")) return "[]const u8";
+        // Generic instantiation recursion: `HashMap(i32, str)` —
+        // the alias wrap must apply to each top-level type argument
+        // (parenthesis-balanced split) so aliased args (`str` → the
+        // borrowed view) stay transparent inside generic annotations.
+        // Surfaced by std.collections: `HashMap(i32, str)` at a
+        // binding annotation emitted `str` to zig, which rejects it
+        // as undeclared. Nested instantiations (`Box(Box(str))`)
+        // recurse via the arg-split. The rebuild lands in a
+        // module-level scratch (single-threaded compiler; each
+        // returned slice is consumed by the next writeType before
+        // the next call overwrites it).
+        const open = std.mem.indexOfScalar(u8, text, '(');
+        if (open != null and open.? > 0) {
+            const close = std.mem.lastIndexOfScalar(u8, text, ')');
+            if (close != null and close.? > open.?) {
+                const head = text[0 .. open.? + 1];
+                const tail = text[close.?..];
+                const inner = text[open.? + 1 .. close.?];
+                var rl: usize = 0;
+                @memcpy(zag_type_zig_scratch[0..head.len], head);
+                rl = head.len;
+                var depth: usize = 0;
+                var start: usize = 0;
+                var i: usize = 0;
+                while (i <= inner.len) : (i += 1) {
+                    if (i < inner.len and inner[i] == '(') depth += 1;
+                    if (i < inner.len and inner[i] == ')') depth -= 1;
+                    if (i == inner.len or (depth == 0 and inner[i] == ',')) {
+                        const part = std.mem.trim(u8, inner[start..i], " ");
+                        const mapped = zagTypeToZig(part);
+                        if (rl > head.len and rl < zag_type_zig_scratch.len) {
+                            zag_type_zig_scratch[rl] = ',';
+                            rl += 1;
+                        }
+                        if (rl + mapped.len <= zag_type_zig_scratch.len) {
+                            @memcpy(zag_type_zig_scratch[rl..][0..mapped.len], mapped);
+                            rl += mapped.len;
+                        }
+                        start = i + 1;
+                    }
+                }
+                @memcpy(zag_type_zig_scratch[rl..][0..tail.len], tail);
+                rl += tail.len;
+                return zag_type_zig_scratch[0..rl];
+            }
+        }
         // v0.1 stdlib migration (String/Writer follow-up commit):
         // String/Writer overrides removed in the String+Writer
         // migration — see the rationale block above. Type aliases

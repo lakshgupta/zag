@@ -188,6 +188,29 @@ pub const Codegen = struct {
     /// first stmt (so the cast arm in `genExpr` sees the populated
     /// set when traversing function-local casts).
     tracked_trait_count: u32,
+    /// Generic-struct base names (`struct Box<T>` — structs with
+    /// `type_params.len > 0`), populated at generate() entry alongside
+    /// `tracked_trait_names`. The `.method_call` arm in expr.zig uses
+    /// the set to dispatch calls on generic instances to the orphan
+    /// free fns (`Box_T_make(comptime T, ...)`) instead of the
+    /// verbatim member-call emit — the thunk-form struct returned by
+    /// `fn Box(comptime T: type) type` has no nested methods, so
+    /// `list.push(x)` must become `Box_T_push(list, x)`.
+    generic_struct_names: [256][]const u8,
+    /// Count of valid entries in `generic_struct_names`.
+    generic_struct_count: u32,
+    /// Scratch backing for `genericInstanceOfTypeText`'s args slice —
+    /// the split parts point into the caller's type-text (which lives
+    /// in source), but the ARRAY must outlive the helper's frame, so
+    /// it's a Codegen field (same lifetime pattern as
+    /// `type_info_buf`).
+    generic_args_buf: [8][]const u8,
+    /// Owned storage for the turbofish-normalized type text
+    /// (`*ArrayList<T>` → `*ArrayList(T)`) — the normalized form is
+    /// stack-built and the arg slices point INTO it, so it must live
+    /// in the Codegen (a stack-local would dangle past the helper's
+    /// return, corrupting the emitted free-fn name).
+    generic_norm_buf: [256]u8,
     // Brace-named-field variant lookup side-table (gap #2 fix):
     // genEnumDecl pushes one entry per brace-named-field variant it
     // emits; the `.enum_variant_ctor` arm in genExpr consults the
@@ -338,6 +361,12 @@ pub const MapEntry = struct {
     pub const isFloatIdentType = @import("core.zig").isFloatIdentType;
     pub const isIntTypeName = @import("core.zig").isIntTypeName;
     pub const isTrackedTrait = @import("core.zig").isTrackedTrait;
+    pub const writeCond = @import("stmt.zig").writeCond;
+    pub const isGenericStructName = @import("core.zig").isGenericStructName;
+    pub const genericStructModulePath = @import("core.zig").genericStructModulePath;
+    pub const genericBaseOfTypeText = @import("core.zig").genericBaseOfTypeText;
+    pub const genericInstanceOfTypeText = @import("core.zig").genericInstanceOfTypeText;
+    pub const genericInstanceOfParenText = @import("core.zig").genericInstanceOfParenText;
     pub const getSourceTypeName = @import("core.zig").getSourceTypeName;
     // Canonical `with Trait (m)` dispatch (docs/17 §"Diamond
     // Disambiguation"). The two helpers below are file-scope
@@ -434,6 +463,10 @@ pub const MapEntry = struct {
             // never observed.
             .tracked_trait_names = undefined,
             .tracked_trait_count = 0,
+            .generic_struct_names = undefined,
+            .generic_struct_count = 0,
+            .generic_args_buf = undefined,
+            .generic_norm_buf = undefined,
             // Brace-named-field variant side-table (gap #2 fix):
             // empty at init(); populated by genEnumDecl when emitting
             // brace-named-field variants. Reset ALSO at generate() entry
@@ -1627,6 +1660,18 @@ pub const MapEntry = struct {
             }
         }
 
+        // Generic-struct tracking: record every struct decl with
+        // type params so `.method_call` can dispatch instance calls
+        // to the orphan free fns (the thunk-form struct has no
+        // nested methods — nested emission is skipped on the thunk
+        // path, see genStructDecl's is_generic branch).
+        for (prog.structs) |sd| {
+            if (sd.type_params.len > 0 and self.generic_struct_count < self.generic_struct_names.len) {
+                self.generic_struct_names[self.generic_struct_count] = sd.name;
+                self.generic_struct_count += 1;
+            }
+        }
+
         // Emit default method free functions for trait methods that
         // have a body. Named `<Trait>__<Method>` with the first
         // parameter `self: *anyopaque` matching the vtable function-
@@ -2153,6 +2198,144 @@ pub const MapEntry = struct {
             if (std.mem.eql(u8, tn, name)) return true;
         }
         return false;
+    }
+
+    /// Generic-struct lookup: returns true iff `base` is a tracked
+    /// generic struct name (a struct decl with type params). Used by
+    /// the `.method_call` arm to route instance/static calls on
+    /// generic types to the orphan free fns. Same O(N) contract as
+    /// `isTrackedTrait`.
+    pub     fn isGenericStructName(self: *Codegen, base: []const u8) bool {
+        if (self.genericStructModulePath(base) != null) return true;
+        for (self.generic_struct_names[0..self.generic_struct_count]) |gs| {
+            if (std.mem.eql(u8, gs, base)) return true;
+        }
+        return false;
+    }
+
+    /// Stdlib generic → module path: the orphan free fns for
+    /// MATERIALIZED stdlib generics (`ArrayList_*`) live in
+    /// lib/std/collections.zag, not the user module — call sites
+    /// must route through `@import("lib/std/collections.zag").Name`.
+    /// User-defined generic structs (declared in the module being
+    /// generated) return null — their free fns are same-module.
+    /// Keep in sync with generic struct decls added to lib/std/.
+    pub     fn genericStructModulePath(self: *Codegen, base: []const u8) ?[]const u8 {
+        // Paths are the MATERIALIZED module names — the imports loop
+        // emits `@import("std/collections.zig")` (the build/gen/std/
+        // tree), NOT the source `lib/std/collections.zag` path.
+        const KNOWN = &[_]struct { name: []const u8, path: []const u8 }{
+            .{ .name = "ArrayList", .path = "std/collections.zig" },
+            .{ .name = "HashMap", .path = "std/collections.zig" },
+        };
+        for (KNOWN) |k| {
+            if (std.mem.eql(u8, k.name, base)) {
+                // Self-module case: the materialized std module's own
+                // codegen instance (source_path == the KNOWN source
+                // path) must call its free fns BARE — the inline
+                // `@import("std/collections.zig")` inside
+                // build/gen/std/collections.zig would resolve
+                // relative to itself and fail to load.
+                if (self.source_path.len > 0 and std.mem.endsWith(u8, self.source_path, "collections.zag")) {
+                    return null;
+                }
+                return k.path;
+            }
+        }
+        return null;
+    }
+
+    /// Generic-instance receiver type check: `list: Box(i32)` tracks
+    /// the source type text `Box(i32)`. Returns a small struct when
+    /// the text has the `<GenericBase>(...)` shape AND the base is a
+    /// tracked generic struct; null otherwise. `*`-prefixed forms
+    /// (`self: *Box(T)` — the receiver of the orphan free fns) strip
+    /// the leading `*`/`*const` first and record `is_pointer` so the
+    /// call-site dispatch knows whether to emit `&receiver` (a value
+    /// receiver needs address-of; an already-pointer receiver passes
+    /// verbatim).
+    pub const GenericInstance = struct {
+        base: []const u8,
+        args: []const []const u8,
+        is_pointer: bool,
+    };
+
+    pub     fn genericInstanceOfTypeText(self: *Codegen, type_text: []const u8) ?GenericInstance {
+        var t = type_text;
+        var is_pointer = false;
+        if (std.mem.startsWith(u8, t, "*const ")) {
+            t = t["*const ".len..];
+            is_pointer = true;
+        } else if (std.mem.startsWith(u8, t, "*")) {
+            t = t["*".len..];
+            is_pointer = true;
+        }
+        // Turbofish normalization: source annotations inside generic
+        // impl receivers use the `<...>` form (`self: *ArrayList<T>`),
+        // while binding annotations use the paren form
+        // (`list: ArrayList(i32)`). Normalize the first `<...>` segment
+        // to `(...)` so both parse identically below.
+        const lt = std.mem.indexOfScalar(u8, t, '<');
+        if (lt != null) {
+            const gt = std.mem.indexOfScalar(u8, t[lt.? + 1 ..], '>');
+            if (gt != null) {
+                const inner = t[lt.? + 1 .. lt.? + 1 + gt.?];
+                var nl: usize = 0;
+                if (lt.? > 0) {
+                    @memcpy(self.generic_norm_buf[0..lt.?], t[0..lt.?]);
+                    nl = lt.?;
+                }
+                self.generic_norm_buf[nl] = '(';
+                nl += 1;
+                @memcpy(self.generic_norm_buf[nl..][0..inner.len], inner);
+                nl += inner.len;
+                self.generic_norm_buf[nl] = ')';
+                nl += 1;
+                const tail_start = lt.? + 1 + gt.? + 1;
+                if (tail_start < t.len) {
+                    @memcpy(self.generic_norm_buf[nl..][0 .. t.len - tail_start], t[tail_start..]);
+                    nl += t.len - tail_start;
+                }
+                const norm = self.generic_norm_buf[0..nl];
+                return self.genericInstanceOfParenText(norm, is_pointer);
+            }
+        }
+        return self.genericInstanceOfParenText(t, is_pointer);
+    }
+
+    fn genericInstanceOfParenText(self: *Codegen, t: []const u8, is_pointer: bool) ?GenericInstance {
+        const paren = std.mem.indexOfScalar(u8, t, '(');
+        if (paren == null or paren.? == 0) return null;
+        const base = t[0..paren.?];
+        if (!self.isGenericStructName(base)) return null;
+        const close = std.mem.lastIndexOfScalar(u8, t, ')');
+        if (close == null or close.? < paren.?) return null;
+        const inner = t[paren.? + 1 .. close.?];
+        var arg_count: usize = 0;
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i <= inner.len) : (i += 1) {
+            if (i == inner.len or inner[i] == ',') {
+                const part = std.mem.trim(u8, inner[start..i], " ");
+                if (part.len > 0 and arg_count < self.generic_args_buf.len) {
+                    self.generic_args_buf[arg_count] = part;
+                    arg_count += 1;
+                }
+                start = i + 1;
+            }
+        }
+        return .{
+            .base = base,
+            .args = self.generic_args_buf[0..arg_count],
+            .is_pointer = is_pointer,
+        };
+    }
+
+    /// Back-compat wrapper: base name only (used where the caller
+    /// only needs the generic-struct identity).
+    pub     fn genericBaseOfTypeText(self: *Codegen, type_text: []const u8) ?[]const u8 {
+        if (self.genericInstanceOfTypeText(type_text)) |gi| return gi.base;
+        return null;
     }
 
     /// Phase 3 trait-cast: returns the source-type recorded for the

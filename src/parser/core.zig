@@ -421,6 +421,22 @@ pub fn isClosureBound(self: *Parser, name: []const u8) bool {
     }
 
 
+pub fn isTypeishName(self: *Parser, name: []const u8) bool {
+    _ = self;
+    if (name.len == 0) return false;
+    if (name[0] >= 'A' and name[0] <= 'Z') return true;
+    const builtins = [_][]const u8{
+        "u8",   "u16",  "u32",  "u64", "u128", "usize",
+        "i8",   "i16",  "i32",  "i64", "i128", "isize",
+        "f16",  "f32",  "f64",  "bool", "str", "void",
+        "u6",   "u7",   "u5",   "comptime_int", "comptime_float",
+    };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, b, name)) return true;
+    }
+    return false;
+}
+
 pub fn isKnownVariant(self: *Parser, name: []const u8) bool {
         // Gap #2 closure (docs/manual/14-unions §Mixed Bare + Payload):
         // linear scan over `known_variant_names` populated at module
@@ -638,6 +654,8 @@ pub const Parser = struct {
     // member function named 'isKnownVariant' / 'parseEnumVariantCtorBrace'
     // in 'parser.core.Parser'` compile error at the call site.    pub const isKnownVariant = @import("core.zig").isKnownVariant;
     pub const isSimdTypeName = @import("core.zig").isSimdTypeName;
+    pub const isTypeishName = @import("core.zig").isTypeishName;
+
     // Gap #2 closure helper re-export: parsePrimary's `.identifier` arm
     // (src/parser/primary.zig) calls `self.isKnownStruct(name)` (added by the
     // BLOCKING #2 fix) to decide whether to route to `parseStructLit` (when
@@ -736,6 +754,7 @@ pub const Parser = struct {
         .{ .name = "std.atomic", .path = "lib/std/atomic.zag" },
         .{ .name = "std.bench", .path = "lib/std/bench.zag" },
         .{ .name = "std.mem", .path = "lib/std/mem.zag" },
+        .{ .name = "std.collections", .path = "lib/std/collections.zag" },
         .{ .name = "std.sort", .path = "lib/std/sort.zag" },
         .{ .name = "std.encoding", .path = "lib/std/encoding.zag" },
         .{ .name = "std.hash", .path = "lib/std/hash.zag" },
@@ -875,6 +894,7 @@ pub const Parser = struct {
     pub const parsePostfix = @import("primary.zig").parsePostfix;
     pub const parsePrimary = @import("primary.zig").parsePrimary;
     pub const parseStructLit = @import("primary.zig").parseStructLit;
+    pub const parseStructLitWithArgs = @import("primary.zig").parseStructLitWithArgs;
     // Gap #2 closure (docs/manual/14-unions §Mixed Bare + Payload) ctor
     // parser re-export: parsePrimary's `.identifier` arm routes brace-
     // form ctors `Variant { f1: v1, f2: v2 }` to

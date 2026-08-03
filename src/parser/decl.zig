@@ -738,12 +738,20 @@ pub fn parseImplBlock(self: *Parser) ast.ImplBlock {
         self.expect(.impl_kw);
         // Generics (docs/16 §"Generic impl Blocks"): if the source
         // uses `impl<T>`, consume the `<...>` BEFORE the target-type
-        // ident. Same ler as parseFunDecl.
+        // ident. Same ler as parseFunDecl. The post-target form
+        // `impl Box<T>` (type params bound to the target, the shape
+        // generic-struct impl blocks use) is consumed after the
+        // target ident below — both spell the same semantics: the
+        // impl's methods become orphan free fns parameterized by
+        // `comptime T: type`.
         var type_params: []const ast.TypeParam = &[_]ast.TypeParam{};
         if (self.peek().tag == .lt) {
             type_params = self.parseTypeParams();
         }
         const target_type = self.expectIdent();
+        if (self.peek().tag == .lt) {
+            type_params = self.parseTypeParams();
+        }
         // Canonical trait-spec clause (docs/17 §"Implementing"):
         // `impl Type with T1 (m1, m2)?, T2 (m3)? { ... }`. Optional —
         // when absent, falls back to the legacy non-trait impl path

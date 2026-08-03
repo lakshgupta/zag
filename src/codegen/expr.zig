@@ -171,6 +171,57 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .call => |c| {
                 if (std.mem.eql(u8, c.name, "print")) {
                     self.genPrintCall(c);
+                } else if (std.mem.indexOfScalar(u8, c.name, '.')) |dot| {
+                    // Dotted call `list.len()`: the template-literal
+                    // placeholder parser builds dotted callees as
+                    // `.call` with name "list.len" (not `.method_call`
+                    // — its extraction is a token-scan, not the full
+                    // postfix chain). Route generic instances through
+                    // the same free-fn dispatch as the method_call
+                    // arm so `print("{list.len()}")` doesn't emit the
+                    // verbatim (non-existent) member call. The
+                    // non-generic fallback emits the call verbatim —
+                    // this branch is an else-if TERMINAL, so a
+                    // non-generic dotted call MUST emit here or the
+                    // arg tuple ends up empty.
+                    const recv = c.name[0..dot];
+                    const meth = c.name[dot + 1 ..];
+                    var dispatched = false;
+                    if (self.getSourceTypeName(recv)) |tn| {
+                        if (self.genericInstanceOfTypeText(tn)) |gi| {
+                            if (self.genericStructModulePath(gi.base)) |mod_path| {
+                                self.write("@import(\"");
+                                self.write(mod_path);
+                                self.write("\").");
+                            }
+                            self.write(gi.base);
+                            self.write("_");
+                            self.write(meth);
+                            self.write("(");
+                            for (gi.args, 0..) |ga, i| {
+                                if (i > 0) self.write(", ");
+                                self.writeType(ga);
+                            }
+                            if (gi.args.len > 0) self.write(", ");
+                            if (!gi.is_pointer) self.write("&");
+                            self.write(recv);
+                            for (c.args) |a| {
+                                self.write(", ");
+                                self.genExpr(a);
+                            }
+                            self.write(")");
+                            dispatched = true;
+                        }
+                    }
+                    if (!dispatched) {
+                        self.write(c.name);
+                        self.write("(");
+                        for (c.args, 0..) |arg, i| {
+                            if (i > 0) self.write(", ");
+                            self.genExpr(arg);
+                        }
+                        self.write(")");
+                    }
                 } else if (self.isClosureBound(c.name)) {
                     // Phase 2 (docs/15 §"Closures"): rewrite a closure-
                     // bound callee into a method-call on the closure's
@@ -533,10 +584,19 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // zig form for the lib/std/fs.zag openat path argument
                 // (surfaced by the Tier-1 migration's first full zig
                 // compile of the materialized stdlib).
+                //
+                // ALIGNMENT: `[*]T` targets from a byte allocator
+                // (`__zag_page_alloc(...) as [*]i32` — std.collections
+                // grow) increase alignment (1 → 4), and zig 0.16
+                // rejects a bare @ptrCast for that ("@ptrCast
+                // increases pointer alignment"). @alignCast around the
+                // @ptrCast is a no-op when the alignment is unchanged
+                // and asserts it when it increases (page_allocator
+                // hands out max-aligned pages).
                 if (std.mem.startsWith(u8, c.type_text, "[*")) {
-                    self.write("@ptrCast(");
+                    self.write("@alignCast(@ptrCast(");
                     self.genExpr(c.expr.*);
-                    self.write(")");
+                    self.write("))");
                 } else {
                     self.genExpr(c.expr.*);
                 }
@@ -771,6 +831,18 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // unconditionally because struct-literal type names
                 // are the user-visible type, not a type-param slot.
                 self.writeType(sl.type_name);
+                // Generic struct literals `Box<T> { v: x }` (docs/16
+                // §2): the thunk-instantiation call parenthesizes the
+                // type args — `.Box(T) { .v = x }`. Empty `type_args`
+                // keeps the non-generic emit byte-identical.
+                if (sl.type_args.len > 0) {
+                    self.write("(");
+                    for (sl.type_args, 0..) |ta, i| {
+                        if (i > 0) self.write(", ");
+                        self.write(ta);
+                    }
+                    self.write(")");
+                }
                 self.write("{ ");
                 // Positional slots (SIMD vector literals —
                 // `f32x4 { 1.0, 2.0, ... }` from docs/manual/24):
@@ -1126,6 +1198,97 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // and the middle identifier matches a known trait, emit
                 // ConcreteType_TraitName_methodName(ident, args) — a
                 // direct monomorphized call with zero vtable overhead.
+                // Generic-instance dispatch (docs/16 §2): the
+                // thunk-form generic struct (`fn Box(comptime T:
+                // type) type`) has NO nested methods — impl methods
+                // were emitted as orphan free fns (`Box_T_make`),
+                // so `list.push(x)` cannot stay verbatim. Two shapes:
+                //   1. ident receiver with a tracked generic type —
+                //      `list: Box(i32)`; `list.push(x)` →
+                //      `Box_T_push(i32, &list, x)` — the comptime
+                //      type arg passes EXPLICITLY (zig does not infer
+                //      it from the receiver param), and a value
+                //      receiver gets address-of (`&list` → `*Box(i32)`)
+                //      mirroring zig's own method-call sugar; a
+                //      pointer receiver (`self: *Box(T)` inside the
+                //      orphan fns) passes verbatim.
+                //   2. static constructor `Box(i32).make(42)` → the
+                //      type args pass explicitly (no receiver to
+                //      infer from): `Box_T_make(i32, 42)`. The paren
+                //      args are the comptime type args; turbofish
+                //      `Box<i32>(...)` carries them in type_args.
+                if (mc.target.payload == .ident) {
+                    if (self.getSourceTypeName(mc.target.payload.ident)) |tn| {
+                        if (self.genericInstanceOfTypeText(tn)) |gi| {
+                            // Materialized stdlib generics (collections)
+                            // emit the orphan fns into THEIR module —
+                            // qualify through the inline @import; the
+                            // module's own generic structs call bare.
+                            if (self.genericStructModulePath(gi.base)) |mod_path| {
+                                self.write("@import(\"");
+                                self.write(mod_path);
+                                self.write("\").");
+                            }
+                            self.write(gi.base);
+                            self.write("_");
+                            self.write(mc.name);
+                            self.write("(");
+                            for (gi.args, 0..) |ga, i| {
+                                if (i > 0) self.write(", ");
+                                self.writeType(ga);
+                            }
+                            if (gi.args.len > 0) self.write(", ");
+                            if (!gi.is_pointer) self.write("&");
+                            self.genExpr(mc.target.*);
+                            for (mc.args) |a| {
+                                self.write(", ");
+                                self.genExpr(a);
+                            }
+                            self.write(")");
+                            return;
+                        }
+                    }
+                }
+                if (mc.target.payload == .call) {
+                    const tc = mc.target.payload.call;
+                    if (self.isGenericStructName(tc.name)) {
+                        if (self.genericStructModulePath(tc.name)) |mod_path| {
+                            self.write("@import(\"");
+                            self.write(mod_path);
+                            self.write("\").");
+                        }
+                        self.write(tc.name);
+                        self.write("_");
+                        self.write(mc.name);
+                        self.write("(");
+                        if (tc.type_args.len > 0) {
+                            for (tc.type_args, 0..) |ta, i| {
+                                if (i > 0) self.write(", ");
+                                self.writeType(ta);
+                            }
+                        } else {
+                            for (tc.args, 0..) |a, ai| {
+                                if (ai > 0) self.write(", ");
+                                // Type-arg idents route through
+                                // writeType for the transparent-alias
+                                // wrap (`str` → `[]const u8`); any
+                                // non-ident arg falls back to the
+                                // generic expression emit.
+                                if (a.payload == .ident) {
+                                    self.writeType(a.payload.ident);
+                                } else {
+                                    self.genExpr(a);
+                                }
+                            }
+                        }
+                        for (mc.args) |a| {
+                            self.write(", ");
+                            self.genExpr(a);
+                        }
+                        self.write(")");
+                        return;
+                    }
+                }
                 self.genExpr(mc.target.*);
                 self.write(".");
                 self.write(mc.name);

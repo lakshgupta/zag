@@ -352,7 +352,13 @@ test "parser: method call {obj.f()} gate accepts dot and parens inside braces" {
     try std.testing.expectEqual(@as(usize, 2), arg.payload.template_lit.parts.len);
     try std.testing.expect(arg.payload.template_lit.parts[0].literal == null);
     try std.testing.expect(arg.payload.template_lit.parts[0].expr != null);
-    try std.testing.expectEqualStrings("obj.f()", arg.payload.template_lit.parts[0].expr.?.payload.ident);
+    // `{obj.f()}` parses as a zero-arg DOTTED call (name "obj.f") —
+    // the zero-arg-call gate landed with the std.collections batch so
+    // `{list.len()}` inside print placeholders routes through the
+    // codegen's dotted-call generic dispatch instead of staying an
+    // opaque ident.
+    try std.testing.expect(arg.payload.template_lit.parts[0].expr.?.payload == .call);
+    try std.testing.expectEqualStrings("obj.f", arg.payload.template_lit.parts[0].expr.?.payload.call.name);
     try std.testing.expect(arg.payload.template_lit.parts[0].spec == null);
 }
 

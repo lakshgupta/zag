@@ -1,0 +1,216 @@
+## std.collections — generic containers over page-allocated storage.
+##
+## Generic STRUCTS (docs/16 §2) — the impl-block methods emit as
+## orphan free fns (`ArrayList_T_push(comptime T, self: *ArrayList(T),
+## value: T)`), and call sites dispatch through the generic-instance
+## rewrite: `list.push(5)` → `ArrayList_T_push(i32, &list, 5)`.
+##
+##   import std.collections.{ArrayList, HashMap}
+##
+##   var list: ArrayList(i32) = ArrayList(i32).new();
+##   list.push(10);
+##   list.push(20);
+##   print("{list.get(1)}\n");         # 20
+##   list.deinit();
+##
+##   var m: HashMap(str, i32) = HashMap(str, i32).new();
+##   m.put("a", 1);
+##   print("{m.get("a")}\n");
+##   m.deinit();
+##
+## Ownership: both containers own their heap buffers; `deinit`
+## releases them (the process-exit reclaim would mask leaks, but the
+## escape analyzer still flags missing deinit as an escaping-alloc
+## warning-free path — call it in long-lived programs).
+##
+## HashMap v1: open addressing with linear probing, FNV-1a key
+## hashing over `size_of(K)` bytes, equality via `==`. Value keys
+## (i32/u64/...) are content-correct; `str` keys hash the slice
+## descriptor (pointer+len), so two equal-looking strings in
+## different buffers do NOT collide — content-key equality is a
+## documented follow-up (needs a generic eq hook).
+
+pub struct ArrayList<T> {
+    # Typed many-pointer field: the thunk body must REFERENCE T
+    # somewhere (zig rejects an unused `comptime T: type` thunk
+    # param), and the typed pointer removes the cast layer from
+    # push/get/grow entirely.
+    items: [*]T,
+    len: usize,
+    cap: usize,
+}
+
+impl ArrayList<T> {
+    pub fun new() -> ArrayList<T> {
+        return ArrayList<T> { items: undefined, len: 0, cap: 0 };
+    }
+
+    pub fun push(self: *ArrayList<T>, value: T) {
+        if (self.len == self.cap) {
+            self.grow();
+        }
+        self.items[self.len] = value;
+        self.len = self.len + 1;
+    }
+
+    pub fun get(self: *ArrayList<T>, idx: usize) -> T {
+        if (idx >= self.len) {
+            __zag_panic("std.collections.ArrayList.get: index out of bounds");
+        }
+        return self.items[idx];
+    }
+
+    pub fun set(self: *ArrayList<T>, idx: usize, value: T) {
+        if (idx >= self.len) {
+            __zag_panic("std.collections.ArrayList.set: index out of bounds");
+        }
+        self.items[idx] = value;
+    }
+
+    pub fun len(self: *ArrayList<T>) -> usize {
+        return self.len;
+    }
+
+    pub fun clear(self: *ArrayList<T>) {
+        self.len = 0;
+    }
+
+    pub fun deinit(self: *ArrayList<T>) {
+        if (self.cap > 0) {
+            __zag_page_free(self.items as [*]u8, self.cap * size_of(T));
+            self.cap = 0;
+            self.len = 0;
+        }
+    }
+
+    fun grow(self: *ArrayList<T>) {
+        let new_cap: usize = if (self.cap == 0) { 4 } else { self.cap * 2 };
+        let old_len: usize = self.len;
+        var p: [*]T = __zag_page_alloc(new_cap * size_of(T)) as [*]T;
+        if (self.cap > 0) {
+            var i: usize = 0;
+            while (i < old_len) {
+                p[i] = self.items[i];
+                i = i + 1;
+            }
+            __zag_page_free(self.items as [*]u8, self.cap * size_of(T));
+        }
+        self.items = p;
+        self.cap = new_cap;
+    }
+}
+
+pub struct HashMap<K, V> {
+    keys: [*]K,
+    values: [*]V,
+    used: [*]bool,
+    cap: usize,
+    len: usize,
+}
+
+impl HashMap<K, V> {
+    pub fun new() -> HashMap<K, V> {
+        return HashMap<K, V> { keys: undefined, values: undefined, used: undefined, cap: 0, len: 0 };
+    }
+
+    pub fun put(self: *HashMap<K, V>, key: K, value: V) {
+        if (self.len * 2 >= self.cap) {
+            self.grow();
+        }
+        let idx: usize = self.probe(key);
+        # The key is written UNCONDITIONALLY — a fresh slot's keys[]
+        # entry is undefined memory, and the probe's equality check
+        # reads it; the update-vs-insert distinction lives in the
+        # used[] flag alone.
+        self.keys[idx] = key;
+        self.values[idx] = value;
+        self.used[idx] = true;
+        self.len = self.len + 1;
+    }
+
+    pub fun get(self: *HashMap<K, V>, key: K) -> V {
+        let idx: usize = self.probe(key);
+        if (!self.used[idx] || !(self.keys[idx] == key)) {
+            __zag_panic("std.collections.HashMap.get: key not found");
+        }
+        return self.values[idx];
+    }
+
+    pub fun contains(self: *HashMap<K, V>, key: K) -> bool {
+        let idx: usize = self.probe(key);
+        return self.used[idx] && self.keys[idx] == key;
+    }
+
+    pub fun len(self: *HashMap<K, V>) -> usize {
+        return self.len;
+    }
+
+    pub fun deinit(self: *HashMap<K, V>) {
+        if (self.cap > 0) {
+            __zag_page_free(self.keys as [*]u8, self.cap * size_of(K));
+            __zag_page_free(self.values as [*]u8, self.cap * size_of(V));
+            __zag_page_free(self.used as [*]u8, self.cap);
+            self.cap = 0;
+            self.len = 0;
+        }
+    }
+
+    fun probe(self: *HashMap<K, V>, key: K) -> usize {
+        let mask: usize = self.cap - 1;
+        var idx: usize = hash_key<K>(key) & mask;
+        while (self.used[idx] && !(self.keys[idx] == key)) {
+            idx = (idx + 1) & mask;
+        }
+        return idx;
+    }
+
+    fun grow(self: *HashMap<K, V>) {
+        let new_cap: usize = if (self.cap == 0) { 8 } else { self.cap * 2 };
+        let old_cap: usize = self.cap;
+        let old_keys: [*]K = self.keys;
+        let old_values: [*]V = self.values;
+        let old_used: [*]bool = self.used;
+        var nk: [*]K = __zag_page_alloc(new_cap * size_of(K)) as [*]K;
+        var nv: [*]V = __zag_page_alloc(new_cap * size_of(V)) as [*]V;
+        var nu: [*]bool = __zag_page_alloc(new_cap) as [*]bool;
+        if (old_cap > 0) {
+            var i: usize = 0;
+            while (i < old_cap) {
+                if (old_used[i]) {
+                    let mask: usize = new_cap - 1;
+                    var idx: usize = hash_key<K>(old_keys[i]) & mask;
+                    while (nu[idx]) {
+                        idx = (idx + 1) & mask;
+                    }
+                    nk[idx] = old_keys[i];
+                    nv[idx] = old_values[i];
+                    nu[idx] = true;
+                }
+                i = i + 1;
+            }
+            __zag_page_free(old_keys as [*]u8, old_cap * size_of(K));
+            __zag_page_free(old_values as [*]u8, old_cap * size_of(V));
+            __zag_page_free(old_used as [*]u8, old_cap);
+        }
+        self.keys = nk;
+        self.values = nv;
+        self.used = nu;
+        self.cap = new_cap;
+    }
+}
+
+# Generic FREE fn (not a method): the impl-level `comptime V`
+# param would be unused here (hash only touches K), and zig
+# rejects unused comptime params. Call sites turbofish the K.
+fun hash_key<K>(key: K) -> usize {
+    let kp: [*]const u8 = (&key) as [*]const u8;
+    var h: u64 = 2166136261;
+    var i: usize = 0;
+    while (i < size_of(K)) {
+        h = h ^ (kp[i] as u64);
+        h = h * 16777619;
+        h = h % 4294967296;
+        i = i + 1;
+    }
+    return h as usize;
+}

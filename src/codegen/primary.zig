@@ -635,6 +635,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         // type_info::init()` pattern at codegen struct init.
         args_cg.type_info_buf = self.type_info_buf;
         args_cg.type_info_count = self.type_info_count;
+        // Generic-struct + trait tracking transfer: the generic
+        // dispatch (`list.push(5)` inside a print placeholder) and
+        // trait casts consult these sets on the codegen instance —
+        // without the transfer the child's sets are empty and the
+        // calls emit verbatim (`list.len()` → zig "type 'usize' not
+        // a function"). Surfaced by std.collections demo prints.
+        args_cg.generic_struct_names = self.generic_struct_names;
+        args_cg.generic_struct_count = self.generic_struct_count;
+        args_cg.tracked_trait_names = self.tracked_trait_names;
+        args_cg.tracked_trait_count = self.tracked_trait_count;
         var first_arg = true;
 
         for (t.parts) |part| {

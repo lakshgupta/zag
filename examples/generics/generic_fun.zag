@@ -7,8 +7,10 @@
 ##     Codegen emits `if (!@hasDecl(T, "compare")) @compileError(...)` at body entry.
 ##   - §4 Const generic param: `fill<T, const N: usize>(val: T) -> [N]T` + `fill<i32, 4>(0)`
 ##
-## Deferred (separate commits): generic structs (§2), generic impl<T> blocks,
-## const-block initializers (§5, §6).
+## Generic STRUCTS (§2) + impl<T> blocks landed in the std.collections
+## batch (docs/17 §"Generic Types" + lib/std/collections.zag) — see
+## examples/stdlib/collections.zag. Const-block initializers (§5, §6)
+## remain deferred.
 
 # §1: single-type-param generic. Codegen emits
 #     `pub fn identity(comptime T: type, x: T) T { return x; }`.

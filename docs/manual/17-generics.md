@@ -94,6 +94,8 @@ impl<T> List<T> {
 
 The first `<T>` introduces the type-param into scope; the second `<T>` (and any `T` inside `List<T>`) references it. Both are required — there is no `impl List<T>` shorthand, because without the first `<T>` there is no scope in which to introduce `T`. This mirrors the function form `fun max<T: Ordered>(a: T, b: T)` — the `<T>` declares, the `T`s in the signature and body use.
 
+> **Update (stdlib batch):** the post-target form `impl List<T> { … }` is ALSO accepted — the type params may be declared after the target name. Both spellings emit identical orphan free functions.
+
 Generic impl blocks emit one orphan free function per method at module scope:
 
 ```
@@ -102,6 +104,17 @@ pub fn List_T_push(comptime T: type, self: *List(T), value: T) void { ... }
 ```
 
 The compiler rewrites each `<TYPE>` segment in receiver and parameter types to `(TYPE)` when the segment matches one of the impl's declared type-param names (`T`, `U`, `K`, `V`, …). Segments that don't match a type-param name on the enclosing impl (e.g. nested generic-enum or generic-union monomorphizations, including `enum(T)` instances like `enum(str) Color` where `T` isn't a type-param of the enclosing impl) pass through verbatim.
+
+**Call sites** dispatch to the free fns automatically — the thunk-form struct has no nested methods, so the compiler rewrites:
+
+```
+var list: ArrayList(i32) = ArrayList(i32).new();   # → ArrayList_new(i32)
+list.push(10);                                      # → ArrayList_T_push(i32, &list, 10)
+print("{list.len()}");                              # → works inside placeholders too
+list.deinit();                                      # → ArrayList_T_deinit(i32, &list)
+```
+
+Value receivers get address-of (`&list`) mirroring zig's own method-call sugar (declare the binding `var` when the method mutates — same rule as non-generic `*self` methods); pointer receivers (`self: *List(T)` inside the impl) pass verbatim. Stdlib generics (collections) route through an inline `@import("std/collections.zig")` so the free fns resolve from the user module.
 
 ## No Trait Bounds on Associated Types
 

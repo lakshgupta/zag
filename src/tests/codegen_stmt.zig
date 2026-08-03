@@ -106,8 +106,10 @@ test "codegen: if-stmt with else-if chain emits chained zig emission" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    if a {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    } else if b {") != null);
+    // Ident conds now wrap in explicit parens (writeCond — zig 0.16
+    // rejects `if a {`), so the pins carry `(a)` / `(b)`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    if (a) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    } else if (b) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    } else {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    __zag_print(\"other\\n\", .{});") != null);
 }

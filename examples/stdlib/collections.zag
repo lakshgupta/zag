@@ -1,0 +1,46 @@
+## stdlib/collections.zag — generic containers (docs/16 §2 generic
+## structs + lib/std/collections.zag).
+##
+##   import std.collections.{ArrayList, HashMap}
+##
+## ArrayList<T>: growable vector over page-allocated storage.
+##   var list: ArrayList(i32) = ArrayList(i32).new();
+##   list.push(10);
+##   list.get(1);        # bounds-checked (panics on OOB)
+##   list.deinit();      # releases the buffer
+##
+## HashMap<K, V>: open addressing, linear probing, FNV-1a key
+## hashing over `size_of(K)` bytes, `==` equality. Value keys
+## (i32/u64/...) are content-correct.
+##
+## The impl methods emit as orphan free fns
+## (`ArrayList_T_push(comptime T, self: *ArrayList(T), value: T)`)
+## and call sites dispatch through the generic-instance rewrite:
+## `list.push(5)` → `@import("std/collections.zig").ArrayList_push(
+## i32, &list, 5)` — including inside print placeholders.
+
+import std.collections.{ArrayList, HashMap}
+
+fun main() {
+    var list: ArrayList(i32) = ArrayList(i32).new();
+    list.push(10);
+    list.push(20);
+    list.push(30);
+    print("len {list.len()} get1 {list.get(1)} get2 {list.get(2)}\n");
+    list.set(0, 99);
+    print("after set(0, 99): {list.get(0)}\n");
+    list.deinit();
+
+    var m: HashMap(i32, str) = HashMap(i32, str).new();
+    m.put(1, "one");
+    m.put(2, "two");
+    m.put(3, "three");
+    m.put(4, "four");
+    m.put(5, "five");
+    m.put(6, "six");
+    let g3: str = m.get(3);
+    let g6: str = m.get(6);
+    print("map len {m.len()} has2 {m.contains(2)} has9 {m.contains(9)}\n");
+    print("map get3 {g3} get6 {g6}\n");
+    m.deinit();
+}
