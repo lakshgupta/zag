@@ -1427,17 +1427,40 @@ pub const MapEntry = struct {
                         const rel_start = "lib/std/".len;
                         if (resolved_path.len <= rel_start) continue;
                         const rel_path = resolved_path[rel_start..];
-                        const zig_ext_start = if (std.mem.endsWith(u8, rel_path, ".zag"))
-                            rel_path.len - ".zag".len
+                        // Nested materialized modules (std.collections
+                        // directory split): a file transpiled INTO the
+                        // mirror (import_std_base == "") emits sibling
+                        // imports relative to ITS OWN directory —
+                        // `build/gen/std/collections/mod.zig` must
+                        // import `array_list.zig`, NOT
+                        // `collections/array_list.zig` (which would
+                        // resolve under build/gen/std/collections/).
+                        // Strip the current file's directory prefix
+                        // from the resolved path when the file lives
+                        // under lib/std/.
+                        var emit_rel: []const u8 = rel_path;
+                        if (self.import_std_base.len == 0 and self.source_path.len > 0) {
+                            const src_dir_end = std.mem.lastIndexOfScalar(u8, self.source_path, '/');
+                            if (src_dir_end) |sde| {
+                                const src_dir = self.source_path[0..sde];
+                                if (std.mem.startsWith(u8, resolved_path, src_dir) and
+                                    resolved_path.len > src_dir.len and resolved_path[src_dir.len] == '/')
+                                {
+                                    emit_rel = resolved_path[src_dir.len + 1 ..];
+                                }
+                            }
+                        }
+                        const zig_ext_start = if (std.mem.endsWith(u8, emit_rel, ".zag"))
+                            emit_rel.len - ".zag".len
                         else
-                            rel_path.len;
+                            emit_rel.len;
                         self.write("const __zag_imported_");
                         var idx_buf: [16]u8 = undefined;
                         const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{import_i}) catch "X";
                         self.write(idx_str);
                         self.write(" = @import(\"");
                         self.write(self.import_std_base);
-                        self.write(rel_path[0..zig_ext_start]);
+                        self.write(emit_rel[0..zig_ext_start]);
                         self.write(".zig\");\n");
                         for (imp.selectors) |sel| {
                             const preamble_name = stdlibPreambleName(sel.name);
@@ -2222,21 +2245,22 @@ pub const MapEntry = struct {
     /// Keep in sync with generic struct decls added to lib/std/.
     pub     fn genericStructModulePath(self: *Codegen, base: []const u8) ?[]const u8 {
         // Paths are the MATERIALIZED module names — the imports loop
-        // emits `@import("std/collections.zig")` (the build/gen/std/
-        // tree), NOT the source `lib/std/collections.zag` path.
+        // emits `@import("std/collections/array_list.zig")` (the
+        // build/gen/std/ tree), NOT the source lib/std/ paths.
         const KNOWN = &[_]struct { name: []const u8, path: []const u8 }{
-            .{ .name = "ArrayList", .path = "std/collections.zig" },
-            .{ .name = "HashMap", .path = "std/collections.zig" },
+            .{ .name = "ArrayList", .path = "std/collections/array_list.zig" },
+            .{ .name = "HashMap", .path = "std/collections/hash_map.zig" },
         };
         for (KNOWN) |k| {
             if (std.mem.eql(u8, k.name, base)) {
-                // Self-module case: the materialized std module's own
-                // codegen instance (source_path == the KNOWN source
+                // Self-module case: the per-type file's own codegen
+                // instance (source_path ends with the KNOWN source
                 // path) must call its free fns BARE — the inline
-                // `@import("std/collections.zig")` inside
-                // build/gen/std/collections.zig would resolve
-                // relative to itself and fail to load.
-                if (self.source_path.len > 0 and std.mem.endsWith(u8, self.source_path, "collections.zag")) {
+                // @import("std/collections/array_list.zig") inside
+                // build/gen/std/collections/array_list.zig would
+                // resolve relative to itself and fail to load.
+                const src_name = if (std.mem.eql(u8, base, "ArrayList")) "array_list.zag" else "hash_map.zag";
+                if (self.source_path.len > 0 and std.mem.endsWith(u8, self.source_path, src_name)) {
                     return null;
                 }
                 return k.path;

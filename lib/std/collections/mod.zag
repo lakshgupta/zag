@@ -1,0 +1,21 @@
+## std.collections — DIRECTORY module (lib/std/collections/).
+##
+## Each container type lives in its own file:
+##
+##   lib/std/collections/
+##     mod.zag         ← this barrel (re-exports the public surface)
+##     array_list.zag  ← ArrayList<T>
+##     hash_map.zag    ← HashMap<K, V>
+##
+## The per-type files are registered as nested std modules
+## (`std.collections.array_list`, `std.collections.hash_map`) in
+## KNOWN_STD_MODULES; this barrel resolves `std.collections` itself
+## and chains the re-exports so `import std.collections.{ArrayList}`
+## resolves through `array_list.zag`'s compile — the selector
+## bindings in the user module forward through the barrel's
+## `pub const` re-exports.
+##
+##   import std.collections.{ArrayList, HashMap}
+
+pub import std.collections.array_list.{ArrayList}
+pub import std.collections.hash_map.{HashMap}

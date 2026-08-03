@@ -1,105 +1,24 @@
-## std.collections — generic containers over page-allocated storage.
+## std.collections.hash_map — HashMap<K, V>.
 ##
-## Generic STRUCTS (docs/16 §2) — the impl-block methods emit as
-## orphan free fns (`ArrayList_T_push(comptime T, self: *ArrayList(T),
-## value: T)`), and call sites dispatch through the generic-instance
-## rewrite: `list.push(5)` → `ArrayList_T_push(i32, &list, 5)`.
+## Lives at lib/std/collections/hash_map.zag — std.collections is a
+## DIRECTORY module (see array_list.zag's docblock).
 ##
-##   import std.collections.{ArrayList, HashMap}
-##
-##   var list: ArrayList(i32) = ArrayList(i32).new();
-##   list.push(10);
-##   list.push(20);
-##   print("{list.get(1)}\n");         # 20
-##   list.deinit();
-##
-##   var m: HashMap(str, i32) = HashMap(str, i32).new();
-##   m.put("a", 1);
-##   print("{m.get("a")}\n");
-##   m.deinit();
-##
-## Ownership: both containers own their heap buffers; `deinit`
-## releases them (the process-exit reclaim would mask leaks, but the
-## escape analyzer still flags missing deinit as an escaping-alloc
-## warning-free path — call it in long-lived programs).
-##
-## HashMap v1: open addressing with linear probing, FNV-1a key
+## HashMap<K, V> — open addressing with linear probing, FNV-1a key
 ## hashing over `size_of(K)` bytes, equality via `==`. Value keys
 ## (i32/u64/...) are content-correct; `str` keys hash the slice
 ## descriptor (pointer+len), so two equal-looking strings in
 ## different buffers do NOT collide — content-key equality is a
 ## documented follow-up (needs a generic eq hook).
-
-pub struct ArrayList<T> {
-    # Typed many-pointer field: the thunk body must REFERENCE T
-    # somewhere (zig rejects an unused `comptime T: type` thunk
-    # param), and the typed pointer removes the cast layer from
-    # push/get/grow entirely.
-    items: [*]T,
-    len: usize,
-    cap: usize,
-}
-
-impl ArrayList<T> {
-    pub fun new() -> ArrayList<T> {
-        return ArrayList<T> { items: undefined, len: 0, cap: 0 };
-    }
-
-    pub fun push(self: *ArrayList<T>, value: T) {
-        if (self.len == self.cap) {
-            self.grow();
-        }
-        self.items[self.len] = value;
-        self.len = self.len + 1;
-    }
-
-    pub fun get(self: *ArrayList<T>, idx: usize) -> T {
-        if (idx >= self.len) {
-            __zag_panic("std.collections.ArrayList.get: index out of bounds");
-        }
-        return self.items[idx];
-    }
-
-    pub fun set(self: *ArrayList<T>, idx: usize, value: T) {
-        if (idx >= self.len) {
-            __zag_panic("std.collections.ArrayList.set: index out of bounds");
-        }
-        self.items[idx] = value;
-    }
-
-    pub fun len(self: *ArrayList<T>) -> usize {
-        return self.len;
-    }
-
-    pub fun clear(self: *ArrayList<T>) {
-        self.len = 0;
-    }
-
-    pub fun deinit(self: *ArrayList<T>) {
-        if (self.cap > 0) {
-            __zag_page_free(self.items as [*]u8, self.cap * size_of(T));
-            self.cap = 0;
-            self.len = 0;
-        }
-    }
-
-    fun grow(self: *ArrayList<T>) {
-        let new_cap: usize = if (self.cap == 0) { 4 } else { self.cap * 2 };
-        let old_len: usize = self.len;
-        var p: [*]T = __zag_page_alloc(new_cap * size_of(T)) as [*]T;
-        if (self.cap > 0) {
-            var i: usize = 0;
-            while (i < old_len) {
-                p[i] = self.items[i];
-                i = i + 1;
-            }
-            __zag_page_free(self.items as [*]u8, self.cap * size_of(T));
-        }
-        self.items = p;
-        self.cap = new_cap;
-    }
-}
-
+##
+##   import std.collections.{HashMap}
+##
+##   var m: HashMap(i32, str) = HashMap(i32, str).new();
+##   m.put(1, "one");
+##   print("{m.get(1)}\n");
+##   m.deinit();
+##
+## Ownership: the container owns its heap buffers; `deinit` releases
+## them.
 pub struct HashMap<K, V> {
     keys: [*]K,
     values: [*]V,

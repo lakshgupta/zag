@@ -17,7 +17,7 @@ surface of the modules below.
 | Module | Surface | Allocation |
 |---|---|---|
 | `std.types` | `String` (owned mutable UTF-8 buffer) | heap |
-| `std.collections` | `ArrayList<T>`, `HashMap<K, V>` (generic structs, docs/17 §Generic Types) | heap |
+| `std.collections` | **directory module** (`lib/std/collections/`) — `ArrayList<T>` in `array_list.zag`, `HashMap<K, V>` in `hash_map.zag`, barrel `mod.zag` re-exports; each type can live in its own file | heap |
 | `std.encoding` | `base64_encode/decode`, `hex_encode/decode`, `utf8_validate` | heap (encode/decode) |
 | `std.hash` | `fnv1a32/64`, `crc32`, `sha256` | none |
 | `std.random` | `XorShift64Star` (new / seed_from, next_u64/32/f64) | none |
@@ -32,6 +32,25 @@ surface of the modules below.
 | `std.process` | `exec`, `exit` | heap |
 | `std.debug` | `panic` | none |
 
+## Directory modules
+
+Stdlib modules are identified by their DIRECTORY when a module grows
+multiple types: `std.collections` resolves to `lib/std/collections/`
+with one file per container (`array_list.zag`, `hash_map.zag`) and a
+`mod.zag` barrel chaining the re-exports. The per-type files register
+as nested modules (`std.collections.array_list`,
+`std.collections.hash_map`) and are importable directly or through
+the barrel:
+
+```zag
+import std.collections.{ArrayList}        # barrel → array_list.zag
+import std.collections.hash_map.{HashMap} # direct nested import
+```
+
+Materialization mirrors the tree (`build/gen/std/collections/*.zig`);
+the generic dispatch emits per-type import paths. The same pattern
+backs `std.async.stream` / `std.arch.x86.avx2` / `std.concurrent.*`.
+
 ## Generic containers
 
 `std.collections` is built on generic *structs* (docs/17 §Generic
@@ -39,7 +58,7 @@ Types): `struct ArrayList<T>` thunks to `fn ArrayList(comptime T:
 type) type`, impl methods become orphan free fns
 (`ArrayList_T_push(comptime T, self: *ArrayList(T), value: T)`), and
 call sites dispatch automatically — `list.push(5)` rewrites to
-`@import("std/collections.zig").ArrayList_push(i32, &list, 5)`.
+`@import("std/collections/array_list.zig").ArrayList_push(i32, &list, 5)`.
 Value receivers get address-of at the call site; declare the binding
 `var` when methods mutate. `HashMap` hashes keys via FNV-1a over
 `size_of(K)` bytes with `==` equality (value keys are
