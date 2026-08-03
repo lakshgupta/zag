@@ -1,8 +1,9 @@
-## std.types — core data types shared across the standard library.
+## std.types.string — String (lives at lib/std/types/string.zag).
 ##
-## Canonical home of the heap-allocated mutable UTF-8 `String` type
-## (docs/manual/11-strings.md). `String` moved here from
-## `std.string` so the type lives under the "types" namespace:
+## std.types is a DIRECTORY module (see lib/std/types/mod.zag): the
+## heap-allocated mutable UTF-8 `String` type (docs/manual/11-strings)
+## lives in its own file. `String` moved here from `std.string` so
+## the type lives under the "types" namespace:
 ##
 ##   import std.types.{String}
 ##

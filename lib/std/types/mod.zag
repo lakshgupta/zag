@@ -1,0 +1,13 @@
+## std.types — DIRECTORY module (lib/std/types/).
+##
+##   lib/std/types/
+##     mod.zag     ← this barrel (re-exports the public surface)
+##     string.zag  ← String
+##
+## Registered as `std.types.string` in KNOWN_STD_MODULES; the barrel
+## chains the re-export so `import std.types.{String}` resolves
+## through string.zag's compile.
+##
+##   import std.types.{String}
+
+pub import std.types.string.{String}

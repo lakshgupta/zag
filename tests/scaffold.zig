@@ -364,7 +364,7 @@ test "joinDottedPath: every joined form resolves via KNOWN_STD_MODULES" {
     var scratch: [256]u8 = undefined;
     const cases = [_]struct { nodes: []const []const u8, expected: []const u8 }{
         .{ .nodes = &[_][]const u8{ "std" }, .expected = "lib/std/mod.zag" },
-        .{ .nodes = &[_][]const u8{ "std", "types" }, .expected = "lib/std/types.zag" },
+        .{ .nodes = &[_][]const u8{ "std", "types" }, .expected = "lib/std/types/mod.zag" },
         .{ .nodes = &[_][]const u8{ "std", "error" }, .expected = "lib/std/error.zag" },
         .{ .nodes = &[_][]const u8{ "std", "fmt" }, .expected = "lib/std/fmt.zag" },
         .{ .nodes = &[_][]const u8{ "std", "async", "stream" }, .expected = "lib/std/async/stream.zag" },
@@ -394,7 +394,7 @@ test "scaffold: KNOWN_STD_MODULES table entries all map to parseable stubs" {
     // at a real .zag file the parser accepts.
     const expected_minimum_paths = [_][]const u8{
         "lib/std/mod.zag",
-        "lib/std/types.zag",
+        "lib/std/types/mod.zag",
         "lib/std/error.zag",
         "lib/std/fmt.zag",
         "lib/std/time.zag",
@@ -422,7 +422,7 @@ test "scaffold: KNOWN_STD_MODULES table entries all map to parseable stubs" {
     try std.testing.expect(resolved == null);
     const resolved2 = parser_mod.Parser.resolveStdImport("std.types");
     try std.testing.expect(resolved2 != null);
-    try std.testing.expectEqualStrings("lib/std/types.zag", resolved2.?);
+    try std.testing.expectEqualStrings("lib/std/types/mod.zag", resolved2.?);
     // Multi-segment path roundtrip:
     const resolved_async = parser_mod.Parser.resolveStdImport("std.async.stream");
     try std.testing.expect(resolved_async != null);

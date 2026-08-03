@@ -2053,7 +2053,7 @@ test "codegen: all 12 KNOWN_STD_MODULES entries are recognized by the import rou
     // parser+codegen pipeline accepts all entries.
     const cases = [_]struct { name: []const u8, expected: []const u8 }{
         .{ .name = "std",               .expected = "lib/std/mod.zag" },
-        .{ .name = "std.types",         .expected = "lib/std/types.zag" },
+        .{ .name = "std.types",         .expected = "lib/std/types/mod.zag" },
         .{ .name = "std.error",         .expected = "lib/std/error.zag" },
         .{ .name = "std.fmt",           .expected = "lib/std/fmt.zag" },
         .{ .name = "std.time",          .expected = "lib/std/time.zag" },

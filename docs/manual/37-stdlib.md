@@ -36,15 +36,17 @@ surface of the modules below.
 
 Stdlib modules are identified by their DIRECTORY when a module grows
 multiple types: `std.collections` resolves to `lib/std/collections/`
-with one file per container (`array_list.zag`, `hash_map.zag`) and a
-`mod.zag` barrel chaining the re-exports. The per-type files register
-as nested modules (`std.collections.array_list`,
-`std.collections.hash_map`) and are importable directly or through
-the barrel:
+and `std.types` to `lib/std/types/`, with one file per type
+(`array_list.zag`, `hash_map.zag`, `string.zag`) and a `mod.zag`
+barrel chaining the re-exports. The per-type files register as
+nested modules (`std.collections.array_list`,
+`std.types.string`) and are importable directly or through the
+barrel:
 
 ```zag
 import std.collections.{ArrayList}        # barrel → array_list.zag
 import std.collections.hash_map.{HashMap} # direct nested import
+import std.types.{String}                 # barrel → types/string.zag
 ```
 
 Materialization mirrors the tree (`build/gen/std/collections/*.zig`);

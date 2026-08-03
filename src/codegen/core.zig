@@ -1296,7 +1296,7 @@ pub const MapEntry = struct {
             // std.types hosts the String type (the std.string module
             // was removed — String is ONLY importable as
             // std.types.{String}); the hybrid rebinding follows.
-            self.write("const __zag_std_types = @import(\"std/types.zig\");\n");
+            self.write("const __zag_std_types = @import(\"std/types/mod.zig\");\n");
             // String/Writer rebindings (v0.1 follow-up): in hybrid
             // mode, the @imported module's exported type aliases to
             // `__zag_String` / `__zag_Writer` so call sites written
