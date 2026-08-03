@@ -23,6 +23,10 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 // docblock before any edit.
 const parser = @import("../parser.zig");
 
+/// Scratch for the nested-materialized-module `../` relative-import
+/// prefix (see the imports loop in generate()).
+var std_module_rel_scratch: [1024]u8 = undefined;
+
 /// Lightweight per-function type-info map entry. Lives next to
 /// `Codegen` rather than in `ast.zig` because the caller has no
 /// use for the map after compilation — only the shim predicates
@@ -872,6 +876,40 @@ pub const MapEntry = struct {
             \\        i += 1;
             \\    }
             \\}
+            \\// Generic container key helpers (std.collections): zig's
+            \\// `==` on slices compares the slice DESCRIPTOR (and is
+            \\// rejected outright for []const u8 operands), so the
+            \\// HashMap's generic probe/contains/get equality + hashing
+            \\// delegate here — a comptime K branch selects CONTENT
+            \\// semantics for slice keys (str) and value semantics for
+            \\// everything else. Pure zig side, so the comptime `if`
+            \\// discards the dead branch properly (the .zag emitter
+            \\// can't do that — its comptime if still type-checks both
+            \\// branches).
+            \\fn __zag_keys_eq(comptime K: type, a: K, b: K) bool {
+            \\    if (K == []const u8) {
+            \\        return std.mem.eql(u8, a, b);
+            \\    }
+            \\    return a == b;
+            \\}
+            \\fn __zag_key_hash(comptime K: type, key: K) usize {
+            \\    if (K == []const u8) {
+            \\        const s: []const u8 = key;
+            \\        var h: u64 = 2166136261;
+            \\        for (s) |b| {
+            \\            h = (h ^ @as(u64, b)) *% 16777619;
+            \\        }
+            \\        return @as(usize, @truncate(h));
+            \\    }
+            \\    const bytes: [*]const u8 = @ptrCast(&key);
+            \\    var h: u64 = 2166136261;
+            \\    var i: usize = 0;
+            \\    while (i < @sizeOf(K)) {
+            \\        h = (h ^ @as(u64, bytes[i])) *% 16777619;
+            \\        i += 1;
+            \\    }
+            \\    return @as(usize, @truncate(h));
+            \\}
             \\fn __zag_fd_write(fd: i32, bytes: []const u8) void {
             \\    var pos: usize = 0;
             \\    while (pos < bytes.len) {
@@ -1447,6 +1485,24 @@ pub const MapEntry = struct {
                                     resolved_path.len > src_dir.len and resolved_path[src_dir.len] == '/')
                                 {
                                     emit_rel = resolved_path[src_dir.len + 1 ..];
+                                } else if (sde > "lib/std/".len) {
+                                    // Cross-directory import from a
+                                    // NESTED materialized module:
+                                    // build/gen/std/strings/slices.zig
+                                    // importing std.collections needs
+                                    // `../collections/mod.zig`, not
+                                    // `collections/mod.zig` (which
+                                    // resolves under its own dir).
+                                    // All lib/std modules live at
+                                    // depth <= 1, so a single `../`
+                                    // prefix suffices.
+                                    if ("../".len + rel_path.len <= std_module_rel_scratch.len) {
+                                        std_module_rel_scratch[0] = '.';
+                                        std_module_rel_scratch[1] = '.';
+                                        std_module_rel_scratch[2] = '/';
+                                        @memcpy(std_module_rel_scratch[3..][0..rel_path.len], rel_path);
+                                        emit_rel = std_module_rel_scratch[0 .. 3 + rel_path.len];
+                                    }
                                 }
                             }
                         }
@@ -2262,6 +2318,29 @@ pub const MapEntry = struct {
                 const src_name = if (std.mem.eql(u8, base, "ArrayList")) "array_list.zag" else "hash_map.zag";
                 if (self.source_path.len > 0 and std.mem.endsWith(u8, self.source_path, src_name)) {
                     return null;
+                }
+                // Nested materialized module calling a generic from
+                // ANOTHER std dir (std.strings.slices using
+                // std.collections.ArrayList): the path is relative to
+                // the generated file's dir, so strip the `std/`
+                // module-root prefix and prepend `../`.
+                if (self.import_std_base.len == 0 and self.source_path.len > 0) {
+                    const src_dir_end = std.mem.lastIndexOfScalar(u8, self.source_path, '/');
+                    if (src_dir_end) |sde| {
+                        if (sde > "lib/std/".len) {
+                            const rel_to_std = if (std.mem.startsWith(u8, k.path, "std/"))
+                                k.path["std/".len..]
+                            else
+                                k.path;
+                            if (std_module_rel_scratch.len >= 3 + rel_to_std.len) {
+                                std_module_rel_scratch[0] = '.';
+                                std_module_rel_scratch[1] = '.';
+                                std_module_rel_scratch[2] = '/';
+                                @memcpy(std_module_rel_scratch[3..][0..rel_to_std.len], rel_to_std);
+                                return std_module_rel_scratch[0 .. 3 + rel_to_std.len];
+                            }
+                        }
+                    }
                 }
                 return k.path;
             }

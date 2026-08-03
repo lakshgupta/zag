@@ -107,7 +107,7 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                 }
                 if (lparen_idx) |lparen| {
                     if (expr_text.len > 0 and expr_text[expr_text.len - 1] == ')') {
-                        const name_text = std.mem.trim(u8, expr_text[0..lparen], " \t");
+                        var name_text = std.mem.trim(u8, expr_text[0..lparen], " \t");
                         const args_text = std.mem.trim(u8, expr_text[lparen + 1 .. expr_text.len - 1], " \t");
                         var args_buf: [16]ast.Expr = undefined;
                         var arg_count: usize = 0;
@@ -153,7 +153,45 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                         if (name_text.len > 0) {
                             const args_arena = self.arena.alloc(ast.Expr, arg_count);
                             @memcpy(args_arena, args_buf[0..arg_count]);
-                            build_expr = Expr{ .payload = .{ .call = .{ .name = name_text, .args = args_arena } }, .loc = start_loc };
+                            // Turbofish inside placeholders —
+                            // `{min<i32>(3, 5)}` (std.math batch): the
+                            // mini-parser's name_text carries the
+                            // `<i32>` — split it into the call's
+                            // type_args so the codegen `.call` arm's
+                            // existing turbofish emit rewrites to
+                            // `min(i32, 3, 5)`. Without the split the
+                            // verbatim `min<i32>(3, 5)` reaches zig,
+                            // which rejects `<` ("comparison operators
+                            // cannot be chained").
+                            var targs: []const []const u8 = &[_][]const u8{};
+                            if (std.mem.indexOfScalar(u8, name_text, '<')) |lt| {
+                                if (std.mem.lastIndexOfScalar(u8, name_text, '>')) |gt| {
+                                    if (gt > lt) {
+                                        var targs_buf: [8][]const u8 = undefined;
+                                        var targ_count: usize = 0;
+                                        const inner = name_text[lt + 1 .. gt];
+                                        var tstart: usize = 0;
+                                        var tpos: usize = 0;
+                                        while (tpos <= inner.len) : (tpos += 1) {
+                                            if (tpos == inner.len or inner[tpos] == ',') {
+                                                const part = std.mem.trim(u8, inner[tstart..tpos], " \t");
+                                                if (part.len > 0 and targ_count < targs_buf.len) {
+                                                    targs_buf[targ_count] = part;
+                                                    targ_count += 1;
+                                                }
+                                                tstart = tpos + 1;
+                                            }
+                                        }
+                                        if (targ_count > 0) {
+                                            const targs_arena = self.arena.alloc([]const u8, targ_count);
+                                            @memcpy(targs_arena, targs_buf[0..targ_count]);
+                                            targs = targs_arena;
+                                            name_text = name_text[0..lt];
+                                        }
+                                    }
+                                }
+                            }
+                            build_expr = Expr{ .payload = .{ .call = .{ .name = name_text, .args = args_arena, .type_args = targs } }, .loc = start_loc };
                         }
                     }
                 }

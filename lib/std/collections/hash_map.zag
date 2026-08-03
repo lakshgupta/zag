@@ -4,11 +4,10 @@
 ## DIRECTORY module (see array_list.zag's docblock).
 ##
 ## HashMap<K, V> — open addressing with linear probing, FNV-1a key
-## hashing over `size_of(K)` bytes, equality via `==`. Value keys
-## (i32/u64/...) are content-correct; `str` keys hash the slice
-## descriptor (pointer+len), so two equal-looking strings in
-## different buffers do NOT collide — content-key equality is a
-## documented follow-up (needs a generic eq hook).
+## hashing, equality via the preamble `__zag_keys_eq`/`__zag_key_hash`
+## helpers. Value keys (i32/u64/...) compare by value; `str` keys
+## compare by CONTENT (std.mem.eql + content FNV) — string-keyed maps
+## work, including equal strings in different buffers.
 ##
 ##   import std.collections.{HashMap}
 ##
@@ -49,7 +48,7 @@ impl HashMap<K, V> {
 
     pub fun get(self: *HashMap<K, V>, key: K) -> V {
         let idx: usize = self.probe(key);
-        if (!self.used[idx] || !(self.keys[idx] == key)) {
+        if (!self.used[idx] || !__zag_keys_eq(K, self.keys[idx], key)) {
             __zag_panic("std.collections.HashMap.get: key not found");
         }
         return self.values[idx];
@@ -57,7 +56,7 @@ impl HashMap<K, V> {
 
     pub fun contains(self: *HashMap<K, V>, key: K) -> bool {
         let idx: usize = self.probe(key);
-        return self.used[idx] && self.keys[idx] == key;
+        return self.used[idx] && __zag_keys_eq(K, self.keys[idx], key);
     }
 
     pub fun len(self: *HashMap<K, V>) -> usize {
@@ -77,7 +76,7 @@ impl HashMap<K, V> {
     fun probe(self: *HashMap<K, V>, key: K) -> usize {
         let mask: usize = self.cap - 1;
         var idx: usize = hash_key<K>(key) & mask;
-        while (self.used[idx] && !(self.keys[idx] == key)) {
+        while (self.used[idx] && !__zag_keys_eq(K, self.keys[idx], key)) {
             idx = (idx + 1) & mask;
         }
         return idx;
@@ -122,14 +121,8 @@ impl HashMap<K, V> {
 # param would be unused here (hash only touches K), and zig
 # rejects unused comptime params. Call sites turbofish the K.
 fun hash_key<K>(key: K) -> usize {
-    let kp: [*]const u8 = (&key) as [*]const u8;
-    var h: u64 = 2166136261;
-    var i: usize = 0;
-    while (i < size_of(K)) {
-        h = h ^ (kp[i] as u64);
-        h = h * 16777619;
-        h = h % 4294967296;
-        i = i + 1;
-    }
-    return h as usize;
+    # Preamble helper: CONTENT hashing for slice keys (str), byte
+    # hashing for value keys — the comptime K branch lives in pure
+    # zig where the dead branch is properly discarded.
+    return __zag_key_hash(K, key);
 }

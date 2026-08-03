@@ -1,0 +1,246 @@
+## std.strings.slices — borrowed-view string ops (lib/std/strings/).
+##
+## All functions take `str` ([]const u8) borrowed views && return
+## either borrowed sub-views (no allocation) || heap slices (caller
+## owns — `defer free(...)`). Content semantics throughout: `eq`,
+## `contains`, `starts_with`, `ends_with`, `index_of` compare bytes,
+## NOT slice descriptors.
+
+import std.collections.{ArrayList}
+
+
+## Content equality of two borrowed views (the missing `==` for
+## slices — zig's `==` compares the descriptor && is rejected for
+## []const u8 operands).
+pub fun eq(a: str, b: str) -> bool {
+    if (a.len != b.len) { return false; }
+    var i: usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fun contains(s: str, needle: str) -> bool {
+    return index_of(s, needle) != null;
+}
+
+pub fun starts_with(s: str, prefix: str) -> bool {
+    if (prefix.len > s.len) { return false; }
+    var i: usize = 0;
+    while (i < prefix.len) {
+        if (s[i] != prefix[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fun ends_with(s: str, suffix: str) -> bool {
+    if (suffix.len > s.len) { return false; }
+    var i: usize = 0;
+    while (i < suffix.len) {
+        if (s[s.len - suffix.len + i] != suffix[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+## First byte index of `needle` in `s`, || null.
+pub fun index_of(s: str, needle: str) -> ?usize {
+    if (needle.len == 0) { return 0; }
+    if (needle.len > s.len) { return null; }
+    var i: usize = 0;
+    while (i + needle.len <= s.len) {
+        if (s[i] == needle[0]) {
+            var j: usize = 1;
+            var matched: bool = true;
+            while (j < needle.len) {
+                if (s[i + j] != needle[j]) { matched = false; break; }
+                j = j + 1;
+            }
+            if (matched) { return i; }
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+## Split `s` on every occurrence of `sep` (empty `sep` splits into
+## single bytes). Returns a heap ArrayList of BORROWED views into
+## `s` — the caller owns the ArrayList (deinit) && must not use
+## the pieces after `s` dies.
+pub fun split(s: str, sep: str) -> ArrayList(str) {
+    var parts: ArrayList(str) = ArrayList(str).new();
+    if (sep.len == 0) {
+        var i: usize = 0;
+        while (i < s.len) {
+            parts.push(s[i .. i + 1]);
+            i = i + 1;
+        }
+        return parts;
+    }
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i + sep.len <= s.len) {
+        var j: usize = 0;
+        var matched: bool = true;
+        while (j < sep.len) {
+            if (s[i + j] != sep[j]) { matched = false; break; }
+            j = j + 1;
+        }
+        if (matched) {
+            parts.push(s[start..i]);
+            i = i + sep.len;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    parts.push(s[start..s.len]);
+    return parts;
+}
+
+## Join the pieces with `sep` between them. Heap result — caller frees.
+pub fun join(parts: ArrayList(str), sep: str) -> []u8 {
+    # The `parts` param is const — the ArrayList methods take
+    # `*self`, so iterate the raw fields instead (`parts.len` field,
+    # `parts.items[i]` element access — both const-safe).
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < parts.len) {
+        let piece: []const u8 = parts.items[i];
+        total = total + piece.len;
+        if (i + 1 < parts.len) { total = total + sep.len; }
+        i = i + 1;
+    }
+    let out: *raw u8 = __zag_page_alloc(total);
+    __zag_bench_alloc(total);
+    var pos: usize = 0;
+    var k: usize = 0;
+    while (k < parts.len) {
+        let piece: []const u8 = parts.items[k];
+        __zag_memcpy(out[pos .. pos + piece.len], piece[0..], piece.len);
+        pos = pos + piece.len;
+        if (k + 1 < parts.len) {
+            __zag_memcpy(out[pos .. pos + sep.len], sep[0..], sep.len);
+            pos = pos + sep.len;
+        }
+        k = k + 1;
+    }
+    return out[0..total];
+}
+
+## Replace every occurrence of `from` with `to`. Heap result.
+## Single-pass builder (no quadratic re-scan).
+pub fun replace(s: str, from: str, to: str) -> []u8 {
+    if (from.len == 0) {
+        let out: *raw u8 = __zag_page_alloc(s.len);
+        __zag_bench_alloc(s.len);
+        __zag_memcpy(out[0..s.len], s[0..], s.len);
+        return out[0..s.len];
+    }
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + from.len <= s.len) {
+        var j: usize = 0;
+        var matched: bool = true;
+        while (j < from.len) {
+            if (s[i + j] != from[j]) { matched = false; break; }
+            j = j + 1;
+        }
+        if (matched) { count = count + 1; i = i + from.len; } else { i = i + 1; }
+    }
+    let out_len: usize = (s.len + count * to.len) - count * from.len;
+    let out: *raw u8 = __zag_page_alloc(out_len);
+    __zag_bench_alloc(out_len);
+    var pos: usize = 0;
+    var k: usize = 0;
+    while (k < s.len) {
+        var j: usize = 0;
+        var matched: bool = true;
+        while (j < from.len && k + j < s.len) {
+            if (s[k + j] != from[j]) { matched = false; break; }
+            j = j + 1;
+        }
+        if (matched && k + from.len <= s.len) {
+            __zag_memcpy(out[pos .. pos + to.len], to[0..], to.len);
+            pos = pos + to.len;
+            k = k + from.len;
+        } else {
+            out[pos] = s[k];
+            pos = pos + 1;
+            k = k + 1;
+        }
+    }
+    return out[0..out_len];
+}
+
+## Borrowed view with leading/trailing ASCII whitespace removed.
+pub fun trim(s: str) -> []const u8 {
+    return trim_end(trim_start(s));
+}
+
+pub fun trim_start(s: str) -> []const u8 {
+    var lo: usize = 0;
+    while (lo < s.len) {
+        let c: u8 = s[lo];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { lo = lo + 1; } else { break; }
+    }
+    return s[lo..s.len];
+}
+
+pub fun trim_end(s: str) -> []const u8 {
+    var hi: usize = s.len;
+    while (hi > 0) {
+        let c: u8 = s[hi - 1];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { hi = hi - 1; } else { break; }
+    }
+    return s[0..hi];
+}
+
+## ASCII case conversion — heap copies, non-ASCII bytes untouched.
+pub fun to_upper(s: str) -> []u8 {
+    let out: *raw u8 = __zag_page_alloc(s.len);
+    __zag_bench_alloc(s.len);
+    var i: usize = 0;
+    while (i < s.len) {
+        let c: u8 = s[i];
+        if (c >= 'a' && c <= 'z') {
+            out[i] = c - ('a' - 'A');
+        } else {
+            out[i] = c;
+        }
+        i = i + 1;
+    }
+    return out[0..s.len];
+}
+
+pub fun to_lower(s: str) -> []u8 {
+    let out: *raw u8 = __zag_page_alloc(s.len);
+    __zag_bench_alloc(s.len);
+    var i: usize = 0;
+    while (i < s.len) {
+        let c: u8 = s[i];
+        if (c >= 'A' && c <= 'Z') {
+            out[i] = c + ('a' - 'A');
+        } else {
+            out[i] = c;
+        }
+        i = i + 1;
+    }
+    return out[0..s.len];
+}
+
+## `s` repeated `n` times. Heap result.
+pub fun repeat(s: str, n: usize) -> []u8 {
+    let out_len: usize = s.len * n;
+    let out: *raw u8 = __zag_page_alloc(out_len);
+    __zag_bench_alloc(out_len);
+    var i: usize = 0;
+    while (i < n) {
+        __zag_memcpy(out[i * s.len .. (i + 1) * s.len], s[0..], s.len);
+        i = i + 1;
+    }
+    return out[0..out_len];
+}

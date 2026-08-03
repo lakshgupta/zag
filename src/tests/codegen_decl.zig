@@ -1967,7 +1967,10 @@ test "codegen: non-trait cast `x as i32` preserves @as(T, x) emit unchanged" {
     // contains `@ptrCast(&path_z[0])` in its source-line reader.
     const cast_map_at = std.mem.indexOf(u8, zig, "__ZagMapEntry") orelse zig.len;
     try std.testing.expect(std.mem.indexOf(u8, zig[0..cast_map_at], "_VTable_for_") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig[0..cast_map_at], "@ptrCast(&") == null);
+    // Scoped to the USER code (`pub fn f` onwards): the preamble's
+    // __zag_key_hash helper legitimately contains @ptrCast(&key).
+    const user_at = std.mem.indexOf(u8, zig, "pub fn f") orelse 0;
+    try std.testing.expect(std.mem.indexOf(u8, zig[user_at..cast_map_at], "@ptrCast(&") == null);
 }
 
 test "codegen: pub import std.types.{String as MyStr} + std.fmt.{Display as MyDisp} emits aliases" {

@@ -1,0 +1,59 @@
+## std.math — scalar math helpers (generic where useful).
+##
+##   import std.math.{min, max, abs, clamp, is_pow2, next_pow2, gcd}
+##
+## Generic fns use the turbofish call-site form (docs/17 §1):
+##
+##   let lo: i32 = min<i32>(3, 5);
+##   let hi: f64 = max<f64>(1.5, 2.5);
+
+pub fun min<T>(a: T, b: T) -> T {
+    if (a < b) { return a; }
+    return b;
+}
+
+pub fun max<T>(a: T, b: T) -> T {
+    if (a > b) { return a; }
+    return b;
+}
+
+pub fun abs<T>(v: T) -> T {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+## Clamp `v` into [lo, hi]. `lo` must be <= `hi` — unclamped
+## behavior is undefined if not.
+pub fun clamp<T>(v: T, lo: T, hi: T) -> T {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+## True when `v` is a power of two (v >= 1 and v & (v - 1) == 0).
+pub fun is_pow2<T>(v: T) -> bool {
+    if (v == 0) { return false; }
+    return (v & (v - 1)) == 0;
+}
+
+## Smallest power of two >= `v`. `v` must be >= 1; 0 returns 1.
+pub fun next_pow2<T>(v: T) -> T {
+    if (v == 0) { return 1; }
+    var out: T = 1;
+    while (out < v) {
+        out = out * 2;
+    }
+    return out;
+}
+
+## Greatest common divisor (Euclidean algorithm).
+pub fun gcd<T>(a: T, b: T) -> T {
+    var x: T = a;
+    var y: T = b;
+    while (y != 0) {
+        let t: T = x % y;
+        x = y;
+        y = t;
+    }
+    return x;
+}

@@ -1,0 +1,21 @@
+## std.strings — DIRECTORY module (lib/std/strings/).
+##
+## Borrowed-view string operations over `str` ([]const u8) — the
+## Go-`strings`-package equivalent. Everything operates on borrowed
+## views; heap-returning functions (join, replace, to_upper, ...)
+## allocate fresh slices the caller owns and must `free`.
+##
+##   lib/std/strings/
+##     mod.zag   ← this barrel
+##     slices.zag ← the ops
+##
+##   import std.strings.{split, join, contains, trim, ...}
+##
+##   let parts: ArrayList([]const u8) = split("a,b,c", ",");
+##   defer free(parts.items[0..parts.len()]);   # the pieces borrow the input
+##   parts.deinit();
+##
+## The pieces returned by `split` are BORROWED views into the input
+## slice — they stay valid as long as the input does.
+
+pub import std.strings.slices.{split, join, replace, index_of, contains, starts_with, ends_with, eq, trim, trim_start, trim_end, to_upper, to_lower, repeat}

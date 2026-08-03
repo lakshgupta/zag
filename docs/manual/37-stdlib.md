@@ -35,18 +35,19 @@ surface of the modules below.
 ## Directory modules
 
 Stdlib modules are identified by their DIRECTORY when a module grows
-multiple types: `std.collections` resolves to `lib/std/collections/`
-and `std.types` to `lib/std/types/`, with one file per type
-(`array_list.zag`, `hash_map.zag`, `string.zag`) and a `mod.zag`
-barrel chaining the re-exports. The per-type files register as
-nested modules (`std.collections.array_list`,
-`std.types.string`) and are importable directly or through the
-barrel:
+multiple types: `std.collections` resolves to `lib/std/collections/`,
+`std.types` to `lib/std/types/`, and `std.strings` to
+`lib/std/strings/`, with one file per type (`array_list.zag`,
+`hash_map.zag`, `string.zag`, `slices.zag`) and a `mod.zag` barrel
+chaining the re-exports. The per-type files register as nested
+modules (`std.collections.array_list`, `std.types.string`) and are
+importable directly or through the barrel:
 
 ```zag
 import std.collections.{ArrayList}        # barrel → array_list.zag
 import std.collections.hash_map.{HashMap} # direct nested import
 import std.types.{String}                 # barrel → types/string.zag
+import std.strings.{split, join}          # barrel → strings/slices.zag
 ```
 
 Materialization mirrors the tree (`build/gen/std/collections/*.zig`);
@@ -56,7 +57,18 @@ backs `std.async.stream` / `std.arch.x86.avx2` / `std.concurrent.*`.
 ## Generic containers
 
 `std.collections` is built on generic *structs* (docs/17 §Generic
-Types): `struct ArrayList<T>` thunks to `fn ArrayList(comptime T:
+Types). HashMap keys hash and compare via the preamble
+`__zag_key_hash` / `__zag_keys_eq` helpers — `str` keys get CONTENT
+semantics (std.mem.eql + content FNV), so string-keyed maps work
+including equal strings in different buffers:
+
+```zag
+var m: HashMap(str, i32) = HashMap(str, i32).new();
+m.put("alpha", 1);
+m.get("alpha");   # 1
+```
+
+The container structs thunk to `fn ArrayList(comptime T:
 type) type`, impl methods become orphan free fns
 (`ArrayList_T_push(comptime T, self: *ArrayList(T), value: T)`), and
 call sites dispatch automatically — `list.push(5)` rewrites to

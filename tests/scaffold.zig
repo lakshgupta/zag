@@ -78,9 +78,9 @@ fn parseStub(_name: []const u8, src: []const u8) !ast.Program {
 // trait/fun decls. The barrel imports track the canonical surface
 // listed in docs/manual/22-modules.md "Adding a new std module".
 // ---------------------------------------------------------------
-test "scaffold: std.mod parses with 23 selective-import decls" {
+test "scaffold: std.mod parses with 26 selective-import decls" {
     const prog = try parseStub("std.mod", build_options.stub_mod);
-    try std.testing.expectEqual(@as(usize, 23), prog.imports.len);
+    try std.testing.expectEqual(@as(usize, 26), prog.imports.len);
     // Each line is `pub import std.X.{A, B, …}` so is_pub=true on
     // every entry and selectors.len >= 2.
     const expected_paths = [_][]const u8{
@@ -101,6 +101,9 @@ test "scaffold: std.mod parses with 23 selective-import decls" {
         "std.process",
         "std.mem",
         "std.collections",
+        "std.strings",
+        "std.io",
+        "std.math",
         "std.fmt",
         "std.sort",
         "std.encoding",

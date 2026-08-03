@@ -1,0 +1,58 @@
+## stdlib/strings_io_math.zag — the strings/io/math batch.
+##
+##   import std.strings.{split, join, replace, contains, index_of, trim, eq, to_upper, repeat}
+##   import std.io.{read_line, write_all}
+##   import std.math.{min, max, abs, clamp, is_pow2, next_pow2, gcd}
+##
+## std.strings is a DIRECTORY module (lib/std/strings/) — borrowed-
+## view ops over `str`; heap-returning functions (join, replace,
+## to_upper, repeat) allocate slices the caller frees. std.math is
+## generic (turbofish call sites). std.io reads/writes raw fds.
+##
+##   import std.collections.{ArrayList}
+##
+##   let parts: ArrayList(str) = split("a,b,c", ",");   # borrowed views
+##   parts.deinit();
+##
+## String-keyed HashMaps (std.collections) work since the
+## hash_map batch: content equality + content hashing.
+
+import std.strings.{split, join, replace, contains, index_of, trim, eq, to_upper, repeat}
+import std.io.{read_line, write_all}
+import std.math.{min, max, abs, clamp, is_pow2, next_pow2, gcd}
+import std.collections.{ArrayList, HashMap}
+
+fun main() {
+    var parts: ArrayList(str) = split("a,b,c,,d", ",");
+    print("parts len {parts.len()}\n");
+    let j: []u8 = join(parts, "-");
+    defer free(j);
+    print("join {j}\n");
+    parts.deinit();
+
+    let r: []u8 = replace("hello hello world", "hello", "hi");
+    defer free(r);
+    print("replace {r}\n");
+
+    let c1: bool = contains("hello", "ell");
+    let t1: str = trim("  x y  ");
+    let e1: bool = eq("ab", "ab");
+    print("contains {c1} trim [{t1}] eq {e1}\n");
+
+    print("min {min<i32>(3, 5)} abs {abs<i32>(-7)} clamp {clamp<i32>(9, 0, 5)}\n");
+    print("next_pow2 {next_pow2<u64>(1000)} gcd {gcd<u64>(48, 18)}\n");
+
+    var m: HashMap(str, i32) = HashMap(str, i32).new();
+    m.put("alpha", 1);
+    m.put("beta", 2);
+    let b: i32 = m.get("beta");
+    let ha: bool = m.contains("alpha");
+    print("str-keyed map: beta {b} has alpha {ha}\n");
+    m.deinit();
+
+    var line_buf: [256]u8 = undefined;
+    let ln: ?usize = read_line(0, line_buf[0..]);
+    if let l = ln {
+        write_all(1, line_buf[0..l]);
+    }
+}
