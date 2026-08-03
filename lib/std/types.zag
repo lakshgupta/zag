@@ -97,4 +97,137 @@ impl String {
         self.ptr[pos] = ch;
         self.len = needed;
     }
+
+    # Copy constructor — heap-allocates a fresh buffer holding the
+    # caller's bytes (independent of the source's lifetime).
+    pub fun from_str(s: []const u8) -> String {
+        var out: String = String.with_capacity(s.len);
+        out.push_str(s);
+        return out;
+    }
+
+    # Content equality with a borrowed view (`str`). Note: zig's `==`
+    # on slices compares the slice DESCRIPTOR (ptr+len), so this is
+    # the method to use for value comparison.
+    pub fun eq(self: *const String, other: []const u8) -> bool {
+        let a: []const u8 = self.as_str();
+        if (a.len != other.len) { return false; }
+        var i: usize = 0;
+        while (i < a.len) {
+            if (a[i] != other[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    pub fun contains(self: *const String, needle: []const u8) -> bool {
+        let a: []const u8 = self.as_str();
+        if (needle.len == 0) { return true; }
+        if (needle.len > a.len) { return false; }
+        var i: usize = 0;
+        while (i + needle.len <= a.len) {
+            if (a[i] == needle[0]) {
+                var j: usize = 1;
+                var matched: bool = true;
+                while (j < needle.len) {
+                    if (a[i + j] != needle[j]) { matched = false; break; }
+                    j = j + 1;
+                }
+                if (matched) { return true; }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    pub fun starts_with(self: *const String, prefix: []const u8) -> bool {
+        let a: []const u8 = self.as_str();
+        if (prefix.len > a.len) { return false; }
+        var i: usize = 0;
+        while (i < prefix.len) {
+            if (a[i] != prefix[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    pub fun ends_with(self: *const String, suffix: []const u8) -> bool {
+        let a: []const u8 = self.as_str();
+        if (suffix.len > a.len) { return false; }
+        var i: usize = 0;
+        while (i < suffix.len) {
+            if (a[a.len - suffix.len + i] != suffix[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    # First occurrence of `needle` (byte index), or null.
+    pub fun find(self: *const String, needle: []const u8) -> ?usize {
+        let a: []const u8 = self.as_str();
+        if (needle.len == 0) { return 0; }
+        if (needle.len > a.len) { return null; }
+        var i: usize = 0;
+        while (i + needle.len <= a.len) {
+            if (a[i] == needle[0]) {
+                var j: usize = 1;
+                var matched: bool = true;
+                while (j < needle.len) {
+                    if (a[i + j] != needle[j]) { matched = false; break; }
+                    j = j + 1;
+                }
+                if (matched) { return i; }
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    # Borrowed view of the [start, end) byte range (bounds-checked).
+    pub fun slice(self: *const String, start: usize, end: usize) -> []const u8 {
+        if (start > end || end > self.len) {
+            __zag_panic("String.slice: index out of bounds");
+        }
+        let a: []const u8 = self.as_str();
+        return a[start..end];
+    }
+
+    # Borrowed view with leading/trailing ASCII whitespace removed.
+    pub fun trim(self: *const String) -> []const u8 {
+        let a: []const u8 = self.as_str();
+        var lo: usize = 0;
+        var hi: usize = a.len;
+        while (lo < hi) {
+            let c: u8 = a[lo];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { lo = lo + 1; } else { break; }
+        }
+        while (hi > lo) {
+            let c: u8 = a[hi - 1];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { hi = hi - 1; } else { break; }
+        }
+        return a[lo..hi];
+    }
+
+    # In-place ASCII case conversion (non-ASCII bytes untouched).
+    pub fun to_upper(self: *String) {
+        var i: usize = 0;
+        while (i < self.len) {
+            let c: u8 = self.ptr[i];
+            if (c >= 'a' && c <= 'z') {
+                self.ptr[i] = c - ('a' - 'A');
+            }
+            i = i + 1;
+        }
+    }
+
+    pub fun to_lower(self: *String) {
+        var i: usize = 0;
+        while (i < self.len) {
+            let c: u8 = self.ptr[i];
+            if (c >= 'A' && c <= 'Z') {
+                self.ptr[i] = c + ('a' - 'A');
+            }
+            i = i + 1;
+        }
+    }
 }

@@ -58,3 +58,95 @@ pub enum FmtError {
     Overflow,
     Invalid,
 }
+
+## Number formatting + parsing (strconv-style free fns).
+##
+##   import std.fmt.{format_u64, format_i64, parse_u64, parse_i64}
+##
+##   let s: []u8 = format_u64(255, 16);    # "ff" — heap slice, caller frees
+##   let n: ?u64 = parse_u64("1234");      # Some(1234), null on invalid
+##
+## The formatters return heap-allocated slices (caller owns them —
+## `defer free(s)`), matching std.encoding's convention and bench
+## accounting. Parsers return Option — null on empty/invalid input
+## and on i64/u64 overflow (checked before the multiply, so no
+## panic).
+
+pub fun format_u64(value: u64, base: u32) -> []u8 {
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    var v: u64 = value;
+    if (v == 0) {
+        buf[0] = '0';
+        n = 1;
+    } else {
+        while (v > 0) {
+            let d: u64 = v % (base as u64);
+            v = v / (base as u64);
+            if (d < 10) {
+                buf[n] = (d as u8) + '0';
+            } else {
+                buf[n] = ((d - 10) as u8) + 'a';
+            }
+            n = n + 1;
+        }
+    }
+    var i: usize = 0;
+    while (i < n / 2) {
+        let t: u8 = buf[i];
+        buf[i] = buf[n - 1 - i];
+        buf[n - 1 - i] = t;
+        i = i + 1;
+    }
+    let out: *raw u8 = __zag_page_alloc(n);
+    __zag_bench_alloc(n);
+    __zag_memcpy(out[0..n], buf[0..n], n);
+    return out[0..n];
+}
+
+pub fun format_i64(value: i64, base: u32) -> []u8 {
+    if (value < 0) {
+        let mag: u64 = (0 - value) as u64;
+        let digits: []u8 = format_u64(mag, base);
+        let out: *raw u8 = __zag_page_alloc(digits.len + 1);
+        __zag_bench_alloc(digits.len + 1);
+        out[0] = '-';
+        __zag_memcpy(out[1 .. digits.len + 1], digits[0..], digits.len);
+        free(digits);
+        return out[0 .. digits.len + 1];
+    }
+    return format_u64(value as u64, base);
+}
+
+pub fun parse_u64(s: []const u8) -> ?u64 {
+    if (s.len == 0) { return null; }
+    var result: u64 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        let c: u8 = s[i];
+        if (c < '0' || c > '9') { return null; }
+        if (result > 1844674407370955161) { return null; }
+        result = result * 10 + ((c - '0') as u64);
+        i = i + 1;
+    }
+    return result;
+}
+
+pub fun parse_i64(s: []const u8) -> ?i64 {
+    if (s.len == 0) { return null; }
+    var neg: bool = false;
+    var i: usize = 0;
+    if (s[0] == '-') { neg = true; i = 1; }
+    if (s[0] == '+') { i = 1; }
+    if (i >= s.len) { return null; }
+    var result: i64 = 0;
+    while (i < s.len) {
+        let c: u8 = s[i];
+        if (c < '0' || c > '9') { return null; }
+        if (result > 922337203685477580) { return null; }
+        result = result * 10 + ((c - '0') as i64);
+        i = i + 1;
+    }
+    if (neg) { return 0 - result; }
+    return result;
+}
