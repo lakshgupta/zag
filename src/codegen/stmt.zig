@@ -275,6 +275,22 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             if (binds.len > 0 and binds[0] != null) {
                                 if (self.variantSlotType(ev.variant_name, 0, "")) |pt| {
                                     self.seedCaptureType(binds[0].?, pt);
+                                } else if (ifs.cond.payload == .ident) {
+                                    // Preamble Result/Option capture
+                                    // (`if let Ok(v) = parsed` where
+                                    // parsed: Result(Json, str)): the
+                                    // variant isn't in prog.enums, so
+                                    // variantSlotType misses — resolve
+                                    // the payload from the scrutinee's
+                                    // tracked generic args so union
+                                    // member calls on the capture
+                                    // (`v.get("name")` on the Json
+                                    // payload) dispatch.
+                                    if (self.getSourceTypeName(ifs.cond.payload.ident)) |tn| {
+                                        if (preambleVariantPayloadType(tn, ev.variant_name)) |pt| {
+                                            self.seedCaptureType(binds[0].?, pt);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1165,6 +1181,59 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         return null;
     }
 
+    /// Preamble Result/Option payload-type resolution for if-let /
+    /// match captures (`Ok(v)`, `Err(e)`, `Some(x)`, `None`). The
+    /// preamble unions (the generate() preamble in core.zig) are
+    /// emitted as zig types, NOT prog.enums decls, so `variantSlotType`
+    /// misses them. Derive the payload from the SCRUTINEE's tracked
+    /// generic type instead: `parsed: Result(Json, str)` → Ok→Json /
+    /// Err→str; `opt: Option(u32)` → Some→u32. Returns null when the
+    /// scrutinee isn't a Result/Option annotation (callers fall back
+    /// to no-seed and the capture stays untyped — union member-call
+    /// dispatch then falls through to verbatim, mirroring the
+    /// pre-dispatch surface).
+    pub     fn preambleVariantPayloadType(scrut_type: []const u8, variant_name: []const u8) ?[]const u8 {
+        // Accept BOTH generic spellings — paren `Result(Json, str)` and
+        // turbofish `Result<Json, str>`: getSourceTypeName returns the
+        // VERBATIM source annotation, which may be either form (the
+        // codegen-side turbofish normalization only applies to emitted
+        // zig text, not tracked type names). The open delimiter is
+        // whichever of `(` / `<` appears first; the matching close is
+        // the LAST delimiter of the same kind, so nested same-kind
+        // generic args (`Result(ArrayList(Json), str)`) keep the outer
+        // args intact and comma-splitting sees only the top level.
+        const paren_open = std.mem.indexOfScalar(u8, scrut_type, '(');
+        const angle_open = std.mem.indexOfScalar(u8, scrut_type, '<');
+        const open: ?usize = if (paren_open) |po|
+            if (angle_open) |ao| (if (po < ao) po else ao) else po
+        else
+            angle_open;
+        if (open == null or open.? == 0) return null;
+        const paren_form = paren_open != null and (angle_open == null or paren_open.? <= angle_open.?);
+        const close: ?usize = if (paren_form)
+            std.mem.lastIndexOfScalar(u8, scrut_type, ')')
+        else
+            std.mem.lastIndexOfScalar(u8, scrut_type, '>');
+        if (close == null or close.? < open.?) return null;
+        const base = std.mem.trim(u8, scrut_type[0..open.?], " \t");
+        const inner = std.mem.trim(u8, scrut_type[open.? + 1 .. close.?], " \t");
+        const comma = std.mem.indexOfScalar(u8, inner, ',');
+        const first_arg = if (comma) |cm| std.mem.trim(u8, inner[0..cm], " \t") else inner;
+        if (std.mem.eql(u8, base, "Result")) {
+            if (std.mem.eql(u8, variant_name, "Ok")) return first_arg;
+            if (std.mem.eql(u8, variant_name, "Err")) {
+                if (comma == null) return null;
+                return std.mem.trim(u8, inner[comma.? + 1 ..], " \t");
+            }
+            return null;
+        }
+        if (std.mem.eql(u8, base, "Option")) {
+            if (std.mem.eql(u8, variant_name, "Some") or std.mem.eql(u8, variant_name, "None")) return first_arg;
+            return null;
+        }
+        return null;
+    }
+
     /// Seed a match/if-let capture binding's resolved payload type into
     /// type_info_buf so the generic-instance method dispatch
     /// (`.method_call` ident path via getSourceTypeName) can rewrite
@@ -1328,6 +1397,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             // `Json.Array(items)` capture).
                             if (self.variantSlotType(ev.variant_name, i, "")) |pt| {
                                 self.seedCaptureType(name, pt);
+                            } else if (self.getSourceTypeName(scrut_name)) |tn| {
+                                // Preamble Result/Option arm capture
+                                // (`match parsed { Ok(v) => ... }`):
+                                // variant not in prog.enums — resolve
+                                // the payload from the scrutinee's
+                                // tracked generic args.
+                                if (preambleVariantPayloadType(tn, ev.variant_name)) |pt| {
+                                    self.seedCaptureType(name, pt);
+                                }
                             }
                         }
                     }

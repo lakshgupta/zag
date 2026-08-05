@@ -203,13 +203,36 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                                 self.writeType(ga);
                             }
                             if (gi.args.len > 0) self.write(", ");
-                            if (!gi.is_pointer) self.write("&");
-                            self.write(recv);
+                            // `&<recv>` wrapped in @constCast: a const
+                            // capture (zig optional-capture `|v|`) would
+                            // otherwise produce `*const T`, rejected as
+                            // const-discard by the `*T` orphan receiver.
+                            // No-op on mutable bindings.
+                            if (!gi.is_pointer) {
+                                self.write("@constCast(&");
+                                self.write(recv);
+                                self.write(")");
+                            } else {
+                                self.write(recv);
+                            }
                             for (c.args) |a| {
                                 self.write(", ");
                                 self.genExpr(a);
                             }
                             self.write(")");
+                            dispatched = true;
+                        }
+                    }
+                    if (!dispatched) {
+                        // Union orphan-method dispatch for dotted callees
+                        // (`print("{ClickEvent.is_action(hover)}")` — the
+                        // template-literal placeholder parser token-scans
+                        // dotted calls into `.call` with name
+                        // "ClickEvent.is_action", not `.method_call`).
+                        // Same rewrite as the `.method_call` arm below:
+                        // union impl methods flatten to module-scope free
+                        // fns `<Union>_<Method>`.
+                        if (self.tryEmitUnionOrphanCall(recv, meth, c.args)) {
                             dispatched = true;
                         }
                     }
@@ -1248,8 +1271,19 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                                 self.writeType(ga);
                             }
                             if (gi.args.len > 0) self.write(", ");
-                            if (!gi.is_pointer) self.write("&");
-                            self.genExpr(mc.target.*);
+                            // `&<receiver>` wrapped in @constCast: a
+                            // const capture (zig optional-capture `|v|`)
+                            // would otherwise produce `*const T`,
+                            // rejected as const-discard by the `*T`
+                            // orphan receiver. No-op on mutable
+                            // bindings.
+                            if (!gi.is_pointer) {
+                                self.write("@constCast(&");
+                                self.genExpr(mc.target.*);
+                                self.write(")");
+                            } else {
+                                self.genExpr(mc.target.*);
+                            }
                             for (mc.args) |a| {
                                 self.write(", ");
                                 self.genExpr(a);
@@ -1295,8 +1329,18 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                                             self.writeType(ga);
                                         }
                                         if (gi.args.len > 0) self.write(", ");
-                                        if (!field_is_pointer) self.write("&");
-                                        self.genExpr(mc.target.*);
+                                        // `&<receiver>` wrapped in
+                                        // @constCast (same rationale as
+                                        // the ident-receiver dispatch
+                                        // above — const captures reject
+                                        // bare `&` as const-discard).
+                                        if (!field_is_pointer) {
+                                            self.write("@constCast(&");
+                                            self.genExpr(mc.target.*);
+                                            self.write(")");
+                                        } else {
+                                            self.genExpr(mc.target.*);
+                                        }
                                         for (mc.args) |a| {
                                             self.write(", ");
                                             self.genExpr(a);
@@ -1345,6 +1389,22 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             self.genExpr(a);
                         }
                         self.write(")");
+                        return;
+                    }
+                }
+                // Union orphan-method dispatch — `hover.is_action()`
+                // (member form) and `ClickEvent.is_action(hover)`
+                // (qualified static form). Union impl methods flatten to
+                // module-scope free fns `<Union>_<Method>` (genFreeMethod
+                // — zig 0.16 rejects methods nested inside `union(enum)`),
+                // so neither shape can stay verbatim. The shared rewrite
+                // resolves the union name from the receiver, confirms the
+                // method exists, and emits the orphan call with `&` on the
+                // receiver when the impl takes a pointer and the binding
+                // is a value. Trait-turbofish call sites (mc.type_args)
+                // skip the rewrite — the trait dispatch path handles them.
+                if (mc.target.payload == .ident and mc.type_args.len == 0) {
+                    if (self.tryEmitUnionOrphanCall(mc.target.payload.ident, mc.name, mc.args)) {
                         return;
                     }
                 }
