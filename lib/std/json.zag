@@ -1,0 +1,274 @@
+## std.json — JSON parsing + stringify (v1 subset).
+##
+##   import std.json.{Json, parse, stringify, JsonPair}
+##
+##   let v: Result(Json, str) = parse("{\"a\": [1, 2, 3]}");
+##   if let Ok(jv) = v {
+##       let out: String = stringify(jv);
+##       print("{out.as_str()}\n");
+##   }
+##
+## Model: `Json` is a tagged union. Strings are OWNED (`String`),
+## objects are an ArrayList of key-value pairs (linear-scan lookup —
+## content equality via String.eq). Numbers are f64. The parsed tree
+## is process-exit reclaimed (String/ArrayList lifecycle) — call
+## deinit on the containers for long-lived programs.
+##
+## Errors are str messages via Result(Json, str); the `?` operator
+## propagates them.
+
+import std.types.{String}
+import std.collections.{ArrayList}
+
+pub struct JsonPair {
+    key: String,
+    value: Json,
+}
+
+pub union Json {
+    Null,
+    Bool(bool),
+    Number(f64),
+    Str(String),
+    Array(ArrayList(Json)),
+    Object(ArrayList(JsonPair)),
+}
+
+impl Json {
+    # Linear-scan object lookup by content-equal key. Returns the
+    # value, || null when the Json isn't an object || the key is
+    # absent.
+    pub fun get(self: *Json, key: str) -> ?Json {
+        if let Json.Object(pairs) = self {
+            var i: usize = 0;
+            while (i < pairs.len) {
+                let pair: JsonPair = pairs.get(i);
+                if (pair.key.eq(key)) { return pair.value; }
+                i = i + 1;
+            }
+        }
+        return null;
+    }
+}
+
+struct ParserState {
+    s: str,
+    pos: usize,
+}
+
+impl ParserState {
+    fun eof(self: *ParserState) -> bool {
+        return self.pos >= self.s.len;
+    }
+
+    fun peek(self: *ParserState) -> u8 {
+        return self.s[self.pos];
+    }
+
+    fun skip_ws(self: *ParserState) {
+        while (!self.eof()) {
+            let c: u8 = self.peek();
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                self.pos = self.pos + 1;
+            } else { break; }
+        }
+    }
+
+    fun parse_value(self: *ParserState) -> Result(Json, str) {
+        self.skip_ws();
+        if (self.eof()) { return Err("json: unexpected end of input"); }
+        let c: u8 = self.peek();
+        if (c == '{') { return self.parse_object(); }
+        if (c == '[') { return self.parse_array(); }
+        if (c == '"') { return self.parse_string(); }
+        if (c == 't' || c == 'f') { return self.parse_bool(); }
+        if (c == 'n') { return self.parse_null(); }
+        if (c == '-' || (c >= '0' && c <= '9')) { return self.parse_number(); }
+        return Err("json: unexpected character");
+    }
+
+    fun parse_null(self: *ParserState) -> Result(Json, str) {
+        if (self.s.len - self.pos >= 4 && self.s[self.pos..self.pos + 4] == "null") {
+            self.pos = self.pos + 4;
+            return Ok(Json.Null);
+        }
+        return Err("json: invalid null");
+    }
+
+    fun parse_bool(self: *ParserState) -> Result(Json, str) {
+        if (self.s.len - self.pos >= 4 && self.s[self.pos..self.pos + 4] == "true") {
+            self.pos = self.pos + 4;
+            return Ok(Json.Bool(true));
+        }
+        if (self.s.len - self.pos >= 5 && self.s[self.pos..self.pos + 5] == "false") {
+            self.pos = self.pos + 5;
+            return Ok(Json.Bool(false));
+        }
+        return Err("json: invalid bool");
+    }
+
+    fun parse_number(self: *ParserState) -> Result(Json, str) {
+        let start: usize = self.pos;
+        while (!self.eof()) {
+            let c: u8 = self.peek();
+            if (c >= '0' && c <= '9' || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+                self.pos = self.pos + 1;
+            } else { break; }
+        }
+        if (self.pos == start) { return Err("json: invalid number"); }
+        let span: str = self.s[start..self.pos];
+        let f: f64 = __zag_atof(span);
+        return Ok(Json.Number(f));
+    }
+
+    fun parse_string(self: *ParserState) -> Result(Json, str) {
+        self.pos = self.pos + 1;
+        var out: String = String.with_capacity(16);
+        while (true) {
+            if (self.eof()) { return Err("json: unterminated string"); }
+            let c: u8 = self.peek();
+            if (c == '"') {
+                self.pos = self.pos + 1;
+                return Ok(Json.Str(out));
+            }
+            if (c == '\\') {
+                self.pos = self.pos + 1;
+                if (self.eof()) { return Err("json: unterminated escape"); }
+                let e: u8 = self.peek();
+                self.pos = self.pos + 1;
+                if (e == 'n') { out.push_ch('\n'); } else if (e == 't') { out.push_ch('\t'); } else if (e == 'r') { out.push_ch('\r'); } else if (e == '"') { out.push_ch('"'); } else if (e == '\\') { out.push_ch('\\'); } else if (e == '/') { out.push_ch('/'); } else { return Err("json: invalid escape"); }
+            } else {
+                out.push_ch(c);
+                self.pos = self.pos + 1;
+            }
+        }
+    }
+
+    fun parse_array(self: *ParserState) -> Result(Json, str) {
+        self.pos = self.pos + 1;
+        var items: ArrayList(Json) = ArrayList(Json).new();
+        self.skip_ws();
+        if (!self.eof() && self.peek() == ']') {
+            self.pos = self.pos + 1;
+            return Ok(Json.Array(items));
+        }
+        while (true) {
+            let v: Result(Json, str) = self.parse_value();
+            if let Err(e) = v { return Err(e); }
+            if let Ok(jv) = v {
+                items.push(jv);
+            }
+            self.skip_ws();
+            if (self.eof()) { return Err("json: unterminated array"); }
+            let c: u8 = self.peek();
+            if (c == ',') { self.pos = self.pos + 1; continue; }
+            if (c == ']') { self.pos = self.pos + 1; return Ok(Json.Array(items)); }
+            return Err("json: expected , || ] in array");
+        }
+    }
+
+    fun parse_object(self: *ParserState) -> Result(Json, str) {
+        self.pos = self.pos + 1;
+        var pairs: ArrayList(JsonPair) = ArrayList(JsonPair).new();
+        self.skip_ws();
+        if (!self.eof() && self.peek() == '}') {
+            self.pos = self.pos + 1;
+            return Ok(Json.Object(pairs));
+        }
+        while (true) {
+            self.skip_ws();
+            if (self.eof() || self.peek() != '"') { return Err("json: expected string key"); }
+            let kv: Result(Json, str) = self.parse_string();
+            if let Err(e) = kv { return Err(e); }
+            if let Ok(kj) = kv {
+                var key_str: String = undefined;
+                if let Json.Str(sv) = kj {
+                    key_str = sv;
+                } else {
+                    return Err("json: bad key");
+                }
+                self.skip_ws();
+                if (self.eof() || self.peek() != ':') { return Err("json: expected : after key"); }
+                self.pos = self.pos + 1;
+                let vv: Result(Json, str) = self.parse_value();
+                if let Err(e) = vv { return Err(e); }
+                if let Ok(jv) = vv {
+                    pairs.push(JsonPair { key: key_str, value: jv });
+                }
+            }
+            self.skip_ws();
+            if (self.eof()) { return Err("json: unterminated object"); }
+            let c: u8 = self.peek();
+            if (c == ',') { self.pos = self.pos + 1; continue; }
+            if (c == '}') { self.pos = self.pos + 1; return Ok(Json.Object(pairs)); }
+            return Err("json: expected , || } in object");
+        }
+    }
+}
+
+## Parse a JSON document. `Result(Json, str)` — Err carries a
+## message; Ok carries the owned tree.
+pub fun parse(s: str) -> Result(Json, str) {
+    var p: ParserState = ParserState { s: s, pos: 0 };
+    return p.parse_value();
+}
+
+## Stringify a Json value into an owned String.
+pub fun stringify(v: Json) -> String {
+    var out: String = String.with_capacity(64);
+    stringify_into(&out, v);
+    return out;
+}
+
+fun stringify_into(out: *String, v: Json) {
+    match v {
+        Json.Null => {
+            out.push_str("null");
+        },
+        Json.Bool(b) => {
+            if (b) { out.push_str("true"); } else { out.push_str("false"); }
+        },
+        Json.Number(f) => {
+            var buf: [64]u8 = undefined;
+            let n: usize = __zag_ftoa(f, buf[0..]);
+            out.push_str(buf[0..n]);
+        },
+        Json.Str(s) => {
+            out.push_ch('"');
+            let raw: []const u8 = s.as_str();
+            var i: usize = 0;
+            while (i < raw.len) {
+                let c: u8 = raw[i];
+                if (c == '"') { out.push_ch(34); } else if (c == 92) { out.push_ch(92); } else if (c == '\n') { out.push_str("\\n"); } else if (c == '\t') { out.push_str("\\t"); } else if (c == '\r') { out.push_str("\\r"); } else { out.push_ch(c); }
+                i = i + 1;
+            }
+            out.push_ch('"');
+        },
+        Json.Array(items) => {
+            out.push_ch('[');
+            var i: usize = 0;
+            while (i < items.len) {
+                if (i > 0) { out.push_str(", "); }
+                let item: Json = items.get(i);
+                stringify_into(out, item);
+                i = i + 1;
+            }
+            out.push_ch(']');
+        },
+        Json.Object(pairs) => {
+            out.push_ch('{');
+            var i: usize = 0;
+            while (i < pairs.len) {
+                if (i > 0) { out.push_str(", "); }
+                let pair: JsonPair = pairs.get(i);
+                let key_raw: []const u8 = pair.key.as_str();
+                out.push_ch('"');
+                out.push_str(key_raw);
+                out.push_str("\": ");
+                stringify_into(out, pair.value);
+                i = i + 1;
+            }
+            out.push_ch('}');
+        },
+    }
+}

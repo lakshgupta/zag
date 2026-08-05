@@ -1,0 +1,16 @@
+## std.async — DIRECTORY module (lib/std/async/).
+##
+##   lib/std/async/
+##     mod.zag    ← this barrel
+##     loop.zag   ← EventLoop (timers, poll, run_for, sleep)
+##     stream.zag ← AsyncStream trait
+##
+##   import std.async.{EventLoop, sleep}
+##
+## Timer-driven event loop: futures complete when the loop's poll
+## fires their deadline; wait()/run_for() advance the loop with
+## nanosleep (no busy-wait). `sleep` is the async-compatible blocking
+## sleep for the v1 eager-drive model (time.after busy-waits; this
+## does not).
+
+pub import std.async.loop.{EventLoop, sleep, now_ms}

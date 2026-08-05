@@ -65,6 +65,7 @@ pub import std.process.{exec}
 pub import std.process.{exit}
 pub import std.mem.{alloc}
 pub import std.collections.{ArrayList, HashMap}
+pub import std.async.{EventLoop, sleep, now_ms}
 pub import std.strings.{split, join, replace, index_of, contains, starts_with, ends_with, eq, trim, trim_start, trim_end, to_upper, to_lower, repeat}
 pub import std.io.{read_line, read_all, write_all}
 pub import std.math.{min, max, abs, clamp, is_pow2, next_pow2, gcd}
@@ -74,3 +75,4 @@ pub import std.encoding.{base64_encode, base64_decode, hex_encode, hex_decode, u
 pub import std.hash.{fnv1a32, fnv1a64, crc32, sha256}
 pub import std.random.{XorShift64Star}
 pub import std.debug.{panic}
+pub import std.json.{Json, JsonPair, parse, stringify}
