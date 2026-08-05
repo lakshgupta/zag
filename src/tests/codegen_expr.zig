@@ -383,6 +383,204 @@ test "codegen: method_call emits target.name(args) verbatim" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const len: f64 = v.length();") != null);
 }
 
+test "codegen: member call on union value dispatches to orphan free fn" {
+    // `hover.is_action()` — union impl methods flatten to module-scope
+    // free fns (`ClickEvent_is_action`) because zig 0.16 rejects
+    // methods nested inside `union(enum)` (the orphan-impl loop in
+    // generate()), so the member call must rewrite to the orphan fn
+    // with the receiver as the first argument. The receiver is a VALUE
+    // binding (`hover: ClickEvent`) and the impl receiver is a value
+    // param (`e: ClickEvent`) — passed verbatim, no `&`.
+    const src =
+        \\union ClickEvent {
+        \\    Hover,
+        \\    Press(i32),
+        \\}
+        \\
+        \\impl ClickEvent {
+        \\    pub fun is_action(e: ClickEvent) -> bool {
+        \\        return false;
+        \\    }
+        \\}
+        \\
+        \\fun f() {
+        \\    let hover: ClickEvent = ClickEvent.Hover;
+        \\    let b: bool = hover.is_action();
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "ClickEvent_is_action(hover)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "hover.is_action()") == null);
+}
+
+test "codegen: qualified union method call dispatches to orphan free fn" {
+    // `ClickEvent.is_action(hover)` — the qualified static form routes
+    // to the same orphan free fn, with the args passed verbatim (no
+    // synthetic receiver). Previously emitted verbatim and rejected by
+    // zig (`union 'ClickEvent' has no member named 'is_action'`,
+    // surfaced by examples/types/union_demo.zag).
+    const src =
+        \\union ClickEvent {
+        \\    Hover,
+        \\    Press(i32),
+        \\}
+        \\
+        \\impl ClickEvent {
+        \\    pub fun is_action(e: ClickEvent) -> bool {
+        \\        return false;
+        \\    }
+        \\}
+        \\
+        \\fun f() {
+        \\    let hover: ClickEvent = ClickEvent.Hover;
+        \\    let b: bool = ClickEvent.is_action(hover);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "ClickEvent_is_action(hover)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "ClickEvent.is_action(hover)") == null);
+}
+
+test "codegen: union member call with pointer receiver adds address-of" {
+    // `jv.get("k")` where the impl receiver is a pointer
+    // (`get(self: *Json, key: str)`) and the binding is a value
+    // (`jv: Json`) — the orphan dispatch passes `&jv` (mirroring zig's
+    // own method-call sugar: `jv.get(...)` auto-addresses a `*self`
+    // method). Same-module union, so no @import prefix.
+    const src =
+        \\union Json {
+        \\    Null,
+        \\    Str(str),
+        \\}
+        \\
+        \\impl Json {
+        \\    pub fun get(self: *Json, key: str) -> bool {
+        \\        return false;
+        \\    }
+        \\}
+        \\
+        \\fun f() {
+        \\    let jv: Json = Json.Null;
+        \\    let b: bool = jv.get("k");
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // `jv` is a const binding, so `&jv` would be `*const Json` — the
+    // dispatch wraps the address in @constCast (no-op on mutable
+    // bindings, required for const captures) so the `*Json` orphan
+    // receiver accepts it.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Json_get(@constCast(&jv), \"k\")") != null);
+}
+
+test "codegen: union KNOWN table pins stdlib Json routing" {
+    // KNOWN-table sync guard (review): the union-dispatch tables in
+    // core.zig must not silently drift from lib/std. `Json` resolves
+    // to the materialized std/json.zig module, and `get` is the one
+    // stdlib union method with a pointer receiver. A fresh Codegen
+    // (no prog decls, no source_path) consults the tables directly.
+    var cg = codegen_mod.Codegen.init();
+    try std.testing.expect(std.mem.eql(u8, cg.unionModulePath("Json") orelse "", "std/json.zig"));
+    try std.testing.expect(cg.unionModulePath("NotAUnion") == null);
+    try std.testing.expect(cg.unionMethodReceiverIsPointer("Json", "get") == true);
+    try std.testing.expect(cg.unionMethodReceiverIsPointer("Json", "stringify") == null);
+    try std.testing.expect(cg.unionMethodReceiverIsPointer("NotAUnion", "get") == null);
+}
+
+test "codegen: local struct named like stdlib union is NOT hijacked" {
+    // Shadowing guard (review): a user module declaring its own
+    // `struct Json` must win over the KNOWN stdlib-union table — a
+    // local struct's methods stay nested and dispatch natively, so
+    // `Json.get(jv)` must emit VERBATIM, not rewrite to
+    // `@import("std/json.zig").Json_get(jv)`. The pre-fix ordering
+    // (KNOWN table consulted before prog.structs) hijacked local
+    // types sharing a stdlib union name.
+    const src =
+        \\struct Json {
+        \\    value: str,
+        \\}
+        \\
+        \\impl Json {
+        \\    pub fun get(self: *Json, key: str) -> bool {
+        \\        return false;
+        \\    }
+        \\}
+        \\
+        \\fun f() {
+        \\    let b: bool = Json.get(jv);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Json.get(jv)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Json_get(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std/json.zig") == null);
+}
+
+test "codegen: turbofish Result capture seeds union member dispatch" {
+    // Turbofish-scrutinee guard (review): `parsed: Result<Json, str>`
+    // uses the angle-bracket spelling. getSourceTypeName returns the
+    // VERBATIM source annotation, so preambleVariantPayloadType must
+    // accept both `Result(...)` and `Result<...>` forms — otherwise
+    // the `Ok(v)` capture stays unseeded and `v.get("k")` falls back
+    // to verbatim (broken emission for a union payload).
+    const src =
+        \\union Json {
+        \\    Null,
+        \\    Str(str),
+        \\}
+        \\
+        \\impl Json {
+        \\    pub fun get(self: *Json, key: str) -> bool {
+        \\        return false;
+        \\    }
+        \\}
+        \\
+        \\fun f() {
+        \\    let parsed: Result<Json, str> = Ok(Json.Null);
+        \\    if let Ok(v) = parsed {
+        \\        let b: bool = v.get("k");
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Json_get(@constCast(&v), \"k\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "v.get(\"k\")") == null);
+}
+
 test "codegen: field_assign emits target.field = value;" {
     // `v.x = 10.0;` → `    v.x = 10.0;`. Zig accepts field-write to a
     // `var`-binding receiver verbatim; writing to a `const`-recevier is

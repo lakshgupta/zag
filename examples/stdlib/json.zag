@@ -20,6 +20,13 @@ fun main() {
     if let Ok(jv) = v {
         let out: String = stringify(jv);
         print("stringify: {out.as_str()}\n");
+        # Union member-call dispatch: `get` is an impl method on the
+        # Json union — the orphan free fn Json_get lives in the
+        # materialized std/json.zig and the dispatch qualifies through
+        # it automatically (`jv.get(...)` works like a struct method).
+        let got: ?Json = jv.get("name");
+        let found: bool = got != null;
+        print("name lookup: {found}\n");
         match jv {
             Json.Object(pairs) => {
                 print("top-level: object with {pairs.len} pair(s)\n");
