@@ -583,6 +583,29 @@ const Codegen = core.Codegen;
         // for the method's own locals (not the enclosing pub fn's).
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
+        // Param-type seeding (mirror of genFun/genFreeMethod): the
+        // generic-field dispatch (`self.timers.push(...)` —
+        // std.async EventLoop) reads `self`'s tracked type to resolve
+        // the field's declared generic type; without the seed the
+        // member-access dispatch misses and the call emits verbatim
+        // ("no field or member function named 'push'").
+        for (m.params) |p| {
+            if (self.type_info_count >= self.type_info_buf.len) break;
+            var already = false;
+            for (self.type_info_buf[0..self.type_info_count]) |ti| {
+                if (std.mem.eql(u8, ti.name, p.name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            self.type_info_buf[self.type_info_count] = .{
+                .name = p.name,
+                .type_name = p.type_text,
+                .is_closure = false,
+            };
+            self.type_info_count += 1;
+        }
         // async is a top-level `async fun` surface (v1); methods are
         // always synchronous — keep the future-wrap flag off.
         self.fn_is_async = false;
@@ -679,7 +702,8 @@ const Codegen = core.Codegen;
         return emitted;
     }
 
-    pub     fn zagTypeToZig(text: []const u8) []const u8 {        // Type aliases (docs/07 "Type Aliases"): zag provides
+    pub     fn zagTypeToZig(text_in: []const u8) []const u8 {
+        var text: []const u8 = text_in;
         //     type str = []const u8;
         // and "Aliases are transparent" — the type and its alias are
         // the same type under the v1 type system. Codegen expands
@@ -719,7 +743,52 @@ const Codegen = core.Codegen;
         // module-level scratch (single-threaded compiler; each
         // returned slice is consumed by the next writeType before
         // the next call overwrites it).
+        // Recursed-input snapshot: when `text` IS the module scratch
+        // (the turbofish-normalization recursion), the rebuild below
+        // would clobber the head/tail/inner VIEWS while copying —
+        // snapshot into a stack copy so the views stay intact.
+        // 1024 covers deeply-nested generic signatures (e.g.
+        // HashMap<String, ArrayList<Result<TimerEntry, str>>>)
+        // — a truncation would silently skip the snapshot and
+        // re-enter the clobber hazard it exists to prevent.
+        var local_copy: [1024]u8 = undefined;
+        if (@as([*]const u8, text.ptr) == @as([*]const u8, @ptrCast(&zag_type_zig_scratch[0]))) {
+            if (text.len <= local_copy.len) {
+                @memcpy(local_copy[0..text.len], text);
+                text = local_copy[0..text.len];
+            }
+        }
         const open = std.mem.indexOfScalar(u8, text, '(');
+        // Turbofish normalization: `Result<i32, str>` — the source
+        // annotation uses `<...>`; normalize to the paren form before
+        // the arg-split so the alias wrap reaches the args (`str` →
+        // `[]const u8`). The rebuilt text lands in the module scratch
+        // (consumed immediately by the recursion below).
+        if (open == null) {
+            const lt = std.mem.indexOfScalar(u8, text, '<');
+            if (lt != null and lt.? > 0) {
+                const gt = std.mem.lastIndexOfScalar(u8, text, '>');
+                if (gt != null and gt.? > lt.?) {
+                    var nl: usize = 0;
+                    if (lt.? > 0) {
+                        @memcpy(zag_type_zig_scratch[0..lt.?], text[0..lt.?]);
+                        nl = lt.?;
+                    }
+                    zag_type_zig_scratch[nl] = '(';
+                    nl += 1;
+                    @memcpy(zag_type_zig_scratch[nl..][0 .. gt.? - lt.? - 1], text[lt.? + 1 .. gt.?]);
+                    nl += gt.? - lt.? - 1;
+                    zag_type_zig_scratch[nl] = ')';
+                    nl += 1;
+                    const tail_start = gt.? + 1;
+                    if (tail_start < text.len) {
+                        @memcpy(zag_type_zig_scratch[nl..][0 .. text.len - tail_start], text[tail_start..]);
+                        nl += text.len - tail_start;
+                    }
+                    return zagTypeToZig(zag_type_zig_scratch[0..nl]);
+                }
+            }
+        }
         if (open != null and open.? > 0) {
             const close = std.mem.lastIndexOfScalar(u8, text, ')');
             if (close != null and close.? > open.?) {
@@ -743,13 +812,17 @@ const Codegen = core.Codegen;
                             rl += 1;
                         }
                         if (rl + mapped.len <= zag_type_zig_scratch.len) {
-                            @memcpy(zag_type_zig_scratch[rl..][0..mapped.len], mapped);
+                            // copyForwards (memmove semantics): a
+                            // NESTED generic arg's recursion returns a
+                            // slice into the SAME scratch — the
+                            // forward copy handles the overlap.
+                            std.mem.copyForwards(u8, zag_type_zig_scratch[rl..][0..mapped.len], mapped);
                             rl += mapped.len;
                         }
                         start = i + 1;
                     }
                 }
-                @memcpy(zag_type_zig_scratch[rl..][0..tail.len], tail);
+                std.mem.copyForwards(u8, zag_type_zig_scratch[rl..][0..tail.len], tail);
                 rl += tail.len;
                 return zag_type_zig_scratch[0..rl];
             }

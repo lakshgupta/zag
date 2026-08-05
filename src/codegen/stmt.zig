@@ -112,7 +112,12 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     /// by lib/std/collections.zag's `if (uslot[idx])` and fs.zag's
     /// `while (true)`.
     pub     fn writeCond(self: *Codegen, cond: ast.Expr) void {
-        const self_parens = cond.payload == .binary or cond.payload == .unary;
+        // Only `.binary` self-parenthesizes (the binary emit wraps
+        // the whole expression in parens). Unary emit (`!flag`,
+        // `-x`) does NOT wrap its operand, so a unary cond needs
+        // the explicit parens too — `while (!fut.done)` (surfaced
+        // by std.async's poll loop).
+        const self_parens = cond.payload == .binary;
         if (!self_parens) self.write("(");
         self.genExpr(cond);
         if (!self_parens) self.write(")");
@@ -200,13 +205,56 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             },
             .if_stmt => |ifs| {
                 if (ifs.is_if_let) {
-                    self.write("    if (");
-                    self.genExpr(ifs.cond);
-                    self.write(") |");
-                    // Write the capture name from the pattern
                     const pat = ifs.if_let_pat;
                     if (pat == .enum_variant) {
+                        // Enum-variant pattern (`if let Err(e) = r`):
+                        // zig 0.16 rejects payload capture on a bool
+                        // condition (`if (r == .Err) |e|` — "expected
+                        // optional type") — unions are not optionals.
+                        // Emit a block that switch-extracts the
+                        // payload into an optional temp, then a plain
+                        // optional-capture if:
+                        //   (blk: { var __zag_iflet_0: ?@TypeOf(r).Err = null;
+                        //          switch (r) { .Err => |v| __zag_iflet_0 = v, else => {} }
+                        //          if (__zag_iflet_0) |e| { ...body... }
+                        //          else { ... } });
                         const ev = pat.enum_variant;
+                        const id = self.blk_counter;
+                        self.blk_counter += 1;
+                        var tmp_buf: [32]u8 = undefined;
+                        const tmp = std.fmt.bufPrint(&tmp_buf, "__zag_iflet_{d}", .{id}) catch "__zag_iflet";
+                        // Pointer scrutinee (`if let Json.Object(pairs)
+                        // = self` inside an impl method — `self: *Json`):
+                        // @FieldType on a pointer type is rejected
+                        // ("expected struct, found pointer"), so the
+                        // deref suffix `.*` applies to BOTH the
+                        // @TypeOf operand and the switch scrutinee.
+                        // Value scrutinees stay bare. Resolved from the
+                        // tracked type when the scrutinee is an ident.
+                        var cond_is_pointer = false;
+                        if (ifs.cond.payload == .ident) {
+                            if (self.getSourceTypeName(ifs.cond.payload.ident)) |tn| {
+                                if (std.mem.startsWith(u8, tn, "*")) cond_is_pointer = true;
+                            }
+                        }
+                        self.write("({ var ");
+                        self.write(tmp);
+                        self.write(": ?@FieldType(@TypeOf(");
+                        self.genExpr(ifs.cond);
+                        if (cond_is_pointer) self.write(".*");
+                        self.write("), \"");
+                        self.write(ev.variant_name);
+                        self.write("\") = null; switch (");
+                        self.genExpr(ifs.cond);
+                        if (cond_is_pointer) self.write(".*");
+                        self.write(") { .");
+                        self.write(ev.variant_name);
+                        self.write(" => |__zag_iflet_payload| ");
+                        self.write(tmp);
+                        self.write(" = __zag_iflet_payload, else => {} } ");
+                        self.write("if (");
+                        self.write(tmp);
+                        self.write(") |");
                         if (ev.bindings) |binds| {
                             if (binds.len > 0 and binds[0] != null) {
                                 self.write(binds[0].?);
@@ -216,7 +264,31 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         } else {
                             self.write("_");
                         }
-                    } else if (pat == .ident) {
+                        self.write("| {\n");
+                        // Seed the if-let capture's payload type so
+                        // generic-instance dispatch works on it inside
+                        // the body (`pairs.get(i)` for
+                        // `if let Json.Object(pairs) = self` in
+                        // std.json's get). Mirror of the match-arm
+                        // seeding in emitPatternBindings.
+                        if (ev.bindings) |binds| {
+                            if (binds.len > 0 and binds[0] != null) {
+                                if (self.variantSlotType(ev.variant_name, 0, "")) |pt| {
+                                    self.seedCaptureType(binds[0].?, pt);
+                                }
+                            }
+                        }
+                        for (ifs.then_body) |s| self.genStmt(s, false);
+                        self.write("    }");
+                        self.genElseBranch(ifs.else_kind);
+                        self.write(" });\n");
+                        return;
+                    }
+                    self.write("    if (");
+                    self.genExpr(ifs.cond);
+                    self.write(") |");
+                    // Write the capture name from the pattern
+                    if (pat == .ident) {
                         self.write(pat.ident);
                     } else {
                         self.write("_");
@@ -238,12 +310,46 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             },
             .while_stmt => |ws| {
                 if (ws.is_while_let) {
-                    self.write("    while (");
-                    self.genExpr(ws.cond);
-                    self.write(") |");
                     const pat = ws.while_let_pat;
                     if (pat == .enum_variant) {
+                        // Enum-variant while-let (`while let Err(e) =
+                        // r`): mirror of the if-let switch-extract —
+                        // zig 0.16 rejects payload capture on a bare
+                        // union condition (`while (r == .Err) |e|`), so
+                        // the condition becomes a labeled block that
+                        // switch-extracts the payload into an optional
+                        // temp and breaks with it:
+                        //   while (__zag_wl_0: {
+                        //       var __zag_whilelet_0: ?@FieldType(@TypeOf(r), "Err") = null;
+                        //       switch (r) { .Err => |p| __zag_whilelet_0 = p, else => {} }
+                        //       break :__zag_wl_0 __zag_whilelet_0;
+                        //   }) |e| { ...body... }
                         const ev = pat.enum_variant;
+                        const id = self.blk_counter;
+                        self.blk_counter += 1;
+                        var tmp_buf: [32]u8 = undefined;
+                        const tmp = std.fmt.bufPrint(&tmp_buf, "__zag_whilelet_{d}", .{id}) catch "__zag_whilelet";
+                        var lbl_buf: [32]u8 = undefined;
+                        const lbl = std.fmt.bufPrint(&lbl_buf, "__zag_wl_{d}", .{id}) catch "__zag_wl";
+                        self.write("    while (");
+                        self.write(lbl);
+                        self.write(": { var ");
+                        self.write(tmp);
+                        self.write(": ?@FieldType(@TypeOf(");
+                        self.genExpr(ws.cond);
+                        self.write("), \"");
+                        self.write(ev.variant_name);
+                        self.write("\") = null; switch (");
+                        self.genExpr(ws.cond);
+                        self.write(") { .");
+                        self.write(ev.variant_name);
+                        self.write(" => |__zag_whilelet_payload| ");
+                        self.write(tmp);
+                        self.write(" = __zag_whilelet_payload, else => {} } break :");
+                        self.write(lbl);
+                        self.write(" ");
+                        self.write(tmp);
+                        self.write("; }) |");
                         if (ev.bindings) |binds| {
                             if (binds.len > 0 and binds[0] != null) {
                                 self.write(binds[0].?);
@@ -253,7 +359,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         } else {
                             self.write("_");
                         }
-                    } else if (pat == .ident) {
+                        self.write("| {\n");
+                        for (ws.body) |s| self.genStmt(s, false);
+                        self.write("    }\n");
+                        return;
+                    }
+                    self.write("    while (");
+                    self.genExpr(ws.cond);
+                    self.write(") |");
+                    if (pat == .ident) {
                         self.write(pat.ident);
                     } else {
                         self.write("_");
@@ -870,11 +984,38 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             // `.discard` patterns. See `emitPatternBindings` doc
             // for the zig 0.16 unused-const throwaway rationale.
             self.emitPatternBindings(scrut_name, arm.pat);
-            self.write("break :blk ");
-            // `arm.expr` is `*Expr` (cycle-breaking pointer) — deref before
-            // emitting the arm-body expression.
-            self.genExpr(arm.expr.*);
-            self.write("; }");
+            // Block-bodied arms (`Json.Null => { ... }`): emit the
+            // block's statements INLINE with the final statement as
+            // `break :blk EXPR` — the arm's own blk context is
+            // already open, so a nested `(blk: {` would collide on
+            // the `blk` label (redefinition error surfaced by
+            // std.json's stringify).
+            if (arm.expr.payload == .block_expr) {
+                const body = arm.expr.payload.block_expr;
+                for (body, 0..) |s, si| {
+                    if (si == body.len - 1 and s.payload == .return_stmt) {
+                        const rs = s.payload.return_stmt;
+                        if (rs.value) |v| {
+                            self.write("break :blk ");
+                            self.genExpr(v);
+                            self.write(";");
+                        } else {
+                            self.genStmt(s, false);
+                        }
+                    } else if (si == body.len - 1 and s.payload == .expr_stmt) {
+                        self.write("break :blk ");
+                        self.genExpr(s.payload.expr_stmt);
+                        self.write(";");
+                    } else {
+                        self.genStmt(s, false);
+                    }
+                }
+            } else {
+                self.write("break :blk ");
+                self.genExpr(arm.expr.*);
+                self.write(";");
+            }
+            self.write(" }");
             had_any_arm = true;
         }
         const last_is_wildcard = m.arms.len > 0 and m.arms[m.arms.len - 1].pat == .discard;
@@ -981,6 +1122,72 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     }
 
 
+    /// Resolve a variant payload slot's declared type text for capture
+    /// seeding. `variant_name` identifies the union variant (scanned
+    /// across the module's enum decls); `index` is the binding position
+    /// (paren-positional) and `field_name` is set when the pattern used
+    /// the brace-named form. Returns a slice into source text (safe for
+    /// type_info_buf lifetime — the parts point into the parsed
+    /// payload_type / VariantField slices).
+    pub     fn variantSlotType(self: *Codegen, variant_name: []const u8, index: usize, field_name: []const u8) ?[]const u8 {
+        for (self.prog.enums) |ed| {
+            for (ed.variants) |v| {
+                if (!std.mem.eql(u8, v.name, variant_name)) continue;
+                if (v.fields.len > 0) {
+                    // Brace-named decl: match by field name first, then
+                    // fall back to positional.
+                    if (field_name.len > 0) {
+                        for (v.fields) |f| {
+                            if (std.mem.eql(u8, f.name, field_name)) return f.type_text;
+                        }
+                    }
+                    if (index < v.fields.len) return v.fields[index].type_text;
+                    return null;
+                }
+                const pt = v.payload_type orelse return null;
+                var start: usize = 0;
+                var idx: usize = 0;
+                var i: usize = 0;
+                while (i <= pt.len) : (i += 1) {
+                    if (i == pt.len or pt[i] == ',') {
+                        if (idx == index) {
+                            const part = std.mem.trim(u8, pt[start..i], " \t");
+                            if (part.len > 0) return part;
+                            return null;
+                        }
+                        idx += 1;
+                        start = i + 1;
+                    }
+                }
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /// Seed a match/if-let capture binding's resolved payload type into
+    /// type_info_buf so the generic-instance method dispatch
+    /// (`.method_call` ident path via getSourceTypeName) can rewrite
+    /// `items.get(i)` on a `Json.Array(items)` capture →
+    /// `ArrayList_get(Json, &items, i)`. Captures carry no `: T`
+    /// annotation, so the typed-binding walk never records them;
+    /// without the seed the call emits verbatim and zig rejects it
+    /// ("no field or member function named 'get'", surfaced by
+    /// std.json's stringify on array/object payloads).
+    pub     fn seedCaptureType(self: *Codegen, name: []const u8, type_text: []const u8) void {
+        if (name.len == 0 or type_text.len == 0) return;
+        if (self.type_info_count >= self.type_info_buf.len) return;
+        for (self.type_info_buf[0..self.type_info_count]) |ti| {
+            if (std.mem.eql(u8, ti.name, name)) return;
+        }
+        self.type_info_buf[self.type_info_count] = .{
+            .name = name,
+            .type_name = type_text,
+            .is_closure = false,
+        };
+        self.type_info_count += 1;
+    }
+
     pub     fn emitPatternBindings(self: *Codegen, scrut_name: []const u8, p: ast.Pattern) void {
         // gap #6 — emit per-arm payload-binding preamble so captures
         // declared on the pattern (`Variant { x: w, y: h }` for the
@@ -1017,10 +1224,73 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         switch (p) {
             .enum_variant => |ev| {
                 if (ev.bindings) |bs| {
+                    // Single-letter field names are ONLY used when the
+                    // variant's payload is a MULTI-arg anonymous struct
+                    // (`Rect: struct { a: f64, b: f64 }` — zig names the
+                    // anonymous-struct fields a/b/c in declaration
+                    // order). A SINGLE paren-positional arg emits the
+                    // payload type directly (`Bool: bool`), so the union
+                    // field IS the value: `__m_0.Bool` with NO `.a`
+                    // suffix — the letters-suffixed access was rejected
+                    // by zig (`type 'bool' does not support field
+                    // access`, surfaced by std.json's stringify match on
+                    // `Json.Bool(b)` / `Json.Str(s)` / `Json.Array(x)`).
+                    // Resolve the shape from the enum decl when the
+                    // scrutinee's union is declared locally; the legacy
+                    // letters emit stays as the fallback when the
+                    // variant can't be found (cross-module scrutinees).
+                    var single_payload = false;
+                    if (bs.len == 1) {
+                        var found = false;
+                        for (self.prog.enums) |ed| {
+                            for (ed.variants) |v| {
+                                if (std.mem.eql(u8, v.name, ev.variant_name) and v.fields.len == 0) {
+                                    found = true;
+                                    if (v.payload_type) |pt| {
+                                        var comma_count: usize = 0;
+                                        for (pt) |c| if (c == ',') {
+                                            comma_count += 1;
+                                        };
+                                        single_payload = comma_count == 0;
+                                    }
+                                }
+                            }
+                        }
+                        // Cross-module scrutinee (matching an IMPORTED
+                        // union from the user module): the variant shape
+                        // is unknowable here. Single-arg payloads are the
+                        // overwhelmingly common case (Json.Object(pairs),
+                        // Json.Str(s), Option.Some(x) — all emit the
+                        // payload type directly), so assume the direct-
+                        // access form (`__m_0.Object`) rather than the
+                        // letters suffix (`__m_0.Object.a`, rejected for
+                        // bare payloads like `bool` / `ArrayList(Json)`).
+                        // KNOWN LIMITATION: a cross-module variant whose
+                        // payload is a NAMED-FIELD struct with exactly
+                        // one field (`Variant: struct { x: i32 }`) would
+                        // bind the whole anonymous struct to the capture
+                        // here instead of the field — within-module
+                        // scrutinees resolve the shape correctly (the
+                        // `found` path above), so this only bites
+                        // imported unions with single-field named
+                        // payloads. Acceptable for v1; revisit if such
+                        // unions appear in lib/std.
+                        if (!found) single_payload = true;
+                    }
                     const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
                     for (bs, 0..) |b, i| {
                         if (b) |name| {
-                            self.write("const ");
+                            // `var` (not `const`): the generic-instance
+                            // dispatch passes `&capture` to orphan free
+                            // fns (`ArrayList_get(Json, &items, i)` for
+                            // `items.get(i)` on a Json.Array capture) —
+                            // a const binding would produce a
+                            // `*const T` receiver that zig rejects
+                            // ("cast discards const qualifier", surfaced
+                            // by std.json's stringify). The capture is a
+                            // by-value copy of the union payload, so
+                            // mutability is harmless.
+                            self.write("var ");
                             self.write(name);
                             self.write(" = ");
                             self.write(scrut_name);
@@ -1035,9 +1305,30 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             // The `if (__m_0 == .Variant)` cond already established
                             // the active variant so the prefix is statically sound.
                             self.write(ev.variant_name);
-                            self.write(".");
-                            self.write(letters[i]);
+                            if (!single_payload) {
+                                self.write(".");
+                                self.write(letters[i]);
+                            }
                             self.write("; ");
+                            // zig 0.16 diagnostic silhouette: `_ = &NAME;`
+                            // marks the capture as referenced AND as
+                            // potentially-mutated-through-pointer, so a
+                            // capture the arm body never uses (or only
+                            // reads) doesn't trigger "unused local
+                            // variable" / "local variable is never
+                            // mutated". The var form itself is required
+                            // for the generic-instance dispatch to pass
+                            // `&NAME` as a mutable receiver.
+                            self.write("_ = &");
+                            self.write(name);
+                            self.write("; ");
+                            // Seed the capture's payload type so
+                            // generic-instance dispatch works on it
+                            // (e.g. `items.get(i)` for a
+                            // `Json.Array(items)` capture).
+                            if (self.variantSlotType(ev.variant_name, i, "")) |pt| {
+                                self.seedCaptureType(name, pt);
+                            }
                         }
                     }
                 }
@@ -1061,7 +1352,10 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         // "no field named 'foo' in struct" diagnostic
                         // if they typo the field name on the pattern
                         // side.
-                        self.write("const ");
+                        // `var` (not `const`): mirror of the
+                        // paren-positional arm — generic-instance
+                        // dispatch passes `&capture` to orphan fns.
+                        self.write("var ");
                         self.write(name);
                         self.write(" = ");
                         self.write(scrut_name);
@@ -1080,6 +1374,18 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         self.write(".");
                         self.write(f.name);
                         self.write("; ");
+                        // zig 0.16 diagnostic silhouette (mirror of the
+                        // paren-positional arm): `_ = &NAME;` silences
+                        // unused / never-mutated errors on the var
+                        // capture.
+                        self.write("_ = &");
+                        self.write(name);
+                        self.write("; ");
+                        // Seed the capture's payload type (mirror of
+                        // the paren-positional arm above).
+                        if (self.variantSlotType(env.variant_name, 0, f.name)) |pt| {
+                            self.seedCaptureType(name, pt);
+                        }
                     }
                 }
             },

@@ -2677,8 +2677,8 @@ test "codegen: brace-named-field match-arm destructuring emits __m == .Variant +
     // preserves user-written field names on the anonymous-struct
     // payload; gap #6 picks them up via `Pattern.VariantFieldPattern
     // .name`).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const w = __m_0.Pos.x") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const h = __m_0.Pos.y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var w = __m_0.Pos.x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "var h = __m_0.Pos.y") != null);
     // zig 0.16 unused-const throwaway: each capture is followed by
     // `_ = NAME;` to silence the "unused local" diagnostic regardless
     // of whether the arm body's EXPR references the capture.
@@ -3391,7 +3391,7 @@ test "codegen: type_name(T) emits @typeName(T)" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "@typeName(i32)") != null);
 }
 
-test "codegen: if let Option.Some(val) emits if (opt) |val| capture" {
+test "codegen: if let Option.Some(val) switch-extracts the payload capture" {
     const src =
         \\fun f() {
         \\    let opt: Option<i32> = Option.Some(10);
@@ -3407,11 +3407,19 @@ test "codegen: if let Option.Some(val) emits if (opt) |val| capture" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // if let emits zig's if (expr) |capture|
-    try std.testing.expect(std.mem.indexOf(u8, zig, "if (opt) |val| {") != null);
+    // Enum-variant if-let (Option.Some / Ok(v) / Err(e)): zig 0.16
+    // rejects payload capture on a bare union condition (`if (opt)
+    // |val|` — "expected optional type"), so the emit switch-extracts
+    // the payload into an optional temp and captures on that:
+    //   ({ var __zag_iflet_0: ?@FieldType(@TypeOf(opt), "Some") = null;
+    //      switch (opt) { .Some => |p| __zag_iflet_0 = p, else => {} }
+    //      if (__zag_iflet_0) |val| { ... } });
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@FieldType(@TypeOf(opt),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "switch (opt) { .Some => |__zag_iflet_payload|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (__zag_iflet_0) |val| {") != null);
 }
 
-test "codegen: while let Option.Some(val) emits while (expr) |val| capture" {
+test "codegen: while let Option.Some(val) switch-extracts the payload capture" {
     const src =
         \\fun f() {
         \\    let opt: Option<i32> = Option.Some(10);
@@ -3427,8 +3435,15 @@ test "codegen: while let Option.Some(val) emits while (expr) |val| capture" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // while let emits zig's while (expr) |capture|
-    try std.testing.expect(std.mem.indexOf(u8, zig, "while (opt) |val| {") != null);
+    // Enum-variant while-let: mirror of the if-let switch-extract —
+    // the condition is a labeled block that extracts the payload into
+    // an optional temp and breaks with it:
+    //   while (__zag_wl_0: { var __zag_whilelet_0: ?@FieldType(@TypeOf(opt), "Some") = null;
+    //       switch (opt) { .Some => |p| __zag_whilelet_0 = p, else => {} }
+    //       break :__zag_wl_0 __zag_whilelet_0; }) |val| { ... }
+    try std.testing.expect(std.mem.indexOf(u8, zig, "while (__zag_wl_0: { var __zag_whilelet_0: ?@FieldType(@TypeOf(opt),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "switch (opt) { .Some => |__zag_whilelet_payload|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "}) |val| {") != null);
 }
 
 test "codegen: __zag_posix preamble pins all 13 helpers + locks out steered-around substrings" {

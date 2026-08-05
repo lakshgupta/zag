@@ -593,7 +593,17 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // @ptrCast is a no-op when the alignment is unchanged
                 // and asserts it when it increases (page_allocator
                 // hands out max-aligned pages).
-                if (std.mem.startsWith(u8, c.type_text, "[*")) {
+                // Check the MAPPED form — `*raw u8` → `[*]u8` must
+                // take the same @ptrCast route as a literal `[*:0]`
+                // spelling (surfaced by std.async's opaque future
+                // pointers). Single-pointer targets from many-
+                // pointer operands (`[*]u8` → `*Future(void)`) need
+                // the same wrap — zig rejects both directions
+                // ("a single pointer cannot cast into a many
+                // pointer" / the reverse) without @ptrCast, and
+                // @alignCast covers the alignment increase.
+                const cast_target_zig = zagTypeToZig(c.type_text);
+                if (std.mem.startsWith(u8, cast_target_zig, "[*") or std.mem.startsWith(u8, cast_target_zig, "*")) {
                     self.write("@alignCast(@ptrCast(");
                     self.genExpr(c.expr.*);
                     self.write("))");
@@ -1249,6 +1259,55 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         }
                     }
                 }
+                // Member-access receivers on GENERIC-TYPED FIELDS —
+                // `self.timers.push(...)` where the field's declared
+                // type is `ArrayList(TimerEntry)` (std.async's
+                // EventLoop). Resolve the field type from the base
+                // ident's tracked struct + the module's struct decls,
+                // then dispatch like the ident case (the receiver
+                // expr — the member_access — emits verbatim; already
+                // a pointer when the field is a struct, so no `&`).
+                if (mc.target.payload == .member_access) {
+                    const ma = mc.target.payload.member_access;
+                    if (ma.target.payload == .ident) {
+                        if (self.getSourceTypeName(ma.target.payload.ident)) |tn| {
+                            // Base struct name: strip `*`/`*const `
+                            // pointer prefixes — the receiver of a
+                            // non-generic struct (`self: *EventLoop`)
+                            // has no generic-paren shape to match.
+                            var base: []const u8 = tn;
+                            if (std.mem.startsWith(u8, base, "*const ")) base = base["*const ".len..];
+                            if (std.mem.startsWith(u8, base, "*")) base = base["*".len..];
+                            if (self.structFieldType(base, ma.name)) |field_type| {
+                                if (self.genericInstanceOfTypeText(field_type)) |gi| {
+                                    const field_is_pointer = std.mem.startsWith(u8, field_type, "*");
+                                        if (self.genericStructModulePath(gi.base)) |mod_path| {
+                                            self.write("@import(\"");
+                                            self.write(mod_path);
+                                            self.write("\").");
+                                        }
+                                        self.write(gi.base);
+                                        self.write("_");
+                                        self.write(mc.name);
+                                        self.write("(");
+                                        for (gi.args, 0..) |ga, i| {
+                                            if (i > 0) self.write(", ");
+                                            self.writeType(ga);
+                                        }
+                                        if (gi.args.len > 0) self.write(", ");
+                                        if (!field_is_pointer) self.write("&");
+                                        self.genExpr(mc.target.*);
+                                        for (mc.args) |a| {
+                                            self.write(", ");
+                                            self.genExpr(a);
+                                        }
+                                        self.write(")");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 if (mc.target.payload == .call) {
                     const tc = mc.target.payload.call;
                     if (self.isGenericStructName(tc.name)) {

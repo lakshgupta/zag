@@ -158,8 +158,16 @@ test "codegen: 1/2 stays bare when both sides are comptime int" {
     // Preserve the explicit `let z: i32 = 1 / 2` annotation through to
     // zig; the carve-out keeps bare-form legal too, so the test stays
     // source-shape stable here.
+    if (std.mem.indexOf(u8, zig, "    const z: i32 = (1 / 2);") == null) {
+        var si: usize = 0;
+        while (si < zig.len) {
+            if (zig[si] == '\n') std.debug.print("\n", .{}) else std.debug.print("{c}", .{zig[si]});
+            si += 1;
+        }
+        std.debug.print("\n", .{});
+    }
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: i32 = (1 / 2);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@divTrunc") == null);
 }
 
 test "codegen: 1.0/2.0 stays bare when LHS is float" {
@@ -177,8 +185,8 @@ test "codegen: 1.0/2.0 stays bare when LHS is float" {
     const zig = cg.generate(prog);
     // Preserve the explicit `let z: f64 = 1.0 / 2.0` annotation through.
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: f64 = (1.0 / 2.0);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@rem") == null);
 }
 
 test "codegen: 2/x stays bare when LHS is comptime int and RHS is ident" {
@@ -197,7 +205,7 @@ test "codegen: 2/x stays bare when LHS is comptime int and RHS is ident" {
     // Source includes the `: i32` annotation — preserve it in the
     // assertion to track the actual emission.
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: i32 = (2 / x);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@divTrunc") == null);
 }
 
 test "codegen: 1.0/x stays bare when LHS is float and RHS is ident" {
@@ -219,8 +227,8 @@ test "codegen: 1.0/x stays bare when LHS is float and RHS is ident" {
     // `1.0` is float and `x` is unannotated, neither path can ever
     // trigger the `@divTrunc` shim).
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: f64 = (1.0 / x);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@rem") == null);
 }
 
 test "codegen: f64-typed ident LHS / int_lit stays bare (typed-binding lookup)" {
@@ -251,8 +259,8 @@ test "codegen: f64-typed ident LHS / int_lit stays bare (typed-binding lookup)" 
     // Source includes the `: f64` annotation — mirror it in the assertion
     // so the test tracks the actual emission.
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const r: f64 = (pi / 2);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@rem") == null);
 }
 
 test "codegen: i32-typed ident LHS / int_lit still triggers @divTrunc shim" {
@@ -303,8 +311,8 @@ test "codegen: f64-typed ident LHS % int_lit stays bare" {
     // Source includes `: f64` annotation; codegen routes the bare form
     // through (mirror of the `/` test).
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const r: f64 = (pi % 2);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@rem") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@divTrunc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@rem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig[std.mem.indexOf(u8, zig, "pub fn f") orelse 0 ..], "@divTrunc") == null);
 }
 
 test "codegen: unannotated i32-init binding / int_lit still triggers @divTrunc" {

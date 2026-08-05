@@ -273,7 +273,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 
     pub     fn needsIntDivShim(self: *Codegen, b: ast.Expr.BinaryExpr) bool {
         if (b.op != .div and b.op != .mod) return false;
-        if (b.rhs.payload != .int_lit) return false;
         // Both sides comptime_int → zig folds the bare form at compile time.
         // Skip the shim so the user's source round-trips: `1 / 2 === (1 / 2)`.
         if (b.lhs.payload == .int_lit) return false;
@@ -282,7 +281,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         // Skip the wrap and emit the bare form; zig infers the operand
         // types from the binding annotations and accepts `f64 / comptime_int`.
         if (b.lhs.payload == .ident and self.isFloatIdentType(b.lhs.payload.ident)) return false;
-        return !exprContainsFloat(b.lhs.*);
+        // Literal RHS: `x / 2` — shim (the historical surface).
+        if (b.rhs.payload == .int_lit) return !exprContainsFloat(b.lhs.*);
+        // Runtime RHS: `a / b` (ident/binary/unary) — the shim must
+        // cover ident-div-ident too (zig rejects bare signed division
+        // "must use @divTrunc"). Float-typed RHS idents and float
+        // literals skip the shim.
+        if (b.rhs.payload == .ident and self.isFloatIdentType(b.rhs.payload.ident)) return false;
+        if (b.rhs.payload == .float_lit) return false;
+        return !exprContainsFloat(b.lhs.*) and !exprContainsFloat(b.rhs.*);
     }
 
     pub     fn genPrintCall(self: *Codegen, c: ast.Expr.CallExpr) void {
