@@ -37,6 +37,17 @@ const BindingTypeInfo = struct {
     is_closure: bool = false,
 };
 
+/// Comptime-empty Program default for freshly-`init()`ed Codegen
+/// instances that never went through `generate()` (the template-
+/// literal placeholder codegen in primary.zig's genTemplateLit builds
+/// an `args_cg = Codegen.init()` and copies only type_info_buf — its
+/// `prog` pointer would otherwise dangle, and any emit path that walks
+/// `self.prog.enums` / `self.prog.structs` (e.g. the union-method
+/// dispatch helpers) would fault on the garbage pointer. All slices
+/// default empty so lookups return "not found" and callers fall
+/// through to verbatim emission.
+const empty_prog: ast.Program = .{ .functions = &[_]ast.FunDecl{} };
+
 pub const Codegen = struct {
     /// Generated-zig output buffer. Grows on demand from the page
     /// allocator — large hybrid stdlib imports (base64 tables,
@@ -66,7 +77,7 @@ pub const Codegen = struct {
     ///     resolve `Status` → its `backing_type`.
     ///   - any future emit pass that needs to look up an enclosing
     ///     type for a nested emit site.
-    prog: *const ast.Program,
+    prog: *const ast.Program = &empty_prog,
     /// Source file path of the zig module being generated
     /// (e.g. "src/main.zag"). Set by the caller before `generate()`.
     source_path: []const u8 = "",
@@ -373,6 +384,20 @@ pub const MapEntry = struct {
     pub const genericInstanceOfParenText = @import("core.zig").genericInstanceOfParenText;
     pub const structFieldType = @import("core.zig").structFieldType;
     pub const getSourceTypeName = @import("core.zig").getSourceTypeName;
+    // Union orphan-method dispatch (union member calls like
+    // `hover.is_action()` / qualified `ClickEvent.is_action(hover)`):
+    // union impl methods flatten to module-scope free fns
+    // (`<Union>_<Method>` — genFreeMethod, because zig 0.16 rejects
+    // methods nested inside `union(enum)`), so the `.method_call` and
+    // dotted `.call` arms route through `tryEmitUnionOrphanCall` with
+    // the three lookups below. Same re-export pattern as
+    // getSourceTypeName / genericStructModulePath above — without
+    // these bindings zig compile-errors with `no field or member
+    // function named '<name>' in 'codegen.core.Codegen'`.
+    pub const unionModulePath = @import("core.zig").unionModulePath;
+    pub const isUnionTarget = @import("core.zig").isUnionTarget;
+    pub const unionMethodReceiverIsPointer = @import("core.zig").unionMethodReceiverIsPointer;
+    pub const tryEmitUnionOrphanCall = @import("core.zig").tryEmitUnionOrphanCall;
     // Canonical `with Trait (m)` dispatch (docs/17 §"Diamond
     // Disambiguation"). The two helpers below are file-scope
     // functions — like their sibling `getSourceTypeName` — re-exported
@@ -416,6 +441,7 @@ pub const MapEntry = struct {
     pub const emitPatternBindings = @import("stmt.zig").emitPatternBindings;
     pub const variantSlotType = @import("stmt.zig").variantSlotType;
     pub const seedCaptureType = @import("stmt.zig").seedCaptureType;
+
     pub const needsIntDivShim = @import("primary.zig").needsIntDivShim;
     // Gap #6 widening helper (`typeAwareFmtSpec`): intentionally
     // NOT re-exported here. Both current call sites (`genPrintCall`
@@ -493,10 +519,18 @@ pub const MapEntry = struct {
             .fn_is_async = false,
             // `prog` is set by `generate()` immediately on entry
             // (see the `self.prog = &prog;` line at the top of
-            // `generate`). Leaving it undefined here is intentional
-            // — every emit call goes through `generate()` so prog
-            // is always populated before any field that reads it.
-            .prog = undefined,
+            // `generate`). Pointing fresh instances at the
+            // comptime-empty Program is intentional: the template-
+            // literal placeholder codegen in primary.zig's
+            // genTemplateLit builds an `args_cg = Codegen.init()`
+            // (copying only type_info_buf) and routes placeholder
+            // exprs through genExpr — any path that walks
+            // `self.prog.enums` / `self.prog.structs` (e.g. the
+            // union-method dispatch helpers) would fault on an
+            // `undefined` pointer. The empty Program's slices are all
+            // empty, so lookups return "not found" and emit falls
+            // through to verbatim.
+            .prog = &empty_prog,
         };
     }
 
@@ -2572,6 +2606,215 @@ pub const MapEntry = struct {
     pub     fn genericBaseOfTypeText(self: *Codegen, type_text: []const u8) ?[]const u8 {
         if (self.genericInstanceOfTypeText(type_text)) |gi| return gi.base;
         return null;
+    }
+
+    /// stdlib union → materialized module path (mirror of
+    /// `genericStructModulePath`): the orphan free fns for
+    /// MATERIALIZED stdlib unions (`Json_get`) live in
+    /// lib/std/json.zag, not the user module — call sites must route
+    /// through `@import("std/json.zig").Json_get(...)`. User-defined
+    /// unions (declared in the module being generated) return null —
+    /// their free fns are same-module. Keep in sync with union decls
+    /// added to lib/std/ (self-module detection below keys off the
+    /// source file name).
+    pub     fn unionModulePath(self: *Codegen, name: []const u8) ?[]const u8 {
+        // Paths are the MATERIALIZED module names — the imports loop
+        // emits `@import("std/json.zig")` (the build/gen/std/ tree),
+        // NOT the source lib/std/ paths.
+        const KNOWN = &[_]struct { name: []const u8, path: []const u8 }{
+            .{ .name = "Json", .path = "std/json.zig" },
+        };
+        for (KNOWN) |k| {
+            if (!std.mem.eql(u8, k.name, name)) continue;
+            // Self-module case: lib/std/json.zag's own codegen instance
+            // (source_path == the stdlib source path) calls its free fns
+            // BARE — an inline @import("std/json.zig") inside
+            // build/gen/std/json.zig would resolve relative to itself
+            // and fail to load. The match is the FULL stdlib source
+            // path, not a bare suffix: examples/stdlib/json.zag also
+            // ends with "json.zag" and would otherwise be mistaken for
+            // the stdlib module, silently dropping the dispatch
+            // (surfaced by examples/stdlib/json.zag's `jv.get(...)`).
+            if (self.source_path.len > 0 and std.mem.endsWith(u8, self.source_path, "lib/std/json.zag")) {
+                return null;
+            }
+            // Materialized std module calling a union from another std
+            // dir: the path is relative to the generated file's dir —
+            // strip the `std/` module-root prefix (the k.path form is
+            // for the USER module at build/gen/main.zig), and prepend
+            // `../` when the caller lives in a nested dir.
+            if (self.import_std_base.len == 0 and self.source_path.len > 0) {
+                const rel_to_std = if (std.mem.startsWith(u8, k.path, "std/"))
+                    k.path["std/".len..]
+                else
+                    k.path;
+                const src_dir_end = std.mem.lastIndexOfScalar(u8, self.source_path, '/');
+                var nested = false;
+                if (src_dir_end) |sde| {
+                    nested = sde > "lib/std/".len;
+                }
+                if (nested) {
+                    if (std_module_rel_scratch.len >= 3 + rel_to_std.len) {
+                        std_module_rel_scratch[0] = '.';
+                        std_module_rel_scratch[1] = '.';
+                        std_module_rel_scratch[2] = '/';
+                        @memcpy(std_module_rel_scratch[3..][0..rel_to_std.len], rel_to_std);
+                        return std_module_rel_scratch[0 .. 3 + rel_to_std.len];
+                    }
+                } else {
+                    return rel_to_std;
+                }
+            }
+            return k.path;
+        }
+        return null;
+    }
+
+    /// True when `name` is a UNION — a payload-bearing or backed enum
+    /// (the container shapes whose impl methods flatten to orphan free
+    /// fns) — either declared in the current module or known from the
+    /// materialized stdlib. BARE enums return false: their methods
+    /// stay nested inside the zig `enum` container and zig's native
+    /// member-call sugar handles them, so the orphan rewrite must not
+    /// fire. Mirrors the generate() gate that records only bare enums
+    /// in matched_targets_buf (gap #3 dispatch-side).
+    pub     fn isUnionTarget(self: *Codegen, name: []const u8) bool {
+        // Module-local decls win over the KNOWN stdlib-union table: a
+        // user module declaring its own `struct Json` / `union Json`
+        // must NOT be hijacked into the stdlib orphan path. A local
+        // struct's methods stay nested and dispatch natively (verbatim
+        // `x.get(...)` compiles — struct methods are NOT flattened),
+        // and a local union's impl blocks are resolved from
+        // prog.impls by unionMethodReceiverIsPointer. The KNOWN table
+        // is consulted only for names with NO module-local decl.
+        for (self.prog.structs) |sd| {
+            if (std.mem.eql(u8, sd.name, name)) return false;
+        }
+        for (self.prog.enums) |ed| {
+            if (!std.mem.eql(u8, ed.name, name)) continue;
+            if (ed.backing_type != null) return true;
+            for (ed.variants) |v| {
+                if (v.payload_type != null or v.fields.len > 0) return true;
+            }
+            return false; // bare enum — nested methods, native dispatch
+        }
+        return self.unionModulePath(name) != null;
+    }
+
+    /// Union orphan-method receiver-shape lookup: returns non-null
+    /// when `method_name` resolves to a non-trait-bound method on
+    /// `union_name`'s impl block; the returned bool is true when the
+    /// method's receiver param is a pointer (`self: *Json`), which the
+    /// call-site emit uses to decide whether to pass the receiver by
+    /// address (`&`). Same-module unions walk `prog.impls`; materialized
+    /// stdlib unions (whose impls aren't visible to the user module)
+    /// consult a KNOWN method table that must stay in sync with the
+    /// impl blocks in lib/std/. Trait-bound methods emit under the
+    /// renamed `<Target>_<Trait>_<Method>` shape (resolveTraitBinding)
+    /// and return null so the verbatim fallback stays in charge.
+    pub     fn unionMethodReceiverIsPointer(self: *Codegen, union_name: []const u8, method_name: []const u8) ?bool {
+        // Module-local impls win (mirror of isUnionTarget's local-first
+        // rule): a user-declared union's receiver shape resolves from
+        // prog.impls, never the stdlib KNOWN table — a local union
+        // sharing a stdlib name must not be shaped by the stdlib's
+        // method signatures. Only names with NO module-local impl
+        // block fall through to the materialized-stdlib table.
+        var local_impl_found = false;
+        for (self.prog.impls) |impl| {
+            if (!std.mem.eql(u8, impl.target_type, union_name)) continue;
+            local_impl_found = true;
+            for (impl.methods) |m| {
+                if (!std.mem.eql(u8, m.name, method_name)) continue;
+                if (self.resolveTraitBinding(&impl, m) != null) continue;
+                if (m.params.len == 0) return false; // static method, no receiver
+                return std.mem.startsWith(u8, m.params[0].type_text, "*");
+            }
+        }
+        if (local_impl_found) return null; // local union lacks the method — verbatim fallback
+        if (self.unionModulePath(union_name) != null) {
+            // Receiver shapes for MATERIALIZED stdlib union methods
+            // (the user module can't see lib/std impl blocks). Keep
+            // in sync with the impl blocks in lib/std/ — a stdlib
+            // method missing here silently falls back to verbatim
+            // (zig then rejects the bare member call), so add an
+            // entry whenever lib/std gains a union method.
+            const KNOWN = &[_]struct { u: []const u8, m: []const u8, recv_ptr: bool }{
+                .{ .u = "Json", .m = "get", .recv_ptr = true },
+            };
+            for (KNOWN) |k| {
+                if (std.mem.eql(u8, k.u, union_name) and std.mem.eql(u8, k.m, method_name)) return k.recv_ptr;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /// Union orphan-method dispatch — the shared rewrite behind both
+    /// `hover.is_action()` (member form) and `ClickEvent.is_action(hover)`
+    /// (qualified static form) in the `.method_call` arm, and their
+    /// template-placeholder dotted-`.call` cousins. Resolves the union
+    /// name from the receiver (a binding's tracked type or a bare
+    /// union type name), confirms the method exists, then emits
+    /// `[<@import>. ]<Union>_<Method>(<receiver?>, <args...>)`. The
+    /// member form passes the receiver as the first argument with `&`
+    /// when the impl's receiver param is a pointer and the binding is
+    /// a value (mirroring the generic-instance dispatch's `&` rule and
+    /// zig's own method-call sugar); the qualified form passes args
+    /// verbatim. Returns true when the call was rewritten — false
+    /// leaves the caller's verbatim fallback in charge.
+    pub     fn tryEmitUnionOrphanCall(self: *Codegen, receiver_ident: []const u8, method_name: []const u8, args: []const ast.Expr) bool {
+        var union_name: []const u8 = receiver_ident;
+        var tracked: ?[]const u8 = null;
+        if (!self.isUnionTarget(union_name)) {
+            // Member form: resolve the binding's tracked type, strip
+            // pointer prefixes to reach the union name, and remember
+            // the original so the `&` decision knows the binding kind.
+            const tn = self.getSourceTypeName(receiver_ident) orelse return false;
+            var base: []const u8 = tn;
+            if (std.mem.startsWith(u8, base, "*const ")) base = base["*const ".len..];
+            if (std.mem.startsWith(u8, base, "*")) base = base["*".len..];
+            if (!self.isUnionTarget(base)) return false;
+            union_name = base;
+            tracked = tn;
+        }
+        const recv_ptr = self.unionMethodReceiverIsPointer(union_name, method_name) orelse return false;
+        if (self.unionModulePath(union_name)) |mod_path| {
+            self.write("@import(\"");
+            self.write(mod_path);
+            self.write("\").");
+        }
+        self.write(union_name);
+        self.write("_");
+        self.write(method_name);
+        self.write("(");
+        if (tracked) |tt| {
+            var base: []const u8 = tt;
+            if (std.mem.startsWith(u8, base, "*const ")) base = base["*const ".len..];
+            if (std.mem.startsWith(u8, base, "*")) base = base["*".len..];
+            const binding_is_ptr = !std.mem.eql(u8, tt, base);
+            if (recv_ptr and !binding_is_ptr) {
+                // Value binding + pointer receiver: a bare `&v` would
+                // be `*const T` when the binding is a const capture
+                // (zig's optional-capture `|v|` and match captures are
+                // const), which zig rejects as const-discard — wrap in
+                // @constCast to strip the qualifier (same pattern as
+                // the trait-cast arm). A no-op on already-mutable
+                // bindings, so the wrap is unconditional for the
+                // address form.
+                self.write("@constCast(&");
+                self.write(receiver_ident);
+                self.write(")");
+            } else {
+                self.write(receiver_ident);
+            }
+            if (args.len > 0) self.write(", ");
+        }
+        for (args, 0..) |a, i| {
+            if (i > 0) self.write(", ");
+            self.genExpr(a);
+        }
+        self.write(")");
+        return true;
     }
 
     /// Resolve a field's declared type text from a module-local
