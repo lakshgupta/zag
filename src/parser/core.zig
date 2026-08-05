@@ -457,6 +457,19 @@ pub fn isKnownVariant(self: *Parser, name: []const u8) bool {
         // preserves legacy behavior). Mirror of the codegen-side
         // lookupVariantFieldsByName call so the parser and codegen
         // agree on the same name-table content.
+        // Preamble union ctors (Result/Option — the codegen preamble
+        // in src/codegen/core.zig): Ok/Err/Some/None count as
+        // registered variant names even though no module decl declares
+        // them — the unqualified `Ok(v)` ctor must route to the
+        // `.enum_variant_ctor` path so the emit produces
+        // `.{ .Ok = v }` (zig infers the union from the binding's
+        // `: T` annotation). Without the registration `Ok(v)` emits
+        // as a bare call and zig rejects the undeclared identifier.
+        if (std.mem.eql(u8, name, "Ok") or std.mem.eql(u8, name, "Err") or
+            std.mem.eql(u8, name, "Some") or std.mem.eql(u8, name, "None"))
+        {
+            return true;
+        }
         var i: u32 = 0;
         while (i < self.known_variant_count) : (i += 1) {
             if (std.mem.eql(u8, self.known_variant_names[i], name)) return true;
@@ -762,11 +775,14 @@ pub const Parser = struct {
         .{ .name = "std.strings.slices", .path = "lib/std/strings/slices.zag" },
         .{ .name = "std.io", .path = "lib/std/io.zag" },
         .{ .name = "std.math", .path = "lib/std/math.zag" },
+        .{ .name = "std.json", .path = "lib/std/json.zag" },
         .{ .name = "std.sort", .path = "lib/std/sort.zag" },
         .{ .name = "std.encoding", .path = "lib/std/encoding.zag" },
         .{ .name = "std.hash", .path = "lib/std/hash.zag" },
         .{ .name = "std.random", .path = "lib/std/random.zag" },
         .{ .name = "std.debug", .path = "lib/std/debug.zag" },
+        .{ .name = "std.async", .path = "lib/std/async/mod.zag" },
+        .{ .name = "std.async.loop", .path = "lib/std/async/loop.zag" },
         .{ .name = "std.async.stream", .path = "lib/std/async/stream.zag" },
         .{ .name = "std.arch.x86.avx2", .path = "lib/std/arch/x86/avx2.zag" },
         .{ .name = "std.concurrent.atomic", .path = "lib/std/concurrent/atomic.zag" },
@@ -910,6 +926,7 @@ pub const Parser = struct {
     // qualified form `Enum.Variant(args)`. Mirrors the existing
     // `parsePrimary`/`parseStructLit` re-exports via `@import` indirection.
     pub const parseEnumVariantCtorBrace = @import("primary.zig").parseEnumVariantCtorBrace;
+    pub const parseEnumVariantCtorParen = @import("primary.zig").parseEnumVariantCtorParen;
     // A2 newline-skip helper re-export (commit 2 of v1.5 multi-dim split,
     // docs/10 §"Multi-Dim Arrays"): parseArrayLit's element-collection
     // loop calls `self.skipNewlines()` to walk past `.newline` tokens

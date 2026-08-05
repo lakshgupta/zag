@@ -899,6 +899,21 @@ fn looksLikeTemplateLiteral(text: []const u8) bool {
                     // doesn't fire for the boilerplate.
                     return false;
                 }
+                if (c == '"' or c == '\'') {
+                    // Quoted content inside `{...}` — embedded code
+                    // or a data literal (JSON object/array strings
+                    // carry `\"` escapes; C-style boilerplate has
+                    // `\"...\"`), never a template interpolation.
+                    // The interpolation mini-parser (buildTemplate)
+                    // only builds `.ident` / `.call` shapes, so any
+                    // content containing a quote character could
+                    // never be a valid `{expr}` — rejecting here
+                    // keeps `parse("{\"a\": [1, 2, 3]}")`
+                    // (lib/std/json.zag's documented surface) a
+                    // plain `.string_lit` instead of mangling it
+                    // into a template with a bogus expression.
+                    return false;
+                }
                 if (c == '}') {
                     found_close = true;
                     i += 1;
@@ -1038,6 +1053,21 @@ pub fn parsePrimary(self: *Parser) Expr {
                     } }, .loc = tok.loc };
                 }
                 if (self.peek().tag == .lparen) {
+                    // Unqualified paren ctor for the PREAMBLE union
+                    // variants (`Ok(v)` / `Err(e)` / `Some(x)` /
+                    // `None`) — the Result/Option ctors surface as
+                    // calls in user code. `isKnownVariant` includes
+                    // the four preamble names; the ctor AST routes the
+                    // emit to `.{ .Ok = v }` (the union type is
+                    // inferred from the binding's `: T` annotation).
+                    // Non-preamble unqualified variants stay calls
+                    // (the qualified form is the documented v1 path).
+                    if (self.isKnownVariant(name)) {
+                        const prev = self.allow_struct_lit;
+                        self.allow_struct_lit = false;
+                        defer self.allow_struct_lit = prev;
+                        return self.parseEnumVariantCtorParen(name, null);
+                    }
                     return self.parseCallExpr(name);
                 } else if (self.peek().tag == .lbrace and self.allow_struct_lit and
                     name.len > 0 and name[0] >= 'A' and name[0] <= 'Z' and
@@ -1529,6 +1559,31 @@ pub fn parseStructLitWithArgs(self: *Parser, type_name: []const u8, type_args: [
 /// skipping inside `{...}`, single ident + colon + expr per slot)
 /// but builds the variant-ctor AST node instead of struct-lit's. The
 /// 16-slot cap matches parseStructLit's `inits_buf` for symmetry.
+
+pub fn parseEnumVariantCtorParen(self: *Parser, variant_name: []const u8, enum_name: ?[]const u8) Expr {
+    const start_loc = self.peek().loc;
+    self.expect(.lparen);
+    var args_buf: [16]Expr = undefined;
+    var arg_count: usize = 0;
+    if (self.peek().tag != .rparen) {
+        args_buf[arg_count] = self.parseExpr();
+        arg_count += 1;
+        while (self.peek().tag == .comma) {
+            self.advance();
+            args_buf[arg_count] = self.parseExpr();
+            arg_count += 1;
+        }
+    }
+    self.expect(.rparen);
+    const args = self.arena.alloc(Expr, arg_count);
+    @memcpy(args, args_buf[0..arg_count]);
+    return Expr{ .payload = .{ .enum_variant_ctor = .{
+        .enum_name = enum_name,
+        .variant_name = variant_name,
+        .args = args,
+    } }, .loc = start_loc };
+}
+
 pub fn parseEnumVariantCtorBrace(self: *Parser, variant_name: []const u8) Expr {
     const start_loc = self.peek().loc;
     // BLOCKING #1 fix (gap #2 closure): reject EMPTY brace `Variant {}` on a

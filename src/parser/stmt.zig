@@ -388,13 +388,31 @@ pub fn parseErrDefer(self: *Parser) Stmt.ErrDeferStmt {
 pub fn parseFieldAssign(self: *Parser) Stmt.FieldAssignStmt {
         const target_loc = self.peek().loc;
         const target_name = self.expectIdent();
-        const target = self.arena.alloc(Expr, 1);
-        target[0] = Expr{ .payload = .{ .ident = target_name }, .loc = target_loc };
+        var target: Expr = .{ .payload = .{ .ident = target_name }, .loc = target_loc };
+        // Dotted-chain target support (`entry.fut.done = true` —
+        // surfaced by std.async's EventLoop.poll): consume
+        // `. ident` pairs while ANOTHER `.` follows, so the final
+        // `.field = value` pair stays unconsumed. The codegen's
+        // field_assign emit writes `target.field = value` where the
+        // target is a member_access expr — the chain round-trips
+        // verbatim.
+        while (self.peek().tag == .dot and
+            self.peekAhead(1) == .identifier and
+            self.peekAhead(2) == .dot)
+        {
+            self.advance();
+            const chain_field = self.expectIdent();
+            const boxed = self.arena.alloc(Expr, 1);
+            boxed[0] = target;
+            target = Expr{ .payload = .{ .member_access = .{ .target = &boxed[0], .name = chain_field } }, .loc = target_loc };
+        }
+        const target_ptr = self.arena.alloc(Expr, 1);
+        target_ptr[0] = target;
         self.expect(.dot);
         const field_name = self.expectIdent();
         self.expect(.equals);
         const value = self.parseExpr();
-        return .{ .target = &target[0], .field_name = field_name, .value = value };
+        return .{ .target = &target_ptr[0], .field_name = field_name, .value = value };
     }
 
 
@@ -924,13 +942,35 @@ pub fn parseStmt(self: *Parser) Stmt {
                     // is supported via this lookahead -- for more complex LHSs
                     // like `(getBox()).x = …` or `arr[i].x = …`, the user can
                     // extract the value to a local first then field-assign.
+                    //
+                    // Dotted CHAIN targets (`entry.fut.done = true` —
+                    // std.async EventLoop.poll): scan forward over
+                    // `. ident` pairs; when an `.equals` follows the
+                    // final ident of the run, route to parseFieldAssign
+                    // (which consumes the whole chain). Without the
+                    // scan the 3-token check misses chains and the
+                    // statement falls to expr_stmt, emitting garbage.
                     if (next == .dot and
                         self.pos + 2 < self.tokens.len and
-                        self.tokens[self.pos + 2].tag == .identifier and
-                        self.pos + 3 < self.tokens.len and
-                        self.tokens[self.pos + 3].tag == .equals)
+                        self.tokens[self.pos + 2].tag == .identifier)
                     {
-                        return Stmt{ .payload = .{ .field_assign = self.parseFieldAssign() }, .loc = tok.loc };
+                        var scan: usize = 1;
+                        var chain_field_assign = false;
+                        while (self.pos + scan + 2 < self.tokens.len and
+                            self.tokens[self.pos + scan].tag == .dot and
+                            self.tokens[self.pos + scan + 1].tag == .identifier)
+                        {
+                            const after = self.tokens[self.pos + scan + 2].tag;
+                            if (after == .equals) {
+                                chain_field_assign = true;
+                                break;
+                            }
+                            if (after != .dot) break;
+                            scan += 2;
+                        }
+                        if (chain_field_assign) {
+                            return Stmt{ .payload = .{ .field_assign = self.parseFieldAssign() }, .loc = tok.loc };
+                        }
                     }
                     // 4-token lookahead for `name . ident [ expr ] =` — the
                     // field-index-write form used by lib/std/string.zag's
