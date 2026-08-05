@@ -1148,3 +1148,10 @@ test "parser: extern variadic fun captures is_variadic flag" {
     try std.testing.expectEqual(@as(usize, 1), prog.externs.len);
     try std.testing.expect(prog.externs[0].is_variadic);
 }
+
+test "probe: json string escapes lex" {
+    const src = "fun f() {\n    let c: u8 = 34;\n    if (c == 34) { print(\"x\\\"y\\n\"); }\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    try std.testing.expect(tokens.len > 3);
+}

@@ -19,12 +19,21 @@ pub     fn readString(self: *Lexer, start_loc: ast.Loc) void {
     const start = self.pos;
     while (self.pos < self.src.len and self.src[self.pos] != '"') {
         if (self.src[self.pos] == '\\') {
-            if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '"') {
-                self.pos += 2;
-                self.col += 2;
+            // Backslash-run rule: only an ODD run escapes the
+            // following quote (`\\\"` = backslash + quote inside the
+            // string; `\\\\"` = two literal backslashes THEN the
+            // closing quote). The naive `\`+`"` pair-skip consumed
+            // the closing quote of even-run strings (`"\\\\"`), so
+            // the string ran to end-of-line and the parse broke
+            // (surfaced by std.json's stringify escape table).
+            var run: u32 = 0;
+            while (self.pos + run < self.src.len and self.src[self.pos + run] == '\\') run += 1;
+            if (run % 2 == 1 and self.pos + run < self.src.len and self.src[self.pos + run] == '"') {
+                self.pos += run + 1;
+                self.col += run + 1;
             } else {
-                self.pos += 1;
-                self.col += 1;
+                self.pos += run;
+                self.col += run;
             }
         } else {
             self.pos += 1;
