@@ -371,6 +371,7 @@ pub const MapEntry = struct {
     pub const genericBaseOfTypeText = @import("core.zig").genericBaseOfTypeText;
     pub const genericInstanceOfTypeText = @import("core.zig").genericInstanceOfTypeText;
     pub const genericInstanceOfParenText = @import("core.zig").genericInstanceOfParenText;
+    pub const structFieldType = @import("core.zig").structFieldType;
     pub const getSourceTypeName = @import("core.zig").getSourceTypeName;
     // Canonical `with Trait (m)` dispatch (docs/17 §"Diamond
     // Disambiguation"). The two helpers below are file-scope
@@ -413,6 +414,8 @@ pub const MapEntry = struct {
     // re-export pattern used by the gap #2 `lookupVariantFields`
     // helper above).
     pub const emitPatternBindings = @import("stmt.zig").emitPatternBindings;
+    pub const variantSlotType = @import("stmt.zig").variantSlotType;
+    pub const seedCaptureType = @import("stmt.zig").seedCaptureType;
     pub const needsIntDivShim = @import("primary.zig").needsIntDivShim;
     // Gap #6 widening helper (`typeAwareFmtSpec`): intentionally
     // NOT re-exported here. Both current call sites (`genPrintCall`
@@ -1014,30 +1017,53 @@ pub const MapEntry = struct {
             // carries Some(T) and None (void). Both types defined here in
             // the preamble so every generated zig module can reference them
             // without an explicit import.
-            \\fn Result(comptime T: type, comptime E: type) type {
-            \\    return union(enum) {
-            \\        Ok: T,
-            \\        Err: E,
-            \\        pub fn unwrap(self: @This()) T {
-            \\            return switch (self) {
-            \\                .Ok => |v| v,
-            \\                .Err => @panic("unwrap on Err"),
-            \\            };
-            \\        }
-            \\    };
-            \\}
-            \\fn Option(comptime T: type) type {
-            \\    return union(enum) {
-            \\        Some: T,
-            \\        None: void,
-            \\        pub fn unwrap(self: @This()) T {
-            \\            return switch (self) {
-            \\                .Some => |v| v,
-            \\                .None => @panic("unwrap on None"),
-            \\            };
-            \\        }
-            \\    };
-            \\}
+            );
+            // Result/Option are emitted CONDITIONALLY: the user module
+            // defines the canonical inline union(enum) types; MATERIALIZED
+            // std modules (use_hybrid_stdlib=false) forward to
+            // @import("root") so a std fn returning Result(T, E) shares
+            // the USER's Result type — without the forwarder, std.json's
+            // parse returns std.json.Result(...) which mismatches the
+            // caller's main.Result(...) annotation (per-module preamble
+            // duplication surfaced by the json batch).
+            if (self.use_hybrid_stdlib) {
+                self.write(
+                            \\pub fn Result(comptime T: type, comptime E: type) type {
+                            \\    return union(enum) {
+                            \\        Ok: T,
+                            \\        Err: E,
+                            \\        pub fn unwrap(self: @This()) T {
+                            \\            return switch (self) {
+                            \\                .Ok => |v| v,
+                            \\                .Err => @panic("unwrap on Err"),
+                            \\            };
+                            \\        }
+                            \\    };
+                            \\}
+                            \\pub fn Option(comptime T: type) type {
+                            \\    return union(enum) {
+                            \\        Some: T,
+                            \\        None: void,
+                            \\        pub fn unwrap(self: @This()) T {
+                            \\            return switch (self) {
+                            \\                .Some => |v| v,
+                            \\                .None => @panic("unwrap on None"),
+                            \\            };
+                            \\        }
+                            \\    };
+                            \\}
+                );
+            } else {
+                self.write(
+                    \\fn Result(comptime T: type, comptime E: type) type {
+                    \\    return @import("root").Result(T, E);
+                    \\}
+                    \\fn Option(comptime T: type) type {
+                    \\    return @import("root").Option(T);
+                    \\}
+                );
+            }
+            self.write(
             \\// Future(T) — async/await v1 (docs/manual/00-overview.md
             \\// "Zero-cost async"): `async fun` returns `Future(T)`
             \\// wrapping the declared return type; `await EXPR` drives
@@ -1110,6 +1136,107 @@ pub const MapEntry = struct {
             \\    const buf = __zag_format_buf[idx..][0..4096];
             \\    __zag_format_buf_idx = (idx + 4096) % (__zag_format_buf.len);
             \\    return std.fmt.bufPrint(buf, "{any}", .{value}) catch "(fmt overflow)";
+            \\}
+            \\
+            \\// __zag_atof — libc-free float parse for std.json: scans a
+            \\// sign, integer digits, fractional digits, then an optional
+            \\// e/E exponent (the v1 subset json.zag produces).
+            \\fn __zag_atof(s: []const u8) f64 {
+            \\    var i: usize = 0;
+            \\    var neg = false;
+            \\    if (i < s.len and (s[i] == '-' or s[i] == '+')) {
+            \\        neg = s[i] == '-';
+            \\        i += 1;
+            \\    }
+            \\    var result: f64 = 0;
+            \\    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            \\        result = result * 10.0 + @as(f64, @floatFromInt(s[i] - '0'));
+            \\    }
+            \\    if (i < s.len and s[i] == '.') {
+            \\        i += 1;
+            \\        var scale: f64 = 0.1;
+            \\        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            \\            result += @as(f64, @floatFromInt(s[i] - '0')) * scale;
+            \\            scale *= 0.1;
+            \\        }
+            \\    }
+            \\    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+            \\        i += 1;
+            \\        var eneg = false;
+            \\        if (i < s.len and (s[i] == '-' or s[i] == '+')) {
+            \\            eneg = s[i] == '-';
+            \\            i += 1;
+            \\        }
+            \\        var exp: i32 = 0;
+            \\        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            \\            exp = exp * 10 + @as(i32, s[i] - '0');
+            \\        }
+            \\        if (eneg) exp = -exp;
+            \\        while (exp > 0) : (exp -= 1) result *= 10.0;
+            \\        while (exp < 0) : (exp += 1) result *= 0.1;
+            \\    }
+            \\    return if (neg) -result else result;
+            \\}
+            \\// __zag_ftoa — libc-free float formatting for std.json:
+            \\// writes integer digits, a '.', and 6 fractional digits
+            \\// into `buf`, returning the byte length.
+            \\fn __zag_ftoa(value: f64, buf: []u8) usize {
+            \\    var v = value;
+            \\    var neg = false;
+            \\    if (v < 0) {
+            \\        neg = true;
+            \\        v = -v;
+            \\    }
+            \\    var int_part: u64 = @intFromFloat(v);
+            \\    var frac = v - @as(f64, @floatFromInt(int_part));
+            \\    var pos: usize = 0;
+            \\    if (neg) {
+            \\        if (pos < buf.len) buf[pos] = '-';
+            \\        pos += 1;
+            \\    }
+            \\    var digits: [32]u8 = undefined;
+            \\    var nd: usize = 0;
+            \\    if (int_part == 0) {
+            \\        digits[0] = '0';
+            \\        nd = 1;
+            \\    } else {
+            \\        while (int_part > 0) : (int_part /= 10) {
+            \\            digits[nd] = @intCast('0' + int_part % 10);
+            \\            nd += 1;
+            \\        }
+            \\    }
+            \\    var d = nd;
+            \\    while (d > 0) {
+            \\        d -= 1;
+            \\        if (pos < buf.len) buf[pos] = digits[d];
+            \\        pos += 1;
+            \\    }
+            \\    if (pos < buf.len) buf[pos] = '.';
+            \\    pos += 1;
+            \\    var k: usize = 0;
+            \\    while (k < 6) : (k += 1) {
+            \\        frac *= 10.0;
+            \\        const digit: u8 = @intFromFloat(frac);
+            \\        frac -= @as(f64, @floatFromInt(digit));
+            \\        if (pos < buf.len) buf[pos] = '0' + digit;
+            \\        pos += 1;
+            \\    }
+            \\    return pos;
+            \\}
+            \\
+            \\// __zag_nanosleep_ms — blocking nanosleep for std.async's
+            \\// timer loop (sleep/wait/run_for tick at 1ms granularity;
+            \\// no busy-wait). Decomposes ms into sec + nsec so long
+            \\// sleeps stay accurate.
+            \\fn __zag_nanosleep_ms(ms: i64) void {
+            \\    var req = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+            \\    if (ms >= 1000) {
+            \\        req.sec = @intCast(@divFloor(ms, 1000));
+            \\        req.nsec = @intCast(@rem(ms, 1000) * 1_000_000);
+            \\    } else if (ms > 0) {
+            \\        req.nsec = @intCast(ms * 1_000_000);
+            \\    }
+            \\    _ = std.os.linux.nanosleep(&req, null);
             \\}
             \\
             \\// __zag_posix family — raw POSIX syscall wrappers
@@ -2319,27 +2446,33 @@ pub const MapEntry = struct {
                 if (self.source_path.len > 0 and std.mem.endsWith(u8, self.source_path, src_name)) {
                     return null;
                 }
-                // Nested materialized module calling a generic from
-                // ANOTHER std dir (std.strings.slices using
-                // std.collections.ArrayList): the path is relative to
-                // the generated file's dir, so strip the `std/`
-                // module-root prefix and prepend `../`.
+                // Materialized std module calling a generic from
+                // another std dir: the path is relative to the
+                // generated file's dir — strip the `std/` module-root
+                // prefix (the k.path form is for the USER module at
+                // build/gen/main.zig), and prepend `../` when the
+                // caller lives in a nested dir (std.strings.slices
+                // → std.collections).
                 if (self.import_std_base.len == 0 and self.source_path.len > 0) {
+                    const rel_to_std = if (std.mem.startsWith(u8, k.path, "std/"))
+                        k.path["std/".len..]
+                    else
+                        k.path;
                     const src_dir_end = std.mem.lastIndexOfScalar(u8, self.source_path, '/');
+                    var nested = false;
                     if (src_dir_end) |sde| {
-                        if (sde > "lib/std/".len) {
-                            const rel_to_std = if (std.mem.startsWith(u8, k.path, "std/"))
-                                k.path["std/".len..]
-                            else
-                                k.path;
-                            if (std_module_rel_scratch.len >= 3 + rel_to_std.len) {
-                                std_module_rel_scratch[0] = '.';
-                                std_module_rel_scratch[1] = '.';
-                                std_module_rel_scratch[2] = '/';
-                                @memcpy(std_module_rel_scratch[3..][0..rel_to_std.len], rel_to_std);
-                                return std_module_rel_scratch[0 .. 3 + rel_to_std.len];
-                            }
+                        nested = sde > "lib/std/".len;
+                    }
+                    if (nested) {
+                        if (std_module_rel_scratch.len >= 3 + rel_to_std.len) {
+                            std_module_rel_scratch[0] = '.';
+                            std_module_rel_scratch[1] = '.';
+                            std_module_rel_scratch[2] = '/';
+                            @memcpy(std_module_rel_scratch[3..][0..rel_to_std.len], rel_to_std);
+                            return std_module_rel_scratch[0 .. 3 + rel_to_std.len];
                         }
+                    } else {
+                        return rel_to_std;
                     }
                 }
                 return k.path;
@@ -2438,6 +2571,26 @@ pub const MapEntry = struct {
     /// only needs the generic-struct identity).
     pub     fn genericBaseOfTypeText(self: *Codegen, type_text: []const u8) ?[]const u8 {
         if (self.genericInstanceOfTypeText(type_text)) |gi| return gi.base;
+        return null;
+    }
+
+    /// Resolve a field's declared type text from a module-local
+    /// struct decl: `timers` on `EventLoop` → `ArrayList(TimerEntry)`.
+    /// Used by the `.method_call` generic dispatch to route
+    /// `self.timers.push(...)` (a member-access receiver whose base
+    /// resolves to a generic-typed field) to the orphan free fn.
+    pub     fn structFieldType(self: *Codegen, struct_name: []const u8, field_name: []const u8) ?[]const u8 {
+        for (self.prog.structs) |sd| {
+            if (!std.mem.eql(u8, sd.name, struct_name)) continue;
+            for (sd.fields) |f| {
+                switch (f.kind) {
+                    .named => |nf| {
+                        if (std.mem.eql(u8, nf.name, field_name)) return nf.type_text;
+                    },
+                    .embed => {},
+                }
+            }
+        }
         return null;
     }
 
