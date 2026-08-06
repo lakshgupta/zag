@@ -517,9 +517,12 @@ test "codegen: expression {a + b} emits verbatim a + b in args tuple" {
     // genExpr `.ident` arm at src/codegen/expr.zig:147-149 does
     // `self.write(name)` — emitting the text VERBATIM. So `a + b`
     // surfaces in the generated zig as a valid binary expression at
-    // the format-arg site. This is the load-bearing assumption the
-    // test pins: if the `.ident` arm ever wraps the text in
-    // `()`/`@as(...)`/etc., `{a + b}` would silently break.
+    // the format-arg site — now wrapped in the runtime-comptime
+    // `__zag_auto_fmt(...)` (the `{f}` + wrapper path for
+    // statically-unresolvable types): the wrapper's `{any}` fallback
+    // renders the i32 sum identically, and the inner text is still
+    // emitted verbatim, so this remains the load-bearing pin for the
+    // `.ident` arm not wrapping the text in `()`/`@as(...)`/etc.
     const src = "fun f() {\n    let a: i32 = 1;\n    let b: i32 = 2;\n    print(\"sum = {a + b}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -528,16 +531,19 @@ test "codegen: expression {a + b} emits verbatim a + b in args tuple" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Format string half: plain `{any}` (no spec — the spec split on `:`,
-    // there is no `:` inside the `{...}`).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "{any}") != null);
-    // Args tuple half: `a + b` appears verbatim in the args list, with
-    // no extra wrapping — the verbatim-emit path is the whole point of
-    // this commit's design. A regression that wrapped it in `()` (e.g.
-    // `.{(@as(i32, a + b),})` for a hypothetical type-coercion path)
-    // would surface as the wrapped form in the negative-substring path
-    // (the positive substring IS `, .{a + b,})` without the wrap).
-    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{a + b,})") != null);
+    // Format string half: `{f}` — the unknown-typed `.ident` payload
+    // `a + b` routes through the runtime-comptime wrap (no spec — the
+    // spec split on `:`, there is no `:` inside the `{...}`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "\"sum = {f}\\n\"") != null);
+    // Args tuple half: `a + b` appears verbatim (unwrapped) INSIDE the
+    // `__zag_auto_fmt(...)` wrapper in the args list — the verbatim
+    // inner-emit path is the whole point of this test's design. A
+    // regression that wrapped the text in `()` (e.g.
+    // `.{__zag_auto_fmt(@as(i32, a + b)),})` for a hypothetical
+    // type-coercion path) would surface as the wrapped form in the
+    // negative-substring path (the positive substring IS
+    // `, .{__zag_auto_fmt(a + b),})` with the inner text unwrapped).
+    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{__zag_auto_fmt(a + b),})") != null);
     // Sanity: the spec-split machinery is not engaged here (no `:` inside
     // the `{...}`), so the format string stays plain `{any}` and the
     // args tuple doesn't grow a `.5`/`:5`/etc. spec suffix.

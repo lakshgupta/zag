@@ -23,8 +23,12 @@ test "codegen: template literal in print emits __zag_print" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     // zig 0.16 requires a trailing comma inside `.{...}` even when only one
-    // field is present; we always emit `.{name,}` for single-arg interpolation.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"hello, {any}\\n\", .{name,})") != null);
+    // field is present; we always emit `.{...,}` for single-arg interpolation.
+    // `name` is UNANNOTATED (`let name = "zag"` has no `: T`), so its type is
+    // not statically known — the interpolation wraps it in `__zag_auto_fmt`
+    // (with `{f}` spec, the runtime-comptime string-vs-{any} dispatch) instead
+    // of the pre-gap byte-list `{any}` emit.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"hello, {f}\\n\", .{__zag_auto_fmt(name),})") != null);
 }
 
 test "codegen: template preserves LF byte in literal via \\n escape" {
@@ -39,9 +43,100 @@ test "codegen: template preserves LF byte in literal via \\n escape" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "\"a{any}a\\n\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"a{any}a\\n\", .{x,})") != null);}
+    // `x` is unannotated → type unknown → auto-fmt wrap (`{f}` spec) around
+    // the byte-escape-preserving format string.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "\"a{f}a\\n\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"a{f}a\\n\", .{__zag_auto_fmt(x),})") != null);}
 
+
+test "codegen: print(call returning str) wraps in __zag_auto_fmt" {
+    // Gap closure: `fun get_name() -> str` + `print(get_name())` — the
+    // arg is a `.call` whose return type codegen does NOT statically
+    // resolve (no typed-binding lookup fires for call exprs). Pre-gap
+    // this emitted `{any}` → the returned `[]const u8` printed as a byte
+    // list `{ 103, 114, 101, 101, 116 }`. Now the unknown-typed arg
+    // wraps in `__zag_auto_fmt(...)` with `{f}` spec — the wrapper's
+    // format() comptime-checks the VALUE's runtime type and prints the
+    // slice as text.
+    const src =
+        \\fun get_name() -> str {
+        \\    return "greet";
+        \\}
+        \\fun f() {
+        \\    print(get_name());
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{f}\", .{__zag_auto_fmt(get_name()),})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{get_name(),})") == null);
+}
+
+test "codegen: template interpolation of call result wraps in __zag_auto_fmt" {
+    // Template-literal analogue: `print("name: {get_name()}")` — the
+    // interpolated payload carries the call text `get_name()` which is
+    // NOT a typed binding, so typeAwareFmtSpec reports the type as
+    // unknown and the interpolation slot wraps it in `__zag_auto_fmt`
+    // with the `{f}` spec.
+    const src = "fun get_name() -> str {\n    return \"greet\";\n}\nfun f() {\n    print(\"name: {get_name()}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "\"name: {f}\\n\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_auto_fmt(get_name())") != null);
+}
+
+test "codegen: template interpolation of binary expr wraps in __zag_auto_fmt" {
+    // `{a + b}` interpolation — the payload is the raw text ident
+    // `a + b` (buildTemplate stores the inner text verbatim), so no
+    // typed-binding resolution fires; the auto-fmt wrap keeps the
+    // byte-`{any}` fallback identical for numeric operands while
+    // enabling string concat (`str + str`) to print as text.
+    const src = "fun f() {\n    let a: i32 = 1;\n    let b: i32 = 2;\n    print(\"sum: {a + b}\\n\");\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "\"sum: {f}\\n\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_auto_fmt(a + b)") != null);
+}
+
+test "codegen: print(call returning ?str) wraps optional in __zag_auto_fmt" {
+    // `let maybe = maybe_name(); print(maybe)` where the callee returns
+    // `?str` — a `.call` shape, so no static type resolution fires (the
+    // ident isn't a typed binding). The auto-fmt wrapper handles the
+    // optional at runtime: text payload via writeAll, "" for null.
+    const src =
+        \\fun maybe_name() -> ?str {
+        \\    return null;
+        \\}
+        \\fun f() {
+        \\    print(maybe_name());
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{f}\", .{__zag_auto_fmt(maybe_name()),})") != null);
+}
 
 test "codegen: binary emission is parenthesised" {
     // The generated zigzag source must wrap binary expressions in `()` so
@@ -84,7 +179,11 @@ test "codegen: method-call {obj.f()} emits verbatim obj.f() in args tuple" {
     // method-call expression at the format-arg site. This is the second
     // load-bearing assumption the test pins (after `{a + b}` above):
     // if the `.ident` arm ever wraps the text in `(blk: { ... })` /
-    // `try obj.f()` / etc., `{obj.f()}` would silently break.
+    // `try obj.f()` / etc., `{obj.f()}` would silently break. Since
+    // the interpolation type is unknown (`obj.f()` isn't a typed
+    // binding), the auto-fmt wrap (`__zag_auto_fmt(obj.f())`) is now
+    // applied around it — `obj.f()` still appears verbatim INSIDE the
+    // wrapper, so the verbatim-emit contract is preserved.
     const src = "fun f() {\n    let obj: i32 = 42;\n    print(\"got {obj.f()}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -93,14 +192,13 @@ test "codegen: method-call {obj.f()} emits verbatim obj.f() in args tuple" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Format string half: plain `{any}` (no spec — the `{...}` has no `:`).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "{any}") != null);
-    // Args tuple half: `obj.f()` appears verbatim in the args list.
-    // A regression that wrapped it in a try-block or labeled-blk
-    // (e.g. `, .{try obj.f(),}` or `, .{(blk: { return obj.f(); }),}`)
-    // would surface here — the positive form is the exact substring
-    // `, .{obj.f(),})` with no wrapping.
-    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{obj.f(),})") != null);
+    // Format string half: `{f}` (auto-fmt dispatch spec — no `:`).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "{f}") != null);
+    // Args tuple half: `obj.f()` appears verbatim (inside the auto-fmt
+    // wrapper) in the args list. A regression that wrapped it in a
+    // try-block or labeled-blk (e.g. `, .{try obj.f(),}` or
+    // `, .{(blk: { return obj.f(); }),}`) would surface here.
+    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{__zag_auto_fmt(obj.f()),})") != null);
     // Sanity: the inner `f()` parens don't surface as a separate token
     // group (which would happen if codegen split on `(` first). The full
     // text `obj.f()` is one contiguous substring in the args list.
@@ -725,9 +823,10 @@ test "codegen: print(label) for non-method body stays at {any}" {
 	// ends, `current_receiver_struct_name` is reset to null so a
 	// subsequent top-level `pub fun` declaration does NOT inherit
 	// the prior impl's receiver. The `label` ident here would
-	// resolve as a free binding with no struct context, so the
-	// {any} fallback applies (no widening). This test pins the
-	// genFun body-entry reset path.
+	// resolve as a free binding with no struct context, so it is
+	// NOT widened to `{s}` — as an unknown-typed arg it routes
+	// through the auto-fmt wrap (`{f}` + `__zag_auto_fmt(label)`)
+	// instead. This test pins the genFun body-entry reset path.
 	const src =
 		\\struct Box { label: str, }
 		\\impl Box {
@@ -750,10 +849,11 @@ test "codegen: print(label) for non-method body stays at {any}" {
 	// First, the impl-block pattern DOES widen (positive pin from
 	// the previous test, reproduced inline for context here):
 	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{s}\", .{self.label,})") != null);
-	// Second, the top-level `print(label)` line stays at {any}
-	// because no current-receiver context carries over into main.
-	// We pin `__zag_print("{any}", .{label,})` substring:
-	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{label,})") != null);
+	// Second, the top-level `print(label)` line does NOT widen to
+	// `{s}` — no current-receiver context carries over into main.
+	// As an unknown-typed arg it wraps in `__zag_auto_fmt` (with
+	// `{f}` spec). We pin that exact shape:
+	try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{f}\", .{__zag_auto_fmt(label),})") != null);
 }
 
 test "codegen: ? postfix try-operator unwraps Result with label-block" {
