@@ -58,6 +58,17 @@ pub const Codegen = struct {
     /// generate pass).
     out_buf: []u8 = &[_]u8{},
     out_len: usize,
+    /// Lazily-emitted print fallback: set when a print arg's type is
+    /// not statically known (genPrintCall else arm / genTemplateLit
+    /// interpolation slot route through `{f}` + `__zag_auto_fmt(...)`).
+    /// The helper is appended at the END of generate() — NOT the
+    /// preamble — so tests that scan the whole output for
+    /// `@TypeOf`/`struct {`/`blk: {`/`pub fn f` substrings, the
+    /// 13-helper __zag_posix preamble pin, and the `std.mem.span`
+    /// forbidden-substring pin never see it unless a print site
+    /// actually needs it. Zig container decls are order-independent,
+    /// so the end-of-file helper is reachable from earlier user code.
+    used_auto_fmt: bool = false,
     /// Reference to the parsed `ast.Program` this codegen pass
     /// operates on. `init()` leaves it undefined; `generate()`
     /// sets it to `&prog` immediately at entry so every emit
@@ -2377,6 +2388,85 @@ pub const MapEntry = struct {
                 );
             }
 
+        // __zag_auto_fmt family — emitted LAZILY at the end of
+        // generate() rather than in the always-on preamble. Only
+        // programs whose print args have a statically-unresolvable
+        // type (function returns, method results, unannotated
+        // bindings, cross-module values) set `used_auto_fmt`; the
+        // preamble stays byte-identical for everything else, which
+        // keeps whole-output scans in the test suite (the 13-helper
+        // __zag_posix pin, the @TypeOf / struct { / blk: { / pub fn f
+        // absence pins, and the std.mem.span forbidden-substring pin)
+        // green. Zig container-level decls are order-independent, so
+        // the end-of-file helper is reachable from earlier user code.
+        //
+        // The wrapper's format() comptime-inspects the VALUE's runtime
+        // type: the byte-slice family ([]const u8 / str, []u8, string
+        // literals as *const [N:0]u8, [:0]const u8, sentinel many-ptrs,
+        // ?str optionals) prints as text via writeAll; everything else
+        // falls back to `{any}` — byte-identical to the pre-gap output
+        // for scalars/structs/unions. Closes the gap where a string
+        // whose type wasn't statically known printed as a byte list
+        // (`{ 104, 101, 108, 108, 111 }`).
+        if (self.used_auto_fmt) {
+            self.write(
+                \\fn __zag_auto_fmt(value: anytype) __zag_AutoFmt(@TypeOf(value)) {
+                \\    return .{ .value = value };
+                \\}
+                \\fn __zag_AutoFmt(comptime T: type) type {
+                \\    return struct {
+                \\        value: T,
+                \\        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+                \\            const TT = @TypeOf(self.value);
+                \\            // Optional-of-byte-slice (?str): unwrap, text or "" for null.
+                \\            if (@typeInfo(TT) == .optional) {
+                \\                const child = @typeInfo(TT).optional.child;
+                \\                if (comptime __zag_is_byte_slice(child)) {
+                \\                    if (self.value) |v| return w.writeAll(__zag_as_str(v));
+                \\                    return w.writeAll("");
+                \\                }
+                \\            }
+                \\            if (comptime !__zag_is_byte_slice(TT)) {
+                \\                return w.print("{any}", .{self.value});
+                \\            }
+                \\            return w.writeAll(__zag_as_str(self.value));
+                \\        }
+                \\    };
+                \\}
+                \\fn __zag_is_byte_slice(comptime T: type) bool {
+                \\    return switch (@typeInfo(T)) {
+                \\        .pointer => |info| switch (info.size) {
+                \\            .slice => info.child == u8,
+                \\            .one => blk: {
+                \\                if (info.child == u8) break :blk true;
+                \\                if (@typeInfo(info.child) == .array) {
+                \\                    const ai = @typeInfo(info.child).array;
+                \\                    break :blk ai.child == u8;
+                \\                }
+                \\                break :blk false;
+                \\            },
+                \\            .many, .c => info.child == u8 and info.sentinel_ptr != null,
+                \\        },
+                \\        else => false,
+                \\    };
+                \\}
+                \\fn __zag_as_str(value: anytype) []const u8 {
+                \\    const T = @TypeOf(value);
+                \\    switch (@typeInfo(T)) {
+                \\        .pointer => |info| switch (info.size) {
+                \\            .slice => return value,
+                \\            .one => {
+                \\                if (info.child == u8) return value[0..1];
+                \\                return value;
+                \\            },
+                \\            .many, .c => return std.mem.span(value),
+                \\        },
+                \\        else => return value,
+                \\    }
+                \\}
+                \\
+            );
+        }
         return self.out_buf[0..self.out_len];
     }
 

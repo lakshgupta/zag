@@ -141,14 +141,23 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
     // `<Trait>_VTable_for_<Type>` keyed resolution) at the start
     // of v2 module wiring — for v1 the user's code must declare
     // the receiver struct in the same file as the print site.
-    pub fn typeAwareFmtSpec(self: *Codegen, expr: ast.Expr) struct { spec: []const u8, is_optional_byte_slice: bool } {
+    pub fn typeAwareFmtSpec(self: *Codegen, expr: ast.Expr) struct { spec: []const u8, is_optional_byte_slice: bool, wrap_auto: bool } {
         // .ident arm: existing typed-binding lookup via
         // type_info_buf (gap #6 widening, unchanged behaviour).
         if (expr.payload == .ident) {
             const ident_name = expr.payload.ident;
             var i: u32 = 0;
+            // found_ident distinguishes "statically known non-string"
+            // (binding exists with a scalar/struct type — keep bare
+            // `{any}`, byte-identical to pre-gap output) from "type
+            // not statically known" (binding absent — e.g. unannotated
+            // globals, cross-module values, params not in the map) which
+            // the caller routes through `{f}` + `__zag_auto_fmt(...)` so
+            // the VALUE's runtime type decides string-vs-`{any}`.
+            var found_ident = false;
             while (i < self.type_info_count) : (i += 1) {
                 if (std.mem.eql(u8, self.type_info_buf[i].name, ident_name)) {
+                    found_ident = true;
                     const rewritten = zagTypeToZig(self.type_info_buf[i].type_name);
                     // Pointer-to-optional byte slice (`*?[]const u8`) is
                     // OUT of scope for v1 widening — deref-then-orelse
@@ -166,11 +175,12 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             // (`_ = T;` etc.); punt to v1.2.
                             .is_optional_byte_slice = self.type_info_buf[i].type_name.len > 0 and
                                 self.type_info_buf[i].type_name[0] == '?',
+                            .wrap_auto = false,
                         };
                     }
                 }
             }
-            return .{ .spec = "any", .is_optional_byte_slice = false };
+            return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = !found_ident };
         }
         // v1.6 widening. Same-module member-access when receiver struct
         // is set (set by genFreeMethod body entry +
@@ -178,10 +188,10 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         // genFun body entry + end-of-impl-body emit).
         if (expr.payload == .member_access) {
             const recv_name_opt = self.current_receiver_struct_name;
-            if (recv_name_opt == null) return .{ .spec = "any", .is_optional_byte_slice = false };
+            if (recv_name_opt == null) return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = true };
             const recv_name = recv_name_opt.?;
             const ma = expr.payload.member_access;
-            if (ma.target.payload != .ident) return .{ .spec = "any", .is_optional_byte_slice = false };
+            if (ma.target.payload != .ident) return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = true };
             for (self.prog.structs) |sd| {
                 if (!std.mem.eql(u8, sd.name, recv_name)) continue;
                 for (sd.fields) |f| {
@@ -195,19 +205,40 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         return .{
                             .spec = "s",
                             .is_optional_byte_slice = tt.len > 0 and tt[0] == '?',
+                            .wrap_auto = false,
                         };
                     }
                     // Field exists but isn't a byte-slice family.
                     // Return `{any}` here rather than continuing the
                     // outer prog.structs walk — zag's struct names are
                     // unique within a program so the receiver-struct
-                    // match is definitive.
-                    return .{ .spec = "any", .is_optional_byte_slice = false };
+                    // match is definitive. Statically known scalar:
+                    // keep bare `{any}`, no auto-wrap needed.
+                    return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = false };
                 }
             }
-            return .{ .spec = "any", .is_optional_byte_slice = false };
+            // Receiver struct not found in prog.structs (e.g. a
+            // cross-module struct, or a struct whose decl lives in a
+            // different file) OR field not found on the matched struct:
+            // the field type is NOT statically known — defer to the
+            // `{f}` + `__zag_auto_fmt` runtime dispatch.
+            return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = true };
         }
-        return .{ .spec = "any", .is_optional_byte_slice = false };
+        // Literals carry statically-known scalar types (comptime_int /
+        // f64 / bool / char / null): keep the bare `{any}` so
+        // `print(42)` doesn't wrap pointlessly — the wrapper would
+        // render identically at runtime but adds emission noise.
+        if (expr.payload == .int_lit or expr.payload == .float_lit or
+            expr.payload == .bool_lit or expr.payload == .char_lit or
+            expr.payload == .null_lit)
+        {
+            return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = false };
+        }
+        // All other shapes (.call, .method_call, .binary, .unary,
+        // .cast, ...): no static type info — the arg may well be a
+        // string produced by a function call / method / operator, so
+        // route through the runtime-comptime wrapper.
+        return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = true };
     }
 
     // v1.6 byte-slice widening (legacy docblock — preserved as a
@@ -494,12 +525,28 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // at top of file for the full `.ident` +
                 // `.member_access` semantics.
                 const info = typeAwareFmtSpec(self, arg);
-                format_spec = info.spec;
+                // wrap_auto (type not statically known): switch the
+                // spec to `{f}` (zig 0.16's custom-format dispatch,
+                // Io/Writer.zig printValue routes a bare `f` spec to
+                // `value.format(w)`) and wrap the arg in
+                // `__zag_auto_fmt(...)` — the wrapper comptime-checks
+                // the VALUE's runtime type so byte-slices print as text
+                // while scalars/structs keep the identical `{any}`
+                // rendering. Statically-known non-strings keep the
+                // bare `{any}` (byte-identical to pre-gap output).
+                format_spec = if (info.wrap_auto) "f" else info.spec;
                 is_optional_byte_slice = info.is_optional_byte_slice;
+                // Lazily-emitted helper: the module's generate() appends
+                // the __zag_auto_fmt family at the END of the output only
+                // when at least one print site needs it (see the flag's
+                // docblock in core.zig).
+                if (info.wrap_auto) self.used_auto_fmt = true;
                 self.write("__zag_print(\"{");
                 self.write(format_spec);
                 self.write("}\", .{");
+                if (info.wrap_auto) self.write("__zag_auto_fmt(");
                 self.genExpr(arg);
+                if (info.wrap_auto) self.write(")");
                 if (is_optional_byte_slice) self.write(" orelse \"\"");
                 self.write(",})");
             },
@@ -848,7 +895,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // brace-wrapping pattern (`{` + spec + optional
                 // `:` + spec + `}`).
                 const info = typeAwareFmtSpec(self, expr);
-                format_spec = info.spec;
+                // wrap_auto (type not statically known): switch the
+                // spec to `{f}` and wrap the arg in `__zag_auto_fmt(...)`
+                // (mirror of the genPrintCall else arm above). The
+                // wrapper's format() comptime-dispatches on the VALUE's
+                // runtime type: byte-slices print as text, everything
+                // else keeps the byte-identical `{any}` rendering. A
+                // user-supplied explicit `:spec` (e.g. `{x:2}`) is
+                // preserved verbatim and skips the auto-wrap — an
+                // explicit numeric/hex spec means the author knows the
+                // type, so the unknown-type fallback shouldn't override
+                // their intent.
+                const wrap_auto = info.wrap_auto and part.spec == null;
+                if (wrap_auto) self.used_auto_fmt = true;
+                format_spec = if (wrap_auto) "f" else info.spec;
                 is_optional_byte_slice = info.is_optional_byte_slice;
                 if (fmt_len + 1 + format_spec.len + (if (part.spec) |spec| 1 + spec.len else 0) + 1 <= fmt_buf.len) {
                     fmt_buf[fmt_len] = '{';
@@ -869,7 +929,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     fmt_len += 1;
                 }
                 if (!first_arg) args_cg.write(", ");
+                if (wrap_auto) args_cg.write("__zag_auto_fmt(");
                 args_cg.genExpr(expr);
+                if (wrap_auto) args_cg.write(")");
                 if (is_optional_byte_slice) args_cg.write(" orelse \"\"");
                 first_arg = false;
             }
