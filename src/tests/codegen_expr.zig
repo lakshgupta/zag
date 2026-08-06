@@ -138,6 +138,82 @@ test "codegen: print(call returning ?str) wraps optional in __zag_auto_fmt" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{f}\", .{__zag_auto_fmt(maybe_name()),})") != null);
 }
 
+test "codegen: print(*[]const u8 binding) wraps pointer in __zag_auto_fmt" {
+    // Pointer-to-byte-slice form: `ps: *[]const u8` (e.g. `&s` on a
+    // slice binding). The v1.6 strict-`{s}` widening can't fire — zig
+    // rejects a pointer at a `{s}` slot — and pre-gap the binding was
+    // classified as a statically-known non-string, emitting bare
+    // `{any}` (the pointer rendered as `[]const u8@<addr>`). Now the
+    // pointer-form check defers to the runtime wrapper (`{f}` +
+    // `__zag_auto_fmt(ps)`), whose format() derefs the pointee and
+    // writes it as text.
+    const src =
+        \\fun f() {
+        \\    let s: []const u8 = "hello";
+        \\    let ps: *const []const u8 = &s;
+        \\    print(ps);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{f}\", .{__zag_auto_fmt(ps),})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{ps,})") == null);
+}
+
+test "codegen: print(*?[]const u8 binding) wraps pointer-optional in __zag_auto_fmt" {
+    // Pointer-to-optional-byte-slice form: `po: *?[]const u8` (e.g.
+    // `&o` on a `?str` binding). Same deferral as the plain pointer
+    // form — the wrapper unwraps the optional at runtime, printing the
+    // pointee as text when non-null and "" when null.
+    const src =
+        \\fun f() {
+        \\    let o: ?[]const u8 = "world";
+        \\    let po: *const ?[]const u8 = &o;
+        \\    print(po);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{f}\", .{__zag_auto_fmt(po),})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{po,})") == null);
+}
+
+test "codegen: print(*[]const u8 field) wraps member_access in __zag_auto_fmt" {
+    // Member-access analogue: a struct field typed `*const []const u8`
+    // printed inside an impl-block method. The member_access arm's
+    // pointer-form check defers to the wrapper just like the ident arm.
+    const src =
+        \\struct Doc { ptr: *const []const u8, }
+        \\impl Doc {
+        \\    pub fun show(self: *Doc) {
+        \\        print(self.ptr);
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{f}\", .{__zag_auto_fmt(self.ptr),})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{self.ptr,})") == null);
+}
+
 test "codegen: binary emission is parenthesised" {
     // The generated zigzag source must wrap binary expressions in `()` so
     // downstream zig's natural precedence rules cannot reorder the AST's
