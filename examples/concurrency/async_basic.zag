@@ -1,6 +1,6 @@
 ## Async/await basic example
 ##
-## v1 (synchronous driver): `async fun` returns Future(T); `await`
+## v1 (synchronous driver): `async fun` returns Future<T>; `await`
 ## drives the awaited future inline — `after(ms)` busy-waits on
 ## CLOCK_MONOTONIC inside the call, then completes its future.
 ##

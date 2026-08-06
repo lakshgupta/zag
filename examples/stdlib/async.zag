@@ -4,8 +4,8 @@
 ##   import std.async.{EventLoop, sleep, now_ms}
 ##
 ##   var loop: EventLoop = EventLoop.new();
-##   var t1: Future(void) = undefined;
-##   loop.set_timeout(50, &t1);   # &t1 is a *Future(void) — the
+##   var t1: Future<void> = undefined;
+##   loop.set_timeout(50, &t1);   # &t1 is a *Future<void> — the
 ##                                # loop's API takes *raw u8, so
 ##                                # pass `&t1 as *raw u8`.
 ##   loop.wait(&t1, 500);         # drive until t1 is done or timeout
@@ -21,8 +21,8 @@ import std.async.{EventLoop, sleep, now_ms}
 fun main() {
     var loop: EventLoop = EventLoop.new();
     let start: i64 = now_ms();
-    var t1: Future(void) = undefined;
-    var t2: Future(void) = undefined;
+    var t1: Future<void> = undefined;
+    var t2: Future<void> = undefined;
     loop.set_timeout(30, &t1 as *raw u8);
     loop.set_timeout(80, &t2 as *raw u8);
     let ok1: bool = loop.wait(&t2 as *raw u8, 500);

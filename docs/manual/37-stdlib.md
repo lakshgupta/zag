@@ -63,7 +63,7 @@ semantics (std.mem.eql + content FNV), so string-keyed maps work
 including equal strings in different buffers:
 
 ```zag
-var m: HashMap(str, i32) = HashMap(str, i32).new();
+var m: HashMap<str, i32> = HashMap<str, i32>.new();
 m.put("alpha", 1);
 m.get("alpha");   # 1
 ```

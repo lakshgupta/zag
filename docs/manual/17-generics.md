@@ -108,13 +108,13 @@ The compiler rewrites each `<TYPE>` segment in receiver and parameter types to `
 **Call sites** dispatch to the free fns automatically — the thunk-form struct has no nested methods, so the compiler rewrites:
 
 ```
-var list: ArrayList(i32) = ArrayList(i32).new();   # → ArrayList_new(i32)
+var list: ArrayList<i32> = ArrayList<i32>.new();   # → ArrayList_new(i32)
 list.push(10);                                      # → ArrayList_T_push(i32, &list, 10)
 print("{list.len()}");                              # → works inside placeholders too
 list.deinit();                                      # → ArrayList_T_deinit(i32, &list)
 ```
 
-Value receivers get address-of (`&list`) mirroring zig's own method-call sugar (declare the binding `var` when the method mutates — same rule as non-generic `*self` methods); pointer receivers (`self: *List(T)` inside the impl) pass verbatim. Stdlib generics route through an inline `@import("std/collections/array_list.zig")` (std.collections is a DIRECTORY module — see docs/37 §Standard Library) so the free fns resolve from the user module.
+Value receivers get address-of (`&list`) mirroring zig's own method-call sugar (declare the binding `var` when the method mutates — same rule as non-generic `*self` methods); pointer receivers (`self: *List<T>` inside the impl) pass verbatim. Stdlib generics route through an inline `@import("std/collections/array_list.zig")` (std.collections is a DIRECTORY module — see docs/37 §Standard Library) so the free fns resolve from the user module.
 
 ## No Trait Bounds on Associated Types
 

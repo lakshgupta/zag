@@ -3,9 +3,9 @@
 ##
 ##   import std.json.{Json, parse, stringify}
 ##
-## `parse` returns Result(Json, str); `?`/if-let propagate errors.
+## `parse` returns Result<Json, str>; `?`/if-let propagate errors.
 ## Json is a tagged union: Null / Bool / Number(f64) / Str(String)
-## / Array(ArrayList(Json)) / Object(ArrayList(JsonPair)). The tree
+## / Array(ArrayList<Json>) / Object(ArrayList<JsonPair>). The tree
 ## is owned (String/ArrayList storage) and process-exit reclaimed.
 ##
 ## NOTE: `print` renders String as a byte list in the v1 surface —
@@ -16,7 +16,7 @@ import std.json.{Json, parse, stringify}
 import std.types.{String}
 
 fun main() {
-    let v: Result(Json, str) = parse("{\"a\": [1, 2, 3], \"name\": \"zag\"}");
+    let v: Result<Json, str> = parse("{\"a\": [1, 2, 3], \"name\": \"zag\"}");
     if let Ok(jv) = v {
         let out: String = stringify(jv);
         print("stringify: {out.as_str()}\n");
@@ -40,18 +40,18 @@ fun main() {
     }
 
     # Error propagation: a malformed document surfaces as Err(str).
-    let bad: Result(Json, str) = parse("{invalid");
+    let bad: Result<Json, str> = parse("{invalid");
     if let Err(e) = bad {
         print("error path: {e}\n");
     }
 
     # Scalars round-trip too.
-    let num: Result(Json, str) = parse("3.5");
+    let num: Result<Json, str> = parse("3.5");
     if let Ok(n) = num {
         let s2: String = stringify(n);
         print("number: {s2.as_str()}\n");
     }
-    let b: Result(Json, str) = parse("true");
+    let b: Result<Json, str> = parse("true");
     if let Ok(t) = b {
         let s3: String = stringify(t);
         print("bool: {s3.as_str()}\n");

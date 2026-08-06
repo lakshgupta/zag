@@ -11,7 +11,7 @@
 ##
 ##   import std.collections.{ArrayList}
 ##
-##   let parts: ArrayList(str) = split("a,b,c", ",");   # borrowed views
+##   let parts: ArrayList<str> = split("a,b,c", ",");   # borrowed views
 ##   parts.deinit();
 ##
 ## String-keyed HashMaps (std.collections) work since the
@@ -23,7 +23,7 @@ import std.math.{min, max, abs, clamp, is_pow2, next_pow2, gcd}
 import std.collections.{ArrayList, HashMap}
 
 fun main() {
-    var parts: ArrayList(str) = split("a,b,c,,d", ",");
+    var parts: ArrayList<str> = split("a,b,c,,d", ",");
     print("parts len {parts.len()}\n");
     let j: []u8 = join(parts, "-");
     defer free(j);
@@ -42,7 +42,7 @@ fun main() {
     print("min {min<i32>(3, 5)} abs {abs<i32>(-7)} clamp {clamp<i32>(9, 0, 5)}\n");
     print("next_pow2 {next_pow2<u64>(1000)} gcd {gcd<u64>(48, 18)}\n");
 
-    var m: HashMap(str, i32) = HashMap(str, i32).new();
+    var m: HashMap<str, i32> = HashMap<str, i32>.new();
     m.put("alpha", 1);
     m.put("beta", 2);
     let b: i32 = m.get("beta");
