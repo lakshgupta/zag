@@ -268,6 +268,46 @@ test "codegen: pointer-alias recursion expands *char, *f32x4, **str" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "const ps2: **str") == null);
 }
 
+test "codegen: array-alias recursion expands [4]str, [8]char, [2]f32x4, [N]str" {
+    // Generalization of the two literal `[]str` / `[3]str` entries:
+    // any alias inside an array wrapper expands via bracket-strip
+    // recursion — `[4]str` → `[4][]const u8`, `[N]str` (comptime
+    // size ident) → `[N][]const u8`, `[8]char` → `[8]u32`, `[2]f32x4`
+    // → `[2]@Vector(4, f32)`, `[3]?str` → `[3]?[]const u8`, and it
+    // composes with the pointer recursion (`*[3]str` →
+    // `*[3][]const u8`). The eql guard keeps non-alias elements
+    // verbatim (`[5]i32`).
+    const src =
+        \\fun f() {
+        \\    let a: [4]str = 0;
+        \\    let b: [8]char = 0;
+        \\    let c: [2]f32x4 = 0;
+        \\    let d: [N]str = 0;
+        \\    let e: [3]?str = 0;
+        \\    let g: *[3]str = 0;
+        \\    let h: [5]i32 = 0;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const a: [4][]const u8 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const b: [8]u32 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const c: [2]@Vector(4, f32) = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const d: [N][]const u8 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const e: [3]?[]const u8 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const g: *[3][]const u8 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const h: [5]i32 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const a: [4]str") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const b: [8]char") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const c: [2]f32x4") == null);
+}
+
 test "codegen: char type ident silently rewrites to u32 (v2 fix path landed)" {
     // Source-of-truth: docs/features.md §08 v2 4-byte Unicode char
     // row, gap (a). Once the fix path lands, zag's codegen
