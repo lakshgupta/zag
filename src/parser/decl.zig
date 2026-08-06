@@ -209,6 +209,16 @@ pub fn parseEnumDecl(self: *Parser) ast.EnumDecl {
             self.expect(.rparen);
         }
         const name = self.expectIdent();
+        // Name-first backing type `enum Status -> u8` (v2.2 canonical
+        // surface): the enum NAME leads and the backing type trails
+        // after the function-return-style arrow, so the bare default
+        // is `enum Status { ... }`. Both this arrow form and the
+        // legacy `enum(u8) Status` paren form above populate the same
+        // `backing_type` slot, so codegen dispatch is unchanged.
+        if (self.peek().tag == .arrow) {
+            self.advance();
+            backing_type = self.collectCastType();
+        }
         self.expect(.lbrace);
         var variants_buf: [64]ast.EnumVariant = undefined;
         var variant_count: usize = 0;

@@ -2889,6 +2889,41 @@ test "codegen: backed-enum(u8) explicit emits enum(u8) { V = N, ... }" {
     }
 }
 
+test "codegen: arrow-form backed enum `enum Status -> u8` emits enum(u8)" {
+    // v2.2 name-first surface: `enum Status -> u8 { ... }` — the enum
+    // NAME leads, the backing type trails after the function-return-
+    // style arrow, and the bare default is `enum Status { ... }` with
+    // no modifier. Both the arrow form and the legacy `enum(u8) Status`
+    // paren form populate the same AST `backing_type` slot, so the
+    // codegen emission is byte-identical (verify below).
+    const src =
+        \\enum Status -> u8 { Ok = 0, Warn = 1, Err = 2 }
+        \\
+        \\enum Direction {
+        \\    North,
+        \\    South,
+        \\}
+        \\
+        \\fun main() { let s: u8 = Status.Ok; print(s); }
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "enum(u8) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Ok = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Warn = 1,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Err = 2,") != null);
+    // The bare default (`enum Direction`) still emits a plain enum.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const Direction = enum {") != null);
+    // Negative: the arrow header must NOT leak into the zig emission.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "Status -> u8") == null);
+}
+
 test "codegen: backed-enum(str) falls back to struct { pub const V = \"...\" }" {
     // zig rejects `enum([]const u8)` because enum tag types must be
     // integers; the codegen synthesizes a struct-with-const-fields
