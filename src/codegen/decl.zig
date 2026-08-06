@@ -876,26 +876,44 @@ const Codegen = core.Codegen;
             return scratch[0..slen];
         }
         if (std.mem.eql(u8, text, "c_void")) return "anyopaque";
-        // Phase 3 (CLI migration) followup: extend the alias table to
-        // cover the array-shaped forms `[]str` and `[N]str` so a
-        // `let args: [3]str = ...;` binding or a `[3]str { a, b, c }`
-        // array-literal rounds-trips to `[3][]const u8` instead of
-        // surfacing a bare `str` ident to zig (which has no such
-        // type slot and rejects with `undeclared identifier 'str'`).
-        // The cli.zag bootstrap's `spawn_leaf` function uses both
-        // forms in one body, so the mapping is end-to-end-exercised
-        // by the e2e test that imports lib/cli.zag.
-        //
-        // The mappings are LITERAL on the bracket shape (the parser
-        // captures the full bracket text including the size digit
-        // span, e.g. `[3]str` and `[15]?[:0]u8`); a future generic
-        // array alias would need a more general rewriter (the
-        // `.range`-style walk of <...> segments in
-        // `rewriteReceiverType` is the model). For v1, the two
-        // concrete sizes (slice + fixed-3) cover the only
-        // array-of-strings shape that the CLI bootstrap uses.
-        if (std.mem.eql(u8, text, "[]str")) return "[][]const u8";
-        if (std.mem.eql(u8, text, "[3]str")) return "[3][]const u8";
+        // General array-prefix recursion: strip the bracket+size
+        // prefix (`[]`, `[3]`, `[N]`, `[15]`) and recurse on the
+        // ELEMENT so every alias expands inside array wrappers of any
+        // shape — `[4]str` → `[4][]const u8`, `[N]str` →
+        // `[N][]const u8`, `[8]char` → `[8]u32`, `[2]f32x4` →
+        // `[2]@Vector(4, f32)`, `[3]?str` → `[3]?[]const u8`.
+        // Replaces the two literal `[]str` / `[3]str` entries
+        // (byte-identical for those shapes — the CLI bootstrap's
+        // spawn_leaf, exercised end-to-end by the e2e test importing
+        // lib/cli.zag, keeps its emission). The parser captures the
+        // full bracket text (size = int / float / identifier, e.g.
+        // `[3]str` and `[15]?[:0]u8`), so the strip is
+        // bracket-anchored, not size-literal-anchored. Composes with
+        // the pointer recursion: `*[3]str` → `*[3][]const u8`,
+        // `[3]*str` → `[3]*[]const u8`. The eql guard returns
+        // non-alias elements (`[5]i32`, `[3]Json`, sentinel
+        // `[*:0]const u8`) untouched, so the common
+        // fixed-size-buffer types pay one cheap compare, not a
+        // scratch rebuild.
+        if (text.len > 1 and text[0] == '[') {
+            const arr_close = std.mem.indexOfScalar(u8, text, ']');
+            if (arr_close != null and arr_close.? >= 1) {
+                const arr_elem = text[arr_close.? + 1 ..];
+                if (arr_elem.len > 0) {
+                    const arr_mapped = zagTypeToZig(arr_elem);
+                    if (!std.mem.eql(u8, arr_mapped, arr_elem)) {
+                        var arr_scratch: [264]u8 = undefined;
+                        const arr_head_len = arr_close.? + 1;
+                        if (arr_head_len + arr_mapped.len <= arr_scratch.len) {
+                            @memcpy(arr_scratch[0..arr_head_len], text[0..arr_head_len]);
+                            @memcpy(arr_scratch[arr_head_len..][0..arr_mapped.len], arr_mapped);
+                            return arr_scratch[0 .. arr_head_len + arr_mapped.len];
+                        }
+                    }
+                    return text;
+                }
+            }
+        }
         // Optional-string form `?str` → `?[]const u8` — the get_env
         // contract (`get_env(name) -> ?str`) and user `let x: ?str`
         // bindings both emit this shape. Surfaced when the Tier-1
