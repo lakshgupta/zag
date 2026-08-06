@@ -159,9 +159,6 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 if (std.mem.eql(u8, self.type_info_buf[i].name, ident_name)) {
                     found_ident = true;
                     const rewritten = zagTypeToZig(self.type_info_buf[i].type_name);
-                    // Pointer-to-optional byte slice (`*?[]const u8`) is
-                    // OUT of scope for v1 widening — deref-then-orelse
-                    // codegen (`s.? orelse \"\"`) needs a separate pass.
                     if (self.type_info_buf[i].type_name.len > 0 and
                         self.type_info_buf[i].type_name[0] != '*' and
                         std.mem.indexOf(u8, rewritten, "[]const u8") != null)
@@ -171,12 +168,26 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             // `?[]const u8` → caller wraps with
                             // `orelse ""` so the strictly-typed `{s}`
                             // formatter sees a non-optional slice.
-                            // `*?[]const u8` is NOT supported in v1
-                            // (`_ = T;` etc.); punt to v1.2.
                             .is_optional_byte_slice = self.type_info_buf[i].type_name.len > 0 and
                                 self.type_info_buf[i].type_name[0] == '?',
                             .wrap_auto = false,
                         };
+                    }
+                    // Pointer-to-byte-slice forms (`*[]const u8`,
+                    // `*?[]const u8`): the strict `{s}` widening can't
+                    // apply — zig rejects a pointer at a `{s}` slot, and
+                    // the deref-then-orelse codegen was previously
+                    // punted. Defer to the runtime wrapper instead:
+                    // wrap_auto routes the caller through
+                    // `{f}` + `__zag_auto_fmt()`, whose comptime check
+                    // derefs the pointee and prints it as text (null
+                    // `*?[]const u8` → "").
+                    if (self.type_info_buf[i].type_name.len > 0 and
+                        self.type_info_buf[i].type_name[0] == '*' and
+                        (std.mem.indexOf(u8, rewritten, "[]const u8") != null or
+                         std.mem.indexOf(u8, rewritten, "[]u8") != null))
+                    {
+                        return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = true };
                     }
                 }
             }
@@ -207,6 +218,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             .is_optional_byte_slice = tt.len > 0 and tt[0] == '?',
                             .wrap_auto = false,
                         };
+                    }
+                    // Pointer-to-byte-slice field (`*[]const u8`,
+                    // `*?[]const u8`): same runtime-wrapper deferral as
+                    // the ident arm — the wrapper derefs and prints the
+                    // pointee as text.
+                    if (tt.len > 0 and tt[0] == '*' and
+                        (std.mem.indexOf(u8, rewritten, "[]const u8") != null or
+                         std.mem.indexOf(u8, rewritten, "[]u8") != null))
+                    {
+                        return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = true };
                     }
                     // Field exists but isn't a byte-slice family.
                     // Return `{any}` here rather than continuing the

@@ -2403,7 +2403,8 @@ pub const MapEntry = struct {
         // The wrapper's format() comptime-inspects the VALUE's runtime
         // type: the byte-slice family ([]const u8 / str, []u8, string
         // literals as *const [N:0]u8, [:0]const u8, sentinel many-ptrs,
-        // ?str optionals) prints as text via writeAll; everything else
+        // ?str optionals, and the pointer forms *[]const u8 / *?[]const
+        // u8) prints as text via writeAll; everything else
         // falls back to `{any}` — byte-identical to the pre-gap output
         // for scalars/structs/unions. Closes the gap where a string
         // whose type wasn't statically known printed as a byte list
@@ -2435,13 +2436,23 @@ pub const MapEntry = struct {
                 \\}
                 \\fn __zag_is_byte_slice(comptime T: type) bool {
                 \\    return switch (@typeInfo(T)) {
+                \\        .optional => __zag_is_byte_slice(@typeInfo(T).optional.child),
                 \\        .pointer => |info| switch (info.size) {
                 \\            .slice => info.child == u8,
                 \\            .one => blk: {
-                \\                if (info.child == u8) break :blk true;
-                \\                if (@typeInfo(info.child) == .array) {
-                \\                    const ai = @typeInfo(info.child).array;
+                \\                const child = info.child;
+                \\                if (child == u8) break :blk true;
+                \\                if (@typeInfo(child) == .array) {
+                \\                    const ai = @typeInfo(child).array;
                 \\                    break :blk ai.child == u8;
+                \\                }
+                \\                // Pointer-to-byte-slice forms: the pointee is itself
+                \\                // a slice (*[]const u8) or an optional of a slice
+                \\                // (*?[]const u8) — recurse on the pointee shape.
+                \\                if (@typeInfo(child) == .optional) break :blk __zag_is_byte_slice(@typeInfo(child).optional.child);
+                \\                if (@typeInfo(child) == .pointer) {
+                \\                    const ci = @typeInfo(child).pointer;
+                \\                    if (ci.size == .slice) break :blk ci.child == u8;
                 \\                }
                 \\                break :blk false;
                 \\            },
@@ -2453,10 +2464,18 @@ pub const MapEntry = struct {
                 \\fn __zag_as_str(value: anytype) []const u8 {
                 \\    const T = @TypeOf(value);
                 \\    switch (@typeInfo(T)) {
+                \\        .optional => return if (value) |v| __zag_as_str(v) else "",
                 \\        .pointer => |info| switch (info.size) {
                 \\            .slice => return value,
                 \\            .one => {
-                \\                if (info.child == u8) return value[0..1];
+                \\                const child = info.child;
+                \\                if (child == u8) return value[0..1];
+                \\                // *[]const u8 — deref to the slice.
+                \\                if (@typeInfo(child) == .pointer and @typeInfo(child).pointer.size == .slice) return value.*;
+                \\                // *?[]const u8 — deref, then unwrap the optional.
+                \\                if (@typeInfo(child) == .optional) {
+                \\                    return if (value.*) |v| __zag_as_str(v) else "";
+                \\                }
                 \\                return value;
                 \\            },
                 \\            .many, .c => return std.mem.span(value),
