@@ -190,6 +190,32 @@ test "codegen: print(*?[]const u8 binding) wraps pointer-optional in __zag_auto_
     try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{any}\", .{po,})") == null);
 }
 
+test "codegen: print(?*str binding) wraps optional-pointer in __zag_auto_fmt" {
+    // Optional-POINTER-to-slice: `po: ?*str` rewrites to `?*[]const
+    // u8`. The `{s}` widening must NOT fire (its `orelse ""` would
+    // mismatch the non-null pointer case — surfaced by the generalized
+    // pointer-alias recursion); the `?*`-prefix check routes it through
+    // the wrapper, which derefs the pointee for text (null → "").
+    const src =
+        \\fun f() {
+        \\    var s: str = "hi";
+        \\    var p1: *str = &s;
+        \\    let po: ?*str = p1;
+        \\    print(po);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{f}\", .{__zag_auto_fmt(po),})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_print(\"{s}\", .{po orelse \"\",})") == null);
+}
+
 test "codegen: print(*[]const u8 field) wraps member_access in __zag_auto_fmt" {
     // Member-access analogue: a struct field typed `*const []const u8`
     // printed inside an impl-block method. The member_access arm's

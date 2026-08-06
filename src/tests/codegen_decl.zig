@@ -237,6 +237,37 @@ test "codegen: *str / *?str pointer annotations expand the str alias" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "const pco: *const?str") == null);
 }
 
+test "codegen: pointer-alias recursion expands *char, *f32x4, **str" {
+    // Generalization of the four literal `*str` entries: any alias
+    // inside a pointer wrapper expands via prefix-strip recursion.
+    // `*char` → `*u32`, `*f32x4` → `*@Vector(4, f32)`, `**str` →
+    // `**[]const u8` (nested), while non-alias pointees like `*Json`
+    // round-trip untouched (the eql guard returns `text` verbatim).
+    const src =
+        \\fun f() {
+        \\    let pc: *char = 0;
+        \\    let pv: *f32x4 = 0;
+        \\    let ps2: **str = 0;
+        \\    let pj: *Json = 0;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const pc: *u32 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const pv: *@Vector(4, f32) = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const ps2: **[]const u8 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const pj: *Json = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const pc: *char") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const pv: *f32x4") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const ps2: **str") == null);
+}
+
 test "codegen: char type ident silently rewrites to u32 (v2 fix path landed)" {
     // Source-of-truth: docs/features.md §08 v2 4-byte Unicode char
     // row, gap (a). Once the fix path lands, zag's codegen
