@@ -172,7 +172,9 @@ test "codegen: bf16 passes through to zigzag verbatim (zig rejects, not zag)" {
     // for the rejection-layer claim this test pins.
     //
     // Mechanism: `bf16` is NOT in v1's `zagTypeToZig` alias set
-    // (only `str` / `[]str` / `[3]str` round-trip), so the source
+    // (only `str` / `[]str` / `[3]str` and the pointer forms
+    // `*str` / `*?str` / `*const str` / `*const ?str` round-trip),
+    // so the source
     // type-text reaches codegen unchanged. The leaf zigzag
     // contains `const v: bf16 = 0;` literally; zig 0.16 then
     // rejects with `error: use of undeclared identifier 'bf16'`.
@@ -197,6 +199,42 @@ test "codegen: bf16 passes through to zigzag verbatim (zig rejects, not zag)" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "@as(f16,") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@as(f32,") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@as(bf16,") == null);
+}
+
+test "codegen: *str / *?str pointer annotations expand the str alias" {
+    // Alias-table extension: the docs/07 transparent-alias contract
+    // holds inside pointer wrappers too. Pre-fix `*str` round-tripped
+    // verbatim and zig rejected the bare `str` ident (`use of
+    // undeclared identifier 'str'`); now the four pointer shapes
+    // expand to their `*[]const u8` forms at emit time. Surfaced by
+    // the auto-fmt pointer-form widening — `*str`-typed print args
+    // rewrite to `*[]const u8`, so they also route through `{f}` +
+    // `__zag_auto_fmt()` and print as text.
+    const src =
+        \\fun f() {
+        \\    let s: str = "hello";
+        \\    let ps: *str = &s;
+        \\    let pc: *const str = &s;
+        \\    let o: ?str = "world";
+        \\    let po: *?str = &o;
+        \\    let pco: *const ?str = &o;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const ps: *[]const u8 = &s;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const pc: *const []const u8 = &s;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const po: *?[]const u8 = &o;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const pco: *const?[]const u8 = &o;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const ps: *str") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const po: *?str") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const pco: *const?str") == null);
 }
 
 test "codegen: char type ident silently rewrites to u32 (v2 fix path landed)" {
