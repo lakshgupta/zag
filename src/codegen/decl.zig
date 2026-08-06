@@ -902,6 +902,25 @@ const Codegen = core.Codegen;
         // stdlib migration made lib/std/env.zag's `-> ?str` return
         // type compile through zig for the first time.
         if (std.mem.eql(u8, text, "?str")) return "?[]const u8";
+        // Pointer-to-string forms (`*str`, `*?str`, `*const str`,
+        // `*const?str`): the alias table above covers the bare,
+        // optional, and array shapes but NOT pointer wrappers —
+        // `*str` round-tripped verbatim and zig rejected the bare
+        // `str` ident (`use of undeclared identifier 'str'`). The
+        // docs/07 transparent-alias contract extends through
+        // pointers: `&s` on a `str` binding is naturally annotated
+        // `*str`. Surfaced by the auto-fmt pointer-form widening —
+        // once `*str` rewrites to `*[]const u8`, print args typed
+        // `*str` / `*?str` also route through `{f}` +
+        // `__zag_auto_fmt()` and print as text. NOTE: the parser's
+        // collectCastType glues `?` onto the preceding token
+        // (`prev_was_ptr`), so the source spelling `*const ?str` is
+        // captured as `*const?str` — the table keys match the
+        // PARSER's output, not the source whitespace.
+        if (std.mem.eql(u8, text, "*str")) return "*[]const u8";
+        if (std.mem.eql(u8, text, "*const str")) return "*const []const u8";
+        if (std.mem.eql(u8, text, "*?str")) return "*?[]const u8";
+        if (std.mem.eql(u8, text, "*const?str")) return "*const?[]const u8";
         // v2 char fix path (docs/features.md §08 v2 4-byte Unicode char
         // row): zag's `char` ident silently rewrites to zig's `u32`
         // primitive so let-bind / var-bind / struct-field / enum-varlist /
