@@ -11,7 +11,7 @@
 
 **Layout reference (zig-equivalent):**
 - `enum { North, South }` ⇒ `pub const Direction = enum { North, South };` — bare enum, 1-byte tag.
-- `enum(u8) { Ok = 0, Err = 1 }` ⇒ `pub const Status = enum(u8) { Ok = 0, Err = 1 };` — backed enum, no per-variant tag, storage is `sizeof(u8)`.
+- `enum Status -> u8 { Ok = 0, Err = 1 }` (legacy `enum(u8) { Ok = 0, Err = 1 }` also parses) ⇒ `pub const Status = enum(u8) { Ok = 0, Err = 1 };` — backed enum, no per-variant tag, storage is `sizeof(u8)`.
 - `union { Circle(f64), Rect(f64, f64) }` ⇒ `pub const Shape = union(enum) { Circle: f64, Rect: [2]f64 };` — tagged union, tag + max payload size; payload fields are anonymous.
 
 `enum(T)` (backed enum) is for "category of similar values" — all variants share `T` and storage is `sizeof(T)` directly. `union` is for variants whose payload types may differ (`Shape { Circle(f64), Rect(f64, f64) }`). The two keywords are deliberately separated so the "category of similar values" form (enums) doesn't pay for a per-variant tag that's redundant when all variants share `T`.
@@ -107,22 +107,22 @@ fun is_north(d: Direction) -> bool {
 
 Use qualified names when the type is ambiguous or for clarity.
 
-## Backed Enums (`enum(T)`)
+## Backed Enums
 
-Parens (not angle brackets) signal that `T` is a concrete backing type, not a generic parameter. Per [Generics](17-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type. See [`examples/types/enum_backed.zag`](../../examples/types/enum_backed.zag) for the end-to-end runnable demonstration covering `enum(u8)`, `enum(str)`, `enum(char)`, and the auto-inferred `enum(u8)` shape.
+The name-first arrow form is canonical (v2.2): the enum NAME leads and the backing type trails after a `->`, with no modifier meaning a plain enum — `enum Status -> u8` is the u8-backed spelling while `enum Direction` stays bare. The legacy paren form `enum(u8) Status` still parses for transition; both spellings populate the same backing-type slot, so codegen is identical. (In the legacy form, parens — not angle brackets — signal that `T` is a concrete backing type rather than a generic parameter; per [Generics](17-generics.md), `<T>` introduces a type variable into scope while `(T)` wraps a concrete type.) See [`examples/types/enum_backed.zag`](../../examples/types/enum_backed.zag) for the end-to-end runnable demonstration covering the u8/str/char-backed and auto-inferred shapes.
 
 An `enum` may declare a backing type `T`. The supported `T` universe is restricted to integer types, `bool`, `char`, and `str` — custom `Copy` struct/enum/array types as `T` are deferred. Each variant identifier is bound to a value of type `T` at compile time:
 
 ```zag
 # String-backed enum (TypeScript / PHP BackedEnum / Swift-style)
-enum(str) Level {
+enum Level -> str {
     Low    = "low",
     Medium = "medium",
     High   = "high",
 }
 
 # Integer-backed enum (Zig-style)
-enum(u8) Status {
+enum Status -> u8 {
     Ok   = 0,
     Warn = 1,
     Err  = 2,
@@ -132,7 +132,7 @@ enum(u8) Status {
 **Rules:**
 - For str-backed enums, every variant MUST carry `= "value"` (zig's `const`-field requires an initializer; zig rejects an empty const-decl without one). Omitting the value routes through the codegen's `""` fallback (same string-literal syntax as the empty `="\\"\\""` source-side form).
 - For int-/char/bool-backed enums, `= v` is OPTIONAL — variants without an explicit value auto-infer (zig picks the next T-value, walking up from the prior variant — `First = 0`, `Second = 1`, `Third = 2` for an all-implicit `enum(u8)`).
-- Default `enum { V1, V2 }` (no `T`) keeps bare-only behavior; tag-only memory layout (1-byte tag for ≤256 variants).
+- Default `enum { V1, V2 }` (no backing type) keeps bare-only behavior; tag-only memory layout (1-byte tag for ≤256 variants).
 - Storage: `sizeof(T)` per value. The variant identifier IS the value — there is no extra tag byte.
 - Variants remain bare; there is no per-variant payload type distinct from `T`.
 
@@ -165,9 +165,9 @@ let ok_neq:   bool = (Status.Ok   != Status.Err); # true — 0 != 2
 - `let x: Level = "low";` — bind by T-value; compile error if `"low"` doesn't match a registered variant.
 - `Level.High` and the literal `"high"` are interchangeable **in any binding position whose expected type is `Level`** (`: Level` annotation, `match` scrutinee of type `Level`, function parameter of type `Level`). In free-context bindings (e.g. `let s = "high";`, no annotation), the literal is a borrowed string view, not `Level` — there is no implicit coercion.
 
-> **Rust users take note:** `enum(str) Level { High = "high" }` introduces true value-equality (`Level.High == "high"`). This differs from Rust's bare-reference enum, where `High == "high"` is a compile error (different types). Read the provided methods above as the binding contract.
+> **Rust users take note:** `enum Level -> str { High = "high" }` introduces true value-equality (`Level.High == "high"`). This differs from Rust's bare-reference enum, where `High == "high"` is a compile error (different types). Read the provided methods above as the binding contract.
 
-**Combining with FFI:** `@[repr(C, T1)] enum(T2) X { … }` keeps `T2` as the zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries. See [FFI and Interop](25-ffi.md) for the full interaction.
+**Combining with FFI:** `@[repr(C, T1)] enum X -> T2 { … }` (legacy `@[repr(C, T1)] enum(T2) X`) keeps `T2` as the zag-side value type while using `T1` for the C-ABI footprint. The compiler synthesizes the conversion at FFI boundaries. See [FFI and Interop](25-ffi.md) for the full interaction.
 
 ## Repr Control
 

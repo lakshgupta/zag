@@ -1,13 +1,15 @@
 # examples/types/enum_backed.zag
 #
-# End-to-end demonstration of `enum(T)` backed enums (docs/manual/
-# 13-enums.md §"Backed Enums enum(T)"). Covers:
-#   - `enum(u8)` integer-backed form with explicit `= value` per variant
-#   - `enum(str)` string-backed form (round-trips via the str→[]const u8
-#     type alias)
-#   - `enum(char)` char-backed form (round-trips via the char→u32 alias)
-#   - `enum(u8)` with auto-inferred values (zig picks the next byte when
-#     the user omits `= expr`)
+# End-to-end demonstration of backed enums (docs/manual/13-enums.md
+# §"Backed Enums"). Uses the name-first arrow form (`enum Name -> T`);
+# the legacy `enum(T) Name` paren form also parses. Covers:
+#   - `enum Status -> u8` integer-backed form with explicit `= value`
+#   - `enum Level -> str` string-backed form (round-trips via the
+#     str→[]const u8 type alias)
+#   - `enum Vowel -> char` char-backed form (round-trips via the
+#     char→u32 alias)
+#   - `enum AutoInfer -> u8` with auto-inferred values (zig picks the
+#     next byte when the user omits `= expr`)
 #
 # Backing-enum semantics: every variant is a value of type T at compile
 # time. The tag type is `T` (vs. the bare-enum `u8` byte tag) so
@@ -15,22 +17,21 @@
 # equality. This is the bridge that turns zag enums into a "category of
 # similar values" surface — the docs/13 design rationale.
 #
-# v1 status: this surface was docs-only until the v2 split landed.
-# The `enum(T)` keyword shape is now parsed end-to-end.
+# The name-first arrow shape is parsed end-to-end.
 
-enum(u8) Status {
+enum Status -> u8 {
     Ok = 0,
     Warn = 1,
     Err = 2,
 }
 
-enum(str) Level {
+enum Level -> str {
     Low = "low",
     Medium = "medium",
     High = "high",
 }
 
-enum(char) Vowel {
+enum Vowel -> char {
     A = 'a',
     E = 'e',
     I = 'i',
@@ -38,7 +39,7 @@ enum(char) Vowel {
     U = 'u',
 }
 
-enum(u8) AutoInfer {
+enum AutoInfer -> u8 {
     First,
     Second,
     Third,
