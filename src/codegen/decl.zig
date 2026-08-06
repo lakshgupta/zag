@@ -902,25 +902,52 @@ const Codegen = core.Codegen;
         // stdlib migration made lib/std/env.zag's `-> ?str` return
         // type compile through zig for the first time.
         if (std.mem.eql(u8, text, "?str")) return "?[]const u8";
-        // Pointer-to-string forms (`*str`, `*?str`, `*const str`,
-        // `*const?str`): the alias table above covers the bare,
-        // optional, and array shapes but NOT pointer wrappers —
-        // `*str` round-tripped verbatim and zig rejected the bare
-        // `str` ident (`use of undeclared identifier 'str'`). The
-        // docs/07 transparent-alias contract extends through
-        // pointers: `&s` on a `str` binding is naturally annotated
-        // `*str`. Surfaced by the auto-fmt pointer-form widening —
-        // once `*str` rewrites to `*[]const u8`, print args typed
-        // `*str` / `*?str` also route through `{f}` +
-        // `__zag_auto_fmt()` and print as text. NOTE: the parser's
-        // collectCastType glues `?` onto the preceding token
-        // (`prev_was_ptr`), so the source spelling `*const ?str` is
-        // captured as `*const?str` — the table keys match the
-        // PARSER's output, not the source whitespace.
-        if (std.mem.eql(u8, text, "*str")) return "*[]const u8";
-        if (std.mem.eql(u8, text, "*const str")) return "*const []const u8";
-        if (std.mem.eql(u8, text, "*?str")) return "*?[]const u8";
-        if (std.mem.eql(u8, text, "*const?str")) return "*const?[]const u8";
+        // General pointer-prefix recursion: strip the pointer marker
+        // (plus optional `const` qualifier / `?` optional-pointer
+        // marker) and recurse on the POINTEE so every alias expands
+        // inside pointer wrappers of any shape — `*str` → `*[]const
+        // u8`, `*?str` → `*?[]const u8`, `*char` → `*u32`, `*f32x4`
+        // → `*@Vector(4, f32)`, `*c_void` → `*anyopaque`, `**str` →
+        // `**[]const u8` (depth-limited: each level strips one
+        // marker). Replaces the four literal `*str` entries — the
+        // prefix round-trips verbatim and only the pointee walks the
+        // alias table. When the pointee contains no alias (the
+        // recursion returns it unchanged) the original `text` is
+        // returned untouched, so the ubiquitous `*Json` /
+        // `*ArrayList(...)` receiver types pay one cheap compare, not
+        // a scratch rebuild. NOTE: collectCastType glues `?` onto the
+        // preceding token, so source `*const ?str` is captured as
+        // `*const?str` — the `*const?` prefix key matches the
+        // PARSER's output, not the source whitespace. Runs AFTER the
+        // `*raw ` / `?*raw ` handlers so the v1.5 raw-pointer surface
+        // (`*raw T` → `[*]T`) wins.
+        var ptr_prefix: []const u8 = "";
+        var ptr_pointee: []const u8 = text;
+        if (std.mem.startsWith(u8, text, "*const?")) {
+            ptr_prefix = "*const?";
+            ptr_pointee = text["*const?".len..];
+        } else if (std.mem.startsWith(u8, text, "*const ")) {
+            ptr_prefix = "*const ";
+            ptr_pointee = text["*const ".len..];
+        } else if (std.mem.startsWith(u8, text, "?*")) {
+            ptr_prefix = "?*";
+            ptr_pointee = text[2..];
+        } else if (std.mem.startsWith(u8, text, "*") and text.len > 1) {
+            ptr_prefix = "*";
+            ptr_pointee = text[1..];
+        }
+        if (ptr_prefix.len > 0 and ptr_pointee.len > 0) {
+            const mapped = zagTypeToZig(ptr_pointee);
+            if (!std.mem.eql(u8, mapped, ptr_pointee)) {
+                var pscratch: [264]u8 = undefined;
+                if (ptr_prefix.len + mapped.len <= pscratch.len) {
+                    @memcpy(pscratch[0..ptr_prefix.len], ptr_prefix);
+                    @memcpy(pscratch[ptr_prefix.len..][0..mapped.len], mapped);
+                    return pscratch[0 .. ptr_prefix.len + mapped.len];
+                }
+            }
+            return text;
+        }
         // v2 char fix path (docs/features.md §08 v2 4-byte Unicode char
         // row): zag's `char` ident silently rewrites to zig's `u32`
         // primitive so let-bind / var-bind / struct-field / enum-varlist /

@@ -159,8 +159,14 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 if (std.mem.eql(u8, self.type_info_buf[i].name, ident_name)) {
                     found_ident = true;
                     const rewritten = zagTypeToZig(self.type_info_buf[i].type_name);
-                    if (self.type_info_buf[i].type_name.len > 0 and
-                        self.type_info_buf[i].type_name[0] != '*' and
+                    const tn = self.type_info_buf[i].type_name;
+                    // `?*str` — optional POINTER to byte slice — is NOT
+                    // `{s}`-printable (its non-null case is a pointer, so
+                    // `orelse ""` mismatches); route it to the wrapper
+                    // like the `*`-prefixed forms. `?str` (optional
+                    // slice) stays on the `{s}` + `orelse ""` path.
+                    const tn_is_opt_ptr = tn.len > 1 and tn[0] == '?' and tn[1] == '*';
+                    if (tn.len > 0 and tn[0] != '*' and !tn_is_opt_ptr and
                         std.mem.indexOf(u8, rewritten, "[]const u8") != null)
                     {
                         return .{
@@ -168,22 +174,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             // `?[]const u8` → caller wraps with
                             // `orelse ""` so the strictly-typed `{s}`
                             // formatter sees a non-optional slice.
-                            .is_optional_byte_slice = self.type_info_buf[i].type_name.len > 0 and
-                                self.type_info_buf[i].type_name[0] == '?',
+                            .is_optional_byte_slice = tn.len > 0 and tn[0] == '?',
                             .wrap_auto = false,
                         };
                     }
                     // Pointer-to-byte-slice forms (`*[]const u8`,
-                    // `*?[]const u8`): the strict `{s}` widening can't
-                    // apply — zig rejects a pointer at a `{s}` slot, and
-                    // the deref-then-orelse codegen was previously
-                    // punted. Defer to the runtime wrapper instead:
-                    // wrap_auto routes the caller through
+                    // `*?[]const u8`, `?*[]const u8`): the strict `{s}`
+                    // widening can't apply — zig rejects a pointer at a
+                    // `{s}` slot, and the deref-then-orelse codegen was
+                    // previously punted. Defer to the runtime wrapper
+                    // instead: wrap_auto routes the caller through
                     // `{f}` + `__zag_auto_fmt()`, whose comptime check
                     // derefs the pointee and prints it as text (null
-                    // `*?[]const u8` → "").
-                    if (self.type_info_buf[i].type_name.len > 0 and
-                        self.type_info_buf[i].type_name[0] == '*' and
+                    // `*?[]const u8` / `?*[]const u8` → "").
+                    if (tn.len > 0 and (tn[0] == '*' or tn_is_opt_ptr) and
                         (std.mem.indexOf(u8, rewritten, "[]const u8") != null or
                          std.mem.indexOf(u8, rewritten, "[]u8") != null))
                     {
@@ -210,7 +214,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     if (!std.mem.eql(u8, f.kind.named.name, ma.name)) continue;
                     const tt = f.kind.named.type_text;
                     const rewritten = zagTypeToZig(tt);
-                    if (tt.len > 0 and tt[0] != '*' and
+                    const tt_is_opt_ptr = tt.len > 1 and tt[0] == '?' and tt[1] == '*';
+                    if (tt.len > 0 and tt[0] != '*' and !tt_is_opt_ptr and
                         std.mem.indexOf(u8, rewritten, "[]const u8") != null)
                     {
                         return .{
@@ -220,10 +225,10 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         };
                     }
                     // Pointer-to-byte-slice field (`*[]const u8`,
-                    // `*?[]const u8`): same runtime-wrapper deferral as
-                    // the ident arm — the wrapper derefs and prints the
-                    // pointee as text.
-                    if (tt.len > 0 and tt[0] == '*' and
+                    // `*?[]const u8`, `?*[]const u8`): same
+                    // runtime-wrapper deferral as the ident arm — the
+                    // wrapper derefs and prints the pointee as text.
+                    if (tt.len > 0 and (tt[0] == '*' or tt_is_opt_ptr) and
                         (std.mem.indexOf(u8, rewritten, "[]const u8") != null or
                          std.mem.indexOf(u8, rewritten, "[]u8") != null))
                     {
