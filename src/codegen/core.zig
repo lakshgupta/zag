@@ -904,26 +904,16 @@ pub const MapEntry = struct {
             \\pub fn __zag_bench_allocs() usize {
             \\    return @import("root").__zag_bench_allocations;
             \\}
-            \\// v0.1 stdlib migration follow-up: `__zag_memcpy` accepts a
-            \\// slice (`[]u8`) for the destination rather than a
-            \\// many-pointer (`[*]u8`). The reason: the .zag impl
-            \\// blocks in lib/std/string.zag pattern-match on
-            \\// `self.ptr[self.len..]` at the call site, which zag's
-            \\// codegen translates to a slice expression on a
-            \\// many-pointer — in zig, `[*]u8[lo..hi]` produces a
-            \\// `[]u8` (slice) NOT a `[*]u8` (pointer). The original
-            \\// `__zag_memcpy(dst: [*]u8, ...)` signature was rejected
-            \\// at zig compile time because the call site passes a
-            \\// slice. Indexing internals (`dst[i] = src[i]`) work
-            \\// identically for both types, so the helper's internal
-            \\// implementation is unchanged.
-            \\fn __zag_memcpy(dst: []u8, src: []const u8, len: usize) void {
-            \\    var i: usize = 0;
-            \\    while (i < len) {
-            \\        dst[i] = src[i];
-            \\        i += 1;
-            \\    }
-            \\}
+            \\// RETIRED in the v0.4 pass: __zag_memcpy (byte-copy
+            \\// helper, slice-destination form) moved into
+            \\// lib/std/mem.zag as a plain .zag fn — an index loop is
+            \\// fully expressible in .zag, so the always-emitted
+            \\// helper gave way. The slice-destination signature it
+            \\// carried (accepted `[]u8` not `[*]u8` because the .zag
+            \\// call sites pattern-match on `self.ptr[self.len..]`-
+            \\// shaped expressions, which transpile to slice
+            \\// expressions) is preserved verbatim in the .zag fn's
+            \\// `dst: []u8` param.
             \\// RETIRED with the comptime-type-dispatch batch: the
             \\// __zag_keys_eq / __zag_key_hash generic container key
             \\// helpers moved into lib/std/collections/hash_map.zag as

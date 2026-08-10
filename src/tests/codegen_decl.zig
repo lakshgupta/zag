@@ -3733,6 +3733,7 @@ test "codegen: __zag_posix preamble pins all 13 helpers + locks out steered-arou
         "fn __zag_posix_spawn",
         "fn __zag_waitpid",
         "fn __zag_process_spawn",
+        "fn __zag_memcpy",
         "var __zag_env_buf",
     };
     inline for (forbidden) |substr| {

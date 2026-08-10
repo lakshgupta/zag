@@ -32,9 +32,13 @@ pub import std.bench.{Counters}
 #   `pub import std.env.{get_env}`     → REAL impl in lib/std/env.zag backed by
 #                                         __zag_getenv (Tier-1 migration;
 #                                         renamed from `getEnv`).
-#   `pub import std.fs.{read_file}`    → REAL impl in lib/std/fs.zag backed by the
-#                                         __zag_posix preamble family (__zag_openat /
-#                                         __zag_read / __zag_close / __zag_memcpy).
+#   `pub import std.fs.{read_file}`    → REAL impl in lib/std/fs.zag backed by
+#                                         the __zag_posix preamble family
+#                                         (__zag_openat / __zag_read /
+#                                         __zag_close) — itself fully retired
+#                                         into lib/std/posix.zag by the v0.3/v0.4
+#                                         passes; byte copies go through
+#                                         std.mem.memcpy.
 #                                         The codegen-router entry fs_read_file was
 #                                         RETIRED in favour of the @import+alias
 #                                         fallthrough in src/codegen/core.zig's imports

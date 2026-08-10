@@ -21,6 +21,8 @@
 ## in this iteration (the `##` block above is the new module-level
 ## rationale + carries migration context).
 
+import std.mem.{memcpy}
+
 pub trait Display {
     fun write(self: *const Self, writer: *Writer);
 }
@@ -100,7 +102,7 @@ pub fun format_u64(value: u64, base: u32) -> []u8 {
     }
     let out: *raw u8 = __zag_page_alloc(n);
     __zag_bench_alloc(n);
-    __zag_memcpy(out[0..n], buf[0..n], n);
+    memcpy(out[0..n], buf[0..n], n);
     return out[0..n];
 }
 
@@ -111,7 +113,7 @@ pub fun format_i64(value: i64, base: u32) -> []u8 {
         let out: *raw u8 = __zag_page_alloc(digits.len + 1);
         __zag_bench_alloc(digits.len + 1);
         out[0] = '-';
-        __zag_memcpy(out[1 .. digits.len + 1], digits[0..], digits.len);
+        memcpy(out[1 .. digits.len + 1], digits[0..], digits.len);
         free(digits);
         return out[0 .. digits.len + 1];
     }

@@ -7,6 +7,7 @@
 ## NOT slice descriptors.
 
 import std.collections.{ArrayList}
+import std.mem.{memcpy}
 
 
 ## Content equality of two borrowed views (the missing `==` for
@@ -120,10 +121,10 @@ pub fun join(parts: ArrayList(str), sep: str) -> []u8 {
     var k: usize = 0;
     while (k < parts.len) {
         let piece: []const u8 = parts.items[k];
-        __zag_memcpy(out[pos .. pos + piece.len], piece[0..], piece.len);
+        memcpy(out[pos .. pos + piece.len], piece[0..], piece.len);
         pos = pos + piece.len;
         if (k + 1 < parts.len) {
-            __zag_memcpy(out[pos .. pos + sep.len], sep[0..], sep.len);
+            memcpy(out[pos .. pos + sep.len], sep[0..], sep.len);
             pos = pos + sep.len;
         }
         k = k + 1;
@@ -137,7 +138,7 @@ pub fun replace(s: str, from: str, to: str) -> []u8 {
     if (from.len == 0) {
         let out: *raw u8 = __zag_page_alloc(s.len);
         __zag_bench_alloc(s.len);
-        __zag_memcpy(out[0..s.len], s[0..], s.len);
+        memcpy(out[0..s.len], s[0..], s.len);
         return out[0..s.len];
     }
     var count: usize = 0;
@@ -164,7 +165,7 @@ pub fun replace(s: str, from: str, to: str) -> []u8 {
             j = j + 1;
         }
         if (matched && k + from.len <= s.len) {
-            __zag_memcpy(out[pos .. pos + to.len], to[0..], to.len);
+            memcpy(out[pos .. pos + to.len], to[0..], to.len);
             pos = pos + to.len;
             k = k + from.len;
         } else {
@@ -239,7 +240,7 @@ pub fun repeat(s: str, n: usize) -> []u8 {
     __zag_bench_alloc(out_len);
     var i: usize = 0;
     while (i < n) {
-        __zag_memcpy(out[i * s.len .. (i + 1) * s.len], s[0..], s.len);
+        memcpy(out[i * s.len .. (i + 1) * s.len], s[0..], s.len);
         i = i + 1;
     }
     return out[0..out_len];

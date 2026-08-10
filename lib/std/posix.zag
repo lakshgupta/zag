@@ -33,6 +33,8 @@
 ## sign bit or cast to isize. read/write return signed isize directly
 ## (bytes transferred, or negative errno).
 
+pub import std.mem.{memcpy}
+
 ## openat — raw `openat(2)` on a path slice. Copies the path into a
 ## sentinel-terminated stack buffer (fs.zag's caller-side pattern
 ## moved here so callers pass plain `str`), then hands the buffer to
@@ -46,7 +48,7 @@ pub fun openat(dirfd: i32, path: str, flags: u32, mode: u32) -> usize {
     if (n + 1 > path_z.len) {
         return 0xFFFFFFFFFFFFFFFF;
     }
-    __zag_memcpy(path_z[0..n], path, n);
+    memcpy(path_z[0..n], path, n);
     path_z[n] = 0;
     return std.os.linux.openat(dirfd, &path_z[0] as [*:0]const u8, bitcast(flags), mode);
 }
@@ -81,7 +83,7 @@ pub fun mkdirat(dirfd: i32, path: str, mode: u32) -> usize {
     if (n + 1 > path_z.len) {
         return 0xFFFFFFFFFFFFFFFF;
     }
-    __zag_memcpy(path_z[0..n], path, n);
+    memcpy(path_z[0..n], path, n);
     path_z[n] = 0;
     return std.os.linux.mkdirat(dirfd, &path_z[0] as [*:0]const u8, mode);
 }
@@ -195,7 +197,7 @@ pub fun spawn(argv: []const []const u8) -> i32 {
     while (i < nargs) {
         let a: []const u8 = argv[i];
         if (off + a.len + 1 > arg_arena.len) { return 255; }
-        __zag_memcpy(arg_arena[off .. off + a.len], a, a.len);
+        memcpy(arg_arena[off .. off + a.len], a, a.len);
         arg_arena[off + a.len] = 0;
         let seg: []const u8 = arg_arena[off .. off + a.len];
         arg_ptrs[i] = seg.ptr as [*:0]const u8;

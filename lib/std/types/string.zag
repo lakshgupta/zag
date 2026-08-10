@@ -14,14 +14,17 @@
 ##
 ## Real impl — methods compose against the always-emitted
 ## `__zag_page_alloc` / `__zag_page_realloc` / `__zag_page_free`
-## / `__zag_memcpy` / `__zag_panic` family primitives in the
-## generated zig preamble (see src/codegen/core.zig's preamble block).
-## After zag's transpile pass, build/gen/std/types.zig is the
-## source of truth at runtime — this .zag surface matches its
-## emitted zig shape 1:1, with method names in snake_case (the
-## codegen router arms in src/codegen/expr.zig emit
-## `__zag_String.with_capacity(N)` as the migrated call site, so
-## impl-block method names must match).
+## / `__zag_panic` family primitives in the generated zig preamble
+## (see src/codegen/core.zig's preamble block); the byte copies use
+## std.mem's `memcpy` (the `__zag_memcpy` preamble helper retired
+## there in the v0.4 pass). After zag's transpile pass,
+## build/gen/std/types.zig is the source of truth at runtime — this
+## .zag surface matches its emitted zig shape 1:1, with method
+## names in snake_case (the codegen router arms in
+## src/codegen/expr.zig emit `__zag_String.with_capacity(N)` as the
+## migrated call site, so impl-block method names must match).
+
+import std.mem.{memcpy}
 ##
 ## Layout { ptr: [*]u8, len: usize, cap: usize }. The `*u8` raw
 ## pointer shape rewrites through zagTypeToZig's `*raw T` rule
@@ -53,7 +56,7 @@ impl String {
             self.ptr = __zag_page_realloc(self.ptr, self.cap, new_cap);
             self.cap = new_cap;
         }
-        __zag_memcpy(self.ptr[self.len..self.len + s.len], s, s.len);
+        memcpy(self.ptr[self.len..self.len + s.len], s, s.len);
         self.len = needed;
     }
 

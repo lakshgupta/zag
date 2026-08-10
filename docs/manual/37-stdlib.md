@@ -25,7 +25,7 @@ surface of the modules below.
 | `std.time` | `Duration`, `Timer`, `now` | none |
 | `std.atomic` | `AtomicI32/64/Usize/Bool`, `Ordering` | none |
 | `std.bench` | `Counters` (allocation counters) | — |
-| `std.mem` | `alloc`, `free` keyword | heap |
+| `std.mem` | `alloc` (keyword `free`), `memcpy` | heap |
 | `std.argv` | `get` | heap |
 | `std.env` | `get_env` (borrowed view) | none |
 | `std.fs` | `read_file`, `write_file`, `mkdir` | heap |
@@ -107,6 +107,12 @@ Conventions, mirroring the retired preamble:
 `std.fs`, `std.env`, `std.time`, and `std.process` import from this
 facade; `std.process.exit` re-exports it under the alias
 `exit as sys_exit`, and `std.process.exec` delegates to `spawn`.
+
+`std.mem.memcpy(dst: []u8, src: []const u8, len)` is the pure
+byte-copy primitive (the retired `__zag_memcpy` preamble helper) —
+the arena copies in `spawn`, `String.push_str`, `fmt`'s format
+helpers, and `std.strings.slices`' join/replace all route through
+it.
 
 ## Generic containers
 
