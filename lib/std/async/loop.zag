@@ -21,10 +21,11 @@
 ## stable across it.
 
 import std.collections.{ArrayList}
+import std.time.{clock_gettime}
 
 ## Clock now in milliseconds (CLOCK_MONOTONIC).
 pub fun now_ms() -> i64 {
-    return __zag_clock_gettime(1) / 1_000_000;
+    return clock_gettime(1) / 1_000_000;
 }
 
 ## Blocking sleep via nanosleep — returns an already-completed

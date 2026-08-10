@@ -10,6 +10,8 @@
 ## overridden with `seed_from(entropy: u64)` for reproducibility.
 ## Not cryptographically secure — use for tests, shuffles, jitter.
 
+import std.posix.{openat, read}
+
 pub struct XorShift64Star {
     state: u64,
 }
@@ -54,8 +56,8 @@ impl XorShift64Star {
 
 fun urandom_u64() -> u64 {
     var buf: [8]u8 = undefined;
-    const fd: usize = __zag_openat(std.posix.AT.FDCWD, "/dev/urandom", 0, 0);
-    let n: isize = __zag_read(fd as i32, buf[0..], 8);
+    const fd: usize = openat(std.posix.AT.FDCWD, "/dev/urandom", 0, 0);
+    let n: isize = read(fd as i32, buf[0..], 8);
     if (n < 8) {
         return 0x9E3779B97F4A7C15;
     }

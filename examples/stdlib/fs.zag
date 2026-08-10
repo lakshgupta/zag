@@ -26,9 +26,9 @@
 ## ambient in fixture files.
 
 import std.fs.{read_file};
-import std.string.{String};
+import std.types.{String};
 
 fun main() {
-    let data: String = read_file("examples/basics/hello.zag");
+    let data: String = read_file("basics/hello.zag");
     print("read {data.as_str().len} bytes\n");
 }
