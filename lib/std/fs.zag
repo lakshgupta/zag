@@ -2,11 +2,12 @@
 ##
 ## v0.1 stdlib migration status (this file):
 ##
-##   `read_file` — REAL impl. Uses the always-emitted __zag_posix
-##   preamble family from src/codegen/core.zig::generate():
-##     __zag_openat(dirfd, path, flags, mode) -> fd
-##     __zag_read(fd, buf, len) -> bytes-read
-##     __zag_close(fd) -> 0
+##   `read_file` — REAL impl. Backed by the lib/std/posix.zag syscall
+##   facade (v0.3 syscall-FFI migration — the __zag_posix preamble
+##   family from src/codegen/core.zig retired into posix.zag):
+##     openat(dirfd, path, flags, mode) -> fd
+##     read(fd, buf, len) -> bytes-read
+##     close(fd) -> 0
 ##   After this migration, `pub import std.fs.{read_file}` resolves to
 ##   this real function via the @import + per-selector alias emitted by
 ##   src/codegen/core.zig's imports loop (Option A fallthrough — when
@@ -14,15 +15,15 @@
 ##   emits `const __zag_imported_<i> = @import("lib/std/fs.zag")`
 ##   plus `const read_file = __zag_imported_<i>.read_file` rather than
 ##   dropping the selector silently).
-##   Chunked-read approach (v0.1): no __zag_fstat / __zag_lseek exist
-##   in the landed preamble, so we don't precompute total size. Each
-##   read loop iterates 4 KiB at a time and `push_str`-es into a heap
-##   `String` until __zag_read returns 0 (EOF) or negative (errno).
+##   Chunked-read approach (v0.1): no fstat / lseek in the posix
+##   facade, so we don't precompute total size. Each read loop
+##   iterates 4 KiB at a time and `push_str`-es into a heap
+##   `String` until read returns 0 (EOF) or negative (errno).
 ##   The `String` accumulator comes from `String.with_capacity` in
 ##   lib/std/types.zag's String, itself backed by __zag_page_alloc
 ##   in the preamble — same heap ownership contract as before.
 ##
-##   Error model: __zag_openat / __zag_read errno values (returned as
+##   Error model: openat / read errno values (returned as
 ##   high-bit-set usize / negative isize respectively) collapse into
 ##   `__zag_panic(...)` today. v1 keeps the surface simple: any open
 ##   or read failure panics. Phase 2+ may lift `read_file_or` (boots
@@ -30,12 +31,12 @@
 ##   zig-side codegen is wired.
 ##
 ##   `write_file` + `mkdir` — REAL impls (v0.1 Tier-1 migration).
-##   write_file is backed by __zag_openat / __zag_write /
-##   __zag_close; mkdir is backed by __zag_mkdirat. The former
-##   `fs_write_file` / `fs_mkdir` codegen-router rows (which REWROTE
-##   call sites into per-call `blk: { ... }` shapes) were retired —
-##   call sites now resolve through the imports-loop alias to these
-##   real functions, mirroring read_file's path.
+##   write_file is backed by the posix facade's openat / write /
+##   close; mkdir by mkdirat. The former `fs_write_file` /
+##   `fs_mkdir` codegen-router rows (which REWROTE call sites into
+##   per-call `blk: { ... }` shapes) were retired — call sites now
+##   resolve through the imports-loop alias to these real functions,
+##   mirroring read_file's path.
 ##
 ## String import: see the inline `pub import std.types.{String}`
 ## just below -- needed so project-mode `zag generate` parses
@@ -69,22 +70,20 @@
 ## syntax; the post-migration real impl exercises String directly.
 pub import std.types.{String}
 
-pub fun read_file(path: str) -> String {
-    var path_z: [1024]u8 = undefined;
-    let n: usize = path.len;
-    if (n + 1 > path_z.len) {
-        __zag_panic("std.fs.read_file: path exceeds 1023 bytes");
-    }
-    __zag_memcpy(path_z[0..n], path, n);
-    path_z[n] = 0;
+## Syscall facade import (v0.3 syscall-FFI migration): the openat
+## family now lives in lib/std/posix.zag, not the preamble. The
+## selective list binds openat / read / write / close / mkdirat —
+## the five entries this file's real impls route through. Reading
+## against the retired __zag_openat / __zag_read / __zag_write /
+## __zag_close / __zag_mkdirat names is the regression signal.
+pub import std.posix.{openat, read, write, close, mkdirat}
 
-    # openat uses a sentinel-terminated many-pointer for path;
-    # cast our [1024]u8 mutable buffer's first-elem ptr to the
-    # required shape. The trailing NUL we wrote at path_z[n]
-    # satisfies the sentinel contract.
-    const fd_raw: usize = __zag_openat(std.posix.AT.FDCWD, &path_z[0] as [*:0]const u8, 0, 0);
+pub fun read_file(path: str) -> String {
     # openat errno convention: high bit of usize set when negative
-    # errno was returned by the kernel.
+    # errno was returned by the kernel. The path slice travels to
+    # posix.openat directly — the sentinel-terminated stack copy is
+    # the facade's job now (was caller-side __zag_openat plumbing).
+    const fd_raw: usize = openat(std.posix.AT.FDCWD, path, 0, 0);
     if ((fd_raw & 0x8000000000000000) != 0) {
         __zag_panic("std.fs.read_file: openat failed");
     }
@@ -93,21 +92,22 @@ pub fun read_file(path: str) -> String {
     var sb: String = String.with_capacity(4096);
     var stack_buf: [4096]u8 = undefined;
     while (true) {
-        const n_signed: isize = __zag_read(fd, stack_buf[0..stack_buf.len], stack_buf.len);
+        const n_signed: isize = read(fd, stack_buf[0..stack_buf.len], stack_buf.len);
         if (n_signed <= 0) { break; }
         sb.push_str(stack_buf[0..n_signed as usize]);
     }
-    _ = __zag_close(fd);
+    _ = close(fd);
     return sb;
 }
 
 ## write_file: v0.1 Tier-1 migration — real impl, backed by the
-## always-emitted __zag_posix family (__zag_openat / __zag_write /
-## __zag_close). Mirrors read_file's path handling: sentinel-
-## terminated stack copy of the path, errno-high-bit open check,
-## then a partial-write-tolerant loop (write(2) may write fewer
-## bytes than requested) until the whole content slice lands.
-## Flags 0x241 = O_WRONLY | O_CREAT | O_TRUNC; mode 0o644.
+## lib/std/posix.zag syscall facade (posix.openat / posix.write /
+## posix.close — the v0.3 migration retired the __zag_posix family
+## into .zag). The facade owns the sentinel-terminated path copy;
+## the flags here are the raw O_* bitmask 0x241 =
+## O_WRONLY | O_CREAT | O_TRUNC; mode 0o644.
+## A partial-write-tolerant loop (write(2) may write fewer
+## bytes than requested) runs until the whole content slice lands.
 ## Returns 0 on success, -1 on any open/write failure (the cli.zag
 ## init handler treats -1 as "scaffolding failed" and exits 1).
 ## The pre-migration `fs_write_file` router row emitted
@@ -115,15 +115,7 @@ pub fun read_file(path: str) -> String {
 ## Tier-1 migration.
 
 pub fun write_file(path: str, content: []const u8) -> i32 {
-    var path_z: [1024]u8 = undefined;
-    let n: usize = path.len;
-    if (n + 1 > path_z.len) {
-        return -1;
-    }
-    __zag_memcpy(path_z[0..n], path, n);
-    path_z[n] = 0;
-
-    const fd_raw: usize = __zag_openat(std.posix.AT.FDCWD, &path_z[0] as [*:0]const u8, 0x241, 0o644);
+    const fd_raw: usize = openat(std.posix.AT.FDCWD, path, 0x241, 0o644);
     if ((fd_raw & 0x8000000000000000) != 0) {
         return -1;
     }
@@ -132,37 +124,30 @@ pub fun write_file(path: str, content: []const u8) -> i32 {
     var pos: usize = 0;
     while (pos < content.len) {
         const rest: []const u8 = content[pos..content.len];
-        const n_signed: isize = __zag_write(fd, rest, rest.len);
+        const n_signed: isize = write(fd, rest, rest.len);
         if (n_signed <= 0) { break; }
         pos = pos + (n_signed as usize);
     }
-    _ = __zag_close(fd);
+    _ = close(fd);
     if (pos < content.len) { return -1; }
     return 0;
 }
 
 ## mkdir: v0.1 Tier-1 migration — real impl, backed by the
-## always-emitted __zag_mkdirat preamble helper (raw `mkdirat(2)`).
-## Mirrors read_file/write_file's path handling: sentinel-terminated
-## stack copy of the path, then a single mkdirat(2) with mode 0o755.
-## EEXIST (errno 17) is silently coalesced to 0 — cli.zag init's
-## "mkdir -p" semantics; any other errno returns -1. The pre-migration
-## `fs_mkdir` router row emitted
-## `std.Io.Dir.cwd().createDir(__zag_io, ...)`; retired here.
+## lib/std/posix.zag facade's posix.mkdirat (raw `mkdirat(2)`; the
+## v0.3 migration retired the __zag_mkdirat preamble helper into
+## .zag, so the path sentinel copy is the facade's job).
+## A single mkdirat(2) with mode 0o755. EEXIST (errno 17) is
+## silently coalesced to 0 — cli.zag init's "mkdir -p" semantics;
+## any other errno returns -1. The pre-migration `fs_mkdir` router
+## row emitted `std.Io.Dir.cwd().createDir(__zag_io, ...)`;
+## retired here.
 
 pub fun mkdir(path: str) -> i32 {
-    var path_z: [1024]u8 = undefined;
-    let n: usize = path.len;
-    if (n + 1 > path_z.len) {
-        return -1;
-    }
-    __zag_memcpy(path_z[0..n], path, n);
-    path_z[n] = 0;
-
-    const rc: usize = __zag_mkdirat(std.posix.AT.FDCWD, &path_z[0] as [*:0]const u8, 0o755);
+    const rc: usize = mkdirat(std.posix.AT.FDCWD, path, 0o755);
     if ((rc & 0x8000000000000000) != 0) {
         let err_i64: i64 = rc as i64;
-        let errno_val: i64 = 0 - err_i64;
+        let errno_val: i64 = 0 -% err_i64;
         if (errno_val == 17) {
             return 0;
         }

@@ -27,9 +27,10 @@ surface of the modules below.
 | `std.bench` | `Counters` (allocation counters) | — |
 | `std.mem` | `alloc`, `free` keyword | heap |
 | `std.argv` | `get` | heap |
-| `std.env` | `get_env` | heap |
+| `std.env` | `get_env` (borrowed view) | none |
 | `std.fs` | `read_file`, `write_file`, `mkdir` | heap |
 | `std.process` | `exec`, `exit` | heap |
+| `std.posix` | `openat`, `read`, `write`, `close`, `mkdirat`, `getdents64`, `clock_gettime`, `getcwd`, `getenv`, `exit` | none |
 | `std.debug` | `panic` | none |
 
 ## Directory modules
@@ -54,13 +55,58 @@ Materialization mirrors the tree (`build/gen/std/collections/*.zig`);
 the generic dispatch emits per-type import paths. The same pattern
 backs `std.async.stream` / `std.arch.x86.avx2` / `std.concurrent.*`.
 
+## POSIX syscall facade
+
+`std.posix` (`lib/std/posix.zag`) is the raw-syscall layer the
+system-facing modules build on. It replaced the preamble's
+`__zag_openat` / `__zag_read` / `__zag_write` / `__zag_close` /
+`__zag_mkdirat` / `__zag_getdents64` / `__zag_clock_gettime` /
+`__zag_getcwd` / `__zag_getenv` / `__zag_exit` helpers — the last
+preamble helper to survive is `__zag_process_spawn` (process.spawn
+needs an anonymous SpawnOptions literal the .zag surface cannot yet
+express). Modules import it with the std-to-std form:
+
+```zag
+pub import std.posix.{openat, read, write, close, mkdirat}
+```
+
+Conventions, mirroring the retired preamble:
+
+- `openat(dirfd, path, flags: u32, mode: u32) -> usize` — path is
+  copied into a 4096-byte sentinel buffer (the .zag surface has no
+  `[N:0]u8` literal); callers treat the high bit as the error marker
+  (`(fd & 0x8000000000000000) != 0`), same convention as the
+  preamble. `flags` reaches zig via `bitcast` (the packed `O`
+  bitfield).
+- `read(fd, buf, len) -> isize` / `write(fd, buf, len) -> isize` —
+  the returned raw `usize` is sign-cast back to `isize` so callers
+  can branch on `<= 0` for EOF/error.
+- `getcwd() -> []const u8` / `getenv(name) -> ?str` — return slices
+  into fixed module-level buffers (`var cwd_buf: [4096]u8`,
+  `var env_buf: [32768]u8`); `getenv` scans `/proc/self/environ` so
+  the returned slice is NUL-terminated-free; `getenv` never
+  allocates, so lookups are safe in signal-ish contexts.
+- `clock_gettime(clk_id: i32) -> i64` — nanosecond monotonic time via
+  `enum_from_int` (runtime int → `clockid_t`); `std.time.now`
+  delegates to it.
+- `exit(code: i32) -> noreturn` — raw `std.os.linux.exit`.
+
+`std.fs`, `std.env`, `std.time`, and `std.process` import from this
+facade; `std.process.exit` re-exports it under the alias
+`exit as sys_exit`.
+
 ## Generic containers
 
 `std.collections` is built on generic *structs* (docs/17 §Generic
-Types). HashMap keys hash and compare via the preamble
-`__zag_key_hash` / `__zag_keys_eq` helpers — `str` keys get CONTENT
-semantics (std.mem.eql + content FNV), so string-keyed maps work
-including equal strings in different buffers:
+Types). HashMap key semantics are implemented in pure .zag via the
+compiler's comptime type dispatch: `type_eq(K, str)` (a builtin that
+emits a zig type-equality `K == []const u8`) selects CONTENT
+semantics for `str` keys (byte-wise `str_eq` + content FNV-1a over
+the slice bytes) and VALUE semantics for byte keys (FNV-1a over
+`size_of(K)` bytes reached through `addr_of` — the retired preamble
+`__zag_key_hash`/`__zag_keys_eq` helpers moved into
+lib/std/collections/hash_map.zag). String-keyed maps work including
+equal strings in different buffers:
 
 ```zag
 var m: HashMap<str, i32> = HashMap<str, i32>.new();
@@ -74,10 +120,10 @@ type) type`, impl methods become orphan free fns
 call sites dispatch automatically — `list.push(5)` rewrites to
 `@import("std/collections/array_list.zig").ArrayList_push(i32, &list, 5)`.
 Value receivers get address-of at the call site; declare the binding
-`var` when methods mutate. `HashMap` hashes keys via FNV-1a over
-`size_of(K)` bytes with `==` equality (value keys are
-content-correct; `str` keys hash the slice descriptor — content-key
-equality is a follow-up).
+`var` when methods mutate. Both dispatch branches are comptime-known
+per instantiation, so zig's comptime-if evaluates exactly one —
+`a == b` on a slice never type-checks because the str branch wins
+first, and the value byte-walk never touches a string.
 
 ## Generic functions (turbofish)
 
@@ -111,19 +157,21 @@ The escape analysis treats these as escaping allocations by design
 
 ## Hash arithmetic and wrapping
 
-zig's checked operators panic on overflow in Debug builds, and the
-wrapping operators (`+%` / `*%`) are not expressible in `.zag`
-source. The hash/random implementations therefore accumulate in a
-wider type (`u64` or `u128`) and fold with an explicit modulo:
+zag's checked operators (`+` / `*`) panic on overflow in Debug
+builds, so the hash/random implementations use the wrapping forms
+(`+%` / `*%` — docs/05 §Wrapping Arithmetic) with digest-width state:
 
-```zig
-hash = hash * 16777619;      // fits u64 (below 2^57)
-hash = hash % 4294967296;    // fold back to 32-bit FNV semantics
+```zag
+var hash: u32 = 2166136261;          # fnv1a32's offset basis
+hash = (hash ^ (data[i] as u32)) *% 16777619;   # mod-2^32 wrap
 ```
 
-The same modulo idiom appears in `sha256` (all state variables are
-mod-2^32) and `XorShift64Star` (mod-2^64). Digests are checked
-against the canonical test vectors in `examples/stdlib/hash_core.zag`:
+`sha256` keeps all state variables as `u32` with `+%` adds (the
+spec defines every add mod 2^32), and `XorShift64Star`'s final
+multiply is `*%` (mod 2^64). The pre-wrapping v0.1 forms accumulated
+in `u64`/`u128` and folded with an explicit `% 2^N` — equivalent
+arithmetic, now spelled directly. Digests are checked against the
+canonical test vectors in `examples/stdlib/hash_core.zag`:
 
 | Function | Input | Expected |
 |---|---|---|

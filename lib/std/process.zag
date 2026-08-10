@@ -1,26 +1,30 @@
 ## std.process — process spawn / exit primitives.
 ##
-## v0.1 Tier-1 migration: `exit` is now a real zag impl backed by the
-## always-emitted `__zag_exit` preamble helper (src/codegen/core.zig,
-## a forwarder onto `std.os.linux.exit`). The pre-migration
-## `process_exit` router row emitted
-## `(std.os.linux.exit(@as(u8, @intCast(code))))` inline; the
-## preamble helper takes `i32` directly so the .zag body is the
-## 1-line canonical form. Router row retired in the Tier-1 migration.
+## v0.3 syscall-FFI migration: `exit` is a real zag impl backed by
+## lib/std/posix.zag's posix.exit (`std.os.linux.exit` direct; the
+## `__zag_exit` preamble helper retired into .zag). The import binds
+## the facade entry as `sys_exit` so this module's own `pub fun exit`
+## keeps its public name without a module-level clash. The
+## pre-migration `process_exit` router row emitted
+## `(std.os.linux.exit(@as(u8, @intCast(code))))` inline; retired in
+## the Tier-1 migration.
 ##
-## `exec` — REAL impl (same migration): backed by the always-emitted
-## `__zag_process_spawn` preamble helper — zig 0.16's
+## `exec` — REAL impl (Tier-1 migration): still backed by the
+## always-emitted `__zag_process_spawn` preamble helper — zig 0.16's
 ## std.process.spawn(io, .{ .argv = ... }) + kill + wait, with the
 ## .exited term mapped to the child's exit code and any other term
 ## (signal/stop/abort) or spawn/wait failure mapped to 255. The
 ## anonymous-struct options literal and the term-union switch live in
-## the zig helper because zag source cannot express those shapes; the
+## the zig helper because zag source cannot express those shapes (the
+## one remaining __zag_posix-family preamble resident); the
 ## pre-migration `process_exec` router row emitted the same block
 ## inline and is retired. Call sites resolve through the @import +
 ## per-selector alias (`const exec = __zag_imported_<i>.exec;`).
 
+pub import std.posix.{exit as sys_exit}
+
 pub fun exit(code: i32) {
-    __zag_exit(code);
+    sys_exit(code);
 }
 
 pub fun exec(argv: []const []const u8) -> i32 {

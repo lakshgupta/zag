@@ -551,3 +551,75 @@ test "codegen: bench hooks — non-ident free target keeps plain emit (no double
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.destroy(getBox())") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "({ ") == null);
 }
+
+test "codegen: type_eq(K, str) emits a zig type-equality (K == []const u8)" {
+    // Comptime type dispatch primitive: the args route through the
+    // type-text mapper — `str` lands as `[]const u8`, a generic
+    // param passes verbatim. This is the emitted condition behind
+    // std.collections hash_map's str-vs-value key dispatch.
+    const src = "fun hash_key<K>(key: K) -> usize { if (type_eq(K, str)) { return 1; } return 0; }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if ((K == []const u8))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn hash_key(comptime K: type, key: K) usize") != null);
+}
+
+test "codegen: type_eq with concrete types emits the mapped comparison" {
+    const src = "fun f() { let b: bool = type_eq(i32, str); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const b: bool = (i32 == []const u8);") != null);
+}
+
+test "codegen: addr_of(v) emits (&v) for the value-byte hash walk" {
+    const src = "fun f(key: K) { let p: [*]const u8 = (addr_of(key) as [*]const u8); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(&key)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as([*]const u8, @alignCast(@ptrCast((&key))))") != null);
+}
+
+test "codegen: bitcast(v) emits @bitCast(v) for the openat flags boundary" {
+    // lib/std/posix.zag's openat: zig 0.16's std.os.linux.openat takes
+    // the packed-bitfield O flags type, so the raw u32 flag word is
+    // reinterpreted at the syscall call site.
+    const src = "fun f(flags: u32) { let rc: usize = std.os.linux.openat(-100, \".\", bitcast(flags), 0); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@bitCast(flags)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intCast(flags)") == null);
+}
+
+test "codegen: enum_from_int(v) emits @enumFromInt(v) for the clockid boundary" {
+    // lib/std/posix.zag's clock_gettime: zig 0.16's clockid_t is an
+    // enum, so the plain i32 clock-id crosses at @enumFromInt.
+    const src = "fun f(id: i32) { var ts: std.os.linux.timespec = undefined; _ = std.os.linux.clock_gettime(enum_from_int(id), addr_of(ts)); }\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@enumFromInt(id)") != null);
+}

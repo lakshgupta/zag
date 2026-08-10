@@ -474,12 +474,17 @@ pub const ExternDecl = struct {
     loc: Loc,
 };
 
-/// One top-level `const NAME: TYPE = EXPR;` declaration (docs/26).
-/// Module-level compile-time constants. Codegen emits zig `const`.
+/// One top-level module binding. Two surface shapes share the slot:
+/// `const NAME: TYPE = EXPR;` (docs/26, module-level compile-time
+/// constant; codegen emits zig `const`) and `var NAME: TYPE = EXPR;`
+/// (module-level mutable state, e.g. lib/std/posix.zag's getenv
+/// scan buffer; codegen emits zig `var`). The parser routes on the
+/// leading keyword and records it here via `is_var`.
 pub const ConstDecl = struct {
     name: []const u8,
     type_text: ?[]const u8,
     init: *Expr,
+    is_var: bool = false,
     loc: Loc,
 };
 

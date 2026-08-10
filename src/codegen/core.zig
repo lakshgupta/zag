@@ -924,40 +924,12 @@ pub const MapEntry = struct {
             \\        i += 1;
             \\    }
             \\}
-            \\// Generic container key helpers (std.collections): zig's
-            \\// `==` on slices compares the slice DESCRIPTOR (and is
-            \\// rejected outright for []const u8 operands), so the
-            \\// HashMap's generic probe/contains/get equality + hashing
-            \\// delegate here — a comptime K branch selects CONTENT
-            \\// semantics for slice keys (str) and value semantics for
-            \\// everything else. Pure zig side, so the comptime `if`
-            \\// discards the dead branch properly (the .zag emitter
-            \\// can't do that — its comptime if still type-checks both
-            \\// branches).
-            \\fn __zag_keys_eq(comptime K: type, a: K, b: K) bool {
-            \\    if (K == []const u8) {
-            \\        return std.mem.eql(u8, a, b);
-            \\    }
-            \\    return a == b;
-            \\}
-            \\fn __zag_key_hash(comptime K: type, key: K) usize {
-            \\    if (K == []const u8) {
-            \\        const s: []const u8 = key;
-            \\        var h: u64 = 2166136261;
-            \\        for (s) |b| {
-            \\            h = (h ^ @as(u64, b)) *% 16777619;
-            \\        }
-            \\        return @as(usize, @truncate(h));
-            \\    }
-            \\    const bytes: [*]const u8 = @ptrCast(&key);
-            \\    var h: u64 = 2166136261;
-            \\    var i: usize = 0;
-            \\    while (i < @sizeOf(K)) {
-            \\        h = (h ^ @as(u64, bytes[i])) *% 16777619;
-            \\        i += 1;
-            \\    }
-            \\    return @as(usize, @truncate(h));
-            \\}
+            \\// RETIRED with the comptime-type-dispatch batch: the
+            \\// __zag_keys_eq / __zag_key_hash generic container key
+            \\// helpers moved into lib/std/collections/hash_map.zag as
+            \\// pure .zag (type_eq<K, str> comptime dispatch + addr_of
+            \\// byte-walk), so str keys get CONTENT semantics and value
+            \\// keys get byte semantics without a preamble presence.
             \\fn __zag_fd_write(fd: i32, bytes: []const u8) void {
             \\    var pos: usize = 0;
             \\    while (pos < bytes.len) {
@@ -1283,146 +1255,21 @@ pub const MapEntry = struct {
             \\    }
             \\    _ = std.os.linux.nanosleep(&req, null);
             \\}
-            \\
-            \\// __zag_posix family — raw POSIX syscall wrappers
-            \\// exposed so lib/std/{fs,env,process,time}.zag can be
-            \\// written entirely in .zag (no inline-preamble
-            \\// std.Io / std.process / std.fs calls). Linux-only
-            \\// (project is Linux-first per AGENTS.md).
-            \\
-            \\// __zag_openat — raw `openat(2)`. Returns fd on
-            \\// success, errno-encoded usize on failure. zig 0.16's
-            \\// `std.os.linux.openat` takes the packed-bitfield
-            \\// `os.linux.O` flags type (not a bare u32), so the
-            \\// helper bitcasts the raw flag word at the boundary.
-            \\fn __zag_openat(dirfd: i32, path: [*:0]const u8, flags: u32, mode: u32) usize {
-            \\    return std.os.linux.openat(dirfd, path, @bitCast(flags), @intCast(mode));
-            \\}
-            \\// __zag_read — raw `read(2)`. Returns bytes read
-            \\// (partial reads possible) or -1.
-            \\fn __zag_read(fd: i32, buf: []u8, len: usize) isize {
-            \\    return @bitCast(std.os.linux.read(fd, buf.ptr, len));
-            \\}
-            \\// __zag_write — raw `write(2)`. Returns bytes
-            \\// written (partial writes possible) or -1.
-            \\fn __zag_write(fd: i32, buf: []const u8, len: usize) isize {
-            \\    return @bitCast(std.os.linux.write(fd, buf.ptr, len));
-            \\}
-            \\// __zag_close — raw `close(2)`. Returns 0 on
-            \\// success, errno-encoded usize on failure.
-            \\fn __zag_close(fd: i32) usize {
-            \\    return std.os.linux.close(fd);
-            \\}
-            \\// __zag_mkdirat — raw `mkdirat(2)`. Returns 0 on
-            \\// success, errno-encoded usize on failure (high-bit
-            \\// set; EEXIST = 17, which lib/std/fs.zag's mkdir
-            \\// coalesces to 0 for "mkdir -p" semantics). The
-            \\// `mode_t` param is u32 on Linux so it passes
-            \\// through directly.
-            \\fn __zag_mkdirat(dirfd: i32, path: [*:0]const u8, mode: u32) usize {
-            \\    return std.os.linux.mkdirat(dirfd, path, mode);
-            \\}
-            \\// __zag_getdents64 — raw `getdents64(2)`. Returns
-            \\// bytes written into `buf` (0 = EOF). Caller walks
-            \\// entries via the canonical `d_reclen` offset walk
-            \\// (see src/project.zig::walkSrcTree).
-            \\fn __zag_getdents64(fd: i32, buf: [*]u8, buf_len: usize) usize {
-            \\    return std.os.linux.getdents64(fd, buf, buf_len);
-            \\}
-            \\// __zag_clock_gettime — ns since clock-id epoch
-            \\// (CLOCK_REALTIME=0, CLOCK_MONOTONIC=1 on Linux).
-            \\// zig 0.16's `std.os.linux.clock_gettime` takes the
-            \\// `clockid_t` enum, so the helper casts the i32 at the
-            \\// boundary.
-            \\fn __zag_clock_gettime(clockid: i32) i64 {
-            \\    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-            \\    _ = std.os.linux.clock_gettime(@enumFromInt(clockid), &ts);
-            \\    return @as(i64, ts.sec) * 1_000_000_000 + @as(i64, ts.nsec);
-            \\}
-            \\// __zag_getcwd — CWD written into a 4096-byte static
-            \\// scratch; returns a slice of it. Two calls in the
-            \\// same expression will alias.
-            \\const __zag_cwd_buf: [4096]u8 = undefined;
-            \\fn __zag_getcwd() []const u8 {
-            \\    const n = std.os.linux.getcwd(&__zag_cwd_buf, __zag_cwd_buf.len);
-            \\    if (n == 0) return "";
-            \\    const eff = if (__zag_cwd_buf[n - 1] == 0) n - 1 else n;
-            \\    return __zag_cwd_buf[0..eff];
-            \\}
-            \\// __zag_getenv — scans /proc/self/environ for `name=value\0`.
-            \\// Pure self-contained impl: no dependency on the zig
-            \\// stdlib's env accessor (which has churned across zig
-            \\// versions and zig 0.16 has no libc-getenv bridge at
-            \\// all). Reads env fresh on each call; hot-path callers
-            \\// should cache. Returns the value slice (without the
-            \\// NUL) or null when unset. Takes `[]const u8` (not a
-            \\// sentinel-terminated pointer) so the lib/std/env.zag
-            \\// call site passes `name` directly — no `&buf[0] as
-            \\// [*:0]const u8` cast at the zag level (a single
-            \\// pointer cannot @as-cast into a many-pointer in zig
-            \\// 0.16; surfaced by the Tier-1 env.zag migration).
-            \\var __zag_env_buf: [32768]u8 = undefined;
-            \\// (`var` not `const` so `__zag_env_buf[0..].ptr` is
-            \\// `[*]u8` — a const buffer yields `[*]const u8`, which
-            \\// __zag_read's `[*]u8` buf param rejects)
-            \\fn __zag_getenv(name: []const u8) ?[]const u8 {
-            \\    const fd_raw = __zag_openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
-            \\    const fd_signed: isize = @bitCast(fd_raw);
-            \\    if (fd_signed < 0) return null;
-            \\    const fd: i32 = @intCast(fd_signed);
-            \\    defer _ = __zag_close(fd);
-            \\    const n = __zag_read(fd, __zag_env_buf[0..], __zag_env_buf.len);
-            \\    if (n <= 0) return null;
-            \\    const env_len: usize = @intCast(n);
-            \\    const name_len = name.len;
-            \\    if (name_len == 0) return null;
-            \\    var i: usize = 0;
-            \\    while (i < env_len) {
-            \\        const entry_start = i;
-            \\        while (i < env_len and __zag_env_buf[i] != 0) : (i += 1) {}
-            \\        const entry_len = i - entry_start;
-            \\        if (entry_len > name_len and
-            \\            std.mem.eql(u8, __zag_env_buf[entry_start..][0..name_len], name) and
-            \\            __zag_env_buf[entry_start + name_len] == '=') {
-            \\            return __zag_env_buf[entry_start + name_len + 1 .. i];
-            \\        }
-            \\        if (i < env_len) i += 1;
-            \\    }
-            \\    return null;
-            \\}
-            \\// __zag_exit — `_exit(2)`. noreturn.
-            \\fn __zag_exit(code: i32) noreturn {
-            \\    std.os.linux.exit(code);
-            \\}
-            \\// __zag_posix_spawn — fork + execve + waitpid,
-            \\// blocking. Caller passes sentinel-terminated
-            \\// argv + envp (build `[]?[*:0]const u8` ending in
-            \\// null, then pass `.ptr`). Returns child's exit
-            \\// code on success, -1 on fork-fail or signal-death.
-            \\fn __zag_posix_spawn(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) i32 {
-            \\    const pid = std.math.cast(i32, std.os.linux.fork()) orelse return -1;
-            \\    if (pid == 0) {
-            \\        std.os.linux.execve(argv[0].?, argv, envp);
-            \\        std.os.linux.exit(127);
-            \\    }
-            \\    var status: u32 = 0;
-            \\    _ = std.os.linux.waitpid(pid, &status, 0);
-            \\    if (std.os.linux.W.IFEXITED(status)) {
-            \\        return @as(i32, std.os.linux.W.EXITSTATUS(status));
-            \\    }
-            \\    return -1;
-            \\}
-            \\// __zag_waitpid — blocks waiting for an
-            \\// already-spawned child. Returns exit code on
-            \\// success, -1 on signal-death.
-            \\fn __zag_waitpid(pid: i32) i32 {
-            \\    var status: u32 = 0;
-            \\    _ = std.os.linux.waitpid(pid, &status, 0);
-            \\    if (std.os.linux.W.IFEXITED(status)) {
-            \\        return @as(i32, std.os.linux.W.EXITSTATUS(status));
-            \\    }
-            \\    return -1;
-            \\}
+            \\// __zag_posix family — RETIRED in the v0.3 syscall-FFI
+            \\// migration: the 12 raw syscall wrappers
+            \\// (__zag_openat / __zag_read / __zag_write / __zag_close /
+            \\// __zag_mkdirat / __zag_getdents64 / __zag_clock_gettime /
+            \\// __zag_getcwd / __zag_getenv / __zag_exit /
+            \\// __zag_posix_spawn / __zag_waitpid) moved into
+            \\// lib/std/posix.zag as plain .zag fns once the language
+            \\// surfaces they needed landed (bitcast / enum_from_int
+            \\// builtins + module-level `var`). __zag_posix_spawn and
+            \\// __zag_waitpid were dead (router-era leftovers, only the
+            \\// preamble pin test referenced them) and were dropped
+            \\// outright. The ONE surviving resident is
+            \\// __zag_process_spawn below — std.process.spawn's
+            \\// anonymous SpawnOptions literal is still unexpressible
+            \\// in .zag.
             \\// __zag_process_spawn — zig 0.16 spawn+wait wrapper for
             \\// lib/std/process.zag's exec. std.process.spawn(io,
             \\// SpawnOptions{ .argv }) inherits the parent environment;
@@ -1652,12 +1499,37 @@ pub const MapEntry = struct {
                         if (self.import_std_base.len == 0 and self.source_path.len > 0) {
                             const src_dir_end = std.mem.lastIndexOfScalar(u8, self.source_path, '/');
                             if (src_dir_end) |sde| {
+                                // Compare against the std-root-RELATIVE
+                                // caller dir: resolveStdImport paths are
+                                // root-relative ("lib/std/posix.zag")
+                                // while source_path is the resolved
+                                // (possibly absolute, ZAG_HOME-rooted)
+                                // stdlib path — a direct prefix test
+                                // between the two never matches for
+                                // absolute roots and wrongly emits
+                                // "../posix.zig" for same-dir imports
+                                // (surfaced by the v0.3 std-to-std
+                                // imports). `lastIndexOf("lib/std")`
+                                // finds the root marker in both forms.
                                 const src_dir = self.source_path[0..sde];
-                                if (std.mem.startsWith(u8, resolved_path, src_dir) and
-                                    resolved_path.len > src_dir.len and resolved_path[src_dir.len] == '/')
+                                var root_rel: []const u8 = src_dir;
+                                if (std.mem.lastIndexOf(u8, src_dir, "lib/std")) |root_at| {
+                                    if (root_at == 0 or src_dir[root_at - 1] == '/') {
+                                        root_rel = src_dir[root_at..];
+                                    }
+                                }
+                                if (std.mem.startsWith(u8, resolved_path, root_rel) and
+                                    resolved_path.len > root_rel.len and resolved_path[root_rel.len] == '/')
                                 {
-                                    emit_rel = resolved_path[src_dir.len + 1 ..];
-                                } else if (sde > "lib/std/".len) {
+                                    // Same-residence (or sibling
+                                    // top-level) module: the caller's
+                                    // dir is a prefix of the target, so
+                                    // the remainder is root-relative —
+                                    // correct for BOTH relative
+                                    // ("lib/std/…") and absolute
+                                    // (ZAG_HOME) stdlib roots.
+                                    emit_rel = resolved_path[root_rel.len + 1 ..];
+                                } else if (std_module_rel_scratch.len >= 3 + rel_path.len) {
                                     // Cross-directory import from a
                                     // NESTED materialized module:
                                     // build/gen/std/strings/slices.zig
@@ -1668,13 +1540,11 @@ pub const MapEntry = struct {
                                     // All lib/std modules live at
                                     // depth <= 1, so a single `../`
                                     // prefix suffices.
-                                    if ("../".len + rel_path.len <= std_module_rel_scratch.len) {
-                                        std_module_rel_scratch[0] = '.';
-                                        std_module_rel_scratch[1] = '.';
-                                        std_module_rel_scratch[2] = '/';
-                                        @memcpy(std_module_rel_scratch[3..][0..rel_path.len], rel_path);
-                                        emit_rel = std_module_rel_scratch[0 .. 3 + rel_path.len];
-                                    }
+                                    std_module_rel_scratch[0] = '.';
+                                    std_module_rel_scratch[1] = '.';
+                                    std_module_rel_scratch[2] = '/';
+                                    @memcpy(std_module_rel_scratch[3..][0..rel_path.len], rel_path);
+                                    emit_rel = std_module_rel_scratch[0 .. 3 + rel_path.len];
                                 }
                             }
                         }
@@ -2279,14 +2149,20 @@ pub const MapEntry = struct {
                     \\    if (n + 1 > path_z.len) return;
                     \\    @memcpy(path_z[0..n], file);
                     \\    path_z[n] = 0;
-                    \\    const fd_raw = __zag_openat(std.posix.AT.FDCWD, @as([*:0]const u8, @ptrCast(&path_z[0])), 0, 0);
+                    \\    // v0.3 syscall-FFI migration: the __zag_posix
+                    \\    // helpers retired into lib/std/posix.zag, so the
+                    \\    // source-line printer calls the syscalls directly
+                    \\    // (zig-side literal: `.{}` is the all-default O
+                    \\    // flags = O_RDONLY; @bitCast folds the usize→isize
+                    \\    // errno convention).
+                    \\    const fd_raw = std.os.linux.openat(std.posix.AT.FDCWD, @as([*:0]const u8, @ptrCast(&path_z[0])), .{}, 0);
                     \\    if ((fd_raw & 0x8000000000000000) != 0) return;
                     \\    const fd: i32 = @as(i32, @intCast(fd_raw));
-                    \\    defer _ = __zag_close(fd);
+                    \\    defer _ = std.os.linux.close(fd);
                     \\    var buf: [8192]u8 = undefined;
                     \\    var total: usize = 0;
                     \\    while (total < buf.len) {
-                    \\        const n_signed = __zag_read(fd, buf[total..], buf.len - total);
+                    \\        const n_signed = @as(isize, @bitCast(std.os.linux.read(fd, buf[total..].ptr, buf.len - total)));
                     \\        if (n_signed <= 0) break;
                     \\        total += @as(usize, @intCast(n_signed));
                     \\    }
@@ -2508,7 +2384,12 @@ pub const MapEntry = struct {
         // zig int-family type names. `usize` / `isize` are arch-sized
         // ints; `i8..i128` / `u8..u128` are the fixed-width families.
         // `u128`/`i128` (stdlib fnv1a64's wrapping-accumulator type)
-        // were added alongside the pure-.zag stdlib batch.
+        // were added alongside the pure-.zag stdlib batch. The
+        // Log2Int widths `u4`/`u5`/`u6`/`u7` (shift-amount types for
+        // u16/u32/u64/u128 operands — zig 0.16 requires Log2Int shift
+        // slots) were added for hash.zag's `rotr(x: u32, n: u6)` whose
+        // `(n as u5)` / `((32 - n) as u5)` casts must route through
+        // the `@as(T, @intCast(v))` narrowing carve-out.
         return std.mem.eql(u8, type_name, "usize") or
             std.mem.eql(u8, type_name, "isize") or
             std.mem.eql(u8, type_name, "i8") or
@@ -2516,6 +2397,10 @@ pub const MapEntry = struct {
             std.mem.eql(u8, type_name, "i32") or
             std.mem.eql(u8, type_name, "i64") or
             std.mem.eql(u8, type_name, "i128") or
+            std.mem.eql(u8, type_name, "u4") or
+            std.mem.eql(u8, type_name, "u5") or
+            std.mem.eql(u8, type_name, "u6") or
+            std.mem.eql(u8, type_name, "u7") or
             std.mem.eql(u8, type_name, "u8") or
             std.mem.eql(u8, type_name, "u16") or
             std.mem.eql(u8, type_name, "u32") or
@@ -2604,7 +2489,15 @@ pub const MapEntry = struct {
                     const src_dir_end = std.mem.lastIndexOfScalar(u8, self.source_path, '/');
                     var nested = false;
                     if (src_dir_end) |sde| {
-                        nested = sde > "lib/std/".len;
+                        // Root-agnostic depth test: nested = the
+                        // caller's dir is not the stdlib root dir.
+                        // The old `sde > "lib/std/".len` fired for
+                        // EVERY file under an absolute (ZAG_HOME)
+                        // root, wrongly ../-prefixing top-level
+                        // module paths.
+                        const src_dir = self.source_path[0..sde];
+                        nested = !(std.mem.eql(u8, src_dir, "lib/std") or
+                            std.mem.endsWith(u8, src_dir, "/lib/std"));
                     }
                     if (nested) {
                         if (std_module_rel_scratch.len >= 3 + rel_to_std.len) {
@@ -2760,7 +2653,12 @@ pub const MapEntry = struct {
                 const src_dir_end = std.mem.lastIndexOfScalar(u8, self.source_path, '/');
                 var nested = false;
                 if (src_dir_end) |sde| {
-                    nested = sde > "lib/std/".len;
+                    // Root-agnostic depth test (same rationale as the
+                    // generic-dispatch twin above — the `sde > 7`
+                    // form misfired on absolute ZAG_HOME roots).
+                    const src_dir = self.source_path[0..sde];
+                    nested = !(std.mem.eql(u8, src_dir, "lib/std") or
+                        std.mem.endsWith(u8, src_dir, "/lib/std"));
                 }
                 if (nested) {
                     if (std_module_rel_scratch.len >= 3 + rel_to_std.len) {

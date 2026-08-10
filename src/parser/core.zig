@@ -262,6 +262,16 @@ pub fn parse(self: *Parser) ast.Program {
                 const_count += 1;
                 continue;
             }
+            if (lead == .var_kw) {
+                // Module-level `var NAME: TYPE = EXPR;` — the mutable
+                // sibling of the top-level const (module state, e.g.
+                // lib/std/posix.zag's getenv scan buffer). Same
+                // ConstDecl slot; `is_var` routes codegen to zig `var`.
+                consts_buf[const_count] = self.parseVarDecl();
+                consts_buf[const_count].is_var = true;
+                const_count += 1;
+                continue;
+            }
             // Async fns (docs/manual/18-traits.md §"Async Trait
             // Methods" + the overview's "Zero-cost async" goal):
             // `async fun NAME(...)` — the emitted zig fn wraps the
@@ -715,6 +725,10 @@ pub const Parser = struct {
     pub const parseExternDecl = @import("decl.zig").parseExternDecl;
     // Compile-time (docs/26). parseConstDecl parses `const NAME: TYPE = EXPR;`.
     pub const parseConstDecl = @import("decl.zig").parseConstDecl;
+    // Module-level mutable state: `var NAME: TYPE = EXPR;` (the mutable
+    // sibling of the top-level const — see lib/std/posix.zag's getenv
+    // scan buffer). Shares the ConstDecl slot; codegen emits zig `var`.
+    pub const parseVarDecl = @import("decl.zig").parseVarDecl;
     // Module imports (docs/manual/22-modules.md §Imports).
     // `joinDottedPath` is defined as a file-scope Parser struct
     // member further down in this same file (sibling to
@@ -760,6 +774,7 @@ pub const Parser = struct {
         .{ .name = "std.types.string", .path = "lib/std/types/string.zag" },
         .{ .name = "std.error", .path = "lib/std/error.zag" },
         .{ .name = "std.env", .path = "lib/std/env.zag" },
+        .{ .name = "std.posix", .path = "lib/std/posix.zag" },
         .{ .name = "std.argv", .path = "lib/std/argv.zag" },
         .{ .name = "std.process", .path = "lib/std/process.zag" },
         .{ .name = "std.fs", .path = "lib/std/fs.zag" },

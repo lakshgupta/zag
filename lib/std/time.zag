@@ -3,16 +3,20 @@
 ## Duration and Timer are declared here; their bodies are real
 ## (self-consistent) but currently unused surface.
 ##
-## v0.1 Tier-1 migration: `now()` is a real zag impl backed by the
-## always-emitted `__zag_clock_gettime` preamble helper
-## (src/codegen/core.zig, a forwarder onto `std.os.linux.clock_gettime`).
-## clockid 1 = CLOCK_MONOTONIC on Linux — i64 nanoseconds since the
-## monotonic epoch. The pre-migration `time_now` router row emitted
-## the same syscall inline as a blk-expression; retired in the
-## Tier-1 migration — this .zag body is the single source of truth.
+## v0.3 syscall-FFI migration: `now()` is backed by
+## lib/std/posix.zag's clock_gettime (the `__zag_clock_gettime`
+## preamble helper retired into .zag — the enum_from_int builtin
+## does the clockid boundary conversion at posix.zag's syscall
+## call, not in the preamble). clockid 1 = CLOCK_MONOTONIC on
+## Linux — i64 nanoseconds since the monotonic epoch. The
+## pre-migration `time_now` router row emitted the same syscall
+## inline as a blk-expression; retired in the Tier-1 migration —
+## this .zag body chain is the single source of truth.
+
+pub import std.posix.{clock_gettime}
 
 pub fun now() -> i64 {
-    return __zag_clock_gettime(1);
+    return clock_gettime(1);
 }
 
 pub struct Duration {

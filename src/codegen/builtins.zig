@@ -127,6 +127,44 @@ pub const BuiltinDispatch = enum {
     /// type reflection. arity = 1: `type_name(T)`.
     builtin_type_name,
 
+    /// `builtin_type_eq` — emit a zig TYPE-equality `(A == B)`, the
+    /// comptime-type-dispatch primitive. Args are type-ish idents
+    /// (generic type params like `K`, or zag type names like `str`);
+    /// each routes through the type-text mapper so `str` lands as
+    /// `[]const u8` while params pass through verbatim. The emitted
+    /// condition is comptime-known at every instantiation, so zig's
+    /// comptime-if discards the dead branch — the stdlib HashMap
+    /// helpers (str-content vs value comparison/hashing) now live in
+    /// .zag source instead of the preamble's `__zag_keys_eq` /
+    /// `__zag_key_hash` (whose own comment claimed .zag "can't do
+    /// that"). arity = 2: `type_eq(K, str)`.
+    builtin_type_eq,
+
+    /// `builtin_addr_of` — emit zig's address-of `(&value)` for a
+    /// value-expression operand. Closes the .zag surface gap the
+    /// hash_map byte-walk needs: there's no `&` unary operator in
+    /// zag source, and `__zag_key_hash`'s `@ptrCast(&key)` had no
+    /// .zag spelling to point at. Combined with a `[*]const u8` cast
+    /// (`@alignCast(@ptrCast(...))` at the cast site) it produces
+    /// the canonical value-byte walk. arity = 1: `addr_of(v)`.
+    builtin_addr_of,
+
+    /// `builtin_bitcast` — emit zig's `@bitCast(v)` raw-value cast.
+    /// Zig 0.16's `std.os.linux.openat` flags parameter is the
+    /// packed-bitfield `os.linux.O` type (see lib/std/posix.zag's
+    /// openat), which a plain `as` cast cannot reach — the preamble's
+    /// `__zag_openat` used to own the `@bitCast` at the boundary.
+    /// arity = 1: `bitcast(flags)`.
+    builtin_bitcast,
+
+    /// `builtin_enum_from_int` — emit zig's `@enumFromInt(v)` int→enum
+    /// conversion. Zig 0.16's `std.os.linux.clock_gettime` clock-id
+    /// parameter is the `clockid_t` enum (u32-backed); callers pass a
+    /// plain i32 clock-id (CLOCK_MONOTONIC = 1) and this does the
+    /// boundary conversion (the preamble's `__zag_clock_gettime` owned
+    /// the same `@enumFromInt` call). arity = 1: `enum_from_int(id)`.
+    builtin_enum_from_int,
+
     /// `string_with_capacity` — `String.with_capacity(n)` → `__zag_String.withCapacity(alloc, n)`.
     string_with_capacity,
 
@@ -244,6 +282,18 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "assert", .arity = 1, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "assert", .arity = 2, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "type_name", .arity = 1, .receiver = null, .dispatch = .builtin_type_name },
+    // Comptime type dispatch: type equality (HashMap str-key branch
+    // selection) + value address-of (value-key byte hashing).
+    .{ .name = "type_eq", .arity = 2, .receiver = null, .dispatch = .builtin_type_eq },
+    .{ .name = "addr_of", .arity = 1, .receiver = null, .dispatch = .builtin_addr_of },
+    // Raw-value reinterpretation for the posix.zag syscall boundary:
+    // zig 0.16's `std.os.linux.openat` takes the packed-bitfield `O`
+    // flags type (not a plain u32) and `std.os.linux.clock_gettime`
+    // takes the `clockid_t` enum — neither has a .zag spelling, so
+    // the boundary cast lives in the builtin. bitcast emits
+    // `@bitCast(v)`; enum_from_int emits `@enumFromInt(v)`.
+    .{ .name = "bitcast", .arity = 1, .receiver = null, .dispatch = .builtin_bitcast },
+    .{ .name = "enum_from_int", .arity = 1, .receiver = null, .dispatch = .builtin_enum_from_int },
     // String type static method — receiver = "String" for dispatch
     .{ .name = "with_capacity", .arity = 1, .receiver = "String", .dispatch = .string_with_capacity },
     // Writer type static methods

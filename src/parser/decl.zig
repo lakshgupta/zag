@@ -1094,8 +1094,21 @@ pub fn parseImportDecl(self: *Parser, is_pub: bool) ast.ImportDecl {
 
 
 pub fn parseConstDecl(self: *Parser) ast.ConstDecl {
+        return parseModuleBinding(self, .const_kw, false);
+    }
+
+    /// `var NAME: TYPE = EXPR;` at module scope — the mutable sibling of
+    /// the top-level `const` (module-level state, e.g. a getenv scan
+    /// buffer in lib/std/posix.zag). Shares the ConstDecl AST slot;
+    /// codegen emits zig `var` when `is_var` is set. The `var` / `const`
+    /// token decision happens here; parseModuleBinding does the work.
+    pub fn parseVarDecl(self: *Parser) ast.ConstDecl {
+        return parseModuleBinding(self, .var_kw, true);
+    }
+
+    fn parseModuleBinding(self: *Parser, kw: TokenTag, is_var: bool) ast.ConstDecl {
         const start_loc = self.peek().loc;
-        self.expect(.const_kw);
+        self.expect(kw);
         const name = self.expectIdent();
         var type_text: ?[]const u8 = null;
         if (self.peek().tag == .colon) {
@@ -1109,6 +1122,7 @@ pub fn parseConstDecl(self: *Parser) ast.ConstDecl {
             .name = name,
             .type_text = type_text,
             .init = &init_expr[0],
+            .is_var = is_var,
             .loc = start_loc,
         };
     }

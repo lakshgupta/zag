@@ -4,10 +4,14 @@
 ## DIRECTORY module (see array_list.zag's docblock).
 ##
 ## HashMap<K, V> — open addressing with linear probing, FNV-1a key
-## hashing, equality via the preamble `__zag_keys_eq`/`__zag_key_hash`
-## helpers. Value keys (i32/u64/...) compare by value; `str` keys
-## compare by CONTENT (std.mem.eql + content FNV) — string-keyed maps
-## work, including equal strings in different buffers.
+## hashing, equality via the .zag helpers below (the preamble's
+## `__zag_keys_eq`/`__zag_key_hash` were retired — `type_eq(K, str)`
+## comptime dispatch selects CONTENT semantics for `str` keys vs
+## value semantics for everything else, and the untaken branch is
+## discarded by zig's comptime-if). Value keys (i32/u64/...) compare
+## by value; `str` keys compare by CONTENT (byte-eql + content FNV)
+## — string-keyed maps work, including equal strings in different
+## buffers.
 ##
 ##   import std.collections.{HashMap}
 ##
@@ -48,7 +52,7 @@ impl HashMap<K, V> {
 
     pub fun get(self: *HashMap<K, V>, key: K) -> V {
         let idx: usize = self.probe(key);
-        if (!self.used[idx] || !__zag_keys_eq(K, self.keys[idx], key)) {
+        if (!self.used[idx] || !keys_eq<K>(self.keys[idx], key)) {
             __zag_panic("std.collections.HashMap.get: key not found");
         }
         return self.values[idx];
@@ -56,7 +60,7 @@ impl HashMap<K, V> {
 
     pub fun contains(self: *HashMap<K, V>, key: K) -> bool {
         let idx: usize = self.probe(key);
-        return self.used[idx] && __zag_keys_eq(K, self.keys[idx], key);
+        return self.used[idx] && keys_eq<K>(self.keys[idx], key);
     }
 
     pub fun len(self: *HashMap<K, V>) -> usize {
@@ -76,7 +80,7 @@ impl HashMap<K, V> {
     fun probe(self: *HashMap<K, V>, key: K) -> usize {
         let mask: usize = self.cap - 1;
         var idx: usize = hash_key<K>(key) & mask;
-        while (self.used[idx] && !__zag_keys_eq(K, self.keys[idx], key)) {
+        while (self.used[idx] && !keys_eq<K>(self.keys[idx], key)) {
             idx = (idx + 1) & mask;
         }
         return idx;
@@ -120,9 +124,64 @@ impl HashMap<K, V> {
 # Generic FREE fn (not a method): the impl-level `comptime V`
 # param would be unused here (hash only touches K), and zig
 # rejects unused comptime params. Call sites turbofish the K.
+#
+# Comptime type dispatch: the `type_eq(K, str)` builtin (plain-arg
+# form — builtin lookup only fires on turbofish-free calls) emits a
+# zig type-equality `(K == []const u8)`; the str branch hashes the
+# slice CONTENT, the value branch byte-walks `size_of(K)` via
+# addr_of. Each instantiation sees a comptime-known condition, so
+# zig's comptime-if evaluates exactly one branch.
 fun hash_key<K>(key: K) -> usize {
-    # Preamble helper: CONTENT hashing for slice keys (str), byte
-    # hashing for value keys — the comptime K branch lives in pure
-    # zig where the dead branch is properly discarded.
-    return __zag_key_hash(K, key);
+    if (type_eq(K, str)) {
+        return str_key_hash(key);
+    }
+    return val_key_hash<K>(key);
+}
+
+# FNV-1a fold over the str bytes.
+fun str_key_hash(s: str) -> usize {
+    var h: usize = 2166136261;
+    var i: usize = 0;
+    while (i < s.len) {
+        h = (h ^ (s[i] as usize)) *% 16777619;
+        i = i + 1;
+    }
+    return h;
+}
+
+# FNV-1a fold over the value's raw bytes (size_of(K) via addr_of).
+fun val_key_hash<K>(key: K) -> usize {
+    let p: [*]const u8 = (addr_of(key) as [*]const u8);
+    var h: usize = 2166136261;
+    var i: usize = 0;
+    while (i < size_of(K)) {
+        h = (h ^ (p[i] as usize)) *% 16777619;
+        i = i + 1;
+    }
+    return h;
+}
+
+# Type-dispatched equality: content `==` for str keys, value `==`
+# otherwise (`a == b` on slices is rejected by zig, which is why the
+# str branch must win first).
+fun keys_eq<K>(a: K, b: K) -> bool {
+    if (type_eq(K, str)) {
+        return str_eq(a, b);
+    }
+    return (a == b);
+}
+
+# Byte-wise content equality for str keys.
+fun str_eq(a: str, b: str) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
 }

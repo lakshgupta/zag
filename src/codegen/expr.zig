@@ -1697,6 +1697,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     .mul => self.write("*"),
                     .div => self.write("/"),
                     .mod => self.write("%"),
+                    // wrapping arithmetic (docs/05 §Wrapping Arithmetic —
+                    // verbatim to zig; no shim needed beyond the wrap)
+                    .add_wrap => self.write("+%"),
+                    .sub_wrap => self.write("-%"),
+                    .mul_wrap => self.write("*%"),
                     // bitwise
                     .bitand => self.write("&"),
                     .bitor => self.write("|"),
@@ -1863,6 +1868,57 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             },
             .builtin_type_name => {
                 self.write("@typeName(");
+                self.genExpr(args[0]);
+                self.write(")");
+            },
+            .builtin_type_eq => {
+                // Comptime type dispatch (`type_eq(K, str)`): emits a
+                // zig TYPE-equality `(K == []const u8)`. Args are
+                // type-ish idents — generic type params (pass through
+                // verbatim) or zag type names (`str` → `[]const u8`
+                // via the type-text mapper). The result is
+                // comptime-known at every instantiation, so zig's
+                // comptime-if discards the untaken branch without
+                // type-checking it — which is the property the old
+                // preamble helpers (`__zag_keys_eq` / `__zag_key_hash`)
+                // relied on happening "in pure zig". Non-ident args
+                // (a misuse) fall through to value emission, so the
+                // comparison degenerates to comparing comptime values
+                // of the same type rather than a compile error.
+                self.write("(");
+                for (args, 0..) |arg, i| {
+                    if (i > 0) self.write(" == ");
+                    if (arg.payload == .ident) {
+                        self.writeType(arg.payload.ident);
+                    } else {
+                        self.genExpr(arg);
+                    }
+                }
+                self.write(")");
+            },
+            .builtin_addr_of => {
+                // Address-of (`addr_of(key)` → `(&key)`): .zag has no
+                // `&` unary string, so the value-key byte walk needs
+                // the builtin to synthesize it. `(&v)` is a
+                // single-pointer result; cast sites wrap the usual
+                // @alignCast(@ptrCast(...)) for many/slice targets.
+                self.write("(&");
+                self.genExpr(args[0]);
+                self.write(")");
+            },
+            .builtin_bitcast => {
+                // Raw-value reinterpretation (`bitcast(v)` →
+                // `@bitCast(v)`): the posix.zag syscall boundary
+                // (u32 flag word → the packed-bitfield O flags type).
+                self.write("@bitCast(");
+                self.genExpr(args[0]);
+                self.write(")");
+            },
+            .builtin_enum_from_int => {
+                // Int→enum conversion (`enum_from_int(v)` →
+                // `@enumFromInt(v)`): the clockid_t boundary in
+                // posix.zag's clock_gettime.
+                self.write("@enumFromInt(");
                 self.genExpr(args[0]);
                 self.write(")");
             },

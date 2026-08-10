@@ -732,6 +732,15 @@ const Codegen = core.Codegen;
         // return CANONICAL;` pattern; do NOT site-specialize the
         // alias to a single emit location.
         if (std.mem.eql(u8, text, "str")) return "[]const u8";
+        // `never` → zig `noreturn`: the bottom type, used for
+        // functions that never return (e.g.
+        // `pub fun exit(code: i32) -> never`). zig has no `never`
+        // keyword, so the alias maps to zig's own bottom type
+        // `noreturn` at every emit site (return-type annotations
+        // go through the same writeType → zagTypeToZig funnel, so
+        // `-> never` automatically emits `-> noreturn`). Same
+        // transparent-alias pattern as `str`.
+        if (std.mem.eql(u8, text, "never")) return "noreturn";
         // Generic instantiation recursion: `HashMap(i32, str)` —
         // the alias wrap must apply to each top-level type argument
         // (parenthesis-balanced split) so aliased args (`str` → the
@@ -1851,7 +1860,15 @@ const Codegen = core.Codegen;
 
     /// Emit a zig `const` declaration for a top-level `const` binding.
     pub     fn genConstDecl(self: *Codegen, cd: ast.ConstDecl) void {
-        self.write("const ");
+        // Module binding: `const` (compile-time, docs/26) or `var`
+        // (module-level mutable state, e.g. posix.zag's getenv scan
+        // buffer). Both emit through the same shape — only the leading
+        // keyword differs.
+        if (cd.is_var) {
+            self.write("var ");
+        } else {
+            self.write("const ");
+        }
         self.write(cd.name);
         if (cd.type_text) |tt| {
             self.write(": ");

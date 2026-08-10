@@ -120,6 +120,38 @@ The allocator name is emitted verbatim — `arena` must be a variable in scope w
 | `align_of(T)` | `@alignOf(T)` | `usize` (comptime) |
 | `volatile_store(p, v)` | `@volatileStore(p, v)` | `void` |
 | `volatile_load(p)` | `@volatileLoad(p)` | `T` |
+| `type_eq(A, B)` | `(A == B)` | `bool` (comptime) |
+| `addr_of(v)` | `(&v)` | `*const T` |
+| `bitcast(v)` | `@bitCast(v)` | `T` (same-size reinterpret) |
+| `enum_from_int(v)` | `@enumFromInt(v)` | tagged enum (runtime value) |
+
+`type_eq(A, B)` is the comptime type-dispatch primitive: it emits a
+zig *type equality* — `type_eq(K, str)` emits `(K == []const u8)`
+— where `A`/`B` are type texts (generic type params pass through
+verbatim; zag names map, so `str` becomes `[]const u8`). The result
+is comptime-known at every generic instantiation, so a surrounding
+`if` is a comptime branch in zig and the untaken side is discarded
+without type-checking. This is what lets std.collections hash_map
+give `str` keys content semantics and value keys byte semantics
+entirely in .zag (its key helpers retired the preamble's
+`__zag_keys_eq`/`__zag_key_hash`).
+
+`addr_of(v)` emits zig's address-of `(&v)` for a value expression —
+the .zag surface gap that `val_key_hash`'s byte walk needs; combine
+it with a `[*]const u8` cast (`@alignCast(@ptrCast(...))` at the
+cast site) to hash a value's raw bytes.
+
+`bitcast(v)` emits zig's `@bitCast(v)` — a same-size, no-ops
+reinterpretation of `v`'s bits. The operand must be a *typed* value:
+zig's `@bitCast` rejects comptime-known integers, so pass a
+`u32`-typed flags variable rather than a literal. `lib/std/posix.zag`
+uses it to feed the packed `O` flag bitfield to
+`std.os.linux.openat` (`std.os.linux.openat(-100, ".", @bitCast(flags), 0)`).
+
+`enum_from_int(v)` emits zig's `@enumFromInt(v)` — the runtime
+integer→enum conversion (the comptime-side `@enumFromInt` is implicit
+in `.Tag` syntax). Used by `posix.clock_gettime` to turn a runtime
+`i32` clock id into zig's `clockid_t` enum.
 
 ## Common Patterns
 

@@ -1,0 +1,176 @@
+## lib/std/posix.zag — raw POSIX/linux syscall facade
+##
+## The syscall-FFI migration (v0.3): the always-emitted __zag_posix
+## preamble helpers (src/codegen/core.zig) retire one-by-one into this
+## module as the language surfaces they depended on land:
+##
+##   __zag_openat         -> openat          (bitcast builtin: raw u32
+##                                            flag word -> packed-bitfield
+##                                            os.linux.O type)
+##   __zag_read           -> read
+##   __zag_write          -> write
+##   __zag_close          -> close
+##   __zag_mkdirat        -> mkdirat
+##   __zag_getdents64     -> getdents64
+##   __zag_clock_gettime  -> clock_gettime   (enum_from_int builtin:
+##                                            i32 clockid -> clockid_t
+##                                            enum)
+##   __zag_getcwd         -> getcwd          (module-level `var` buffer —
+##                                            `var` support added in the
+##                                            same pass)
+##   __zag_getenv         -> getenv          (same module-var pattern)
+##   __zag_exit           -> exit
+##   __zag_posix_spawn    - REMOVED (dead since the router era; only the
+##     __zag_waitpid        preamble pin test referenced them)
+##
+## Remaining preamble resident (still unexpressible in .zag):
+##   __zag_process_spawn — std.process.spawn takes an anonymous
+##   SpawnOptions struct literal (`.{...}`), which zag source cannot
+##   spell; lib/std/process.zag's exec keeps calling it.
+##
+## Error convention: uint-returning syscalls follow the kernel's
+## errno-encoding (high bit set = negative errno); callers test the
+## sign bit or cast to isize. read/write return signed isize directly
+## (bytes transferred, or negative errno).
+
+## openat — raw `openat(2)` on a path slice. Copies the path into a
+## sentinel-terminated stack buffer (fs.zag's caller-side pattern
+## moved here so callers pass plain `str`), then hands the buffer to
+## the syscall with the trailing NUL satisfying the `[*:0]const u8`
+## sentinel contract. Returns fd (high-bit-clear) or an errno-encoded
+## usize (0xFFFFFFFFFFFFFFFF for the over-long-path guard — also
+## sign-bit-set, so callers' existing checks catch it).
+pub fun openat(dirfd: i32, path: str, flags: u32, mode: u32) -> usize {
+    var path_z: [4096]u8 = undefined;
+    let n: usize = path.len;
+    if (n + 1 > path_z.len) {
+        return 0xFFFFFFFFFFFFFFFF;
+    }
+    __zag_memcpy(path_z[0..n], path, n);
+    path_z[n] = 0;
+    return std.os.linux.openat(dirfd, &path_z[0] as [*:0]const u8, bitcast(flags), mode);
+}
+
+## read — raw `read(2)` into `buf[0..len]`. Returns bytes read
+## (partial reads possible) or negative errno.
+pub fun read(fd: i32, buf: []u8, len: usize) -> isize {
+    let n: usize = std.os.linux.read(fd, buf.ptr, len);
+    return n as isize;
+}
+
+## write — raw `write(2)` of `buf[0..len]`. Returns bytes written
+## (partial writes possible) or negative errno.
+pub fun write(fd: i32, buf: []const u8, len: usize) -> isize {
+    let n: usize = std.os.linux.write(fd, buf.ptr, len);
+    return n as isize;
+}
+
+## close — raw `close(2)`. Returns 0 on success, errno-encoded usize
+## on failure.
+pub fun close(fd: i32) -> usize {
+    return std.os.linux.close(fd);
+}
+
+## mkdirat — raw `mkdirat(2)`. Path handling mirrors openat (stack
+## sentinel copy). Returns 0 on success, errno-encoded usize on
+## failure (EEXIST = 17, which lib/std/fs.zag's mkdir coalesces to 0
+## for "mkdir -p" semantics).
+pub fun mkdirat(dirfd: i32, path: str, mode: u32) -> usize {
+    var path_z: [4096]u8 = undefined;
+    let n: usize = path.len;
+    if (n + 1 > path_z.len) {
+        return 0xFFFFFFFFFFFFFFFF;
+    }
+    __zag_memcpy(path_z[0..n], path, n);
+    path_z[n] = 0;
+    return std.os.linux.mkdirat(dirfd, &path_z[0] as [*:0]const u8, mode);
+}
+
+## getdents64 — raw `getdents64(2)` directory-entry dump into
+## `buf[0..len]`. Returns bytes written (0 = EOF); caller walks
+## entries via the canonical `d_reclen` offset walk.
+pub fun getdents64(fd: i32, buf: []u8, len: usize) -> usize {
+    return std.os.linux.getdents64(fd, buf.ptr, len);
+}
+
+## clock_gettime — nanoseconds since the clock-id epoch
+## (CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1 on Linux). zig 0.16's
+## `clockid_t` is an enum, so the enum_from_int builtin does the
+## boundary conversion the preamble's __zag_clock_gettime owned.
+pub fun clock_gettime(clockid: i32) -> i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(enum_from_int(clockid), addr_of(ts));
+    return (ts.sec as i64) * 1000000000 + (ts.nsec as i64);
+}
+
+## getcwd — current working directory written into the module-level
+## cwd_buf (a `var`, since zig's getcwd takes `[*]u8`); returns a
+## borrowed slice of it without the trailing NUL. Two calls in the
+## same expression will alias (next call overwrites the buffer).
+var cwd_buf: [4096]u8 = undefined;
+pub fun getcwd() -> []const u8 {
+    let n: usize = std.os.linux.getcwd(addr_of(cwd_buf), 4096);
+    if (n == 0) { return ""; }
+    let eff: usize = if (cwd_buf[n - 1] == 0) { n - 1 } else { n };
+    return cwd_buf[0..eff];
+}
+
+## getenv — scans /proc/self/environ for `name=value\0`. Pure
+## self-contained impl: no zig-stdlib env accessor (which has churned
+## across zig versions and zig 0.16 has no libc-getenv bridge at
+## all). Reads env fresh on each call into the module-level env_buf
+## (`var` — a const buffer would yield `[*]const u8` and reject
+## posix.read's `[]u8` buf); hot-path callers should cache. Returns a
+## borrowed value slice (without the NUL) or null when unset.
+var env_buf: [32768]u8 = undefined;
+pub fun getenv(name: str) -> ?str {
+    let fd_raw: usize = openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
+    let fd_signed: isize = fd_raw as isize;
+    if (fd_signed < 0) { return null; }
+    let fd: i32 = fd_signed as i32;
+    let n: isize = read(fd, env_buf[0..env_buf.len], env_buf.len);
+    _ = close(fd);
+    if (n <= 0) { return null; }
+    let env_len: usize = n as usize;
+    let name_len: usize = name.len;
+    if (name_len == 0) { return null; }
+    var i: usize = 0;
+    while (i < env_len) {
+        let entry_start: usize = i;
+        # scan to the entry NUL terminator (no `and` operator in zag
+        # conditions — break out of the loop instead).
+        while (i < env_len) {
+            if (env_buf[i] == 0) { break; }
+            i = i + 1;
+        }
+        let entry_len: usize = i - entry_start;
+        # `and` chains don't parse in if-conditions (only while guards),
+        # so the three-fold match test nests instead.
+        if (entry_len > name_len) {
+            if (slice_eq(env_buf[entry_start..entry_start + name_len], name)) {
+                if (env_buf[entry_start + name_len] == '=') {
+                    return env_buf[entry_start + name_len + 1 .. i];
+                }
+            }
+        }
+        if (i < env_len) { i = i + 1; }
+    }
+    return null;
+}
+
+## exit — `_exit(2)`. noreturn.
+pub fun exit(code: i32) -> noreturn {
+    std.os.linux.exit(code);
+}
+
+## slice_eq — byte-equality over two slices (the std.mem.eql
+## replacement for the getenv scan; kept private to this module).
+fun slice_eq(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var k: usize = 0;
+    while (k < a.len) {
+        if (a[k] != b[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
