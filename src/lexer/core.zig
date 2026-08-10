@@ -250,11 +250,16 @@ pub const Lexer = struct {
                     }
                 },
                 '*' => {
-                    // `*` is the leading byte of `*=` (compound mul-assign). Bare `*`
-                    // is multiplicative (or, in unary context, deref — the parser
-                    // distinguishes via parseUnary vs parseMultiplicative).
+                    // `*` is the leading byte of `*=` (compound mul-assign) and
+                    // `*%` (wrapping multiply). Bare `*` is multiplicative (or,
+                    // in unary context, deref — the parser distinguishes via
+                    // parseUnary vs parseMultiplicative).
                     if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
                         self.addToken(.{ .tag = .star_eq, .loc = start_loc, .text = "*=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '%') {
+                        self.addToken(.{ .tag = .star_percent, .loc = start_loc, .text = "*%" });
                         self.pos += 2;
                         self.col += 2;
                     } else {
@@ -263,11 +268,16 @@ pub const Lexer = struct {
                     }
                 },
                 '+' => {
-                    // `+` is the leading byte of `+=` (compound add-assign). Bare `+`
-                    // is additive (or, in unary context, plus-prefix on a literal,
-                    // routed to readNumber by the early isDigit check above).
+                    // `+` is the leading byte of `+=` (compound add-assign) and
+                    // `+%` (wrapping add). Bare `+` is additive (or, in unary
+                    // context, plus-prefix on a literal, routed to readNumber
+                    // by the early isDigit check above).
                     if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
                         self.addToken(.{ .tag = .plus_eq, .loc = start_loc, .text = "+=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '%') {
+                        self.addToken(.{ .tag = .plus_percent, .loc = start_loc, .text = "+%" });
                         self.pos += 2;
                         self.col += 2;
                     } else {
@@ -442,12 +452,17 @@ pub const Lexer = struct {
                     // `-` is the leading byte of:
                     //   `->` (arrow function-return-type marker)
                     //   `-=` (compound sub-assign)
+                    //   `-%` (wrapping subtract)
                     if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '>') {
                         self.addToken(.{ .tag = .arrow, .loc = start_loc, .text = "->" });
                         self.pos += 2;
                         self.col += 2;
                     } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '=') {
                         self.addToken(.{ .tag = .minus_eq, .loc = start_loc, .text = "-=" });
+                        self.pos += 2;
+                        self.col += 2;
+                    } else if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '%') {
+                        self.addToken(.{ .tag = .minus_percent, .loc = start_loc, .text = "-%" });
                         self.pos += 2;
                         self.col += 2;
                     } else {

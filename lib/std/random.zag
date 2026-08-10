@@ -25,18 +25,18 @@ impl XorShift64Star {
     }
 
     pub fun next_u64(self: *XorShift64Star) -> u64 {
+        # xorshift64*: shift-twist-xor in u64, then the final multiply
+        # wraps mod 2^64 via `*%` (docs/05 §Wrapping Arithmetic). The
+        # shifts discard out-of-range bits by design (zig's `<<`/`>>`
+        # do not panic on bit loss), and the u64 `*%` yields exactly
+        # the mod-2^64 fold the v0.1 u128 widen-and-modulo form
+        # computed — the direct form is value-identical.
         var s: u64 = self.state;
         s = s ^ (s >> 12);
-        # `s << 25` wraps mod 2^64 in the xorshift — zig's checked
-        # shl panics when bits shift out, so shift in u128 and fold.
-        let up: u128 = (s as u128) << 25;
-        s = s ^ ((up % 18446744073709551616) as u64);
+        s = s ^ (s << 25);
         s = s ^ (s >> 27);
         self.state = s;
-        # Final multiply wraps mod 2^64 (checked `*` would overflow):
-        # 128-bit product, then explicit fold.
-        let mul: u128 = (s as u128) * 2685821657736338717;
-        return (mul % 18446744073709551616) as u64;
+        return s *% 2685821657736338717;
     }
 
     pub fun next_u32(self: *XorShift64Star) -> u32 {

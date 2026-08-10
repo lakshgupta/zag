@@ -403,6 +403,8 @@ pub fn parseAdditive(self: *Parser) Expr {
             const op: ast.Expr.BinaryOp = switch (self.peek().tag) {
                 .plus => .add,
                 .minus => .sub,
+                .plus_percent => .add_wrap,
+                .minus_percent => .sub_wrap,
                 else => break,
             };
             self.advance();
@@ -610,6 +612,7 @@ pub fn parseMultiplicative(self: *Parser) Expr {
                 .star => .mul,
                 .slash => .div,
                 .percent => .mod,
+                .star_percent => .mul_wrap,
                 else => break,
             };
             self.advance();

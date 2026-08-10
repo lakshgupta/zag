@@ -354,3 +354,54 @@ test "lexer: @[test] produces test_annotation token" {
     try std.testing.expectEqualStrings("test", tokens[0].text);
 }
 
+
+test "lexer: wrapping arithmetic operators +%, -%, *%" {
+    const src = "fun f() {\n    let a = x +% 1;\n    let b = y -% 2;\n    let c = z *% 3;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+
+    // Scan for the three wrapping-op tokens, each exactly once.
+    var n_plus: usize = 0;
+    var n_minus: usize = 0;
+    var n_star: usize = 0;
+    for (tokens) |tok| {
+        if (tok.tag == .plus_percent) {
+            n_plus += 1;
+            try std.testing.expectEqualStrings("+%", tok.text);
+        } else if (tok.tag == .minus_percent) {
+            n_minus += 1;
+            try std.testing.expectEqualStrings("-%", tok.text);
+        } else if (tok.tag == .star_percent) {
+            n_star += 1;
+            try std.testing.expectEqualStrings("*%", tok.text);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), n_plus);
+    try std.testing.expectEqual(@as(usize, 1), n_minus);
+    try std.testing.expectEqual(@as(usize, 1), n_star);
+}
+
+test "lexer: wrapping ops do not shadow compound-assign or plain ops" {
+    // `+=`/`-=`/`*=` and bare `+`/`-`/`*` keep their own tokens;
+    // `+%`/`-%`/`*%` only fire when the second char is `%`.
+    const src = "a += b; c -= d; e *= f; g = h + i - j * k;";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var n_eq: usize = 0;
+    var n_plain_plus: usize = 0;
+    var n_plain_minus: usize = 0;
+    var n_plain_star: usize = 0;
+    for (tokens) |tok| {
+        switch (tok.tag) {
+            .plus_eq, .minus_eq, .star_eq => n_eq += 1,
+            .plus => n_plain_plus += 1,
+            .minus => n_plain_minus += 1,
+            .star => n_plain_star += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), n_eq);
+    try std.testing.expectEqual(@as(usize, 1), n_plain_plus);
+    try std.testing.expectEqual(@as(usize, 1), n_plain_minus);
+    try std.testing.expectEqual(@as(usize, 1), n_plain_star);
+}

@@ -189,6 +189,15 @@ pub const ExprPayload = union(enum) {
         mul,
         div,
         mod,
+        // wrapping arithmetic (zig: `+%`, `-%`, `*%` — wrapping on
+        // overflow instead of the checked add/sub/mul above; the
+        // hash/random stdlib impls fold with these instead of the
+        // widen-and-modulo idiom documented in docs/manual/37 §Hash
+        // arithmetic). Emission is verbatim to zig in genExpr's
+        // `.binary` switch arms.
+        add_wrap,
+        sub_wrap,
+        mul_wrap,
         // bitwise
         bitand,
         bitor,

@@ -164,6 +164,15 @@ pub const TokenTag = enum {
     star_eq, // `*=`
     slash_eq, // `/=`
     percent_eq, // `%=`
+    /// Wrapping-arithmetic operators (docs/manual/05-operators.md
+    /// §Wrapping Arithmetic): `+%` / `-%` / `*%` lower to zig's
+    /// wrapping forms. Lexer peeks the second char in the `+`/`-`/`*`
+    /// dispatch arms; each is mutually exclusive with the compound-
+    /// assign form (the second char `=` vs `%`). Named after the
+    /// existing `plus_eq`/`star_eq` compound-assign convention.
+    plus_percent, // `+%`
+    minus_percent, // `-%`
+    star_percent, // `*%`
     amp_eq, // `&=`
     pipe_eq, // `|=`
     caret_eq, // `^=`

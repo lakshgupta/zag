@@ -269,6 +269,49 @@ test "codegen: precedenced arithmetic emits nested parens" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "    const z: i32 = (1 + (2 * 3));") != null);
 }
 
+test "codegen: wrapping arithmetic emits zig +%, -%, *% verbatim" {
+    // docs/05 §Wrapping Arithmetic: `+%`/`-%`/`*%` lower directly to
+    // zig's wrapping operators so hash/random impls can drop the
+    // widen-and-fold idiom (docs/37 §Hash arithmetic).
+    const src =
+        \\fun f() {
+        \\    let a: u32 = 1 +% 2;
+        \\    let b: u32 = 3 -% 4;
+        \\    let c: u32 = 5 *% 6;
+        \\    let d: u32 = (7 +% 8) *% 9;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const a: u32 = (1 +% 2);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const b: u32 = (3 -% 4);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const c: u32 = (5 *% 6);") != null);
+    // Precedence: `*%` binds tighter than `+%` (multiplicative vs
+    // additive), so the wrapped inner group keeps its parens.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const d: u32 = ((7 +% 8) *% 9);") != null);
+}
+
+test "codegen: wrapping ops round-trip through compound-free operands" {
+    // The additive `+%`/`-%` chain must associate left like plain
+    // `+`/`-` — no reordering, no orphaned operator tokens.
+    const src = "fun f() {\n    let a: u32 = 1 +% 2 -% 3 *% 4;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // (1 +% 2) then -% (3 *% 4) — `*%` binds at multiplicative level.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const a: u32 = ((1 +% 2) -% (3 *% 4));") != null);
+}
+
 test "codegen: method-call {obj.f()} emits verbatim obj.f() in args tuple" {
     // Unblocked-pattern pin for the matching-brace gate. The pre-fix
     // char-class gate bailed on `.` and `(` (both non-alphanumeric, not

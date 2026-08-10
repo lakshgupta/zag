@@ -13,6 +13,26 @@ let negated = -a;
 
 **Memory:** All arithmetic is stack-only. No allocation.
 
+## Wrapping Arithmetic
+
+The checked operators (`+`/`-`/`*`) panic on overflow in Debug
+builds. The wrapping forms wrap around the operand's bit width
+(lowering to zig's `+%`/`-%`/`*%`):
+
+```
+let w = a +% b;   # mod-2^N add
+let x = a -% b;   # mod-2^N subtract
+let y = a *% b;   # mod-2^N multiply
+```
+
+**Memory:** Stack-only, like all arithmetic. Wrapping ops are what
+the hash/random stdlib uses — `fnv1a32` accumulates with `*%` and
+mod-2^32 state, and `sha256`'s spec-defined mod-2^32 adds use `+%`.
+Operations with a possibly-in-range result (`a +% b` where `a + b
+<= max`) behave identically to the checked forms — reach for the
+wrapping form only when overflow is semantically part of the
+algorithm.
+
 ## Bitwise
 
 ```
