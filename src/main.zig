@@ -508,22 +508,26 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     else
         "";
     if (std.mem.eql(u8, mode, "run")) {
+        loadRemapTables("build/gen");
         const build_code = if (build_mode != .debug)
-            try runCommand(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig", opt_flag })
+            runCommandCaptured(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig", opt_flag })
         else
-            try runCommand(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig" });
-        if (build_code != 0) {
-            std.debug.print("error: zig build failed (exit {d})\n", .{build_code});
-            std.process.exit(build_code);
+            runCommandCaptured(null, &.{ zig_install_path, "build", "run", "--build-file", "build/gen/build.zig" });
+        if (build_code.stderr_len > 0) remapStderrCapture(capture_buf[0..build_code.stderr_len]);
+        if (build_code.code != 0) {
+            std.debug.print("error: zig build failed (exit {d})\n", .{build_code.code});
+            std.process.exit(build_code.code);
         }
     } else {
+        loadRemapTables("build/gen");
         const build_code = if (build_mode != .debug)
-            try runCommand(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig", opt_flag })
+            runCommandCaptured(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig", opt_flag })
         else
-            try runCommand(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig" });
-        if (build_code != 0) {
-            std.debug.print("error: zig build failed (exit {d})\n", .{build_code});
-            std.process.exit(build_code);
+            runCommandCaptured(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig" });
+        if (build_code.stderr_len > 0) remapStderrCapture(capture_buf[0..build_code.stderr_len]);
+        if (build_code.code != 0) {
+            std.debug.print("error: zig build failed (exit {d})\n", .{build_code.code});
+            std.process.exit(build_code.code);
         }
     }
 
@@ -768,6 +772,17 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
     const source = try readFile(src);
     const result = try transpile(src, source, true);
     try writeFile(f_zig, result.zig);
+    // Zig compiler errors on this build reference the leaf main.zig
+    // by line — write the .zag.map side-file so the captured-stderr
+    // remap pass can translate those headers back to the user's .zag
+    // source (same contract as the build/gen maps in project mode).
+    if (result.map.len > 0) try writeMapFile(f_zig, result.map);
+    // Load zig→zag tables for this leaf (user module + the stdlib
+    // mirror materialized above). Must run BEFORE the build below.
+    loadRemapTables(leaf_dir);
+    var leaf_std_buf: [128]u8 = undefined;
+    const leaf_std = std.fmt.bufPrint(&leaf_std_buf, "{s}/std", .{leaf_dir}) catch leaf_dir;
+    loadRemapTables(leaf_std);
 
     if (std.mem.eql(u8, flag, "test")) {
         const has_test_block = std.mem.indexOf(u8, result.zig, "test \"") != null;
@@ -799,7 +814,12 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
         &.{ zig_install_path, "build-exe", f_emit, f_zig, opt_arg }
     else
         &.{ zig_install_path, "build-exe", f_emit, f_zig };
-    const build_code = try runCommand(null, build_argv);
+    // Capture zig's stderr so compile errors can be re-surfaced with
+    // .zag locations (remapStderrCapture) instead of generated-zig
+    // line numbers no one recognizes.
+    const captured = runCommandCaptured(null, build_argv);
+    if (captured.stderr_len > 0) remapStderrCapture(capture_buf[0..captured.stderr_len]);
+    const build_code = captured.code;
     if (build_code != 0) {
         std.debug.print("error: zig build-exe failed for {s} (exit {d})\n", .{ src, build_code });
         std.process.exit(build_code);
@@ -923,6 +943,93 @@ fn runCommand(executable: ?[]const u8, argv: []const []const u8) !u8 {
         return std.os.linux.W.EXITSTATUS(status);
     }
     return 255;
+}
+
+const CapturedRun = struct {
+    code: u8,
+    stderr_len: usize,
+};
+
+/// 1 MB static capture buffer for zig build-exe / zig build stderr.
+/// Separate from `file_buf` — the remap pass calls readFile (which
+/// owns file_buf) to show the .zag source line for a mapped error.
+var capture_buf: [1024 * 1024]u8 = undefined;
+
+/// runCommand variant that captures the child's fd-2 output through
+/// a pipe instead of inheriting the terminal: the caller can then
+/// remap zig's generated-zig `path:line:col:` error headers back to
+/// the .zag sources via remapStderrCapture. Same fork+execve
+/// discipline as runCommand (no std.process.Child). The child dup2s
+/// the pipe's write end onto fd 2 (raw syscalls — no catch needs);
+/// the parent drains the read end to EOF then waitpids.
+fn runCommandCaptured(executable: ?[]const u8, argv: []const []const u8) CapturedRun {
+    if (argv.len == 0 or argv.len > 14) return .{ .code = 255, .stderr_len = 0 };
+
+    var arg_bufs: [15]?[:0]u8 = .{ null } ** 15;
+    defer for (arg_bufs) |maybe_buf| if (maybe_buf) |buf| std.heap.page_allocator.free(buf);
+
+    var argv_z: [15]?[*:0]const u8 = .{ null } ** 15;
+    for (argv, 0..) |arg, i| {
+        const buf = std.heap.page_allocator.allocSentinel(u8, arg.len, 0) catch return .{ .code = 255, .stderr_len = 0 };
+        @memcpy(buf, arg);
+        arg_bufs[i] = buf;
+        argv_z[i] = buf.ptr;
+    }
+
+    var envp_z: [513]?[*:0]const u8 = .{ null } ** 513;
+    const env_real_count = @min(env_path.environ_count, envp_z.len - 2);
+    for (env_path.environ_entries[0..env_real_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
+
+    const zig_env_opt: ?[:0]u8 = std.fmt.allocPrintSentinel(std.heap.page_allocator, "ZAG_ZIG_PATH={s}", .{zig_install_path}, 0) catch null;
+    defer if (zig_env_opt) |ze| std.heap.page_allocator.free(ze);
+    if (zig_env_opt) |ze| {
+        envp_z[env_real_count] = @constCast(ze.ptr);
+        envp_z[env_real_count + 1] = null;
+    } else {
+        envp_z[env_real_count] = null;
+    }
+
+    var fds: [2]i32 = undefined;
+    const pipe_rc = std.os.linux.pipe2(&fds, .{});
+    if (std.math.cast(isize, pipe_rc) orelse -1 < 0) return .{ .code = 255, .stderr_len = 0 };
+
+    const pid_fork = std.math.cast(i32, std.os.linux.fork()) orelse return .{ .code = 255, .stderr_len = 0 };
+    if (pid_fork == 0) {
+        // Child: stderr → pipe write end.
+        _ = std.os.linux.dup2(fds[1], 2);
+        _ = std.os.linux.close(fds[0]);
+        _ = std.os.linux.close(fds[1]);
+        const exec_path: [*:0]const u8 = blk: {
+            if (executable) |ex| {
+                const e_buf = std.heap.page_allocator.allocSentinel(u8, ex.len, 0) catch std.os.linux.exit(127);
+                @memcpy(e_buf, ex);
+                break :blk e_buf.ptr;
+            }
+            break :blk (arg_bufs[0] orelse std.os.linux.exit(127)).ptr;
+        };
+        const argv_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&argv_z);
+        const envp_z_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(&envp_z);
+        _ = std.os.linux.execve(exec_path, argv_z_ptr, envp_z_ptr);
+        std.os.linux.exit(127);
+    }
+
+    _ = std.os.linux.close(fds[1]);
+    var total: usize = 0;
+    while (total < capture_buf.len) {
+        const n = std.os.linux.read(fds[0], capture_buf[total..].ptr, capture_buf.len - total);
+        if (n <= 0) break;
+        const n_usize: usize = @intCast(n);
+        if (n_usize > capture_buf.len - total) break;
+        total += n_usize;
+    }
+    _ = std.os.linux.close(fds[0]);
+
+    var status: u32 = 0;
+    _ = std.os.linux.waitpid(pid_fork, &status, 0);
+    if (std.os.linux.W.IFEXITED(status)) {
+        return .{ .code = std.os.linux.W.EXITSTATUS(status), .stderr_len = total };
+    }
+    return .{ .code = 255, .stderr_len = total };
 }
 
 var file_buf: [1024 * 1024]u8 = undefined;
@@ -1097,6 +1204,12 @@ fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8,
                     name[0 .. name.len - ".zag".len],
                 }) catch continue;
                 writeFile(dst_path, zig) catch continue;
+                // Side-file map (same contract as build/gen maps):
+                // the file-mode remap pass translates zig build-exe
+                // errors inside stdlib mirrors back to lib/std/*.zag.
+                cg.buildMapText();
+                const map_text = cg.getMapText();
+                if (map_text.len > 0) writeMapFile(dst_path, map_text) catch continue;
             }
         }
     }
@@ -1300,6 +1413,256 @@ fn readFirstMapEntry(map_dir: []const u8, entry_name: []const u8) ![]const u8 {
     }
     if (pi >= 5) return parts[4];
     return "";
+}
+
+const RemapLine = struct {
+    zig_line: u32,
+    zag_line: u32,
+    zag_col: u32,
+};
+
+const RemapTable = struct {
+    zig_path: [256]u8,
+    zig_path_len: usize = 0,
+    zag_path: [512]u8,
+    zag_path_len: usize = 0,
+    count: usize = 0,
+    lines: [1024]RemapLine,
+};
+
+/// zig→zag line tables loaded from `*.zag.map` side-files, used by
+/// remapStderrCapture to rewrite zig compiler error headers
+/// (`<generated.zig>:<line>:<col>: error:`) back to the .zag source
+/// the user actually wrote. Loaded once per compile attempt from the
+/// leaf dir (file mode) or build/gen (project mode).
+var remap_tables: [48]RemapTable = undefined;
+var remap_table_count: usize = 0;
+
+/// Load all `*.zag.map` files from a flat directory into remap_tables.
+/// Each map line: zig_line\tzag_line\tzag_col\tsymbol\tsource_file
+/// (buildMapText format — source_file of the first entry is taken as
+/// the table's zag path).
+fn loadRemapTables(map_dir: []const u8) void {
+    if (remap_table_count >= remap_tables.len) return;
+    const map_dir_fd = posix.openat(posix.AT.FDCWD, map_dir, .{ .ACCMODE = .RDONLY }, 0) catch return;
+    defer _ = std.os.linux.close(map_dir_fd);
+
+    var buf: [4096]u8 align(8) = undefined;
+    while (true) {
+        const nread = std.os.linux.getdents64(map_dir_fd, &buf, buf.len);
+        if (nread == 0) break;
+        if (nread > std.math.maxInt(isize)) break;
+
+        var pos: usize = 0;
+        while (pos < nread) {
+            const entry: *const std.os.linux.dirent64 = @ptrCast(@alignCast(&buf[pos]));
+            pos += entry.reclen;
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.name)));
+            const name = name_z[0..name_z.len];
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (name[0] == '.') continue;
+            if (entry.type != std.os.linux.DT.REG) continue;
+            if (!std.mem.endsWith(u8, name, ".zag.map")) continue;
+            if (remap_table_count >= remap_tables.len) return;
+
+            var full_path_buf: [1024]u8 = undefined;
+            const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ map_dir, name }) catch continue;
+            const content = readFile(full_path) catch continue;
+
+            var table = &remap_tables[remap_table_count];
+            // The global array is `= undefined`; zero the slot's
+            // count/lines before first use (garbage count ≥ 1024
+            // shortcuts the parse loop below).
+            table.count = 0;
+            table.zig_path_len = 0;
+            table.zag_path_len = 0;
+            table.lines = [_]RemapLine{.{ .zig_line = 0, .zag_line = 0, .zag_col = 0 }} ** 1024;
+            const zig_base = name[0..(name.len - ".zag.map".len)];
+            // The map side-file derives from the .zig output by
+            // swapping extensions, so re-append ".zig" to recover
+            // the exact path zig's error headers print. bufPrint
+            // does NOT NUL-terminate the fixed array — keep the
+            // written length alongside.
+            const zig_written = std.fmt.bufPrint(&table.zig_path, "{s}/{s}.zig", .{ map_dir, zig_base }) catch continue;
+            table.zig_path_len = zig_written.len;
+            var first = true;
+            var it = std.mem.splitScalar(u8, content, '\n');
+            while (it.next()) |line| {
+                if (line.len == 0) continue;
+                var parts: [5][]const u8 = undefined;
+                var pi: usize = 0;
+                var pit = std.mem.splitScalar(u8, line, '\t');
+                while (pit.next()) |p| {
+                    if (pi < 5) { parts[pi] = p; pi += 1; }
+                }
+                if (pi < 5) continue;
+                if (table.count >= table.lines.len) break;
+                table.lines[table.count] = .{
+                    .zig_line = std.fmt.parseInt(u32, parts[0], 10) catch continue,
+                    .zag_line = std.fmt.parseInt(u32, parts[1], 10) catch continue,
+                    .zag_col = std.fmt.parseInt(u32, parts[2], 10) catch continue,
+                };
+                if (first) {
+                    if (parts[4].len < table.zag_path.len) {
+                        @memcpy(table.zag_path[0..parts[4].len], parts[4]);
+                        table.zag_path_len = parts[4].len;
+                    }
+                    first = false;
+                }
+                table.count += 1;
+            }
+            if (table.count > 0) remap_table_count += 1;
+        }
+    }
+}
+
+/// Locate the table whose zig path matches the error header's path
+/// token. zig prints paths exactly as handed to it (absolute leaf
+/// paths in file mode, build/gen-relative in project mode) — match
+/// by suffix so both shapes hit.
+fn remapFindTable(path: []const u8) ?*const RemapTable {
+    var i: usize = 0;
+    while (i < remap_table_count) : (i += 1) {
+        const table = &remap_tables[i];
+        const tpath = table.zig_path[0..table.zig_path_len];
+        if (std.mem.endsWith(u8, path, tpath) or std.mem.endsWith(u8, tpath, path)) return table;
+    }
+    return null;
+}
+
+/// Line-exact lookup: the first entry with zig_line >= target is the
+/// mapping (map entries are emitted in ascending zig-line order; the
+/// error's exact line maps to the statement it sits in).
+fn remapFindLine(table: *const RemapTable, zig_line: u32) ?RemapLine {
+    var best: ?RemapLine = null;
+    var i: usize = 0;
+    while (i < table.count) : (i += 1) {
+        const e = table.lines[i];
+        if (e.zig_line > zig_line) break;
+        best = .{ .zig_line = e.zig_line, .zag_line = e.zag_line, .zag_col = e.zag_col };
+    }
+    return best;
+}
+
+/// Static scratch for the remapped stderr text (built in full, then
+/// written to fd 2 in one shot).
+var remap_out_buf: [1024 * 1024 + 8192]u8 = undefined;
+
+/// Emit `    <zag source line>` + caret under a remapped header.
+fn remapEmitSourceLine(out_buf: []u8, out_pos: *usize, zag_path: []const u8, zag_line: u32, zag_col: u32) void {
+    const zsrc = readFile(zag_path) catch return;
+    var lno: u32 = 1;
+    var sit = std.mem.splitScalar(u8, zsrc, '\n');
+    while (sit.next()) |sline| : (lno += 1) {
+        if (lno == zag_line) {
+            const shown = if (sline.len > 100) sline[0..100] else sline;
+            const head = std.fmt.bufPrint(out_buf[out_pos.*..], "    {s}\n", .{shown}) catch return;
+            out_pos.* += head.len;
+            var caret_sp: [96]u8 = undefined;
+            const col: usize = @intCast(@min(zag_col, 96));
+            @memset(caret_sp[0..col], ' ');
+            caret_sp[col] = '^';
+            const caret = std.fmt.bufPrint(out_buf[out_pos.*..], "      {s}\n", .{caret_sp[0..col + 1]}) catch return;
+            out_pos.* += caret.len;
+            return;
+        }
+    }
+}
+
+/// Rewrite zig compiler error output so locations reference the .zag
+/// sources: `<zig>:<line>:<col>: error: msg` → `<zag>:<zag_line>:<zag_col>:
+/// error: msg`, followed by the actual .zag source line + caret.
+/// zig's own context block (the generated-zig source line + `^~~~`
+/// caret underneath the header) is dropped — it would mislead, since
+/// the remapped location names a different file. Unmapped headers
+/// and all non-header output pass through verbatim.
+fn remapStderrCapture(stderr: []const u8) void {
+    var out_pos: usize = 0;
+    var suppress_zig_context = false;
+
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |line| {
+        if (out_pos >= remap_out_buf.len - 512) break;
+
+        // Header shape: `path:LINE:COL:kind: msg` — locate the four
+        // colons with a single scan (line/col/kind/msg offsets). The
+        // kind token is emitted as `: error:` with a leading space —
+        // trim it before comparison.
+        var path_end: usize = 0;
+        var line_end: usize = 0;
+        var col_end: usize = 0;
+        var kind_start: usize = 0;
+        var kind_end: usize = 0;
+        var msg_start: usize = 0;
+        var seen: usize = 0;
+        for (line, 0..) |ch, i| {
+            if (ch == ':') {
+                seen += 1;
+                if (seen == 1) {
+                    path_end = i;
+                } else if (seen == 2) {
+                    line_end = i;
+                } else if (seen == 3) {
+                    col_end = i;
+                } else if (seen == 4) {
+                    kind_end = i;
+                    msg_start = i + 2;
+                    break;
+                }
+            }
+        }
+        var kind_start_real = col_end + 1;
+        while (kind_start_real < kind_end and (line[kind_start_real] == ' ' or line[kind_start_real] == '\t')) kind_start_real += 1;
+        kind_start = kind_start_real;
+
+        var mapped = false;
+        var map_table: ?*const RemapTable = null;
+        var map_line: RemapLine = undefined;
+        if (seen >= 4) {
+            const kind = line[kind_start .. kind_end];
+            const is_kind = std.mem.eql(u8, kind, "error") or std.mem.eql(u8, kind, "note") or std.mem.eql(u8, kind, "warning");
+            if (is_kind) {
+                const zl = std.fmt.parseInt(u32, line[path_end + 1 .. line_end], 10) catch 0;
+                const zc = std.fmt.parseInt(u32, line[line_end + 1 .. col_end], 10) catch 0;
+if (zl > 0 and zc > 0) {
+                    if (remapFindTable(line[0..path_end])) |t| {
+                        if (remapFindLine(t, zl)) |m| {
+                            mapped = true;
+                            map_table = t;
+                            map_line = m;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (mapped) {
+            suppress_zig_context = true;
+            const t = map_table orelse continue;
+            const zag_path = t.zag_path[0..t.zag_path_len];
+            // Zig's message kind after the 4th colon.
+            const kind = line[kind_start .. kind_end];
+            const msg = if (msg_start < line.len) line[msg_start..] else "";
+            const header = std.fmt.bufPrint(remap_out_buf[out_pos..], "{s}:{d}:{d}: {s}: {s}\n", .{ zag_path, map_line.zag_line, map_line.zag_col, kind, msg }) catch break;
+            out_pos += header.len;
+            remapEmitSourceLine(remap_out_buf[0..], &out_pos, zag_path, map_line.zag_line, map_line.zag_col);
+            continue;
+        }
+
+        if (suppress_zig_context) {
+            // zig's context block = indented source + caret lines
+            // directly under the header. Drop them once the block
+            // ends (blank or non-indented line).
+            if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) continue;
+            suppress_zig_context = false;
+        }
+
+        const n = std.fmt.bufPrint(remap_out_buf[out_pos..], "{s}\n", .{line}) catch break;
+        out_pos += n.len;
+    }
+
+    _ = std.os.linux.write(2, &remap_out_buf, out_pos);
 }
 
 var cmdline_buf: [4096]u8 = undefined;
