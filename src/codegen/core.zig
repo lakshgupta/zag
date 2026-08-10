@@ -1255,42 +1255,23 @@ pub const MapEntry = struct {
             \\    }
             \\    _ = std.os.linux.nanosleep(&req, null);
             \\}
-            \\// __zag_posix family — RETIRED in the v0.3 syscall-FFI
-            \\// migration: the 12 raw syscall wrappers
-            \\// (__zag_openat / __zag_read / __zag_write / __zag_close /
-            \\// __zag_mkdirat / __zag_getdents64 / __zag_clock_gettime /
-            \\// __zag_getcwd / __zag_getenv / __zag_exit /
-            \\// __zag_posix_spawn / __zag_waitpid) moved into
-            \\// lib/std/posix.zag as plain .zag fns once the language
-            \\// surfaces they needed landed (bitcast / enum_from_int
-            \\// builtins + module-level `var`). __zag_posix_spawn and
-            \\// __zag_waitpid were dead (router-era leftovers, only the
-            \\// preamble pin test referenced them) and were dropped
-            \\// outright. The ONE surviving resident is
-            \\// __zag_process_spawn below — std.process.spawn's
-            \\// anonymous SpawnOptions literal is still unexpressible
-            \\// in .zag.
-            \\// __zag_process_spawn — zig 0.16 spawn+wait wrapper for
-            \\// lib/std/process.zag's exec. std.process.spawn(io,
-            \\// SpawnOptions{ .argv }) inherits the parent environment;
-            \\// kill+wait(io) reap the child; the .exited term maps to
-            \\// the child's exit code, any other term (signal / stop /
-            \\// abort) or a spawn/wait failure maps to 255 (shell
-            \\// convention for exec failure). The options literal + term
-            \\// union switch live here in zig because zag source cannot
-            \\// express anonymous struct literals or union switches —
-            \\// the same reason the pre-migration process_exec router
-            \\// emitted this block inline.
-            \\fn __zag_process_spawn(argv: []const []const u8) i32 {
-            \\    var __child = std.process.spawn(__zag_io, .{ .argv = argv }) catch return 255;
-            \\    defer __child.kill(__zag_io);
-            \\    const __term = __child.wait(__zag_io) catch return 255;
-            \\    switch (__term) {
-            \\        .exited => |__c| return @as(i32, __c),
-            \\        else => return 255,
-            \\    }
-            \\}
-            \\
+\\// __zag_posix family — RETIRED (v0.3 + v0.4): the twelve
+             \\// raw syscall wrappers (__zag_openat / __zag_read /
+             \\// __zag_write / __zag_close / __zag_mkdirat /
+             \\// __zag_getdents64 / __zag_clock_gettime / __zag_getcwd /
+             \\// __zag_getenv / __zag_exit / __zag_posix_spawn /
+             \\// __zag_waitpid) moved into lib/std/posix.zag as plain
+             \\// .zag fns once bitcast / enum_from_int builtins +
+             \\// module-level `var` landed (__zag_posix_spawn and
+             \\// __zag_waitpid were dead router-era leftovers, dropped
+             \\// outright). The v0.4 pass retired the LAST resident,
+             \\// __zag_process_spawn, into posix.zag's spawn — a raw
+             \\// fork/execve/waitpid path that needs neither
+             \\// std.process.spawn's anonymous SpawnOptions literal nor
+             \\// the term-union .exited switch the old zig helper
+             \\// existed for. The posix family is now COMPLETELY out of
+             \\// the preamble; lib/std/posix.zag owns every raw syscall.
+             \\
         );
 
         // Module imports (docs/manual/22-modules.md §Imports): walk

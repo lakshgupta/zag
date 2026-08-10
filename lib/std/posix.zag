@@ -23,10 +23,10 @@
 ##   __zag_posix_spawn    - REMOVED (dead since the router era; only the
 ##     __zag_waitpid        preamble pin test referenced them)
 ##
-## Remaining preamble resident (still unexpressible in .zag):
-##   __zag_process_spawn — std.process.spawn takes an anonymous
-##   SpawnOptions struct literal (`.{...}`), which zag source cannot
-##   spell; lib/std/process.zag's exec keeps calling it.
+## v0.4: __zag_process_spawn — the LAST __zag_posix-family preamble
+## resident — retired into `spawn` below (raw fork/execve/waitpid;
+## no anonymous SpawnOptions literal / term-union switch needed).
+## The posix family is now COMPLETELY out of the preamble.
 ##
 ## Error convention: uint-returning syscalls follow the kernel's
 ## errno-encoding (high bit set = negative errno); callers test the
@@ -156,6 +156,90 @@ pub fun getenv(name: str) -> ?str {
         if (i < env_len) { i = i + 1; }
     }
     return null;
+}
+
+## spawn — fork/execve/waitpid in .zag: the last __zag_posix-family
+## preamble resident (__zag_process_spawn) retires here. The old
+## zig-side helper wrapped std.process.spawn(+SpawnOptions literal)/
+## kill/wait, which .zag can't spell; the raw path below needs no
+## anonymous structs or term-union switches:
+##   - argv strings are copied into the fixed arg_arena (module-level
+##     `var` — env_buf/cwd_buf pattern), each left NUL-terminated;
+##   - arg_ptrs / env_ptrs are sentinel-terminated pointer arrays
+##     (the `[*:null]const ?[*:0]const u8` execve contract) — the
+##     `[64:null]` / `[256:null]` annotations pass through the .zag
+##     type-text verbatim, and `as [*:0]const u8` casts (the
+##     @alignCast(@ptrCast(...)) route) fabricate sentinel pointers
+##     into the in-buffer NUL-terminated copies;
+##   - envp points into a fresh /proc/self/environ read (the getenv
+##     scanner's buffer + entry walk, duplicated here so the child
+##     inherits the parent environment — std.process.spawn's default);
+##   - fork; the child execve's straight away (between fork and
+##     exec only async-signal-safe work — touching already-copied
+##     memory — happens) and exit(127)s on execve failure (shell's
+##     command-not-found convention; the old helper's 255 covered
+##     spawn-SETUP failures, which this path has no analog of);
+##   - waitpid decodes via the WIFEXITED mask `(status & 0x7F) == 0`
+##     — exit code is `(status >> 8)`; signal kills / wait errors map
+##     to 255.
+## Over-limit inputs (arena or pointer-array overflow) return 255.
+var arg_arena: [16384]u8 = undefined;
+var arg_ptrs: [64:null]?[*:0]const u8 = undefined;
+var env_ptrs: [256:null]?[*:0]const u8 = undefined;
+pub fun spawn(argv: []const []const u8) -> i32 {
+    let nargs: usize = argv.len;
+    if (nargs == 0) { return 255; }
+    if (nargs >= arg_ptrs.len) { return 255; }
+    var off: usize = 0;
+    var i: usize = 0;
+    while (i < nargs) {
+        let a: []const u8 = argv[i];
+        if (off + a.len + 1 > arg_arena.len) { return 255; }
+        __zag_memcpy(arg_arena[off .. off + a.len], a, a.len);
+        arg_arena[off + a.len] = 0;
+        let seg: []const u8 = arg_arena[off .. off + a.len];
+        arg_ptrs[i] = seg.ptr as [*:0]const u8;
+        off = off + a.len + 1;
+        i = i + 1;
+    }
+    arg_ptrs[nargs] = null;
+    let fd_raw: usize = openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
+    let fd_signed: isize = fd_raw as isize;
+    if (fd_signed < 0) { return 255; }
+    let fd: i32 = fd_signed as i32;
+    let en: isize = read(fd, env_buf[0..env_buf.len], env_buf.len);
+    _ = close(fd);
+    if (en <= 0) { return 255; }
+    let env_len: usize = en as usize;
+    var e: usize = 0;
+    var j: usize = 0;
+    while (e < env_len) {
+        if (j >= env_ptrs.len) { return 255; }
+        let entry: []const u8 = env_buf[e .. env_len];
+        env_ptrs[j] = entry.ptr as [*:0]const u8;
+        j = j + 1;
+        while (e < env_len) {
+            if (env_buf[e] == 0) { break; }
+            e = e + 1;
+        }
+        e = e + 1;
+    }
+    env_ptrs[j] = null;
+    let pid: usize = std.os.linux.fork();
+    if ((pid & 0x8000000000000000) != 0) { return 255; }
+    if (pid == 0) {
+        let head: []const u8 = arg_arena[0..off];
+        let path_ptr: [*:0]const u8 = head.ptr as [*:0]const u8;
+        _ = std.os.linux.execve(path_ptr, addr_of(arg_ptrs), addr_of(env_ptrs));
+        exit(127);
+    }
+    var status: u32 = 0;
+    let wrc: usize = std.os.linux.waitpid(pid as i32, addr_of(status), 0);
+    if ((wrc & 0x8000000000000000) != 0) { return 255; }
+    if ((status & 0x7F) == 0) {
+        return (status >> 8) as i32;
+    }
+    return 255;
 }
 
 ## exit — `_exit(2)`. noreturn.

@@ -125,6 +125,60 @@ pub fn collectCastType(self: *Parser) []const u8 {
                     self.advance(); // consume `]`
                     continue;
                 }
+                // Sentinel-array prefix `[<size>:<sentinel>]` — the
+                // `[N:null]T` shape (sentinel-terminated arrays; the
+                // first consumer is lib/std/posix.zag's spawn, whose
+                // `[*:null]const ?[*:0]const u8` execve pointer arrays
+                // need `var arg_ptrs: [64:null]?[*:0]const u8`).
+                // The single-size arm above misses this form (the
+                // bracket interior is `size : sentinel`, so the
+                // `pos+2 == .rbracket` test fails and the capture
+                // bails at the `[`). Sentinel tokens accepted:
+                // integer_literal (`[4:0]`), null_kw (`[64:null]`),
+                // identifier (`[N:S]`).
+                if (tok.tag == .lbracket and self.pos + 4 < self.tokens.len) {
+                    const sent_size_tag = self.tokens[self.pos + 1].tag;
+                    const sent_is_size: bool = switch (sent_size_tag) {
+                        .integer_literal, .identifier => true,
+                        else => false,
+                    };
+                    const sent_tag = self.tokens[self.pos + 3].tag;
+                    const sent_ok: bool = switch (sent_tag) {
+                        .integer_literal, .null_kw, .identifier => true,
+                        else => false,
+                    };
+                    if (sent_is_size and
+                        self.tokens[self.pos + 2].tag == .colon and
+                        sent_ok and
+                        self.tokens[self.pos + 4].tag == .rbracket)
+                    {
+                        if (len + 1 <= buf.len) {
+                            buf[len] = '[';
+                            len += 1;
+                        }
+                        const sent_size_text = self.tokens[self.pos + 1].text;
+                        if (len + sent_size_text.len + 1 <= buf.len) {
+                            @memcpy(buf[len..][0..sent_size_text.len], sent_size_text);
+                            len += sent_size_text.len;
+                            buf[len] = ':';
+                            len += 1;
+                        }
+                        const sent_text = self.tokens[self.pos + 3].text;
+                        if (len + sent_text.len + 1 <= buf.len) {
+                            @memcpy(buf[len..][0..sent_text.len], sent_text);
+                            len += sent_text.len;
+                            buf[len] = ']';
+                            len += 1;
+                        }
+                        prev_was_ptr = true;
+                        self.advance(); // consume `[`
+                        self.advance(); // consume size
+                        self.advance(); // consume `:`
+                        self.advance(); // consume sentinel
+                        self.advance(); // consume `]`
+                        continue;
+                    }
+                }
             }
             // Sentinel-terminated / many-pointer bracket prefix
             // `[*:0]` (and `[*]`, `[:0]`) — the shape lib/std's

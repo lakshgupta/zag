@@ -30,7 +30,7 @@ surface of the modules below.
 | `std.env` | `get_env` (borrowed view) | none |
 | `std.fs` | `read_file`, `write_file`, `mkdir` | heap |
 | `std.process` | `exec`, `exit` | heap |
-| `std.posix` | `openat`, `read`, `write`, `close`, `mkdirat`, `getdents64`, `clock_gettime`, `getcwd`, `getenv`, `exit` | none |
+| `std.posix` | `openat`, `read`, `write`, `close`, `mkdirat`, `getdents64`, `clock_gettime`, `getcwd`, `getenv`, `spawn`, `exit` | none |
 | `std.debug` | `panic` | none |
 
 ## Directory modules
@@ -61,10 +61,10 @@ backs `std.async.stream` / `std.arch.x86.avx2` / `std.concurrent.*`.
 system-facing modules build on. It replaced the preamble's
 `__zag_openat` / `__zag_read` / `__zag_write` / `__zag_close` /
 `__zag_mkdirat` / `__zag_getdents64` / `__zag_clock_gettime` /
-`__zag_getcwd` / `__zag_getenv` / `__zag_exit` helpers — the last
-preamble helper to survive is `__zag_process_spawn` (process.spawn
-needs an anonymous SpawnOptions literal the .zag surface cannot yet
-express). Modules import it with the std-to-std form:
+`__zag_getcwd` / `__zag_getenv` / `__zag_exit` /
+`__zag_process_spawn` helpers — the posix family is now COMPLETELY
+out of the preamble (the last resident retired in the v0.4 `spawn`
+pass, below). Modules import it with the std-to-std form:
 
 ```zag
 pub import std.posix.{openat, read, write, close, mkdirat}
@@ -90,10 +90,23 @@ Conventions, mirroring the retired preamble:
   `enum_from_int` (runtime int → `clockid_t`); `std.time.now`
   delegates to it.
 - `exit(code: i32) -> noreturn` — raw `std.os.linux.exit`.
+- `spawn(argv: []const []const u8) -> i32` — fork/execve/waitpid in
+  .zag (the last preamble retirement). argv strings land in a fixed
+  module-level arena, each NUL-terminated; `arg_ptrs`/`env_ptrs` are
+  `[64:null]`/`[256:null]` sentinel pointer arrays (the `.zag`
+  type-text pass-through gets the sentinel array via `[N:S]T`
+  annotations — the parser's sentinel-size carve-out). The child
+  inherits the parent environment (an envp walk over a fresh
+  /proc/self/environ read) and execve's; execve failure exits 127.
+  The parent waitpid-decodes via `(status & 0x7F) == 0` → exit code
+  is `(status >> 8)`; signal kills / errors map to 255. NOTE:
+  callers must pass a SLICED array (`args[0..2]`) — zig 0.16 removed
+  the by-value array→slice coercion, so a bare `exec(args)` fails
+  ("array literal requires address-of operator").
 
 `std.fs`, `std.env`, `std.time`, and `std.process` import from this
 facade; `std.process.exit` re-exports it under the alias
-`exit as sys_exit`.
+`exit as sys_exit`, and `std.process.exec` delegates to `spawn`.
 
 ## Generic containers
 

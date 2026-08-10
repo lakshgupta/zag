@@ -1122,6 +1122,39 @@ test "codegen: `?[]const u8` annotation round-trips in let binding" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "? []const") == null);
 }
 
+test "codegen: `[N:S]T` sentinel-array annotation round-trips in let binding" {
+    // The sentinel-terminated ARRAY form (`[64:null]?[*:0]const u8`,
+    // `[4:0]u8`) — the execve pointer-array annotations in
+    // lib/std/posix.zag's spawn. The `[<size>]` single-size arm only
+    // matches `[N]T` (its `pos+2 == .rbracket` test fails on the
+    // sentinel slot), and the `[*`/`[:` arm requires a star/colon
+    // IMMEDIATELY after `[` — so without the sentinel-size carve-out
+    // the capture bails at the `[` with "expected equals, got '['"
+    // (surfaced by the spawn materialization). Both a `:null`
+    // sentinel and a `:0` integer sentinel must round-trip verbatim.
+    const src =
+        \\fun f() {
+        \\    var a: [64:null]?[*:0]const u8 = undefined;
+        \\    let b: [4:0]u8 = undefined;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[64:null]?[*:0]const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[4:0]u8") != null);
+    // Sanity: the pre-carve-out truncation shapes must NOT appear —
+    // a lone `[64` type-text (capture died at the sentinel colon) or
+    // an empty `[N]` slot would break the execve annotations.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "[64]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, ": null") == null);
+}
+
 test "codegen: `*const T` annotation round-trips in let binding" {
     // The non-nullable immutable pointer annotation (no `?` prefix).
     // The collectCastType path collects `*`, then `const` (which keeps
@@ -2324,11 +2357,12 @@ test "codegen: process exec resolves via @import+alias (no process_exec router)"
     // v0.1 Tier-1 migration of std.process.exec from the process_exec
     // codegen-router inline emit (per-call `blk: { var __child =
     // std.process.spawn(__zag_io, .{ .argv = ... }) ... }` shape) to
-    // the real lib/std/process.zag impl `return __zag_process_spawn(
-    // argv);` — the always-emitted preamble helper wraps spawn+kill+
-    // wait and maps the .exited term to the child's exit code (else
-    // 255). The call site is now VERBATIM through the @import+alias
-    // fallthrough (Option A pass-through).
+    // the real lib/std/process.zag impl `return exec(argv);` — the
+    // v0.3+ preamble helper `__zag_process_spawn` wrapped spawn+kill+
+    // wait and mapped the .exited term to the child's exit code (else
+    // 255), and the v0.4 pass retired it into lib/std/posix.zag's
+    // spawn (raw fork/execve/waitpid). The call site is now VERBATIM
+    // through the @import+alias fallthrough (Option A pass-through).
     const src =
         \\pub import std.process.{exec}
         \\fun f(argv: []const []const u8) -> i32 {
@@ -2346,11 +2380,11 @@ test "codegen: process exec resolves via @import+alias (no process_exec router)"
     // Positive: verbatim call site + the @import alias bridge.
     try std.testing.expect(std.mem.indexOf(u8, zig, "return exec(argv);") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "const exec = __zag_imported_") != null);
-    // Positive: the preamble helper that the real impl forwards to.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_process_spawn(argv: []const []const u8) i32") != null);
-    // Negative: the retired per-call router blk shape must not appear
-    // at the user's call site (the preamble helper's own body starts
-    // with a plain `var __child` on its own line, not `blk: { var`).
+    // Negative: the v0.4 pass retired the last posix-family preamble
+    // resident — the spawn helper must NOT be re-added, and the
+    // retired per-call router blk shape must not appear at the user's
+    // call site either.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_process_spawn(argv: []const []const u8) i32") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "blk: { var __child = std.process.spawn") == null);
 }
 
@@ -3646,10 +3680,14 @@ test "codegen: while let Option.Some(val) switch-extracts the payload capture" {
 test "codegen: __zag_posix preamble pins all 13 helpers + locks out steered-around substrings" {
     // The __zag_posix family (openat/read/write/close/getdents64/
     // clock_gettime/getcwd/getenv/exit/posix_spawn/waitpid) plus
-    // mkdirat (fs.mkdir) and process_spawn (process.exec) is emitted
+    // mkdirat (fs.mkdir) and process_spawn (process.exec) was emitted
     // verbatim into the `generate()` preamble in src/codegen/core.zig.
     // Trivia zag source (no call sites) exercises the preamble alone,
     // so any per-helper drop shows up as a missing substring.
+    //
+    // As of the v0.3 syscall-FFI + v0.4 spawn migrations the ENTIRE
+    // family is retired into lib/std/posix.zag — the positive
+    // assertions below are gone and every definiton is forbidden.
     //
     // Locks-down regression for two steered-around substrings that
     // historically leaked through the preamble multi-line literal (the
@@ -3673,43 +3711,9 @@ test "codegen: __zag_posix preamble pins all 13 helpers + locks out steered-arou
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
 
-    // Positive: the sole surviving __zag_posix-family preamble helper
-    // must appear (verbatim, with fn-name intact). The other twelve
-    // moved to lib/std/posix.zag in the v0.3 syscall-FFI migration
-    // (__zag_openat/read/write/close/mkdirat/getdents64/clock_gettime/
-    // getcwd/getenv/exit → .zag fns; __zag_posix_spawn/waitpid were
-    // dead and dropped outright).
-    const __zag_posix_names = [_][]const u8{
-        "__zag_process_spawn",
-    };
-    inline for (__zag_posix_names) |name| {
-        try std.testing.expect(std.mem.indexOf(u8, zig, name) != null);
-    }
-
-    // Positive (signature): pin the structurally-unusual signature
-    // that is most likely to regress on a future migration:
-    //   - __zag_process_spawn hands the caller's argv slice straight
-    //     to std.process.spawn's SpawnOptions literal — the reason
-    //     the helper couldn't move to .zag.
-    // Other 12 helpers pin by name only in lib/std/posix.zag's emit.
-    const __zag_posix_sigs = [_][]const u8{
-        "__zag_process_spawn(argv: []const []const u8)",
-    };
-    inline for (__zag_posix_sigs) |sig| {
-        try std.testing.expect(std.mem.indexOf(u8, zig, sig) != null);
-    }
-
-    // Negative: steered-around substrings must not leak back into the
-    // preamble (covers both code paths AND comment text inside the
-    // raw-multi-line preamble literal — see core.zig generate()).
-    // `std.posix.getenv` was the per-call getEnv builtin's emit
-    // (zig-0.16 form; replacement for the retired `system.getenv`),
-    // but BOTH are retired as of the v0.1 Tier-1 migration — env
-    // lookup lives in lib/std/env.zag + lib/std/posix.zag's real
-    // impls. The PREAMBLE itself must never reference std.posix.*
-    // syscall or env surfaces — those all belong to .zag now.
-    // Retired-family DEFINITIONS are pinned by their `fn ` prefix —
-    // the v0.3 migration narrative comment legitimately names the
+    // Negative: the retired-family DEFINITIONS must not be re-added to
+    // the preamble. The two migration narrative comments in
+    // src/codegen/core.zig + lib/std/posix.zag legitimately name the
     // helpers, so bare names aren't forbidden; a re-added
     // `fn __zag_openat` (or env_buf var) however is a regression.
     const forbidden = [_][]const u8{
@@ -3728,6 +3732,7 @@ test "codegen: __zag_posix preamble pins all 13 helpers + locks out steered-arou
         "fn __zag_exit",
         "fn __zag_posix_spawn",
         "fn __zag_waitpid",
+        "fn __zag_process_spawn",
         "var __zag_env_buf",
     };
     inline for (forbidden) |substr| {

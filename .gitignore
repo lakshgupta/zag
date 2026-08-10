@@ -19,6 +19,11 @@ dist/
 # !vendor/zig/zig) and override this block per-release.
 vendor/
 
+# A bare zig/ dir next to the source tree is the same placeholder-stub
+# artifact class as vendor/zig/zig (100-byte ELF marker written by
+# scripts/install.sh) — never commit either.
+zig/
+
 # ─── Python helpers ──────────────────────────────────────────────────────
 # scripts/ carries helper .py files (codegen_split.py, lexer_split.py,
 # ast_split.py, …) that produce __pycache__/ on first import. Patterns

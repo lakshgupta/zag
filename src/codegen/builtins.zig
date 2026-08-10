@@ -253,9 +253,10 @@ pub const builtin_table = [_]BuiltinRoute{
     //   `read_file` / `write_file` / `mkdir` / `exit` / `exec` /
     //   `alloc` / `panic` / `now` / `getEnv`(→get_env) / `get`(argv)
     //   were retired as builtin rows in the v0.1 Tier-1 migration in
-    //   favour of real lib/std .zag impls backed by the __zag_posix /
-    //   __zag_process_spawn preamble family (see lib/std/{fs,env,
-    //   process,time,mem,debug,argv}.zag). Their call sites now
+    //   favour of real lib/std .zag impls backed by the __zag_posix
+    //   preamble family (see lib/std/{fs,env,process,time,mem,debug,
+    //   argv}.zag) — itself fully retired into lib/std/posix.zag by
+    //   the v0.4 spawn pass. Their call sites now
     //   resolve through the @import+alias fallthrough in
     //   src/codegen/core.zig's imports loop (Option A pass-through),
     //   except argv.get which binds preamble-side (__zag_argv lives
