@@ -17,7 +17,7 @@ fun partial_init(a: i32, b: i32) -> Result<i32, str> {
     let p: *i32 = new i32(a);
     errdefer free(p);                  # only runs if ? propagates
 
-    let result: i32 = divide(p, b)?;   # ? may trigger errdefer
+    let result: i32 = divide(*p, b)?;   # ? may trigger errdefer
     free(p);                           # success path — manual free
     return Ok(result);
 }

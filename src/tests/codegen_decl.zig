@@ -3604,8 +3604,13 @@ test "codegen: const block emits comptime blk with break :blk" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // const block emits comptime labeled block
-    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime blk: {") != null);
+    // const block in a const-decl RHS emits the labeled block without
+    // the redundant `comptime` keyword (zig 0.16 rejects "redundant
+    // comptime keyword in already comptime scope" — the const binding
+    // RHS IS already comptime scope), and the `return t;` terminator
+    // becomes `break :blk t`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime blk: {") == null);
     // Return statement becomes break :blk
     try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk t") != null);
 }

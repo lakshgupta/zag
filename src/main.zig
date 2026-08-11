@@ -810,7 +810,21 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
         std.fmt.bufPrint(&opt_buf, "-O{s}", .{optimizeName(build_mode)}) catch "-OReleaseFast"
     else
         "";
-    const build_argv: []const []const u8 = if (build_mode != .debug)
+    // `extern fun` bodies reference libc symbols (open/write/close in
+    // examples/ffi/basic_io.zag) — without `-lc` the post-transpile
+    // build-exe dies on "undefined symbol: write". Zig's default
+    // (no-libc) static builds don't need it, but any program declaring
+    // C ABI functions opts the file into libc linking — harmless for
+    // the standard-library-only programs (the flag links against the
+    // system libc; symbols resolve if present, else the C-link error
+    // is loud and points at the extern).
+    const has_libc = std.mem.indexOf(u8, result.zig, "extern fn ") != null;
+    const build_argv: []const []const u8 = if (has_libc)
+        if (build_mode != .debug)
+            &.{ zig_install_path, "build-exe", f_emit, f_zig, opt_arg, "-lc" }
+        else
+            &.{ zig_install_path, "build-exe", f_emit, f_zig, "-lc" }
+    else if (build_mode != .debug)
         &.{ zig_install_path, "build-exe", f_emit, f_zig, opt_arg }
     else
         &.{ zig_install_path, "build-exe", f_emit, f_zig };

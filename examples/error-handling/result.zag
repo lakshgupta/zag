@@ -24,14 +24,14 @@ fun divide(a: i32, b: i32) -> Result<i32, str> {
 
 fun maybe_get(index: i32) -> Option<i32> {
     if index < 0 || index >= 3 {
-        return None;
+        return Option.None;
     }
     return Some(index * 10);
 }
 
 ## ? try-operator: propagates errors to the enclosing Result-returning function
 fun try_propagate() -> Result<i32, str> {
-    let half = divide(10, 2)?;
+    let half: i32 = divide(10, 2)?;
     return Ok(half * 2);
 }
 

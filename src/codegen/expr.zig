@@ -354,15 +354,33 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 const name = std.fmt.bufPrint(&name_buf, "__p_{d}", .{id}) catch "__p";
                 self.write("blk: { const ");
                 self.write(name);
+                // OOM propagation is return-type-aware: the `try` shape
+                // only works when the enclosing fn can carry the error
+                // (`pub fn main() !void` — the unannotated default).
+                // Inside a fn with an explicit NON-`!` return annotation
+                // (`-> Result<i32, str>`, `-> i32`, ...) `try` would make
+                // zig reject the body ("function cannot return an error"
+                // / "expected type 'main.Result(...)', found
+                // 'error{OutOfMemory}'" — surfaced by the defer/
+                // errdefer_partial + multiple_resources examples'
+                // `new i32(...)` in Result-returning fns). Fall back to a
+                // hard OOM panic there (C-style abort) so the allocation
+                // stays single-expression and the fn signature is kept.
+                const oom_try = self.fn_ret_type_len == 0 or self.fn_ret_type_buf[0] == '!';
+                self.write(" = ");
+                if (oom_try) self.write("try ");
                 if (n.allocator) |alloc_name| {
-                    self.write(" = try ");
                     self.write(alloc_name);
                     self.write(".create(");
                 } else {
-                    self.write(" = try std.heap.page_allocator.create(");
+                    self.write("std.heap.page_allocator.create(");
                 }
                 self.writeType(n.type_name);
-                self.write("); ");
+                if (oom_try) {
+                    self.write("); ");
+                } else {
+                    self.write(") catch @panic(\"__zag: page_alloc OOM\"); ");
+                }
                 // std.bench allocation counter (docs/manual/20 + the
                 // __zag_bench_* preamble helpers): every `new` site
                 // charges @sizeOf(T). The matching charge-back lands
@@ -627,9 +645,27 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // @alignCast covers the alignment increase.
                 const cast_target_zig = zagTypeToZig(c.type_text);
                 if (std.mem.startsWith(u8, cast_target_zig, "[*") or std.mem.startsWith(u8, cast_target_zig, "*")) {
+                    // Const-slice sources (`let msg: str = "…"` cast to
+                    // `*raw u8` — the C-FFI write(2) shape in
+                    // examples/ffi/basic_io.zag): a bare @ptrCast on a
+                    // `[]const u8` ident discards the const qualifier,
+                    // which zig 0.16 REJECTS ("@ptrCast discards const
+                    // qualifier"). Wrap the operand in @constCast — the
+                    // explicit C-FFI escape-hatch for many-pointer casts
+                    // (no-op at runtime on non-const sources). Detection
+                    // is type-informed: only `str` / `[]const …`
+                    // annotated bindings trigger it.
+                    var const_src = false;
+                    if (c.expr.payload == .ident) {
+                        if (self.getSourceTypeName(c.expr.payload.ident)) |st| {
+                            const_src = std.mem.eql(u8, st, "str") or std.mem.startsWith(u8, st, "[]const");
+                        }
+                    }
+                    if (const_src) self.write("@constCast(");
                     self.write("@alignCast(@ptrCast(");
                     self.genExpr(c.expr.*);
                     self.write("))");
+                    if (const_src) self.write(")");
                 } else {
                     self.genExpr(c.expr.*);
                 }
@@ -902,6 +938,53 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(" }");
             },
             .enum_variant_ctor => |evc| {
+                // Preamble builtin generic ctors (`Option.Some(x)`,
+                // `Option.None`, `Result.Ok(v)`, plus the BARE `None`
+                // ident form) — INSTANTIATE the preamble generic from
+                // the binding/return anchor when the enum name resolves
+                // to the anchor's base (`Option<i32>{ .Some = x }`).
+                // Without the anchor, `Option{ .Some = x }` is a
+                // comptime-fn instantiation zig rejects ("expected type
+                // 'type', found 'fn (comptime type) type'") and
+                // `Option.None` is field-access on the fn type. The
+                // anchor is set around let/return RHS emits (see
+                // ctor_anchor_buf field doc in core.zig); no anchor →
+                // legacy qualified emit below preserves today's zig
+                // diagnostic. Docs surface: docs/manual/19
+                // §"Option"-style construction (Option.Some(42) /
+                // Option.None).
+                const en_opt = evc.enum_name;
+                const is_preamble_base = if (en_opt) |en|
+                    std.mem.eql(u8, en, "Option") or std.mem.eql(u8, en, "Result")
+                else
+                    false;
+                const is_bare_none = en_opt == null and
+                    evc.args.len == 0 and
+                    std.mem.eql(u8, evc.variant_name, "None");
+                if ((is_preamble_base or is_bare_none) and self.ctor_anchor_len > 0) {
+                    const anchor = self.ctor_anchor_buf[0..self.ctor_anchor_len];
+                    const base = if (en_opt) |en| en else "Option";
+                    if (anchor.len >= base.len and std.mem.eql(u8, anchor[0..base.len], base)) {
+                        self.writeType(anchor);
+                        self.write("{ .");
+                        self.write(evc.variant_name);
+                        self.write(" = ");
+                        if (evc.args.len == 0) {
+                            self.write("{}");
+                        } else if (evc.args.len == 1) {
+                            self.genExpr(evc.args[0]);
+                        } else {
+                            self.write(".{ ");
+                            for (evc.args, 0..) |a, i| {
+                                if (i > 0) self.write(", ");
+                                self.genExpr(a);
+                            }
+                            self.write(" }");
+                        }
+                        self.write(" }");
+                        return;
+                    }
+                }
                 // zig 0.16 REJECTS the prior emission `Enum.Variant(arg)`
                 // for payload-bearing variants with `type '@typeInfo(...).@"union".tag_type.?' not a function`.
                 // The canonical form is the tagged-union-init literal:
@@ -1451,8 +1534,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .const_block => |body| {
                 // `const { stmts; return expr; }` — compile-time block.
                 // Emit zig comptime labeled block that evaluates at
-                // compile time and yields the return value.
-                self.write("(comptime blk: {\n");
+                // compile time and yields the return value. The
+                // `comptime` keyword is dropped when the emit sits
+                // inside a `const` binding RHS (comptime_scope flag set
+                // by genBinding) — zig 0.16 rejects "redundant comptime
+                // keyword in already comptime scope" there; in runtime
+                // scope (`let x = const { … }`) the keyword stays so the
+                // block still evaluates at compile time.
+                if (!self.comptime_scope) self.write("(comptime ");
+                self.write("blk: {\n");
                 for (body, 0..) |s, i| {
                     if (i == body.len - 1 and s.payload == .return_stmt) {
                         const rs = s.payload.return_stmt;
@@ -1467,7 +1557,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         self.genStmt(s, false);
                     }
                 }
-                self.write("    })");
+                if (self.comptime_scope) {
+                    self.write("    }");
+                } else {
+                    self.write("    })");
+                }
             },
             .await_expr => |ae| {
                 // `await EXPR` (docs/manual/00-overview.md "Zero-cost
@@ -1602,15 +1696,41 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.genExpr(c.expr.*);
                 self.write("; if (@hasField(@TypeOf(__cgt), \"Ok\")) { switch (__cgt) { .Ok => |__v| break :");
                 self.write(cl);
-                self.write(" __v, .Err => |");
-                if (c.err_binding) |eb| { self.write(eb); } else { self.write("_"); }
-                self.write("| break :");
+                self.write(" __v, .Err => ");
+                if (c.err_binding) |eb| {
+                    self.write("|");
+                    self.write(eb);
+                    self.write("| ");
+                }
+                // NOTE: when `err_binding` is null (plain `catch 0`),
+                // the arm OMITS the capture entirely — zig 0.16 rejects
+                // the loose `|_|` discard form with "discard of capture;
+                // omit it instead" (surfaced by
+                // examples/error-handling/result.zag's `catch 0`).
+                self.write("break :");
                 self.write(cl);
                 self.write(" ");
                 self.genExpr(c.handler.*);
                 self.write(", } } else { switch (__cgt) { .Some => |__v| break :");
                 self.write(cl);
-                self.write(" __v, .None => break :");
+                self.write(" __v, .None => ");
+                // `.None` carries no payload, but a `catch |err| { … }`
+                // handler on an OPTION scrutinee may still reference the
+                // bound name (the None arm runs the handler per the
+                // "binding unused but handler runs" contract above).
+                // Bind the option's void payload to the same name the
+                // Err arm binds so `err` stays in scope — without the
+                // capture zig rejects the reference with "use of
+                // undeclared identifier 'err'" (surfaced by
+                // examples/error-handling/error_handling.zag's
+                // block-handler catch on a Result scrutinee, whose None
+                // arm is DEAD code that zig still type-checks).
+                if (c.err_binding) |eb| {
+                    self.write("|");
+                    self.write(eb);
+                    self.write("| ");
+                }
+                self.write("break :");
                 self.write(cl);
                 self.write(" ");
                 self.genExpr(c.handler.*);

@@ -24,7 +24,7 @@ fun build() -> Result<i32, str> {
     let c: *i32 = new i32(3);
     errdefer free(c);
 
-    let v: i32 = maybe_fail(a + b + c)?;
+    let v: i32 = maybe_fail(*a + *b + *c)?;
 
     # Success: manual free all three
     free(a);

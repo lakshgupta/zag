@@ -43,18 +43,22 @@ fun fill<T, const N: usize>(val: T) -> [N]T {
     # `collectCastType` is closed (Phase 3 followup). The `[<int_lit>]T`
     # shape had always round-tripped, but the `[<ident>]T` case
     # (needed for `comptime N`-shaped array annotations) was the
-    # missing piece. Annotation on `var out` is intentionally
-    # omitted so the binding type is inferred from the
-    # `[N]T { val ... }` array-literal RHS (the array literal goes
-    # through `parseArrayLit`, not `collectCastType`, and accepts
-    # bracket-ident sizes natively).
-    var out = [N]T { val ... };
+    # missing piece. Annotation on the binding is intentionally
+    # omitted so the type is inferred from the `[N]T { val ... }`
+    # array-literal RHS (the array literal goes through
+    # `parseArrayLit`, not `collectCastType`, and accepts
+    # bracket-ident sizes natively). `const` per zig's
+    # never-mutated lint. Drop-in swap: on the lattice
+    # `mut_val: T = N` a const binding can't be assigned.
+    const out = [N]T { val ... };
     return out;
 }
 
 # §1: two-type-param generic. Turbofish `pair<i32, str>(7, "zag")` rewrites
 #     to `pair(i32, str, 7, "zag")` at the call-site.
 fun pair<T, U>(a: T, b: U) -> str {
+    _ = a;
+    _ = b;
     return "ok";
 }
 

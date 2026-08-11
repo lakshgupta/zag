@@ -502,9 +502,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     return;
                 }
                 if (r.value) |v| {
+                    // Anchor the return value on the fn's return type so
+                    // builtin Option/Result ctors can instantiate their
+                    // generic (`return Option.None;` in a `-> Option<i32>`
+                    // fn → `return Option(i32){ .None = {} };`). No-op
+                    // unless the signature carries a generic annotation.
+                    const prev_anchor = self.pushCtorAnchor(self.fn_ret_type_buf[0..self.fn_ret_type_len]);
                     self.write("    return ");
                     self.genExpr(v);
                     self.write(";\n");
+                    self.popCtorAnchor(prev_anchor);
                 } else {
                     self.write("    return;\n");
                 }
@@ -633,6 +640,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.writeType(t);
             }
             self.write(" = blk: {\n");
+            const prev_anchor = self.pushCtorAnchor(if (b.type_name) |t| t else "");
             for (stmts) |s| {
                 if (s.payload == .return_stmt) {
                     // `return EXPR;` → `break :blk EXPR;` so zig's
@@ -649,6 +657,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
             }
             self.write("    };\n");
+            self.popCtorAnchor(prev_anchor);
             return;
         }
         // Simple path. Const-block bindings return above; reaching the
@@ -744,6 +753,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
             }
         }
+        // Anchor the RHS emit on the binding's annotation so builtin
+        // Option/Result ctors instantiate their generic (`let opt:
+        // Option<i32> = Option.Some(21);` → `Option(i32){ .Some = 21 }`).
+        // No-op when the binding is unannotated; saved/restored so a
+        // nested binding inside the RHS doesn't leak its type outward.
+        const prev_anchor = self.pushCtorAnchor(if (b.type_name) |tn| tn else "");
+        // Compile-time-block initializers (`const X = const { … }`):
+        // mark the emit comptime-scoped so the `.const_block` expr
+        // drops its `comptime` keyword (zig 0.16 rejects the redundant
+        // spelling inside an already-comptime const binding RHS).
+        // Only `const` bindings qualify — `let`/`var` keep the keyword
+        // so their blocks still evaluate at compile time.
+        const prev_comptime = self.comptime_scope;
+        self.comptime_scope = std.mem.eql(u8, kw, "const") and init_expr.payload == .const_block;
         if (backed_wrap) |wrap| {
             self.write(wrap);
             self.write("(");
@@ -752,6 +775,8 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         } else {
             self.genExpr(init_expr);
         }
+        self.comptime_scope = prev_comptime;
+        self.popCtorAnchor(prev_anchor);
         self.write(";\n");
     }
 

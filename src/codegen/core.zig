@@ -181,6 +181,33 @@ pub const Codegen = struct {
     /// bare indented `(blk: { ... });` statement (the value-discarding
     /// form zig accepts at any other position).
     fn_returns_value: bool,
+    /// Builtin generic-ctor anchor (Option/Result ctor gap): the
+    /// expected type at a binding/return site (`let x: Option<i32> = …`,
+    /// `return Option.None;`). The `.enum_variant_ctor` emit in
+    /// expr.zig reads this to INSTANTIATE the preamble generic —
+    /// `Option.Some(21)` → `Option(i32){ .Some = 21 }`. Without the
+    /// anchor the qualified form emits `Option{ .Some = 21 }` (a
+    /// comptime-fn instantiation zig rejects with "expected type
+    /// 'type', found 'fn (comptime type) type'") or `Option.None`
+    /// (field access on the fn type). Set around the RHS emit at
+    /// binding/return sites; saved/restored around nested emits so
+    /// inner bindings don't leak their annotation outward.
+    ctor_anchor_buf: [256]u8 = undefined,
+    ctor_anchor_len: usize = 0,
+    /// True while emitting the RHS of a `const NAME = const { … }`
+    /// binding (or nested within its body). The `.const_block` expr
+    /// emit (expr.zig) drops the `comptime` keyword in this state —
+    /// zig 0.16 rejects "redundant comptime keyword in already
+    /// comptime scope" when the block is the initializer of a const
+    /// binding. In runtime scope (`let x = const { … }`) the keyword
+    /// stays, so the block still evaluates at compile time.
+    comptime_scope: bool = false,
+    /// Current fn's return-type text (`Option<i32>` etc.), copied at
+    /// genFun/genMethod body entry so `return Option.None;` can anchor
+    /// the ctor emit on the return type. Zeroed at entry when the fn
+    /// has no return annotation.
+    fn_ret_type_buf: [128]u8 = undefined,
+    fn_ret_type_len: usize = 0,
     /// Per-function counter for labeled blocks (`blk: { ... }`).
     /// Reset to 0 by genFun/genMethod so each fn body has unique
     /// `__blk_0`, `__blk_1`, ... labels (zig rejects duplicate labels).
@@ -452,6 +479,16 @@ pub const MapEntry = struct {
     pub const emitPatternBindings = @import("stmt.zig").emitPatternBindings;
     pub const variantSlotType = @import("stmt.zig").variantSlotType;
     pub const seedCaptureType = @import("stmt.zig").seedCaptureType;
+    // Builtin generic-ctor anchor helpers (Option/Result ctor gap):
+    // file-scope functions re-exported so the binding/return sites in
+    // stmt.zig (pushCtorAnchor/popCtorAnchor) and the fn-body entries
+    // in decl.zig (setFnRetType) can address them via `self.` — same
+    // pattern as the getSourceTypeName re-export above. Without the
+    // bindings zig compile-errors with `no field or member function
+    // named '<name>' in 'codegen.core.Codegen'`.
+    pub const setFnRetType = @import("core.zig").setFnRetType;
+    pub const pushCtorAnchor = @import("core.zig").pushCtorAnchor;
+    pub const popCtorAnchor = @import("core.zig").popCtorAnchor;
 
     pub const needsIntDivShim = @import("primary.zig").needsIntDivShim;
     // Gap #6 widening helper (`typeAwareFmtSpec`): intentionally
@@ -498,6 +535,11 @@ pub const MapEntry = struct {
             // doesn't need a scratch — its emit is a single inline
             // `(std.os.linux.exit(...))` statement with no temp names.
             .fn_returns_value = false,
+            .ctor_anchor_buf = undefined,
+            .ctor_anchor_len = 0,
+            .comptime_scope = false,
+            .fn_ret_type_buf = undefined,
+            .fn_ret_type_len = 0,
             // Phase 3 trait-cast: the tracked trait-name set starts
             // empty; generate() populates from prog.traits before any
             // function body emits its first stmt. The array content
@@ -2830,6 +2872,34 @@ pub const MapEntry = struct {
             if (std.mem.eql(u8, ti.name, name)) return ti.type_name;
         }
         return null;
+    }
+
+    /// Copy the current fn's return-type text into `fn_ret_type_buf`
+    /// (bounded 128) so return-position Option/Result ctors can anchor
+    /// on the signature. Called at genFun/genMethod body entry; zero
+    /// length when the fn has no return annotation. Copied verbatim
+    /// (raw source text, `Option<i32>` or `Result<i32, str>`) — the
+    /// instantiated-ctor emit parses the args itself.
+    pub     fn setFnRetType(self: *Codegen, text: []const u8) void {
+        const n = if (text.len > self.fn_ret_type_buf.len) self.fn_ret_type_buf.len else text.len;
+        @memcpy(self.fn_ret_type_buf[0..n], text[0..n]);
+        self.fn_ret_type_len = n;
+    }
+
+    /// Push the expected-type anchor (`let x: Option<i32> = …`) around
+    /// an RHS emit. Returns the PRIOR anchor length so the caller can
+    /// restore it after the emit (nested bindings must not leak their
+    /// annotation outward to sibling expressions).
+    pub     fn pushCtorAnchor(self: *Codegen, text: []const u8) usize {
+        const prev = self.ctor_anchor_len;
+        const n = if (text.len > self.ctor_anchor_buf.len) self.ctor_anchor_buf.len else text.len;
+        if (n > 0) @memcpy(self.ctor_anchor_buf[0..n], text[0..n]);
+        self.ctor_anchor_len = n;
+        return prev;
+    }
+
+    pub     fn popCtorAnchor(self: *Codegen, prev: usize) void {
+        self.ctor_anchor_len = prev;
     }
 
     /// Diamond disambiguator support (docs/17 §"Diamond Disambiguation"):

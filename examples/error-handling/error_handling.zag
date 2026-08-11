@@ -9,10 +9,10 @@ fun divide(a: i32, b: i32) -> Result<i32, str> {
 }
 
 fun maybe_get(index: i32) -> Option<i32> {
-    if index < 0 or index >= 3 {
-        return None;
+    if index < 0 || index >= 3 {
+        return Option.None;
     }
-    return Some(index * 10);
+    return Option.Some(index * 10);
 }
 
 # ? propagates errors to the enclosing Result-returning function

@@ -279,6 +279,7 @@ const Codegen = core.Codegen;
             self.type_info_count += 1;
         }
         self.fn_returns_value = m.return_type != null;
+        if (m.return_type) |rt| self.setFnRetType(rt) else self.fn_ret_type_len = 0;
         // async is a top-level `async fun` surface (v1); methods are
         // always synchronous — keep the future-wrap flag off.
         self.fn_is_async = false;
@@ -583,6 +584,7 @@ const Codegen = core.Codegen;
         // for the method's own locals (not the enclosing pub fn's).
         self.type_info_count = 0;
         self.fn_returns_value = m.return_type != null;
+        if (m.return_type) |rt| self.setFnRetType(rt) else self.fn_ret_type_len = 0;
         // Param-type seeding (mirror of genFun/genFreeMethod): the
         // generic-field dispatch (`self.timers.push(...)` —
         // std.async EventLoop) reads `self`'s tracked type to resolve
@@ -652,7 +654,21 @@ const Codegen = core.Codegen;
             for (tp.bounds) |b| {
                 const method = boundToMethodName(b);
                 if (std.mem.eql(u8, method, b)) continue;
-                self.write("    if (!@hasDecl(");
+                // Primitive types (i32, f64, ...) have no decl namespace:
+                // zig 0.16 REJECTS `@hasDecl(f64, "compare")` outright
+                // ("expected struct, enum, union, or opaque; found
+                // 'f64'") — the `@typeInfo(T) != .int/.float` guards
+                // skip the lookup so the bound passes for primitives
+                // (matching the docs/16 §3 claim that built-in numerics
+                // satisfy the Ordered-style protocol naturally). The
+                // @typeInfo comparisons are comptime-known so the
+                // `and` chain collapses to a constant in every
+                // instantiation.
+                self.write("    if (@typeInfo(");
+                self.write(tp.name);
+                self.write(") != .int and @typeInfo(");
+                self.write(tp.name);
+                self.write(") != .float and !@hasDecl(");
                 self.write(tp.name);
                 self.write(", \"");
                 self.write(method);
@@ -1600,6 +1616,7 @@ const Codegen = core.Codegen;
         // explicit `return expr;` to yield a value, which zig's type
         // checker validates against the emitted `RET_TYPE` signature.
         self.fn_returns_value = false;
+        if (fun.return_type) |rt| self.setFnRetType(rt) else self.fn_ret_type_len = 0;
         // async fun (docs/manual/18 §"Async Trait Methods"): the
         // return_stmt arm wraps `return EXPR;` into
         // `return .{ .done = true, .value = EXPR };` for the emitted
@@ -1875,6 +1892,16 @@ const Codegen = core.Codegen;
             self.writeType(tt);
         }
         self.write(" = ");
+        // Compile-time-block initializer (`const SQUARES: [16]i32 =
+        // const { … }`): mark comptime-scoped like the fn-local
+        // binding path (stmt.zig genBinding) so the `.const_block`
+        // expr drops its `comptime` keyword — zig 0.16 rejects the
+        // redundant spelling inside a const-decl RHS. `var`
+        // module-level decls keep the keyword (variants evaluate at
+        // compile time in runtime scope).
+        const prev_comptime = self.comptime_scope;
+        self.comptime_scope = !cd.is_var and cd.init.*.payload == .const_block;
         self.genExpr(cd.init.*);
+        self.comptime_scope = prev_comptime;
         self.write(";\n\n");
     }

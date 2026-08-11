@@ -16,10 +16,16 @@ fun main() {
         # unconditionally but the `unsafe { }` marker makes the audit
         # boundary explicit.
         let buf: []u8 = alloc(4);
-        let p: *raw u8 = buf;
-        *p = 'a';
-        *((p + 1) as *raw u8) = 'b';
-        free(p as *raw c_void);
+        let p: *raw u8 = buf.ptr;
+        # `*raw u8` is a many-item pointer (`[*]u8`): writes use index
+        # syntax (zig rejects unindexed deref on unknown-length
+        # pointers). Pointer arithmetic is legal on the raw type.
+        p[0] = 'a';
+        let adv: *raw u8 = (p + 1) as *raw u8;
+        adv[0] = 'b';
+        # Free the owning slice (a `*raw`/many-item pointer has no
+        # size for destroy — the slice carries the allocation).
+        free(buf);
         print("unsafe ops completed\n");
     }
     print("after unsafe block\n");
@@ -29,9 +35,9 @@ fun main() {
 fun test_unsafe_block() {
     unsafe {
         let buf: []u8 = alloc(4);
-        let p: *raw u8 = buf;
-        *p = 'a';
-        free(p as *raw c_void);
+        let p: *raw u8 = buf.ptr;
+        p[0] = 'a';
+        free(buf);
     }
     assert(true);
 }

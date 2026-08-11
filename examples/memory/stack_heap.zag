@@ -35,9 +35,9 @@ fun main() {
     print("value allocated: {p}\n");
 
     # Multiple defers run in reverse order (LIFO)
-    defer free(buf);
-    defer free(p);
+    let q: *i32 = new i32(7);
     defer print("defer: cleaned up multiple allocs\n");
+    defer free(q);
 
     print("--- scope exit cleanup ---\n");
 }

@@ -9,6 +9,7 @@ extern fun close(fd: i32) -> i32;
 
 # Write a message to stdout (fd 1) via the write syscall.
 fun main() {
-    let msg = "hello from FFI\n";
+    let msg: str = "hello from FFI\n";
     let n: i32 = write(1, msg as *raw u8, msg.len as usize) as i32;
+    _ = n;
 }

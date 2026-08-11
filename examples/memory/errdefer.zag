@@ -7,31 +7,37 @@
 ## Run: zag run errdefer.zag
 
 # Simulate compute_a (success) and compute_b (intentional failure).
-fun compute_a(): Result<i32, Error> {
+enum Error {
+    Other,
+}
+
+fun compute_a() -> Result<i32, Error> {
     return Ok(10);
 }
 
-fun compute_b(): Result<i32, Error> {
-    return Err(Other);   # forces `?`-propagation in build()
+fun compute_b() -> Result<i32, Error> {
+    return Err(Error.Other);   # forces `?`-propagation in build()
 }
 
 fun build() -> Result<i32, Error> {
-    let a = compute_a()?;
+    let a: i32 = compute_a()?;
     # Runs ONLY on error path (compute_b failing). On the
     # success path, this print never executes.
     errdefer print("errdefer: cleaning partial init\n");
 
-    let b = compute_b()?;   # <- this `?` triggers errdefer
+    let b: i32 = compute_b()?;   # <- this `?` triggers errdefer
     return Ok(a + b);
 }
 
 fun main() {
-    let r = build();
+    let r: Result<i32, Error> = build();
+    _ = r;
     print("returned from build (errdefer ran above)\n");
 }
 
 @[test]
 fun test_errdefer_triggers_on_error() {
-    let r = build();
+    let r: Result<i32, Error> = build();
+    _ = r;
     assert(true);
 }
