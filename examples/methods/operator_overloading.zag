@@ -30,7 +30,7 @@ impl Vec2 {
     }
 
     pub fun __eq__(a: Vec2, b: Vec2) -> bool {
-        return a.x == b.x and a.y == b.y;
+        return a.x == b.x && a.y == b.y;
     }
 
     pub fun __index__(self: *const Vec2, i: usize) -> f64 {

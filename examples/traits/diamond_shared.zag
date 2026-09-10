@@ -26,7 +26,7 @@ struct Button {
     label: str,
 }
 
-fn print_button(self: *Button) {
+fun print_button(self: *Button) {
     print(self.label);
     print("\n");
 }

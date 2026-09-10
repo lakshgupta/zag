@@ -1230,10 +1230,37 @@ fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8,
 }
 
 /// 3-tier stdlib root resolution (see materializeStdlib docblock):
-/// cwd-relative lib/std/ → $ZAG_HOME/lib/std/ → $HOME/.local/share/zag/lib/std/.
+/// cwd-relative lib/std/ → exe-relative lib/std/ → $ZAG_HOME/lib/std/
+/// → $HOME/.local/share/zag/lib/std/.
+///
+/// The exe-relative tier exists because the test harness
+/// (examples/run_all.sh) `cd`s into examples/ before invoking the
+/// compiler — a cwd-only probe misses the in-tree lib/std/ there,
+/// and stdlib-materializing fixtures (stdlib/fs.zag) then fail with
+/// "unable to load 'std/fs.zig'". /proc/self/exe anchors to the
+/// binary's true location (zig-out/bin/<name> → repo root two
+/// dirname hops up), making resolution CWD-independent for the
+/// in-tree development layout.
 fn resolveStdlibRoot(buf: []u8) ?[]const u8 {
     if (dirExists("lib/std")) {
         return "lib/std";
+    }
+    // Exe-relative tier: /proc/self/exe → <repo>/zig-out/bin/zag-*;
+    // try <exe_dir>/../../lib/std (zig-out/bin layout) and
+    // <exe_dir>/../lib/std (flat install layout). Format strings are
+    // spelled out per candidate — bufPrint's fmt parameter is
+    // comptime and a runtime array iteration can't provide that.
+    var exe_buf: [4096:0]u8 = undefined;
+    if (readSelfExe(&exe_buf)) |exe| {
+        if (std.mem.lastIndexOfScalar(u8, exe, '/')) |slash| {
+            const exe_dir = exe[0..slash];
+            if (std.fmt.bufPrint(buf, "{s}/../../lib/std", .{exe_dir}) catch null) |p| {
+                if (dirExists(p)) return p;
+            }
+            if (std.fmt.bufPrint(buf, "{s}/../lib/std", .{exe_dir}) catch null) |p| {
+                if (dirExists(p)) return p;
+            }
+        }
     }
     if (env_path.getenv("ZAG_HOME")) |home| {
         const p = std.fmt.bufPrint(buf, "{s}/lib/std", .{home}) catch return null;
@@ -1244,6 +1271,27 @@ fn resolveStdlibRoot(buf: []u8) ?[]const u8 {
         if (dirExists(p)) return p;
     }
     return null;
+}
+
+/// Readlink /proc/self/exe into `buf` (sentinel-terminated); returns
+/// the populated slice or null when unavailable (non-Linux, buffer
+/// overflow). Linux-only is fine — the fork/execve subprocess model
+/// below is already POSIX-specific.
+fn readSelfExe(buf: *[4096:0]u8) ?[]const u8 {
+    var link_buf: [4096]u8 = undefined;
+    // Raw syscall — zig 0.16 has no std.posix.readlink facade. Raw
+    // std.os.linux.* returns usize with the errno folded into the
+    // high bit; E.init(rc) decodes it (.SUCCESS = rc is the byte
+    // count) — see AGENTS.md pitfalls §2.
+    const rc = std.os.linux.readlink("/proc/self/exe", &link_buf, link_buf.len);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return null,
+    }
+    if (rc == 0 or rc > buf.len) return null;
+    @memcpy(buf[0..rc], link_buf[0..rc]);
+    buf[rc] = 0;
+    return buf[0..rc];
 }
 
 /// Directory-existence probe (open + close; no stat needed).

@@ -24,14 +24,14 @@ impl Button {
 
 fun main() {
     let btn: Button = Button { label: "click me" };
-    let d = btn as Drawable;
+    let d: Drawable = btn as Drawable;
     d.draw();
 }
 
 @[test]
 fun test_drawable_cast() {
     let btn: Button = Button { label: "test" };
-    let d = btn as Drawable;
+    let d: Drawable = btn as Drawable;
     d.draw();
     assert(true);
 }

@@ -34,6 +34,102 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 // FILE-SCOPE methods (EXPR bucket)
 // ============================================================
 
+    /// Overloaded trait-method call-site suffix (docs/manual/18
+    /// §"Overloaded trait methods"): a trait declaring the same
+    /// method name more than once gets its VTable fields suffixed
+    /// `render_0` / `render_1` (traitMethodVtableName). Every trait
+    /// value's dispatch shim owns a distinct zig method per overload
+    /// (arity is the only overload dimension), so the argument count
+    /// alone picks the vtable field. Unique names return null — the
+    /// verbatim emit stays byte-identical for the non-overloaded
+    /// baseline.
+    pub     fn traitOverloadSuffix(self: *Codegen, trait_name: []const u8, method_name: []const u8, arg_count: usize) ?[]const u8 {
+        const td = self.traitDeclByName(trait_name) orelse return null;
+        var dup_count: usize = 0;
+        for (td.methods) |tm| {
+            if (std.mem.eql(u8, tm.name, method_name)) dup_count += 1;
+        }
+        if (dup_count <= 1) return null;
+        // `self` is the implicit receiver; user args follow it. The
+        // FIRST overload whose user-arity matches wins (declaration
+        // order — matches traitMethodVtableName's `_N` indexing).
+        for (td.methods, 0..) |tm, tmi| {
+            if (!std.mem.eql(u8, tm.name, method_name)) continue;
+            if (tm.params.len < 1 or tm.params.len - 1 != arg_count) continue;
+            // Declaration-order index among same-name overloads.
+            var dup_idx: usize = 0;
+            var total: usize = 0;
+            for (td.methods, 0..) |tm2, ti2| {
+                if (std.mem.eql(u8, tm2.name, method_name)) {
+                    if (ti2 < tmi) dup_idx += 1;
+                    total += 1;
+                }
+            }
+            // Instance intern pool (single-threaded compiler): the
+            // returned suffix is a slice that must outlive this call
+            // until the caller writes it — a shared static buffer was
+            // aliased by back-to-back suffix lookups.
+            var scratch: [16]u8 = undefined;
+            const sfx = std.fmt.bufPrint(&scratch, "_{d}", .{dup_idx}) catch return null;
+            return self.internedSuffixName(sfx);
+        }
+        return null;
+    }
+
+    /// Lookup companion for traitOverloadSuffix: the tracked trait
+    /// decl by source name, or null. Mirrors isTrackedTrait's walk
+    /// shape but returns the decl so dispatch sites can read the
+    /// method list without re-walking prog.traits in the caller.
+    pub     fn traitDeclByName(self: *Codegen, name: []const u8) ?ast.TraitDecl {
+        for (self.prog.traits) |td| {
+            if (std.mem.eql(u8, td.name, name)) return td;
+        }
+        return null;
+    }
+
+    /// True when ANY impl method named `method_name` on target type
+    /// `type_name` takes a mutable `self: *T` receiver (vs
+    /// `self: *const T`). Consulted before emitting `&ident` at a
+    /// `obj.Trait.method(...)` direct-dispatch call site: a `let`
+    /// binding's address is `*const T`, and zig rejects passing it
+    /// to a `*T` parameter as const-discard — the caller wraps the
+    /// address in `@constCast`. A no-op verdict for `*const T`
+    /// receivers keeps the qualifier (zig accepts `*const` →
+    /// `*const`). Bounded walk over prog.impls; false when no impl
+    /// matches (unreachable for a resolved binding — the qualifier
+    /// call site only fires after the trait method resolved).
+    /// Type-agnostic variant of methodTakesMutableSelf: true when ANY
+    /// impl in the program provides `method_name` with a mutable
+    /// `self: *T` receiver. Used by the verbatim method-call emit —
+    /// codegen has no full type resolver, so the receiver's concrete
+    /// type may be unknown (embedded forwarders, stdlib types); the
+    /// @constCast wrap is a no-op on mutable bindings and the only
+    /// correct shape for `let`-bound receivers of `*T` methods.
+    pub     fn methodTakesMutableSelfanyType(self: *Codegen, method_name: []const u8) bool {
+        for (self.prog.impls) |impl| {
+            for (impl.methods) |m| {
+                if (!std.mem.eql(u8, m.name, method_name)) continue;
+                if (m.params.len == 0) continue;
+                if (std.mem.startsWith(u8, m.params[0].type_text, "*const")) return false;
+                if (std.mem.startsWith(u8, m.params[0].type_text, "*")) return true;
+            }
+        }
+        return false;
+    }
+
+    pub     fn methodTakesMutableSelf(self: *Codegen, type_name: []const u8, method_name: []const u8) bool {
+        for (self.prog.impls) |impl| {
+            if (!std.mem.eql(u8, impl.target_type, type_name)) continue;
+            for (impl.methods) |m| {
+                if (!std.mem.eql(u8, m.name, method_name)) continue;
+                if (m.params.len == 0) continue;
+                if (std.mem.startsWith(u8, m.params[0].type_text, "*const")) return false;
+                if (std.mem.startsWith(u8, m.params[0].type_text, "*")) return true;
+            }
+        }
+        return false;
+    }
+
     pub     fn genExpr(self: *Codegen, expr: ast.Expr) void {
         if (expr.loc.line > 0) self.recordLoc(expr.loc, "");
         switch (expr.payload) {
@@ -234,6 +330,33 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         // fns `<Union>_<Method>`.
                         if (self.tryEmitUnionOrphanCall(recv, meth, c.args)) {
                             dispatched = true;
+                        }
+                    }
+                    if (!dispatched) {
+                        // docs/manual/18 §"Overloaded trait methods" —
+                        // dotted-callee mirror of the `.method_call`
+                        // trait-value dispatch: a trait-typed receiver
+                        // gets the overload-suffixed vtable shim
+                        // (`r.render_0()`); plain receivers stay verbatim.
+                        if (self.getSourceTypeName(recv)) |rtn| {
+                            var rtrait: []const u8 = rtn;
+                            if (std.mem.startsWith(u8, rtrait, "*const ")) rtrait = rtrait["*const ".len..];
+                            if (std.mem.startsWith(u8, rtrait, "*")) rtrait = rtrait["*".len..];
+                            if (self.isTrackedTrait(rtrait)) {
+                                if (self.traitOverloadSuffix(rtrait, meth, c.args.len)) |sfx| {
+                                    self.write(recv);
+                                    self.write(".");
+                                    self.write(meth);
+                                    self.write(sfx);
+                                    self.write("(");
+                                    for (c.args, 0..) |arg, i| {
+                                        if (i > 0) self.write(", ");
+                                        self.genExpr(arg);
+                                    }
+                                    self.write(")");
+                                    dispatched = true;
+                                }
+                            }
                         }
                     }
                     if (!dispatched) {
@@ -922,9 +1045,75 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // uniform slots (all-named or all-positional), so the
                 // first slot decides.
                 if (sl.inits.len > 0 and sl.inits[0].name.len == 0) {
-                    for (sl.inits, 0..) |fi, i| {
-                        if (i > 0) self.write(", ");
-                        self.genExpr(fi.value.*);
+                    // docs/manual/12 §"Structural Embedding" carve-out:
+                    // a leading positional slot whose expression is a
+                    // bare struct literal of an EMBEDDED field's type
+                    // emits as a NAMED field (`Widget { ... }` →
+                    // `.Widget = ...`), because the outer struct's
+                    // embed row lands as a named field of the embed
+                    // type (genStructDecl's `.embed` arm) and zig
+                    // rejects a positional init on a mixed named-field
+                    // struct. Non-embed SIMD vector literals keep the
+                    // positional emit byte-identical.
+                    var named_embed = false;
+                    if (sl.inits[0].value.payload == .struct_lit) {
+                        const embed_type = sl.inits[0].value.payload.struct_lit.type_name;
+                        var base_sl = sl.type_name;
+                        if (std.mem.startsWith(u8, base_sl, "*const ")) base_sl = base_sl["*const ".len..];
+                        if (std.mem.startsWith(u8, base_sl, "*")) base_sl = base_sl["*".len..];
+                        for (self.prog.structs) |sd2| {
+                            if (!std.mem.eql(u8, sd2.name, base_sl)) continue;
+                            for (sd2.fields) |f2| {
+                                if (f2.kind != .embed) continue;
+                                if (std.mem.eql(u8, f2.kind.embed.type_name, embed_type)) {
+                                    named_embed = true;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (named_embed) {
+                        for (sl.inits, 0..) |fi, i| {
+                            if (i > 0) self.write(", ");
+                            if (fi.name.len > 0) {
+                                // Named slot alongside the embed
+                                // (`label: "ok"`): zig rejects ANY
+                                // positional init once one field is
+                                // named, so emit the `.name = value`
+                                // form for these too.
+                                self.write(".");
+                                self.write(fi.name);
+                                self.write(" = ");
+                                self.genExpr(fi.value.*);
+                            } else if (fi.value.payload == .struct_lit) {
+                                const et = fi.value.payload.struct_lit.type_name;
+                                var matched = false;
+                                for (self.prog.structs) |sd2| {
+                                    if (!std.mem.eql(u8, sd2.name, sl.type_name)) continue;
+                                    for (sd2.fields) |f2| {
+                                        if (f2.kind != .embed) continue;
+                                        if (std.mem.eql(u8, f2.kind.embed.type_name, et)) {
+                                            self.write(".");
+                                            self.write(et);
+                                            self.write(" = ");
+                                            self.genExpr(fi.value.*);
+                                            matched = true;
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if (!matched) self.genExpr(fi.value.*);
+                            } else {
+                                self.genExpr(fi.value.*);
+                            }
+                        }
+                    } else {
+                        for (sl.inits, 0..) |fi, i| {
+                            if (i > 0) self.write(", ");
+                            self.genExpr(fi.value.*);
+                        }
                     }
                 } else {
                     for (sl.inits, 0..) |fi, i| {
@@ -1333,6 +1522,127 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 //      infer from): `Box_T_make(i32, 42)`. The paren
                 //      args are the comptime type args; turbofish
                 //      `Box<i32>(...)` carries them in type_args.
+                //
+                // docs/manual/18 §"Overloaded trait methods": a trait
+                // value bound through `x as Trait` carries the
+                // overload-suffixed dispatch shim (`render_0` /
+                // `render_1`), so a call on a TRAIT-TYPED receiver
+                // gets the arity-matched suffix appended. The receiver's
+                // tracked source-type strips to the trait name; plain
+                // struct receivers keep the verbatim emit (zig resolves
+                // member methods directly). The receiver const-fix
+                // rides the same shape: a `let` binding (const)
+                // calling a `self: *T` method is a const-discard in
+                // zig, so the callee's receiver mutability is checked
+                // and a `@constCast` wraps the address-of form.
+                //
+                // `obj.Trait.method()` direct dispatch (docs/18
+                // §"Dot-qualified methods" — the AST shape is
+                // method_call(member_access(ident, "TraitName"),
+                // "method", args)): emit the monomorphized free fn
+                // `ConcreteType_TraitName_methodName(ident, args)` —
+                // zero vtable overhead. Fires before the trait-value
+                // overload dispatch so the qualified call never
+                // routes through the vtable shim.
+                if (mc.target.payload == .member_access) {
+                    const ma = mc.target.payload.member_access;
+                    if (ma.target.payload == .ident and self.isTrackedTrait(ma.name)) {
+                        const concrete = ma.target.payload.ident;
+                        // Receiver type: the ident's tracked annotation,
+                        // or — for `self.Drawable.draw()` inside a method
+                        // body — the enclosing impl's target type kept in
+                        // current_receiver_struct_name (a bare `self` has
+                        // no typed-binding entry, which previously made
+                        // the resolver emit verbatim and zig reject
+                        // "no field named 'Drawable'").
+                        var receiver_type: ?[]const u8 = null;
+                        if (self.getSourceTypeName(concrete)) |ct| {
+                            receiver_type = ct;
+                        } else if (std.mem.eql(u8, concrete, "self")) {
+                            if (self.current_receiver_struct_name) |rs| receiver_type = rs;
+                        }
+                        if (receiver_type != null) {
+                            const ct = receiver_type.?;
+                            // Fn-name prefix is the CONCRETE TYPE name
+                            // (`Button_Drawable_draw`), never the
+                            // receiver ident — `self.Drawable.draw()`
+                            // inside a resolver body must not decay to
+                            // `self_Drawable_draw` (undeclared ident).
+                            var type_base: []const u8 = ct;
+                            if (std.mem.startsWith(u8, type_base, "*const ")) type_base = type_base["*const ".len..];
+                            if (std.mem.startsWith(u8, type_base, "*")) type_base = type_base["*".len..];
+                        var arg_emitted = false;
+                        self.write(type_base);
+                        self.write("_");
+                        self.write(ma.name);
+                        self.write("_");
+                        self.write(mc.name);
+                        self.write("(");
+                        {
+                            if (!std.mem.startsWith(u8, ct, "*")) {
+                                // Value binding: pass address-of. When
+                                // the callee's receiver is `self: *T`,
+                                // zig rejects a `let` binding's
+                                // `*const T` as const-discard — strip
+                                // the qualifier with @constCast (a
+                                // no-op on mutable `var` bindings).
+                                if (self.methodTakesMutableSelf(ma.name, mc.name)) {
+                                    self.write("@constCast(&");
+                                    self.write(concrete);
+                                    self.write(")");
+                                } else {
+                                    self.write("&");
+                                    self.write(concrete);
+                                }
+                            } else if (std.mem.startsWith(u8, ct, "*const ")) {
+                                // `*const T` binding + `self: *T`
+                                // callee: strip the qualifier in place.
+                                if (self.methodTakesMutableSelf(ma.name, mc.name)) {
+                                    self.write("@constCast(");
+                                    self.write(concrete);
+                                    self.write(")");
+                                } else {
+                                    self.write(concrete);
+                                }
+                            } else {
+                                // `*T` or other pointer: passes verbatim.
+                                self.write(concrete);
+                            }
+                            arg_emitted = true;
+                        }
+                        for (mc.args) |a| {
+                            if (arg_emitted) self.write(", ");
+                            self.genExpr(a);
+                            arg_emitted = true;
+                        }
+                        self.write(")");
+                        return;
+                        }
+                    }
+                }
+                if (mc.target.payload == .ident) {
+                    if (self.getSourceTypeName(mc.target.payload.ident)) |tn| {
+                        // Trait value dispatch: the receiver's annotation
+                        // is (a pointer-stripped) tracked trait name.
+                        var trait_base: []const u8 = tn;
+                        if (std.mem.startsWith(u8, trait_base, "*const ")) trait_base = trait_base["*const ".len..];
+                        if (std.mem.startsWith(u8, trait_base, "*")) trait_base = trait_base["*".len..];
+                        if (self.isTrackedTrait(trait_base)) {
+                            const suffix = self.traitOverloadSuffix(trait_base, mc.name, mc.args.len);
+                            self.genExpr(mc.target.*);
+                            self.write(".");
+                            self.write(mc.name);
+                            if (suffix) |s| self.write(s);
+                            self.write("(");
+                            for (mc.args, 0..) |a, i| {
+                                if (i > 0) self.write(", ");
+                                self.genExpr(a);
+                            }
+                            self.write(")");
+                            return;
+                        }
+                    }
+                }
                 if (mc.target.payload == .ident) {
                     if (self.getSourceTypeName(mc.target.payload.ident)) |tn| {
                         if (self.genericInstanceOfTypeText(tn)) |gi| {
@@ -1489,6 +1799,43 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 if (mc.target.payload == .ident and mc.type_args.len == 0) {
                     if (self.tryEmitUnionOrphanCall(mc.target.payload.ident, mc.name, mc.args)) {
                         return;
+                    }
+                }
+                // Const-receiver fix (docs/18 §"Using Traits" — the
+                // resolving-method call shape): a `let` binding is a
+                // zig const, so `btn.method()` on a `self: *T` method
+                // rejects `&btn` as const-discard. When the receiver
+                // is an ident bound to a VALUE (non-pointer annotation)
+                // AND any impl of that method takes a mutable `self`,
+                // wrap the receiver in `@constCast(&…)`. `var` bindings
+                // (bindingIsVar) stay bare — their `&` is already `*T`,
+                // and an unconditional cast would hide genuine mut-
+                // ability errors. `obj.Trait.method()` and generic-
+                // dispatch sites above carry their own copies of this
+                // logic (the receiver kind differs per path).
+                if (mc.target.payload == .ident) {
+                    if (self.getSourceTypeName(mc.target.payload.ident)) |rtn| {
+                        if (!std.mem.startsWith(u8, rtn, "*")) {
+                            if (self.methodTakesMutableSelfanyType(mc.name)) {
+                                self.write("@constCast(&");
+                                self.genExpr(mc.target.*);
+                                self.write(")");
+                                self.write(".");
+                                self.write(mc.name);
+                                self.write("(");
+                                for (mc.type_args, 0..) |ta, i| {
+                                    if (i > 0) self.write(", ");
+                                    self.writeType(ta);
+                                }
+                                if (mc.args.len > 0 and mc.type_args.len > 0) self.write(", ");
+                                for (mc.args, 0..) |a, i| {
+                                    if (i > 0) self.write(", ");
+                                    self.genExpr(a);
+                                }
+                                self.write(")");
+                                return;
+                            }
+                        }
                     }
                 }
                 self.genExpr(mc.target.*);

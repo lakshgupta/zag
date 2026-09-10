@@ -18,7 +18,7 @@ struct Button {
 }
 
 # Shared helper: formats the button once; both trait bodies call it.
-fn button_format(self: *Button) -> str {
+fun button_format(self: *Button) -> str {
     return self.label;
 }
 

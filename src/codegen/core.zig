@@ -35,6 +35,13 @@ const BindingTypeInfo = struct {
     name: []const u8,
     type_name: []const u8,
     is_closure: bool = false,
+    /// `true` only for `var` bindings — the mutable kind. Method-call
+    /// emit consults this before wrapping a receiver's address in
+    /// `@constCast`: a `var` binding needs NO cast (its `&` is already
+    /// `*T`), and an unconditional cast would hide genuine mutability
+    /// errors (`var` + `*const T` receiver). `let`/`const` default to
+    /// `false`, matching zig's immutable-by-default semantics.
+    is_var: bool = false,
 };
 
 /// Comptime-empty Program default for freshly-`init()`ed Codegen
@@ -339,6 +346,16 @@ pub const Codegen = struct {
     /// Populated by buildMapText() after generate() completes map recording.
     map_text_buf: [131072]u8 = undefined,
     map_text_len: u32 = 0,
+    /// Interning pool for overload-suffixed method names (`go_0`,
+    /// `go_1`, …). traitMethodVtableName / traitMethodVtableNameFull
+    /// previously formatted into a SHARED static buffer, so the Nth
+    /// call overwrote the buffer the (N-1)th call's return slice
+    /// pointed at — two `go` overloads decayed to two `.go_1` vtable
+    /// fields ("duplicate struct member name"). internedSuffixName
+    /// copies each result into this append-only pool; entries live
+    /// for the whole generate() pass, which is all callers need.
+    name_pool_buf: [16384]u8 = undefined,
+    name_pool_len: usize = 0,
 
 /// One entry in `Codegen.variant_fields_buf` (gap #2 fix). Carries
 /// the (enum_name, variant_name) key + the user's actual field names
@@ -404,6 +421,18 @@ pub const MapEntry = struct {
     pub const genTemplateLit = @import("primary.zig").genTemplateLit;
     pub const genTraitDecl = @import("decl.zig").genTraitDecl;
     pub const genTraitRegistration = @import("decl.zig").genTraitRegistration;
+    // Unused-param discard pass (docs/manual/18 §"Default Methods" +
+    // zig 0.16 unused-parameter hard error): the default-method emit
+    // in core.zig and the embed-forwarder emit in decl.zig call
+    // `self.markUnusedParamDiscards(...)`; the walker lives alongside
+    // the other function-body emitters in decl.zig, so re-export it
+    // here (same pattern as genFreeMethod / runEscapeAnalysis above).
+    pub const markUnusedParamDiscards = @import("decl.zig").markUnusedParamDiscards;
+    pub const methodTakesMutableSelfanyType = @import("expr.zig").methodTakesMutableSelfanyType;
+    pub const bindingIsVar = @import("core.zig").bindingIsVar;
+    pub const traitMethodVtableNameFull = @import("core.zig").traitMethodVtableNameFull;
+    pub const traitMethodVtableName = @import("core.zig").traitMethodVtableName;
+    pub const internedSuffixName = @import("core.zig").internedSuffixName;
     pub const genTypeParamsPreamble = @import("decl.zig").genTypeParamsPreamble;
     pub const genBoundsGuards = @import("decl.zig").genBoundsGuards;
     pub const rewriteReceiverType = @import("decl.zig").rewriteReceiverType;
@@ -450,6 +479,15 @@ pub const MapEntry = struct {
     pub const traitDeclaresMethod = @import("core.zig").traitDeclaresMethod;
     pub const resolveTraitBindings = @import("core.zig").resolveTraitBindings;
     pub const resolveTraitBinding = @import("core.zig").resolveTraitBinding;
+    // Overload-suffix call-site dispatch (docs/manual/18 §"Overloaded
+    // trait methods"): the trait-value call sites in expr.zig consult
+    // the trait decl + arity to pick the `_N`-suffixed vtable shim.
+    // Re-exported like traitDeclaresMethod above so
+    // `self.traitOverloadSuffix(...)` / `self.traitDeclByName(...)` /
+    // `self.methodTakesMutableSelf(...)` resolve from expr.zig.
+    pub const traitOverloadSuffix = @import("expr.zig").traitOverloadSuffix;
+    pub const traitDeclByName = @import("expr.zig").traitDeclByName;
+    pub const methodTakesMutableSelf = @import("expr.zig").methodTakesMutableSelf;
     // Gap #2 lookup helper registration: needed because
     // src/codegen/expr.zig's `.enum_variant_ctor` arm calls
     // `self.lookupVariantFields(...)` to recover the user's
@@ -1769,6 +1807,24 @@ pub const MapEntry = struct {
         // `matched_targets_buf` so the orphan-impl loop sees it as
         // unmatched. Non-generic structs keep their existing nested-
         // method emission (genStructDecl's `!is_generic` branch).
+        // Phase 3 trait-cast: populate `tracked_trait_names` from
+        // `prog.traits` BEFORE any decl body emits — this includes the
+        // struct-decl loop below, whose nested method bodies can
+        // contain `self.Trait.method()` resolver dispatches (docs/18
+        // §"Resolving methods"): `genStructDecl` runs while
+        // `genExpr` still walks those bodies, and the dispatch arm in
+        // `genExpr` keys off `isTrackedTrait`. Populating after the
+        // struct loop left the set empty during method-body emission,
+        // so resolver calls fell through to the verbatim emit and zig
+        // rejected them with "no field named '<Trait>'". The populate
+        // only records source-decl names into a plain buffer — order-
+        // independent w.r.t. the struct/impl broadcasting itself.
+        for (prog.traits) |td| {
+            if (self.tracked_trait_count < self.tracked_trait_names.len) {
+                self.tracked_trait_names[self.tracked_trait_count] = td.name;
+                self.tracked_trait_count += 1;
+            }
+        }
         for (prog.structs) |sd| {
             if (matched_count < matched_targets_buf.len and sd.type_params.len == 0) {
                 matched_targets_buf[matched_count] = sd.name;
@@ -1776,23 +1832,9 @@ pub const MapEntry = struct {
             }
             self.genStructDecl(sd, prog.impls);
         }
-        // Phase 3 trait-cast: populate `tracked_trait_names` from
-        // `prog.traits` BEFORE any function body emits so the cast
-        // arm in `genExpr` sees the populated set when traversing
-        // function-local `x as Trait` expressions. The populate
-        // happens AFTER struct/enum-impl broadcasting (so any
-        // forward-reference quirks on the struct side don't bleed
-        // into the trait-side lookup) but before the trait-decl
-        // emission loop below (the trait declarations are emitted
-        // into the output buffer, but the codegen-side tracking can
-        // happen any time since it just records the source-decl name
-        // verbatim — independent of zig-side type resolution).
-        for (prog.traits) |td| {
-            if (self.tracked_trait_count < self.tracked_trait_names.len) {
-                self.tracked_trait_names[self.tracked_trait_count] = td.name;
-                self.tracked_trait_count += 1;
-            }
-        }
+        // (trait-name populate moved above the struct loop — see the
+        // resolver-dispatch comment there; this space intentionally
+        // left to keep the broadcast ordering comment below intact.)
 
         // Generic-struct tracking: record every struct decl with
         // type params so `.method_call` can dispatch instance calls
@@ -1813,7 +1855,7 @@ pub const MapEntry = struct {
         for (prog.traits) |td| {
             for (td.methods, 0..) |tm, tmi| {
                 if (tm.body == null) continue;
-                const vtable_name = traitMethodVtableName(td, tmi);
+                const vtable_name = self.traitMethodVtableName(td, tmi);
                 self.write("pub fn ");
                 self.write(td.name);
                 self.write("__");
@@ -1828,6 +1870,12 @@ pub const MapEntry = struct {
                 self.write(") ");
                 if (tm.return_type) |rt| self.writeType(rt) else self.write("void");
                 self.write(" {\n");
+                // Unused-param discard pass (docs/manual/18 §"Default
+                // Methods"): the *anyopaque receiver shim and any
+                // body-unreferenced user params need `_ = name;`
+                // discards or zig 0.16 hard-errors on the unused
+                // parameter. Same conservative walk as genFreeMethod's.
+                self.markUnusedParamDiscards(tm.params, tm.body.?);
                 for (tm.body.?) |s| self.genStmt(s, false);
                 self.write("}\n\n");
             }
@@ -1938,7 +1986,7 @@ pub const MapEntry = struct {
                         if (!std.mem.eql(u8, td1.name, trait_name)) continue;
                         for (td1.methods, 0..) |tm1, tmi1| {
                             if (std.mem.eql(u8, tm1.name, m.name) and tm1.params.len == m.params.len) {
-                                const vfn = traitMethodVtableName(td1, tmi1);
+                                const vfn = self.traitMethodVtableName(td1, tmi1);
                                 if (!std.mem.eql(u8, vfn, m.name)) {
                                     m_resolved.name = vfn;
                                 }
@@ -2023,20 +2071,43 @@ pub const MapEntry = struct {
             var default_field_buf: [16][]const u8 = undefined;
             var default_count: usize = 0;
             var method_field_buf: [16][]const u8 = undefined;
-            for (prog.traits) |td| {
+            // Defensive default BEFORE the trait-decl walk: an impl
+            // whose trait name doesn't match any declared trait (or a
+            // registration bucket whose decl emit never ran) would
+            // otherwise hand genTraitRegistration UNDEFINED slices —
+            // write() on a garbage slice is UB/integer-overflow. The
+            // walk below overrides entries with the `_N`-suffixed
+            // vtable names when the decl matches.
+            for (trait_reg_buf[ri].methods[0..trait_reg_buf[ri].method_count], 0..) |im, ii| {
+                method_field_buf[ii] = im.name;
+            }
+            // Matched trait decl (for the unfulfilled-slot pass in
+            // genTraitRegistration) — nullable because a registration
+            // bucket can reference a trait whose decl emit didn't run
+            // (defensive; resolveTraitBindings only binds to declared
+            // traits, so this is a can't-happen guard).
+            var matched_trait: ?*const ast.TraitDecl = null;
+            for (prog.traits) |*td| {
                 if (!std.mem.eql(u8, td.name, trait_reg_buf[ri].trait)) continue;
+                matched_trait = @constCast(td);
                 for (td.methods, 0..) |tm, tmi| {
                     if (tm.body == null) continue;
                     var already_impl = false;
                     for (trait_reg_buf[ri].methods[0..trait_reg_buf[ri].method_count]) |im| {
-                        if (std.mem.eql(u8, im.name, tm.name) and im.params.len == tm.params.len) {
+                        // baseMethodNameOf: bucket names carry the `_N`
+                        // overload suffix; decl list is bare. Compare
+                        // base + arity (same contract as the field-name
+                        // walk below).
+                        if (im.params.len == tm.params.len and
+                            std.mem.eql(u8, baseMethodNameOf(im.name), tm.name))
+                        {
                             already_impl = true;
                             break;
                         }
                     }
                     if (!already_impl and default_count < default_buf.len) {
                         default_buf[default_count] = tm.name;
-                        default_field_buf[default_count] = traitMethodVtableName(td, tmi);
+                        default_field_buf[default_count] = self.traitMethodVtableName(td.*, tmi);
                         default_count += 1;
                     }
                 }
@@ -2044,8 +2115,18 @@ pub const MapEntry = struct {
                 for (trait_reg_buf[ri].methods[0..trait_reg_buf[ri].method_count], 0..) |im, ii| {
                     var found = false;
                     for (td.methods, 0..) |tm, tmi| {
-                        if (std.mem.eql(u8, im.name, tm.name) and im.params.len == tm.params.len) {
-                            method_field_buf[ii] = traitMethodVtableName(td, tmi);
+                        // Overload-suffix compare (mirrors genTraitRegis-
+                        // tration's baseMethodName): the bucket stores
+                        // the SUFFIXED name (`render_1`); the decl list
+                        // carries the bare spelling (`render`). Match on
+                        // base name + arity so each overload maps to its
+                        // OWN decl slot — the old exact-equal compare
+                        // matched BOTH buckets to the LAST same-name decl
+                        // and emitted duplicate vtable fields.
+                        if (im.params.len == tm.params.len and
+                            std.mem.eql(u8, baseMethodNameOf(im.name), tm.name))
+                        {
+                            method_field_buf[ii] = self.traitMethodVtableName(td.*, tmi);
                             found = true;
                             break;
                         }
@@ -2061,6 +2142,7 @@ pub const MapEntry = struct {
                 method_field_buf[0..trait_reg_buf[ri].method_count],
                 default_buf[0..default_count],
                 default_field_buf[0..default_count],
+                if (matched_trait) |mtd| mtd.methods else &[_]ast.TraitMethodDecl{},
             );
         }
 
@@ -2874,6 +2956,16 @@ pub const MapEntry = struct {
         return null;
     }
 
+    /// True when `name`'s tracked binding is a `var` (mutable kind).
+    /// Method-call emit consults this before wrapping a receiver's
+    /// address in `@constCast` — see BindingTypeInfo.is_var.
+    pub     fn bindingIsVar(self: *Codegen, name: []const u8) bool {
+        for (self.type_info_buf[0..self.type_info_count]) |ti| {
+            if (std.mem.eql(u8, ti.name, name)) return ti.is_var;
+        }
+        return false;
+    }
+
     /// Copy the current fn's return-type text into `fn_ret_type_buf`
     /// (bounded 128) so return-position Option/Result ctors can anchor
     /// on the signature. Called at genFun/genMethod body entry; zero
@@ -2929,7 +3021,18 @@ pub const MapEntry = struct {
     /// and `render_f64` → `render_0` and `render_1`.
     /// The returned slice points into a static scratch buffer valid
     /// until the next call to this function.
-    pub     fn traitMethodVtableName(trait_decl: ast.TraitDecl, method_index: usize) []const u8 {
+    /// Copy `name` into the per-instance name pool and return the
+    /// pooled slice. See `name_pool_buf` for why the old shared-
+    /// static-buffer contract was unsound for overload suffixes.
+    pub     fn internedSuffixName(self: *Codegen, name: []const u8) []const u8 {
+        if (self.name_pool_len + name.len > self.name_pool_buf.len) return name;
+        const start = self.name_pool_len;
+        @memcpy(self.name_pool_buf[start .. start + name.len], name);
+        self.name_pool_len += name.len;
+        return self.name_pool_buf[start .. start + name.len];
+    }
+
+    pub     fn traitMethodVtableName(self: *Codegen, trait_decl: ast.TraitDecl, method_index: usize) []const u8 {
         if (method_index >= trait_decl.methods.len) return "";
         const method_name = trait_decl.methods[method_index].name;
 
@@ -2943,21 +3046,52 @@ pub const MapEntry = struct {
         }
         if (dup_count <= 1) return method_name;
 
-        // Use a thread-local buffer for the suffixed name. Each call
-        // overwrites; callers must consume the result before the next
-        // call.
-        const tls_buf = struct {
-            var buf: [128]u8 = undefined;
-        };
-        @memcpy(tls_buf.buf[0..method_name.len], method_name);
+        // Format into a local scratch, then INTERN into the
+        // instance's name pool. The old shared static buffer was
+        // overwritten by the next call while earlier return slices
+        // still pointed into it.
+        var scratch: [128]u8 = undefined;
+        @memcpy(scratch[0..method_name.len], method_name);
         const suffix = std.fmt.bufPrint(
-            tls_buf.buf[method_name.len + 1 .. tls_buf.buf.len],
+            scratch[method_name.len + 1 .. scratch.len],
             "{d}",
             .{my_dup_index},
         ) catch "0";
-        tls_buf.buf[method_name.len] = '_';
+        scratch[method_name.len] = '_';
         const total_len = method_name.len + 1 + suffix.len;
-        return tls_buf.buf[0..total_len];
+        return self.internedSuffixName(scratch[0..total_len]);
+    }
+
+    /// Overload-suffix companion to `traitMethodVtableName` operating
+    /// on ANY method list (the same-name-count walk is identical). Used
+    /// by genTraitRegistration's unfulfilled-slot emit where the list
+    /// is the trait's full method slice rather than the (decl, index)
+    /// pair — same `_N` numbering, so a vtable slot name computed here
+    /// always matches the one genTraitDecl computed from the decl.
+    pub     fn traitMethodVtableNameFull(self: *Codegen, methods: []const ast.TraitMethodDecl, method_index: usize) []const u8 {
+        if (method_index >= methods.len) return "";
+        const method_name = methods[method_index].name;
+        var dup_count: usize = 0;
+        var my_dup_index: usize = 0;
+        for (methods, 0..) |tm, i| {
+            if (std.mem.eql(u8, tm.name, method_name)) {
+                if (i < method_index) my_dup_index += 1;
+                dup_count += 1;
+            }
+        }
+        if (dup_count <= 1) return method_name;
+        // Interned like traitMethodVtableName — shared static buffers
+        // alias across calls.
+        var scratch: [128]u8 = undefined;
+        @memcpy(scratch[0..method_name.len], method_name);
+        const suffix = std.fmt.bufPrint(
+            scratch[method_name.len + 1 .. scratch.len],
+            "{d}",
+            .{my_dup_index},
+        ) catch "0";
+        scratch[method_name.len] = '_';
+        const total_len = method_name.len + 1 + suffix.len;
+        return self.internedSuffixName(scratch[0..total_len]);
     }
 
     /// Canonical impl-form dispatch rule (docs/17 §"Implementing"
@@ -3213,4 +3347,18 @@ fn stdlibPreambleName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "Ordering")) return "__zag_Ordering";
     if (std.mem.eql(u8, name, "Counters")) return "__zag_Counters";
     return "";
+}
+
+/// Strip a trailing `_N` overload suffix (`render_1` → `render`).
+/// File-scope twin of decl.zig's baseMethodName (core.zig cannot
+/// import decl.zig at file scope without a cycle — decl imports
+/// core's types). Used by the vtable-registration field-name walk
+/// where bucket entries carry suffixed names but the trait decl's
+/// method list carries bare spellings.
+fn baseMethodNameOf(name: []const u8) []const u8 {
+    if (name.len == 0 or !std.ascii.isDigit(name[name.len - 1])) return name;
+    var end: usize = name.len;
+    while (end > 0 and std.ascii.isDigit(name[end - 1])) end -= 1;
+    if (end == 0 or end + 1 > name.len or name[end - 1] != '_') return name;
+    return name[0 .. end - 1];
 }

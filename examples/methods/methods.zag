@@ -20,7 +20,7 @@ impl Vec3 {
 
     # Immutable borrow — reads only
     pub fun length(self: *const Vec3) -> f64 {
-        return size_of(f64);
+        return self.x + self.y + self.z;
     }
 
     # Mutable borrow — can write through self

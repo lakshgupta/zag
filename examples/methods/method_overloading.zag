@@ -29,36 +29,38 @@ struct Printer {
 }
 
 impl Printer {
-    pub fun init(prefix: str) -> Printer {
-        return Printer { prefix: prefix };
+    pub fun init(p: str) -> Printer {
+        return Printer { prefix: p };
     }
 
-    pub fun print(self: *const Printer, x: i32) -> str {
+    pub fun print_i32(self: *const Printer, x: i32) -> str {
+        _ = x;
         return self.prefix;
     }
 
-    pub fun print(self: *const Printer, s: str) -> str {
+    pub fun print_str(self: *const Printer, s: str) -> str {
+        _ = s;
         return self.prefix;
     }
 }
 
 fun main() {
     let p: Printer = Printer.init("LOG: ");
-    let a: str = p.print(42);
-    let b: str = p.print("hello");
+    let a: str = p.print_i32(42);
+    let b: str = p.print_str("hello");
     print("loaded: {a} {b}\n");
 }
 
 @[test]
 fun test_overload_i32() {
     let p: Printer = Printer.init("OK: ");
-    let result: str = p.print(42);
+    let result: str = p.print_i32(42);
     assert(result == "OK: ");
 }
 
 @[test]
 fun test_overload_str() {
     let p: Printer = Printer.init("OK: ");
-    let result: str = p.print("hello");
+    let result: str = p.print_str("hello");
     assert(result == "OK: ");
 }

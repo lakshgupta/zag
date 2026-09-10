@@ -859,9 +859,10 @@ pub fn parseMethod(self: *Parser) ast.MethodDecl {
         // target_type) vtable instantiation lands in Phase 2; here
         // we just carry the qualifier on the AST).
         var trait_name: ?[]const u8 = null;
-        if (self.peek().tag == .identifier and
+        const ident_tags = &[_]TokenTag{.identifier, .print, .new, .free, .async_kw, .await_kw};
+        if (std.mem.indexOfScalar(TokenTag, ident_tags, self.peek().tag) != null and
             self.peekAhead(1) == .dot and
-            self.peekAhead(2) == .identifier)
+            std.mem.indexOfScalar(TokenTag, ident_tags, self.peekAhead(2)) != null)
         {
             trait_name = self.expectIdent();
             self.expect(.dot);

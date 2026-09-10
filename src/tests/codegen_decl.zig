@@ -3445,8 +3445,12 @@ test "codegen: overloaded trait methods get suffixed VTable field names" {
     // VTable registration uses the suffixed names pointing to suffixed free fns
     try std.testing.expect(std.mem.indexOf(u8, zig, "Widget_Renderer_render_0") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "Widget_Renderer_render_1") != null);
-    // Dispatch shims use the unsuffixed function name (zig handles overloading)
-    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn render(self: Renderer,") != null);
+    // Dispatch shims use the suffixed function name — zig has no
+    // overloading, so the VTable-shim fns inside the trait value type
+    // carry the arity suffix that the call-site dispatch emits
+    // (`r.render_0()` / `r.render_1(x)` on a trait-typed receiver).
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn render_0(self: Renderer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn render_1(self: Renderer") != null);
 }
 
 test "codegen: embedding promotion emits getter methods for embedded struct fields" {
@@ -3502,9 +3506,14 @@ test "codegen: embedding promotion forwards non-trait impl methods" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Forwarded method on Button delegates to Widget, passing &self.Widget
+    // Forwarded method on Button delegates to Widget. The call uses
+    // zig's auto-ref method sugar (`self.Widget.show()`) — zig takes
+    // the address-of for a `*Widget` receiver on the addressable
+    // field expression, so no explicit `&self.Widget` argument is
+    // emitted (the explicit form double-addressed and zig rejected
+    // the *const/*mut mismatch on const receivers).
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn show(self: *Button) []const u8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "self.Widget.show(&self.Widget") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "self.Widget.show()") != null);
 }
 
 test "codegen: extern fun emits pub extern fn declaration" {

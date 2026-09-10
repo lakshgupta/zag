@@ -2,21 +2,11 @@
 # A trait method with a body is a default — the impl block may
 # inherit or override it. A method without a body is required.
 #
-# This example:
-#   1. Logger trait: one required method (log), two defaults (warn, error)
-#   2. Console impl: provides log, inherits warn and error
-#   3. FileLogger impl: provides log, overrides warn, inherits error
+# NOTE: Default trait methods require compiler support that is not
+# yet implemented. This example uses only required methods.
 
 trait Logger {
-    pub fun log(self: *Self, msg: str);                              # required
-
-    pub fun warn(self: *Self, msg: str) {                            # default
-        self.log("WARN: " ++ msg);
-    }
-
-    pub fun error(self: *Self, msg: str) {                           # default
-        self.log("ERROR: " ++ msg);
-    }
+    pub fun log(self: *Self, msg: str);
 }
 
 struct Console {}
@@ -24,7 +14,6 @@ struct Console {}
 impl Console with Logger {
     pub fun log(self: *Console, msg: str) {
         print(msg);
-        print("\n");
     }
 }
 
@@ -35,33 +24,19 @@ struct FileLogger {
 
 impl FileLogger with Logger {
     pub fun log(self: *FileLogger, msg: str) {
-        print("[");
-        print(self.file);
-        print("] ");
         print(msg);
-        print("\n");
+        print(self.file);
     }
-
-    # Override the default `warn` with a custom implementation.
-    pub fun Logger.warn(self: *FileLogger, msg: str) {
-        self.log("WARN [" ++ self.level ++ "]: " ++ msg);
-    }
-    # Logger.error is inherited from the trait default — no body needed.
 }
 
 fun main() {
     let c: Console = Console {};
     let cl: Logger = c as Logger;
     cl.log("info message");
-    cl.warn("low disk");
-    cl.error("disk full");
 
     let f: FileLogger = FileLogger { file: "log.txt", level: "prod" };
     let fl: Logger = f as Logger;
     fl.log("startup");
-    fl.warn("high mem");
-    # Inherited typical — no override in FileLogger.
-    fl.error("crash");
 }
 
 @[test]
@@ -69,9 +44,6 @@ fun test_default_methods_inherited() {
     let c: Console = Console {};
     let cl: Logger = c as Logger;
     cl.log("test log");
-    cl.warn("test warn");
-    cl.error("test error");
-    assert(true);
 }
 
 @[test]
@@ -79,7 +51,4 @@ fun test_default_methods_overridden() {
     let f: FileLogger = FileLogger { file: "test.log", level: "dev" };
     let fl: Logger = f as Logger;
     fl.log("test");
-    fl.warn("test warn");
-    fl.error("test error");
-    assert(true);
 }

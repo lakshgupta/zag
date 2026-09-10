@@ -61,6 +61,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     .name = b.name,
                     .type_name = "",
                     .is_closure = true,
+                    .is_var = stmt.payload == .var_binding,
                 };
                 self.type_info_count += 1;
                 return;
@@ -73,6 +74,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .name = b.name,
             .type_name = tn,
             .is_closure = false,
+            .is_var = stmt.payload == .var_binding,
         };
         self.type_info_count += 1;
         self.collectNestedBindings(stmt);
@@ -1047,6 +1049,19 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         self.write("break :blk ");
                         self.genExpr(s.payload.expr_stmt);
                         self.write(";");
+                    } else if (si == body.len - 1 and s.payload == .return_stmt) {
+                        // Tail `return EXPR;` inside a block-bodied match
+                        // arm: lower to `break :blk EXPR;` (a bare return
+                        // stmt would double-emit the callee's arg tuple
+                        // when the arm's expression is also emitted).
+                        const rs = s.payload.return_stmt;
+                        if (rs.value) |v| {
+                            self.write("break :blk ");
+                            self.genExpr(v);
+                            self.write(";");
+                        } else {
+                            self.genStmt(s, false);
+                        }
                     } else {
                         self.genStmt(s, false);
                     }

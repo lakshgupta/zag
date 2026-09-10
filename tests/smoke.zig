@@ -146,7 +146,12 @@ fn resolveZigPath() []const u8 {
         std.debug.print("smoke: zig resolved to {s} (vendor)\n", .{zig_vendor});
         return zig_vendor;
     }
-    if (std.posix.getenv("ZAG_ZIG_PATH")) |zp| {
+    // zig 0.16 has no std.posix.getenv — the env_path module's
+    // readEnviron()+getenv() pair is the codebase convention (this
+    // binary already imports env_path for its fork+execve envp
+    // propagation).
+    env_path.readEnviron();
+    if (env_path.getenv("ZAG_ZIG_PATH")) |zp| {
         std.debug.print("smoke: zig resolved to {s} (ZAG_ZIG_PATH)\n", .{zp});
         return zp;
     }

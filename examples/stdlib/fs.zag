@@ -29,6 +29,8 @@ import std.fs.{read_file};
 import std.types.{String};
 
 fun main() {
-    let data: String = read_file("basics/hello.zag");
+    # Harness contract (examples/run_all.sh): every fixture runs with
+    # CWD = repo root, so the anchor path is repo-root-relative.
+    let data: String = read_file("examples/basics/hello.zag");
     print("read {data.as_str().len} bytes\n");
 }

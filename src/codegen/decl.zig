@@ -189,6 +189,178 @@ const Codegen = core.Codegen;
         }
     }
 
+    /// Mark every function parameter the body never references with
+    /// a leading `_ = <name>;` discard at body entry - zig 0.16
+    /// rejects unused function parameters with a hard error (docs
+    /// examples' trait-method shims like `log(self: *Console, msg:
+    /// str)` with no `msg` use; docs/manual/29 "unused method
+    /// parameters are declared `_ = x;`"). Conservative shape:
+    /// a shallow lexical walk (params referenced ANYWHERE in the
+    /// body count as used, no scoping), so a false "used" verdict
+    /// only leaves an unused param for zig to flag - never discards
+    /// a genuinely used one. Bounded walks. `self` is NOT skipped:
+    /// zig flags an unused `self: *T` receiver exactly like any
+    /// other param (default-method bodies that ignore the receiver
+    /// — docs/18 §Default Methods — need the discard too), and for
+    /// used receivers the walk marks it like any name.
+    ///
+    /// Discriminated-union subtlety: `.let`/`.var_binding`/
+    /// `.const_binding` share the same payload struct, so the switch
+    /// arms must be grouped - a per-tag payload capture is rejected
+    /// by zig 0.16 for aliasing duplicates of the same payload type.
+    pub fn markUnusedParamDiscards(self: *Codegen, params: []const ast.MethodParam, body: []const ast.Stmt) void {
+        var used: [16]bool = [_]bool{false} ** 16;
+        var walker = UsedNameWalker{ .names = undefined, .used = &used };
+        for (params, 0..) |p, i| {
+            if (i >= used.len) break;
+            walker.names[i] = p.name;
+            walker.name_count += 1;
+        }
+        for (body) |s| walker.walkStmt(s);
+        for (used[0..walker.name_count], 0..) |is_used, i| {
+            if (!is_used) {
+                self.write("    _ = ");
+                self.write(params[i].name);
+                self.write(";\n");
+            }
+        }
+    }
+
+    const UsedNameWalker = struct {
+        names: [16][]const u8,
+        used: *[16]bool,
+        name_count: usize = 0,
+
+        fn mark(self: *UsedNameWalker, name: []const u8) void {
+            for (self.names[0..self.name_count], 0..) |n, i| {
+                if (std.mem.eql(u8, n, name)) self.used[i] = true;
+            }
+        }
+
+        fn walkStmt(self: *UsedNameWalker, s: ast.Stmt) void {
+            switch (s.payload) {
+                .let, .var_binding, .const_binding => |b| {
+                    if (b.init) |init| self.walkExpr(init);
+                    if (b.block) |blk| for (blk) |bs| self.walkStmt(bs);
+                },
+                .assign => |a| self.walkExpr(a.value),
+                .index_assign => |ia| {
+                    self.walkExpr(ia.target.*);
+                    self.walkExpr(ia.index.*);
+                    self.walkExpr(ia.value);
+                },
+                .defer_stmt => |d| self.walkExpr(d.expr),
+                .errdefer_stmt => |d| self.walkExpr(d.expr),
+                .unsafe_block => |blk| for (blk) |bs| self.walkStmt(bs),
+                .expr_stmt => |e| self.walkExpr(e),
+                .if_stmt => |is| {
+                    self.walkExpr(is.cond);
+                    for (is.then_body) |bs| self.walkStmt(bs);
+                    switch (is.else_kind) {
+                        .none => {},
+                        .block => |blk| for (blk) |bs| self.walkStmt(bs),
+                        .if_chain => |chain| self.walkStmt(.{ .payload = .{ .if_stmt = chain.* }, .loc = s.loc }),
+                    }
+                },
+                .while_stmt => |ws| {
+                    self.walkExpr(ws.cond);
+                    for (ws.body) |bs| self.walkStmt(bs);
+                },
+                .for_stmt => |fs| {
+                    self.walkExpr(fs.iter);
+                    for (fs.body) |bs| self.walkStmt(bs);
+                },
+                .match_stmt => |ms| self.walkMatch(ms),
+                .break_stmt, .continue_stmt => {},
+                .return_stmt => |rs| if (rs.value) |v| self.walkExpr(v),
+                .field_assign => |fa| {
+                    self.walkExpr(fa.target.*);
+                    self.walkExpr(fa.value);
+                },
+                .deref_assign => |da| self.walkExpr(da.value),
+            }
+        }
+
+        fn walkMatch(self: *UsedNameWalker, ms: ast.Expr.MatchExpr) void {
+            self.walkExpr(ms.scrutinee.*);
+            for (ms.arms) |arm| {
+                if (arm.guard) |g| self.walkExpr(g.*);
+                self.walkExpr(arm.expr.*);
+            }
+        }
+
+        fn walkExpr(self: *UsedNameWalker, e: ast.Expr) void {
+            switch (e.payload) {
+                .ident => |name| self.mark(name),
+                .string_lit, .int_lit, .float_lit, .bool_lit, .char_lit, .byte_string_lit, .null_lit, .undefined_lit => {},
+                .tuple_lit => |els| for (els) |el| self.walkExpr(el),
+                .single_tuple_lit => |el| self.walkExpr(el.*),
+                .named_tuple_lit => |nt| for (nt.elements) |el| self.walkExpr(el),
+                .array_lit => |a| for (a.elements) |el| self.walkExpr(el),
+                .call => |c| {
+                    for (c.args) |a| self.walkExpr(a);
+                },
+                .new_expr => |n| self.walkExpr(n.value.*),
+                .free_expr => |f| self.walkExpr(f.target.*),
+                .deref => |d| self.walkExpr(d.target_ptr.*),
+                .cast => |c| self.walkExpr(c.expr.*),
+                .template_lit => |t| {
+                    for (t.parts) |part| {
+                        if (part.expr) |pe| self.walkExpr(pe);
+                    }
+                },
+                .binary => |b| {
+                    self.walkExpr(b.lhs.*);
+                    self.walkExpr(b.rhs.*);
+                },
+                .unary => |u| self.walkExpr(u.operand.*),
+                .index => |ix| {
+                    self.walkExpr(ix.target.*);
+                    self.walkExpr(ix.index.*);
+                },
+                .slice => |sl| {
+                    self.walkExpr(sl.target.*);
+                    if (sl.start) |st| self.walkExpr(st.*);
+                    if (sl.end) |en| self.walkExpr(en.*);
+                },
+                .range => |r| {
+                    self.walkExpr(r.start.*);
+                    self.walkExpr(r.end.*);
+                },
+                .if_expr => |ie| {
+                    self.walkExpr(ie.cond.*);
+                    self.walkExpr(ie.then_expr.*);
+                    self.walkExpr(ie.else_expr.*);
+                },
+                .match_expr => |ms| self.walkMatch(ms),
+                .struct_lit => |sl| {
+                    for (sl.inits) |ini| self.walkExpr(ini.value.*);
+                },
+                .member_access => |ma| self.walkExpr(ma.target.*),
+                .method_call => |mc| {
+                    self.walkExpr(mc.target.*);
+                    for (mc.args) |a| self.walkExpr(a);
+                },
+                .enum_variant_ctor => |evc| for (evc.args) |a| self.walkExpr(a),
+                .closure => |cl| {
+                    for (cl.body) |bs| self.walkStmt(bs);
+                },
+                .try_op => |t| self.walkExpr(t.expr.*),
+                .catch_expr => |c| {
+                    self.walkExpr(c.expr.*);
+                    self.walkExpr(c.handler.*);
+                },
+                .block_expr => |blk| for (blk) |bs| self.walkStmt(bs),
+                .const_block => |blk| for (blk) |bs| self.walkStmt(bs),
+                .asm_expr => |a| {
+                    for (a.outputs) |op| self.walkExpr(op.expr.*);
+                    for (a.inputs) |op| self.walkExpr(op.expr.*);
+                },
+                .await_expr => |ae| self.walkExpr(ae.expr.*),
+            }
+        }
+    };
+
     pub     fn genFreeMethod(self: *Codegen, target_type: []const u8, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {        // Trait-method rename (docs/17 §"Implementing"): when `m.trait_name`
         // is set (the `Trait.method` source shape), the emitted free-fn name
         // becomes `<TargetType>_<TraitName>_<MethodName>` so the vtable
@@ -247,6 +419,11 @@ const Codegen = core.Codegen;
         self.write(") ");
         if (m.return_type) |rt| self.writeType(rt) else self.write("void");
         self.write(" {\n");
+        // Unused-param discard pass (docs/manual/18 SS Default Methods
+        // + docs/29): zig 0.16 hard-errors on unused fn params; trait-
+        // method shims routinely ignore some of them. Emits `_ = name;`
+        // for each body-unreferenced param BEFORE any body stmts.
+        self.markUnusedParamDiscards(m.params, m.body);
         // Reset per-function counters (matching `genMethod`/`genFun`).
         self.destructure_counter = 0;
         self.alloc_counter = 0;
@@ -392,7 +569,15 @@ const Codegen = core.Codegen;
                     self.write(ef.type_name);
                     self.write(": ");
                     self.write(ef.type_name);
-                    self.write(" = .{}, // embedded (promote fields+methods via dot deref) \n");
+                    // No `= .{}` default: zig requires EVERY field of
+                    // the embedded struct to have a default before a
+                    // struct-level default is legal (`missing struct
+                    // field: x`). The field is unconditionally provided
+                    // at every construction site — the positional-
+                    // embed-slot emit in expr.zig names it `.Embed = ...`
+                    // — so a default is dead weight that only breaks
+                    // compilation.
+                    self.write(", // embedded (promote fields+methods via dot deref)\n");
                 },
             }
         }
@@ -438,7 +623,16 @@ const Codegen = core.Codegen;
                         self.write("    pub fn ");
                         self.write(m4.name);
                         self.write("(");
-                        // Rewrite the first param (self) to the outer type
+                        // Rewrite the first param (self) to the outer type.
+                        // The receiver constness mirrors the EMBEDDED
+                        // method's: `self: *Widget` forwards as
+                        // `self: *Button` (zig accepts `*Button` →
+                        // `*Widget` via the named `Widget` field — the
+                        // forwarding body passes `&self.Widget`), but a
+                        // `*const Button` forwarder CANNOT hand `*Widget`
+                        // to the inner call (const-discard). Callers on
+                        // `let` bindings would fail, so `*T` receivers
+                        // forward as `*T`.
                         for (m4.params, 0..) |p4, pi| {
                             if (pi > 0) self.write(", ");
                             self.write(p4.name);
@@ -453,6 +647,10 @@ const Codegen = core.Codegen;
                         self.write(") ");
                         if (m4.return_type) |rt| self.writeType(rt) else self.write("void");
                         self.write(" {\n");
+                        // Unused-param discard pass (docs/manual/18 SS
+                        // "Structural Embedding"): forwarding shims that
+                        // drop an argument still bind it - discard it.
+                        self.markUnusedParamDiscards(m4.params, m4.body);
                         if (m4.return_type != null) {
                             self.write("        return ");
                         } else {
@@ -463,14 +661,15 @@ const Codegen = core.Codegen;
                         self.write(".");
                         self.write(m4.name);
                         self.write("(");
-                        for (m4.params, 0..) |p5, pj| {
-                            if (pj > 0) self.write(", ");
-                            if (pj == 0 and p5.is_self) {
-                                self.write("&self.");
-                                self.write(embed_type);
-                            } else {
-                                self.write(p5.name);
-                            }
+                        // p5[0] is the embedded receiver: the inner call
+                        // is a METHOD call on `self.<Embed>` — zig's
+                        // method sugar passes `&self.<Embed>` itself, so
+                        // the forwarder emits NO explicit receiver arg
+                        // (a manual `&self.<Embed>` would double the
+                        // receiver: `self.Widget.show(&self.Widget)`).
+                        for (m4.params[1..]) |p5| {
+                            self.write(", ");
+                            self.write(p5.name);
                         }
                         self.write(");\n");
                         self.write("    }\n");
@@ -534,6 +733,11 @@ const Codegen = core.Codegen;
     }
 
     pub     fn genMethod(self: *Codegen, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
+        // Receiver tracking for nested method bodies (genStructDecl
+        // sets it before calling, but a direct genMethod call — e.g.
+        // the resolver-body path — may arrive without it). Only set
+        // when NOT already tracking; the caller's reset handles the
+        // restore.
         self.write("    pub fn ");
         self.write(m.name);
         self.write("(");
@@ -565,6 +769,8 @@ const Codegen = core.Codegen;
         self.write(") ");
         if (m.return_type) |rt| self.writeType(rt) else self.write("void");
         self.write(" {\n");
+        // Unused-param discard pass - see genFreeMethod's comment.
+        self.markUnusedParamDiscards(m.params, m.body);
         // Trait-bounds guards (docs/16 §3) — see genFun's comment.
         self.genBoundsGuards(impl_type_params);
         // Reset per-function counters before this method body's emission
@@ -1201,7 +1407,13 @@ const Codegen = core.Codegen;
                 break :blk sfn_buf[0 .. m.name.len + 1 + sfx.len];
             };
             self.write("    pub fn ");
-            self.write(m.name);
+            // Overload-suffixed shim name (`render_0` / `render_1`):
+            // zig has no overloading, so the SECOND same-name shim
+            // would collide ("duplicate struct member name 'render'").
+            // The call-site dispatch (traitOverloadSuffix in expr.zig)
+            // appends the same `_N` by arity, so `r.render()` →
+            // `r.render_0()` and `r.render(2.0)` → `r.render_1()`.
+            self.write(vtable_name);
             self.write("(self: ");
             self.write(td.name);
             for (m.params[1..]) |p| {
@@ -1226,7 +1438,22 @@ const Codegen = core.Codegen;
         self.write("};\n\n");
     }
 
-    pub     fn genTraitRegistration(self: *Codegen, trait_name: []const u8, target_type: []const u8, methods: []const ast.MethodDecl, method_field_names: []const []const u8, default_methods: []const []const u8, default_field_names: []const []const u8) void {
+    /// Strip a trailing `_N` overload suffix (`render_1` → `render`)
+    /// so genTraitRegistration's slot matching compares the BARE
+    /// method name against the trait decl's (unsuffixed) method list.
+    /// Registration buckets store suffixed names for overloaded
+    /// traits (traitMethodVtableName), while all_trait_methods carries
+    /// the decl's spelling. Non-suffixed names pass through unchanged.
+    fn baseMethodName(name: []const u8) []const u8 {
+        // Fast path: no trailing digit → no suffix.
+        if (name.len == 0 or !std.ascii.isDigit(name[name.len - 1])) return name;
+        var end: usize = name.len;
+        while (end > 0 and std.ascii.isDigit(name[end - 1])) end -= 1;
+        if (end == 0 or end + 1 > name.len or name[end - 1] != '_') return name;
+        return name[0 .. end - 1];
+    }
+
+    pub     fn genTraitRegistration(self: *Codegen, trait_name: []const u8, target_type: []const u8, methods: []const ast.MethodDecl, method_field_names: []const []const u8, default_methods: []const []const u8, default_field_names: []const []const u8, all_trait_methods: []const ast.TraitMethodDecl) void {
         // Docs/17 §"Implementing" — emit a per-(trait, target_type)
         // vtable instantiation so a future `x.draw()` call site (Phase 3
         // — fat-pointer cast encoding) dispatches through THIS
@@ -1249,6 +1476,74 @@ const Codegen = core.Codegen;
         // implementation's exact-name reference is preserved so the
         // vtable slot maps 1:1 to the renamed `<Target>_<Trait>_<Method>`
         // orphan-impl emit above.
+        // Emit unfulfilled-slot stub fns BEFORE the registration
+        // literal: zig accepts free fns interleaved with decls, but
+        // the literal body itself must contain only `.field = value`
+        // assignments - a stray fn inside `.{ ... }` is a parse error
+        // ("expected field initializer").
+        {
+            var mi0: usize = 0;
+            stub_loop: while (mi0 < all_trait_methods.len) : (mi0 += 1) {
+                const tm = all_trait_methods[mi0];
+                for (methods) |im| {
+                    // Overload-suffix compare: registration buckets
+                    // store the SUFFIXED name (`render_1`) for
+                    // overloaded trait methods, while the trait decl
+                    // list carries the bare name (`render`). Compare
+                    // the base (suffix-stripped) names + arity so an
+                    // implemented overload never gets a stub.
+                    if (im.params.len == tm.params.len and
+                        std.mem.eql(u8, baseMethodName(im.name), tm.name)) continue :stub_loop;
+                }
+                for (default_methods, default_field_names) |_, dfn| {
+                    if (std.mem.eql(u8, dfn, tm.name)) continue :stub_loop;
+                }
+                const vfn = self.traitMethodVtableNameFull(all_trait_methods, mi0);
+                // Stub fn with the EXACT vtable-field signature so the
+                // @ptrCast rebrand needs no coercion. @panic is
+                // noreturn, so a value-returning slot needs no dummy
+                // result expression.
+                self.write("fn __zag_unimpl_");
+                self.write(trait_name);
+                self.write("_");
+                self.write(vfn);
+                self.write("_");
+                self.write(target_type);
+                self.write("(ptr: *anyopaque");
+                for (tm.params[1..]) |p| {
+                    self.write(", ");
+                    self.write(p.name);
+                    self.write(": ");
+                    self.rewriteSelfToT(p.type_text);
+                }
+                self.write(") ");
+                if (tm.return_type) |rt| self.rewriteSelfToT(rt) else self.write("void");
+                self.write(" {\n");
+                self.write("    _ = ptr;\n");
+                // Discard the trait method's remaining params: zig
+                // rejects unused fn params, and a panic stub never
+                // touches them (`render_1(self, scale)` would fail
+                // with "unused function parameter" before it could
+                // even compile the @panic).
+                for (tm.params[1..]) |p| {
+                    self.write("    _ = ");
+                    self.write(p.name);
+                    self.write(";\n");
+                }
+                self.write("    @panic(\"");
+                self.write(trait_name);
+                self.write(".");
+                self.write(tm.name);
+                self.write(" is not implemented for ");
+                self.write(target_type);
+                self.write(" - the `impl ");
+                self.write(target_type);
+                self.write(" with ");
+                self.write(trait_name);
+                self.write("` block leaves this trait slot unfulfilled. Add a body (dot-qualified or plain) for the method.\\n\");\n");
+                self.write("}\n\n");
+            }
+        }
         self.write("pub const ");
         self.write(trait_name);
         self.write("_VTable_for_");
@@ -1275,6 +1570,38 @@ const Codegen = core.Codegen;
             self.write("__");
             self.write(dfn);
             self.write("),\n");
+        }
+        // Unfulfilled slots (docs/manual/18 SS "Dot-qualified methods":
+        // a lopsided diamond leaves Show.print without a body). The
+        // stub fns were emitted above (BEFORE the literal); here we
+        // only bind the missing slots to them so the partial impl
+        // still compiles - the doc's contract: only CALLING the
+        // unfulfilled slot panics.
+        {
+            var mi: usize = 0;
+            slot_loop2: while (mi < all_trait_methods.len) : (mi += 1) {
+                const tm2 = all_trait_methods[mi];
+                for (methods) |im| {
+                    // Same overload-suffix compare as the stub emit
+                    // above: `render_1` in the bucket matches the
+                    // decl's bare `render` when arity agrees.
+                    if (im.params.len == tm2.params.len and
+                        std.mem.eql(u8, baseMethodName(im.name), tm2.name)) continue :slot_loop2;
+                }
+                for (default_methods, default_field_names) |_, dfn| {
+                    if (std.mem.eql(u8, dfn, tm2.name)) continue :slot_loop2;
+                }
+                const vfn2 = self.traitMethodVtableNameFull(all_trait_methods, mi);
+                self.write("    .");
+                self.write(vfn2);
+                self.write(" = @ptrCast(&__zag_unimpl_");
+                self.write(trait_name);
+                self.write("_");
+                self.write(vfn2);
+                self.write("_");
+                self.write(target_type);
+                self.write("),\n");
+            }
         }
         self.write("};\n\n");
     }

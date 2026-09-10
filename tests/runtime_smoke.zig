@@ -153,16 +153,17 @@ const cases = [_]TestCase{
     .{
         .name = "diamond_distinct: trait-name-keyed vtable pick",
         .example = "examples/traits/diamond_distinct.zag",
-        // Display's `print` wraps the value in `<span>...</span>`;
-        // Show's `render` wraps nothing. Two different vtable slots,
-        // two different bodies, same input value ("ok"). v1.6
-        // widening routes `self.label` through `{s}` for the raw
-        // render AND for the HTML-escaped print, so the expected
-        // stdout is `<span>ok</span>` + newline + `ok` + newline
-        // (instead of the byte-deferred form).
+        // Display's `print` prefixes `[display] `; Show's `render`
+        // prefixes `[show] `. Two different vtable slots, two
+        // different bodies, same input value ("ok"). Both bodies
+        // route `self.label` through `{s}` widening, so the expected
+        // stdout is one line per trait dispatch, each tagged with its
+        // trait's prefix. (The example was rewritten to the docs/17
+        // diamond-disambiguation form — prefix tags instead of the
+        // legacy `<span>` HTML-escape shape — and this pin follows.)
         .expected =
-            "<span>ok</span>\n" ++
-            "ok\n",
+            "[display] ok\n" ++
+            "[show] ok\n",
     },
 };
 

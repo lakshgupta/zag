@@ -322,7 +322,7 @@ for file in "${FILES[@]}"; do
 
     case "$MODE" in
         check)
-            if output=$("$ZAG_BIN" check "$file" 2>&1); then
+            if output=$(cd "$PROJECT_ROOT" && "$ZAG_BIN" check "$file" 2>&1); then
                 echo -e "${GREEN}PASS${NC}"
                 record_pass "$local_dir"
             else
@@ -336,7 +336,7 @@ for file in "${FILES[@]}"; do
             fi
             ;;
         run)
-            if output=$("$ZAG_BIN" run "$file" 2>&1); then
+            if output=$(cd "$PROJECT_ROOT" && "$ZAG_BIN" run "$file" 2>&1); then
                 echo -e "${GREEN}PASS${NC}"
                 record_pass "$local_dir"
                 if [[ $VERBOSE -eq 1 ]]; then
