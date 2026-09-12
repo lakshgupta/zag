@@ -265,11 +265,26 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
+        # nullglob (not brace expansion): with no windows zips, the
+        # literal `*.zip` glob under `set -e` makes sha256sum exit 1.
+        # Keeping *.zip in the glob list keeps this step correct the day
+        # windows archives return. Hard-fail on zero archives so a
+        # packaging regression can't publish a checksum-less release.
         run: |
           set -euo pipefail
-          ( cd "dist/$VERSION" && sha256sum *.{tar.gz,zip} > checksums.txt )
+          out_dir="dist/$VERSION"
+          (
+            cd "$out_dir"
+            shopt -s nullglob
+            files=( *.tar.gz *.zip )
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "error: no archives found in $out_dir" >&2
+              exit 1
+            fi
+            sha256sum "${files[@]}" > checksums.txt
+          )
           echo "---"
-          cat "dist/$VERSION/checksums.txt"
+          cat "$out_dir/checksums.txt"
       - name: Upload release archives as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -306,9 +321,10 @@ jobs:
           name: Zag ${{ github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # No *.zip line while windows is out of the matrix — with
+          # fail_on_unmatched_files: true an unmatched glob fails the job.
           files: |
             dist/${{ steps.version.outputs.version }}/*.tar.gz
-            dist/${{ steps.version.outputs.version }}/*.zip
             dist/${{ steps.version.outputs.version }}/checksums.txt
             dist/${{ steps.version.outputs.version }}/zag-install.sh
             dist/${{ steps.version.outputs.version }}/install.ps1
