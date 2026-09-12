@@ -730,8 +730,96 @@ fn usage() void {
     std.debug.print("  -o, --output       Output path (binary for build, dir for generate)\n", .{});
 }
 
-fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extra_args: []const []const u8, build_mode: BuildMode) !void {
-    if (src.len == 0) {
+/// Test-runner shim for file-mode `zag test` (written to
+/// `<leaf>/zag_test_runner.zig`, passed via `zig test --test-runner`).
+///
+/// Why it exists: under zig 0.16's `zig test`, `@import("root")`
+/// resolves to zig's TEST RUNNER (lib/compiler/test_runner.zig),
+/// never to the file under test — so every `@import("root")`
+/// lookup in generated code (bench counters, Result/Option
+/// forwarders) fails with "root source file struct 'test_runner'
+/// has no member". `--test-runner` makes THIS file the compilation
+/// root instead, so it carries the canonical definitions every
+/// module's preamble forwards to — exactly the run/build-mode
+/// contract, with unified cross-module bench accounting.
+///
+/// The shim deliberately does NOT `@import("main.zig")`: zig places
+/// the --test-runner file and the positional test file in two
+/// modules ('test' and 'root'), and a file imported by path into
+/// both is rejected ("file exists in modules 'test' and 'root'").
+/// Test discovery needs no import anyway: `builtin.test_functions`
+/// collects `test` blocks from every module in the compilation.
+///
+/// Result/Option are DEFINED here (not re-exported — the user module
+/// is unreachable by import, see above), mirroring the canonical
+/// hybrid emit in src/codegen/core.zig — keep the two in sync. The
+/// one asymmetry this leaves: a test that passes a Result/Option
+/// value ACROSS the user/std boundary mixes the runner's canonical
+/// with the user module's own canonical and fails to compile. No
+/// example suite does this today (their Results are same-module);
+/// closing it needs the hybrid emit to forward under test (a
+/// `@hasDecl(root, marker)` smart-forwarder), which is recorded as
+/// follow-up work, not done here.
+const zag_test_runner_src: []const u8 =
+    \\//! zag file-mode test root (see zag_test_runner_src in src/main.zig).
+    \\const builtin = @import("builtin");
+    \\const std = @import("std");
+    \\
+    \\pub fn Result(comptime T: type, comptime E: type) type {
+    \\    return union(enum) {
+    \\        Ok: T,
+    \\        Err: E,
+    \\        pub fn unwrap(self: @This()) T {
+    \\            return switch (self) {
+    \\                .Ok => |v| v,
+    \\                .Err => @panic("unwrap on Err"),
+    \\            };
+    \\        }
+    \\    };
+    \\}
+    \\pub fn Option(comptime T: type) type {
+    \\    return union(enum) {
+    \\        Some: T,
+    \\        None: void,
+    \\        pub fn unwrap(self: @This()) T {
+    \\            return switch (self) {
+    \\                .Some => |v| v,
+    \\                .None => @panic("unwrap on None"),
+    \\            };
+    \\        }
+    \\    };
+    \\}
+    \\
+    \\pub var __zag_bench_bytes_live: usize = 0;
+    \\pub var __zag_bench_bytes_total: usize = 0;
+    \\pub var __zag_bench_allocations: usize = 0;
+    \\pub fn __zag_bench_inc(n: usize) void {
+    \\    __zag_bench_bytes_live += n;
+    \\    __zag_bench_bytes_total += n;
+    \\    __zag_bench_allocations += 1;
+    \\}
+    \\pub fn __zag_bench_dec(n: usize) void {
+    \\    __zag_bench_bytes_live -= n;
+    \\}
+    \\
+    \\pub fn main() void {
+    \\    var pass: usize = 0;
+    \\    var fail: usize = 0;
+    \\    for (builtin.test_functions) |t| {
+    \\        t.func() catch {
+    \\            fail += 1;
+    \\            std.debug.print("FAIL {s}\n", .{t.name});
+    \\            continue;
+    \\        };
+    \\        pass += 1;
+    \\        std.debug.print("ok {s}\n", .{t.name});
+    \\    }
+    \\    std.debug.print("{d} passed, {d} failed\n", .{ pass, fail });
+    \\    if (fail > 0) std.process.exit(1);
+    \\}
+;
+
+fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extra_args: []const []const u8, build_mode: BuildMode) !void {    if (src.len == 0) {
         std.debug.print("error: --leaf-process=<mode> missing src argument\n", .{});
         std.process.exit(1);
     }
@@ -788,7 +876,15 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
         const has_test_block = std.mem.indexOf(u8, result.zig, "test \"") != null;
         const has_main = std.mem.indexOf(u8, result.zig, "pub fn main(") != null;
         if (has_test_block) {
-            const test_code = try runCommand(null, &.{ zig_install_path, "test", f_zig });
+            // File-mode test root: plain `zig test <main>` makes
+            // zig's test runner the compilation root, breaking every
+            // `@import("root")` lookup in generated code (bench
+            // counters, Result/Option — see zag_test_runner_src).
+            // Route through our runner shim so the shim is root.
+            var path_runner_buf: [80]u8 = undefined;
+            const f_runner = std.fmt.bufPrint(&path_runner_buf, "/tmp/zag_leaf_{d}/zag_test_runner.zig", .{pid_num}) catch "/tmp/zag_leaf/zag_test_runner.zig";
+            try writeFile(f_runner, zag_test_runner_src);
+            const test_code = try runCommand(null, &.{ zig_install_path, "test", "--test-runner", f_runner, f_zig });
             std.process.exit(test_code);
         } else if (has_main) {
             const run_code = try runCommand(null, &.{ zig_install_path, "run", f_zig });

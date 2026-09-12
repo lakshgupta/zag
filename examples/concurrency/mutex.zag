@@ -95,10 +95,11 @@ fun main() {
 @[test]
 fun test_mutex_serial() {
     var m: Mutex = create();
+    assert(m.word == 0);
     lock(&m);
-    m.word = 7;
+    assert(m.word == 1);
     unlock(&m);
-    assert(m.word == 7);
+    assert(m.word == 0);
 }
 
 @[test]

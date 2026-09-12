@@ -42,7 +42,7 @@ fun main() {
 fun test_concat_basics() {
     let name: str = "world";
     let greeting: str = "hello, " + name;
-    assert(greeting.len == 7);
+    assert(greeting.len == 12);
     assert(greeting == "hello, world");
 
     let a: str = "abc";

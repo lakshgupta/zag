@@ -2262,6 +2262,34 @@ const Codegen = core.Codegen;
         self.match_counter = 0;
         self.blk_counter = 0;
 
+        // Type-info seeding (mirror of genFun): the `as`-cast
+        // lowerings (pointer→int @intFromPtr, float→int
+        // @intFromFloat, print `{s}` widening) read this map, and
+        // without the walk a `ptr as usize` inside a test body falls
+        // through to a bare `@as(usize, ptr)` the zig compiler
+        // rejects. Surfaced by the concurrency examples' threaded
+        // @[test] fns (`spawn(worker, st as usize)`).
+        for (fun.body) |stmt| {
+            self.collectTypedBindings(stmt);
+        }
+        for (fun.params) |p| {
+            if (self.type_info_count >= self.type_info_buf.len) break;
+            var already = false;
+            for (self.type_info_buf[0..self.type_info_count]) |ti| {
+                if (std.mem.eql(u8, ti.name, p.name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            self.type_info_buf[self.type_info_count] = .{
+                .name = p.name,
+                .type_name = p.type_text,
+                .is_closure = false,
+            };
+            self.type_info_count += 1;
+        }
+
         // Doc comment on the test block
         if (fun.doc) |d| self.genDocComment(d);
 

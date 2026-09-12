@@ -1,0 +1,197 @@
+## Reader/writer lock via std.concurrent.rwlock (docs/22)
+##
+##   import std.concurrent.rwlock
+##
+##   var l: RwLock = create();
+##   read_lock(&l);     # shared: many readers hold concurrently
+##   # ... read shared state ...
+##   read_unlock(&l);
+##
+##   write_lock(&l);    # exclusive: drains readers, blocks new ones
+##   # ... mutate shared state ...
+##   write_unlock(&l);  # wakes every parked reader/writer
+##
+## Pure Zag: the state word is a futex-addressable i32 (bit 30 =
+## writer interest, bits 0..29 = active reader count) driven by the
+## compiler's atomic intrinsics (load / compare_exchange / fetch_add
+## — no import needed) and std.posix's private futex primitives.
+## Writer-preferring: once a writer sets the interest bit, new
+## readers park instead of joining, so a reader stream cannot starve
+## the writer.
+##
+## What this example proves:
+##   1. Reader concurrency — 4 readers hold the lock across an 80ms
+##      sleep around a NON-atomic active-count probe. The observed
+##      peak of readers inside the section must exceed 1 (a lock that
+##      wrongly serialized readers would peak at 1).
+##   2. Writer exclusion — two writers + main do NON-atomic
+##      load-then-store increments under write_lock. Without a working
+##      exclusive lock the steps interleave and updates are lost; the
+##      exact total is the proof.
+##   3. Writer blocks readers — main holds write_lock across a 150ms
+##      sleep while THREE readers try to acquire. Every reader must
+##      PARK (WRITER_BIT set) until write_unlock wakes it; join-elapsed
+##      >= 100ms is the park evidence (a reader that slipped past the
+##      interest bit would join near-instantly).
+##   4. Wake-all release — the parked readers ALL proceed after the
+##      single write_unlock (the FUTEX_WAKE count is INT_MAX, the true
+##      wake-all: the kernel takes the count signed, so UINT_MAX
+##      would wake exactly one waiter and strand the rest — the joins
+##      below would hang).
+##
+## Run: zag run rwlock.zag
+
+import std.concurrent.rwlock
+import std.concurrent.thread.{spawn, join, Thread}
+import std.time.{Timer, sleep_ms}
+
+## load / store / fetch_add / compare_exchange / assert are language
+## intrinsics (no import) — see docs/22 §Atomics.
+
+const READERS: i32 = 4;
+
+struct Shared {
+    lock: RwLock,
+    value: i32,
+    active: i32,
+    peak: i32,
+}
+
+## Track the observed peak of `active` with a CAS max-loop (lock-free
+## maxima: re-read and retry when another thread won the race).
+fun raise_max(m: *i32, v: i32) {
+    let p: *i32 = m;
+    while (true) {
+        let cur: i32 = load(p);
+        if (v <= cur) {
+            return;
+        }
+        if (compare_exchange(p, cur, v)) {
+            return;
+        }
+    }
+}
+
+## Reader body: hold a read slot across a sleep so co-resident
+## readers overlap; the peak proves they shared the lock.
+fun reader_hold(ptr_state: usize) {
+    let st: *Shared = ptr_state as *Shared;
+    read_lock(addr_of(st.lock));
+    let prev: i32 = fetch_add(addr_of(st.active), 1);
+    raise_max(addr_of(st.peak), prev + 1);
+    sleep_ms(80);
+    _ = fetch_add(addr_of(st.active), 0 - 1);
+    read_unlock(addr_of(st.lock));
+}
+
+## Plain acquire/release reader for the writer-blocks probe.
+fun reader_once(ptr_state: usize) {
+    let st: *Shared = ptr_state as *Shared;
+    read_lock(addr_of(st.lock));
+    read_unlock(addr_of(st.lock));
+}
+
+## Non-atomic read-modify-write under the WRITE lock: racy without
+## exclusion (lost updates), exact with it.
+fun writer_inc(ptr_state: usize) {
+    let st: *Shared = ptr_state as *Shared;
+    write_lock(addr_of(st.lock));
+    let cur: i32 = load(addr_of(st.value));
+    store(addr_of(st.value), cur + 1);
+    write_unlock(addr_of(st.lock));
+}
+
+fun main() {
+    let st: *Shared = new Shared(Shared {
+        lock: RwLock { state: 0 },
+        value: 0,
+        active: 0,
+        peak: 0,
+    });
+    defer free(st);
+
+    ## 1. Reader concurrency: 4 readers overlap in the 80ms hold.
+    var rhandles: [READERS]Thread = undefined;
+    var i: usize = 0;
+    while (i < READERS) {
+        rhandles[i] = spawn(reader_hold, st as usize);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < READERS) {
+        join(rhandles[i]);
+        i = i + 1;
+    }
+
+    let peak: i32 = load(addr_of(st.peak));
+    assert(peak >= 2);
+    print("peak concurrent readers = {peak} (shared lock held jointly)\n");
+
+    ## 2. Writer exclusion: 2 writers + main's 50 loop iterations =
+    ## 52 non-atomic increments under the write lock.
+    let w1: Thread = spawn(writer_inc, st as usize);
+    let w2: Thread = spawn(writer_inc, st as usize);
+    var j: i32 = 0;
+    while (j < 50) {
+        writer_inc(st as usize);
+        j = j + 1;
+    }
+    join(w1);
+    join(w2);
+
+    let total: i32 = load(addr_of(st.value));
+    assert(total == 52);
+    print("exact total = {total} (52 expected — no lost updates)\n");
+
+    ## 3+4. Writer blocks readers + wake-all release: main holds the
+    ## write lock across a 150ms sleep while THREE readers try to
+    ## acquire. All three park on the interest bit; the single
+    ## write_unlock must wake every one of them (a wake-one bug
+    ## strands two readers and the joins below hang).
+    write_lock(addr_of(st.lock));
+    let t: Timer = Timer.start();
+    let b1: Thread = spawn(reader_once, st as usize);
+    let b2: Thread = spawn(reader_once, st as usize);
+    let b3: Thread = spawn(reader_once, st as usize);
+    sleep_ms(150);
+    write_unlock(addr_of(st.lock));
+    join(b1);
+    join(b2);
+    join(b3);
+    let elapsed: u64 = t.elapsed().as_millis();
+    assert(elapsed >= 100);
+    print("3 readers blocked by writer for {elapsed}ms (parked ≥100ms, all woken)\n");
+}
+
+@[test]
+fun test_rwlock_serial() {
+    var l: RwLock = create();
+    read_lock(&l);
+    assert(l.state == 1);
+    read_unlock(&l);
+    assert(l.state == 0);
+    write_lock(&l);
+    assert(l.state == 0x40000000);
+    write_unlock(&l);
+    assert(l.state == 0);
+}
+
+@[test]
+fun test_rwlock_write_excludes_threads() {
+    let st: *Shared = new Shared(Shared {
+        lock: RwLock { state: 0 },
+        value: 0,
+        active: 0,
+        peak: 0,
+    });
+    defer free(st);
+
+    let h1: Thread = spawn(writer_inc, st as usize);
+    let h2: Thread = spawn(writer_inc, st as usize);
+
+    join(h1);
+    join(h2);
+
+    let val: i32 = load(addr_of(st.value));
+    assert(val == 2);
+}

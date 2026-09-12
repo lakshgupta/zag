@@ -39,8 +39,12 @@ pub struct Once {
 
 ## Sentinel: "wake everything" for the futex wake — the wait queue on
 ## a Once is bounded by the thread count, so an exhaustive wake is
-## the simple correct choice.
-const WAKE_ALL: u32 = 0xFFFFFFFF;
+## the simple correct choice. INT_MAX (not UINT_MAX): the kernel
+## takes the FUTEX_WAKE count as a SIGNED int, so 0xFFFFFFFF reads
+## as -1 and its wake loop (`++woken >= nr_wake`) stops after the
+## first waiter — stranding every waiter past the first. 0x7FFFFFFF
+## is the true wake-all.
+const WAKE_ALL: u32 = 0x7FFFFFFF;
 
 ## create — a fresh, never-run Once.
 pub fun create() -> Once {

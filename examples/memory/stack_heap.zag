@@ -13,7 +13,7 @@ import std.mem.{alloc};
 fun test_heap_value() {
     let p: *i32 = new i32(42);
     defer free(p);
-    assert(p == 42);
+    assert(load(p) == 42);
 }
 
 @[test]

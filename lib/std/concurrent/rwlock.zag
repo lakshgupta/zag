@@ -35,11 +35,16 @@
 ##                  re-CAS (writer vs. freshly woken readers is an
 ##                  equal race — throughput over strict FIFO).
 ##
-## All parked waits use the observed word as the futex expected value,
-## so every state transition that matters (reader decrement, writer
-## release) changes the word and wakes the right queue; the kernel's
-## atomic re-check closes the lost-wake window (EAGAIN when the word
-## moved between our load and the park).
+## All parked waits use a freshly-observed word as the futex
+## expected value, and a park is only ever entered on an
+## interest-set word (or the monotonic-draining inner word, which
+## can only decrease while parked — never alias the expected
+## value). A failed join/claim CAS re-loads instead of parking:
+## parking on a stale no-interest value can miss a silent reader
+## drain (read_unlock issues no wake without a waiting writer) and
+## sleep forever. The kernel's atomic re-check closes the
+## load-to-park window (EAGAIN when the word moved between our load
+## and the park).
 
 import std.posix.{futex_wait, futex_wake}
 
@@ -51,7 +56,11 @@ const WRITER_BIT: i32 = 0x40000000;
 
 ## "Wake everything" futex count for write_unlock — the parked reader
 ## queue plus any queued writers all re-CAS from a clean word.
-const WAKE_ALL: u32 = 0xFFFFFFFF;
+## INT_MAX (not UINT_MAX): the kernel takes the FUTEX_WAKE count as
+## a SIGNED int, so 0xFFFFFFFF reads as -1 and its wake loop
+## (`++woken >= nr_wake`) stops after the first waiter — stranding
+## the rest of the queue. 0x7FFFFFFF is the true wake-all.
+const WAKE_ALL: u32 = 0x7FFFFFFF;
 
 pub struct RwLock {
     state: i32,
@@ -71,14 +80,23 @@ pub fun read_lock(l: *RwLock) {
         let s: i32 = load(w);
         if ((s & WRITER_BIT) == 0) {
             # No writer interest: join the readers. A failed CAS is a
-            # concurrent reader or writer transition — re-load.
+            # concurrent reader or writer transition — RE-LOAD, never
+            # park on the stale `s`: a sibling reader can win the slot
+            # and drain (1→0) before we reach the kernel, and that
+            # drain issues no wake (read_unlock only wakes a waiting
+            # writer) — parking on the stale value would sleep on a
+            # word that already equals it, forever.
             if (compare_exchange(w, s, s + 1)) {
                 return;
             }
+        } else {
+            # Writer holds/drains (freshly observed). Park until the
+            # word moves off the observed value; EAGAIN when it
+            # already moved. Every departure from an interest-set word
+            # either wakes (last reader out, write_unlock) or keeps a
+            # later waker coming, so this park always resolves.
+            _ = futex_wait(w as *const u32, s as u32);
         }
-        # Writer holds/drains (or we raced). Park until the word
-        # moves off the observed value; EAGAIN when it already moved.
-        _ = futex_wait(w as *const u32, s as u32);
     }
 }
 
@@ -103,7 +121,11 @@ pub fun write_lock(l: *RwLock) {
         if ((s & WRITER_BIT) == 0) {
             # Claim writer interest (works from both the unlocked word
             # and a readers-active word). No reader can join after
-            # this lands; holders drain below.
+            # this lands; holders drain below. A failed claim means
+            # the word moved — RE-LOAD, never park on the stale `s`:
+            # with no interest set, readers join AND leave silently
+            # (no wake either way), so the word can come back to the
+            # stale value and a park on it would never resolve.
             if (compare_exchange(w, s, s + WRITER_BIT)) {
                 while (true) {
                     let cur: i32 = load(w);
@@ -117,10 +139,12 @@ pub fun write_lock(l: *RwLock) {
                     _ = futex_wait(w as *const u32, cur as u32);
                 }
             }
+        } else {
+            # Another writer holds interest — park on the freshly
+            # observed interest-set word until its write_unlock
+            # changes the word, then re-CAS.
+            _ = futex_wait(w as *const u32, s as u32);
         }
-        # Another writer holds interest/queue slot — park until its
-        # write_unlock changes the word, then re-CAS.
-        _ = futex_wait(w as *const u32, s as u32);
     }
 }
 

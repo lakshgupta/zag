@@ -2,11 +2,18 @@
 
 Zag's concurrency lives at `std.concurrent.*`. Threads are real
 clone(2) threads (see below); atomics are language intrinsics
-router-emitted by the compiler (they need no import); mutexes are
-still a stub:
+router-emitted by the compiler (they need no import); and the
+synchronization primitives — mutex, semaphore, once, rwlock — are
+pure-Zag futex protocols over those intrinsics plus `std.posix`'s
+futex/wait/wake syscalls. No zig-stdlib `Thread` involvement
+anywhere:
 
 ```
 import std.concurrent.thread.{spawn, join, Thread}
+import std.concurrent.mutex
+import std.concurrent.semaphore
+import std.concurrent.once
+import std.concurrent.rwlock
 ```
 
 ## Atomics (`std.concurrent.atomic`)
@@ -94,20 +101,71 @@ fun main() {
 The child runs on a 128KB stack allocated by `std.mem.alloc` and
 released by `join`.
 
-## Mutexes (`std.concurrent.mutex`)
+## Semaphore (`std.concurrent.semaphore`)
 
-`create()`, `lock(m)`, `unlock(m)` wrap `std.Thread.Mutex`:
+A pure-Zag counting semaphore — the count is a futex-addressable
+`u32` driven by the atomic intrinsics and `std.posix`'s private
+futex primitives:
 
 ```
-import std.concurrent.mutex
+import std.concurrent.semaphore
 
-fun main() {
-    let m = create();
-    lock(m);
-    # critical section
-    unlock(m);
-}
+var sem: Semaphore = create(0);
+wait(&sem);   # take a unit (parks in the kernel at 0)
+post(&sem);   # give a unit (wakes one parked waiter)
 ```
+
+`wait` is a single CAS while the count is positive and a
+`FUTEX_WAIT_PRIVATE` park at 0; `post` is a `fetch_add(1)` plus a
+single-waiter wake. Surplus posts raise the count for later
+waiters. See `examples/concurrency/semaphore.zag` for bounded
+concurrency, exact unit accounting, and the park path.
+
+## Once (`std.concurrent.once`)
+
+Run-once initialization over the classic 3-state protocol
+(INCOMPLETE → RUNNING → COMPLETE) on a futex-addressable word:
+
+```
+import std.concurrent.once
+
+var o: Once = create();
+call_once(&o, init_fn, payload);   # runs init_fn(payload) once
+```
+
+The first thread to CAS 0→1 runs `f(payload)`; concurrent callers
+park until the run completes, late callers return on the fast path.
+A panicking run resets the word so a later call can retry. The fn
+ABI is the thread-body ABI (`*const fn (usize) void`), so state
+passes by pointer without closures. See
+`examples/concurrency/once.zag` for the 8-thread race proof.
+
+## RwLock (`std.concurrent.rwlock`)
+
+A writer-preferring reader/writer lock on a single `i32` word
+(bit 30 = writer interest, bits 0..29 = active reader count):
+
+```
+import std.concurrent.rwlock
+
+var l: RwLock = create();
+read_lock(&l);    # many readers hold concurrently
+# ... read shared state ...
+read_unlock(&l);
+
+write_lock(&l);   # exclusive: drains readers, blocks new ones
+# ... mutate shared state ...
+write_unlock(&l); # wakes every parked reader/writer
+```
+
+Once a writer sets the interest bit, new readers park instead of
+joining, so a reader stream cannot starve the writer; existing
+readers drain, the last one out wakes the writer, and release wakes
+everything (wake count `INT_MAX` — the kernel takes the
+`FUTEX_WAKE` count signed, so `UINT_MAX` would wake exactly one
+waiter and strand the rest). See
+`examples/concurrency/rwlock.zag` for reader concurrency, writer
+exclusion, the block park path, and the wake-all release.
 
 ## Memory Model
 
@@ -121,8 +179,9 @@ These modules build on `std.concurrent.*` primitives and are planned:
 |---|---|---|
 | `std.concurrent.channel` | Atomics | Bounded MPSC channel, inline ring buffer |
 | `std.concurrent.pool` | Threads + Atomics | Work-stealing thread pool |
-| `std.concurrent.rwlock` | Mutex | Read-write lock |
 | `std.concurrent.waitgroup` | Atomics | WaitGroup for barrier synchronization |
-| `std.concurrent.once` | Atomics | One-time initialization |
 
-Each is implementable as a small zig struct emitted in the codegen preamble, with zag builtins wrapping its methods. The pattern: emit the zig type definition, then provide `channel_send`/`channel_recv`-style builtins that call its methods.
+Each is implementable in pure Zag on the same pattern as the
+primitives above: a futex-addressable word driven by the atomic
+intrinsics plus `std.posix`'s futex/wait/wake syscalls — no
+zig-stdlib involvement, no codegen preamble helpers.
