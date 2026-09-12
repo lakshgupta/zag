@@ -50,14 +50,16 @@ const BindingTypeInfo = struct {
 /// discoverModules results and hand it to Codegen.project_modules.
 pub const ProjectModule = struct {
     /// Dotted module name ("lib", "db.schema") — the lookup key.
-    /// The emitted import is the flat output filename derived from
-    /// it ("<name>.zig", same-dir — see the sibling branch in the
-    /// imports loop); projectCmd always emits flat, so the two can
-    /// never diverge.
     name: []const u8,
-    /// Source path ("src/lib.zag") — informational (error messages,
-    /// future whole-module-expansion support); the emit never reads
-    /// the file.
+    /// Flat output FILENAME STEM to emit in `@import("<stem>.zig")`
+    /// — decoupled from `name` because dependency modules land under
+    /// a `deps.` prefixed stem (`internal_tls` → `deps.internal_tls`)
+    /// so a dep file can never collide with (or be shadowed by) a
+    /// same-named src module. Src/test rows pass `name`.
+    stem: []const u8,
+    /// Source path ("src/lib.zag", "deps/fakelib/src/lib.zag") —
+    /// informational (error messages, future whole-module-expansion
+    /// support); the emit never reads the file.
     path: []const u8,
 };
 
@@ -1513,18 +1515,18 @@ pub const MapEntry = struct {
                 var sibling_name: ?[]const u8 = null;
                 for (self.project_modules) |pm| {
                     if (std.mem.eql(u8, pm.name, dotted)) {
-                        sibling_name = pm.name;
+                        sibling_name = pm.stem;
                         break;
                     }
                 }
-                if (sibling_name) |mod_name| {
+                if (sibling_name) |mod_stem| {
                     if (imp.selectors.len == 0) continue;
                     self.write("const __zag_imported_");
                     var sib_idx_buf: [16]u8 = undefined;
                     const sib_idx_str = std.fmt.bufPrint(&sib_idx_buf, "{d}", .{import_i}) catch "X";
                     self.write(sib_idx_str);
                     self.write(" = @import(\"");
-                    self.write(mod_name);
+                    self.write(mod_stem);
                     self.write(".zig\");\n");
                     for (imp.selectors) |sel| {
                         const user_name = sel.alias orelse sel.name;

@@ -13,6 +13,7 @@
 ## run through `zag test`, never `zag run <file>`.)
 
 import lib.{lib_marker}
+import internal_tls.{tls_marker}
 
 fun main() {
     print("cfgtool tests — run `zag test` from the project root\n");
@@ -24,4 +25,8 @@ fun test_lib_marker() {
 
 fun test_lib_marker_positive() {
     assert(lib_marker() > 0);
+}
+
+fun test_path_dep_marker() {
+    assert(tls_marker());
 }

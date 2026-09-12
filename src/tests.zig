@@ -61,4 +61,8 @@ comptime {
     // auto-free/hoisting contract pinned separately from the
     // builtin/expr buckets so its tests stay greppable.
     _ = @import("tests/codegen_escape.zig");
+    // Project manifest/lockfile layer (src/project.zig) — dep-entry
+    // parsing, lockfile derive, toml splicing. Imports only std,
+    // so no build_options/toolchain coupling rides along.
+    _ = @import("project.zig");
 }

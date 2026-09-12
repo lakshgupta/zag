@@ -12,14 +12,33 @@ illustrative SHA values as placeholders (verify by `diff` against the
 fenced code blocks). Use this directory as a copy-paste template for
 new v0.1 zag projects.
 
+## Dependencies (working)
+
+Both dep kinds in `zag.toml` resolve and are usable from source:
+
+- **path dep** — `internal-tls = { path = "../sibling-tls" }`:
+  compiled straight from that directory, no fetch.
+- **remote git dep** — declared with `zag pkg add <url>`, cloned to
+  `deps/<name>/` by `zag install`.
+
+Import them with the dep key, dashes rewritten to underscores:
+
+```zag
+import internal_tls.{tls_marker}
+import lib.{lib_marker}
+```
+
+The dep's entry point is its own `[lib].root` (default
+`src/lib.zag`); other modules in the dep are reachable as
+`<dep>.<module path>`. Transitive deps (a dep's own manifest
+entries) are not resolved in v1.
+
 ## What's intentionally simplified
 
-The `.zag` source files here are **standalone programs** — they do not
-`import internal_tls` or any other dep. The dep-resolver's
-`path = "..."` plumbing is upcoming work in the v0.1 dep CLI. Until
-that ships, the fixture's source layer runs cleanly under
-`examples/run_all.sh`, and the project-layout story is carried by the
-metafiles (`zag.toml`, `zag.lock`):
+The remote deps in `zag.toml` (`json`, `log`, `zig-assert`) are
+manifest-only — nothing imports them, so no fetch is needed to build
+this fixture. The dep machinery itself is exercised by the path-dep
+above. Everything else mirrors the manual:
 
 | Path in walkthrough | On-disk fixture path | Purpose |
 |---|---|---|
@@ -30,10 +49,10 @@ metafiles (`zag.toml`, `zag.lock`):
 
 `tests/parse.zag` is the conventional tests/ root: `fun test_*`
 cases (no `@[test]` annotation needed — location implies suite
-membership) testing the sibling `src/lib.zag` via
-`import lib.{lib_marker}`. Run it with `zag test` from the project
-root; `examples/run_all.sh` skips `tests/` dirs (suites aren't
-runnable programs).
+membership) testing `src/lib.zag` and the path-dep via
+`import lib.{lib_marker}` / `import internal_tls.{tls_marker}`.
+Run it with `zag test` from the project root; `examples/run_all.sh`
+skips `tests/` dirs (suites aren't runnable programs).
 
 ## How to use this as a template
 
@@ -48,5 +67,6 @@ zag test       # discovers tests/, builds one binary per file, runs
 
 [`../sibling-tls/`](../sibling-tls/) ships alongside this fixture as the
 on-disk target for the `internal-tls = { path = "../sibling-tls" }` entry
-in `zag.toml`. It is a one-function stub; the real `internal_tls` surface
-ships when the dep-CLI work lands.
+in `zag.toml` — a real, importable path-dep (see "Dependencies
+(working)" above). It is a one-function stub; the real TLS surface
+is out of scope for the fixture role.

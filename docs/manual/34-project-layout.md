@@ -105,8 +105,8 @@ root = "examples/bench_main.zag"
 | `zag bench` | Discover + run benchmarks under `benches/` |
 | `zag run <file.zag>` | Compile then execute in one pass |
 | `zag check` | Type-check + import resolve only; no codegen |
-| `zag add <url>` | Fetch a new dep + record in `zag.toml` |
-| `zag remove <name>` | Drop an entry from `zag.toml` and `deps/<name>/` |
+| `zag pkg add <url> [--branch\|--rev\|--version] [--save-dev]` | Resolve a git dep + record in `zag.toml` + `zag.lock` |
+| `zag remove <name>` | Drop an entry from `zag.toml` and re-derive `zag.lock` |
 | `zag install` | Sync `deps/` from `zag.lock` |
 | `zag update` | Re-resolve advisory ranges and rewrite `zag.lock` |
 | `zag outdated` | List deps whose upstream can move forward |

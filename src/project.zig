@@ -416,6 +416,315 @@ var cfg_name_buf: [256]u8 = undefined;
 /// TOCTOU-style truncation surprises for niche `ZAG_HOME` paths.
 var cfg_zig_buf: [4096]u8 = undefined;
 
+/// Backing buffer for `TomlFields.lib_root` (`[lib] root = ...`,
+/// the dependency entry point). Same module-private discipline.
+var cfg_lib_buf: [512]u8 = undefined;
+
+/// One discovered dependency source module: a `.zag` file under a
+/// dependency's `src/` tree, addressable from user code as
+/// `import <dep>.<rel...>.{...}` (and the lib root additionally as
+/// bare `import <dep>.{...}`).
+pub const DepModuleEntry = struct {
+    /// Import-root namespace (dep name with `-`/`.` rewritten to
+    /// `_`: `internal-tls` → `internal_tls`, mirroring cargo).
+    dep_import_root: []const u8,
+    /// Dotted module path (`internal_tls.lib`, `internal_tls.sub`).
+    dotted: []const u8,
+    /// Source path relative to the project root
+    /// (`deps/fakelib/src/lib.zag`, `../sibling-tls/src/lib.zag`).
+    zag_path: []const u8,
+    /// Flat gen filename stem (`deps.internal_tls.lib` →
+    /// `build/gen/deps.internal_tls.lib.zig`, same flat discipline
+    /// as src/test outputs so `std/` resolves in-subtree).
+    out_name: []const u8,
+};
+
+// SEPARATE statics (same rationale as the test-discovery buffers:
+// manifest re-parses below must not clobber module/test slices
+// projectCmd is still holding).
+var depmod_buf: [128]DepModuleEntry = undefined;
+var depmod_count: usize = 0;
+
+var depmod_paths_buf: [128 * 160]u8 = undefined;
+var depmod_paths_pos: usize = 0;
+var depmod_names_buf: [128 * 96]u8 = undefined;
+var depmod_names_pos: usize = 0;
+
+/// Clean a dep name into an import-root namespace: `-` and `.`
+/// become `_` (`internal-tls` → `internal_tls`). Writes into the
+/// caller's buffer, returns the cleaned slice.
+fn cleanDepName(name: []const u8, buf: []u8) []const u8 {
+    const n = @min(name.len, buf.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const c = name[i];
+        buf[i] = if (c == '-' or c == '.') '_' else c;
+    }
+    return buf[0..n];
+}
+
+/// Read a small manifest file (dep `zag.toml`) into `buf`.
+/// Returns the bytes read, or null when missing/unreadable
+/// (skip-on-missing: a dep without a manifest uses defaults).
+fn readDepManifest(path: []const u8, buf: []u8) ?[]const u8 {
+    const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.os.linux.close(fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.os.linux.read(fd, buf[total..].ptr, buf.len - total);
+        if (n == 0) break;
+        if (n > std.math.maxInt(isize)) break;
+        total += @as(usize, @intCast(n));
+    }
+    if (total == 0) return null;
+    return buf[0..total];
+}
+
+/// Discover every compilable `.zag` file under each declared
+/// dependency's `src/` tree.
+///
+/// Sources, in order:
+///   - `[dependencies]` + `[dev-dependencies]` entries with `git`
+///     (installed under `deps/<name>/` by `zag install`) or `path`
+///     (a local directory, e.g. `../sibling-tls`).
+///   - Each dep's entry point comes from its own `zag.toml`
+///     `[lib].root` (default `src/lib.zag` when the manifest or the
+///     key is absent); the whole `src/` tree is walked so the dep's
+///     internal sibling imports keep resolving.
+///   - Missing roots / missing manifests / missing lib-root files
+///     skip silently (the importing file then binds nothing and zig
+///     reports the use site loudly).
+///
+/// Transitive deps (a dep's own `[dependencies]`) are NOT followed
+/// in v1 — only main-manifest entries resolve. Out of scope by
+/// design; document, don't silently half-support.
+pub fn discoverDepModules() []const DepModuleEntry {
+    depmod_count = 0;
+    depmod_paths_pos = 0;
+    depmod_names_pos = 0;
+
+    var manifest_buf: [16384]u8 = undefined;
+    const manifest = readDepManifest("zag.toml", &manifest_buf) orelse return &[_]DepModuleEntry{};
+    const fields = parseToml(manifest) orelse return &[_]DepModuleEntry{};
+
+    // Copy dep entries up-front: the per-dep manifest parses below
+    // reuse the same parseToml statics and would clobber these
+    // slices (whose storage in dep_field_buf stays valid — only the
+    // counts reset — but the ENTRY structs themselves live in the
+    // shared dep_entry_buf).
+    var want_buf: [96]DepEntry = undefined;
+    var want_count: usize = 0;
+    for (fields.deps) |d| {
+        if (want_count >= want_buf.len) break;
+        if (d.git == null and d.path == null) continue;
+        want_buf[want_count] = d;
+        want_count += 1;
+    }
+    for (fields.dev_deps) |d| {
+        if (want_count >= want_buf.len) break;
+        if (d.git == null and d.path == null) continue;
+        want_buf[want_count] = d;
+        want_count += 1;
+    }
+    if (want_count == 0) return &[_]DepModuleEntry{};
+
+    var wi: usize = 0;
+    while (wi < want_count) : (wi += 1) {
+        discoverOneDep(want_buf[wi]);
+    }
+    sortDepModsByPath();
+    return depmod_buf[0..depmod_count];
+}
+
+/// Discover one dependency's modules into depmod_buf.
+fn discoverOneDep(dep: DepEntry) void {
+    var clean_buf: [64]u8 = undefined;
+    const clean = cleanDepName(dep.name, &clean_buf);
+
+    // Root dir: `path` dep → the literal dir; git dep → deps/<name>/.
+    var root_buf: [512]u8 = undefined;
+    const root_dir: []const u8 = if (dep.path) |p|
+        p
+    else blk: {
+        const w = std.fmt.bufPrint(&root_buf, "deps/{s}", .{dep.name}) catch return;
+        // Copy out of root_buf is unnecessary — root_dir is consumed
+        // below before root_buf is reused (single-threaded, no
+        // interleaving parses between here and the walk call... EXCEPT
+        // the manifest read below doesn't touch root_buf. Safe.)
+        break :blk w;
+    };
+
+    // Entry point: the dep's own [lib].root, else src/lib.zag.
+    var man_buf: [4096]u8 = undefined;
+    var man_path_buf: [1024]u8 = undefined;
+    const man_path = std.fmt.bufPrint(&man_path_buf, "{s}/zag.toml", .{root_dir}) catch return;
+    const lib_rel: []const u8 = if (readDepManifest(man_path, &man_buf)) |mcontent|
+        if (parseToml(mcontent)) |fields| fields.lib_root orelse "src/lib.zag"
+        else "src/lib.zag"
+    else
+        "src/lib.zag";
+
+    // Verify the lib-root file exists before walking (skip silently
+    // otherwise — the use site errors loudly on the unbound import).
+    var lib_path_buf: [1024]u8 = undefined;
+    const lib_path = std.fmt.bufPrint(&lib_path_buf, "{s}/{s}", .{ root_dir, lib_rel }) catch return;
+    {
+        const fd = posix.openat(posix.AT.FDCWD, lib_path, .{ .ACCMODE = .RDONLY }, 0) catch return;
+        _ = std.os.linux.close(fd);
+    }
+
+    // Walk <root>/src/** for the full module set (lib root +
+    // siblings, so dep-internal imports keep resolving).
+    var src_dir_buf: [1024]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_dir_buf, "{s}/src", .{root_dir}) catch return;
+    const src_fd = posix.openat(posix.AT.FDCWD, src_dir, .{ .ACCMODE = .RDONLY }, 0) catch return;
+    defer _ = std.os.linux.close(src_fd);
+
+    walkDepTree(src_fd, src_dir, "", clean, lib_rel);
+}
+
+/// Recursive walker for one dependency's `src/` tree. Mirrors
+/// walkSrcTree/walkTestsTree: `fs_prefix` is the CWD-relative path
+/// of the tree root for opens (`deps/fakelib/src`), `rel` tracks
+/// position inside it, `clean` is the import namespace, `lib_rel`
+/// is the lib-root path relative to src/ (for the bare-name entry).
+fn walkDepTree(dir_fd: i32, fs_prefix: []const u8, rel: []const u8, clean: []const u8, lib_rel: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.os.linux.getdents64(dir_fd, &buf, buf.len);
+        if (n == 0) break;
+        if (n > std.math.maxInt(isize)) break;
+
+        var pos: usize = 0;
+        while (pos < n) {
+            const entry: *const std.os.linux.dirent64 = @ptrCast(@alignCast(&buf[pos]));
+            pos += entry.reclen;
+
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.name)));
+            const name = name_z[0..name_z.len];
+
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (name[0] == '.') continue;
+
+            if (entry.type == std.os.linux.DT.DIR) {
+                if (std.mem.eql(u8, name, "build")) continue;
+                var new_rel_buf: [512]u8 = undefined;
+                const new_rel: []const u8 = if (rel.len == 0)
+                    std.fmt.bufPrint(&new_rel_buf, "{s}", .{name}) catch continue
+                else
+                    std.fmt.bufPrint(&new_rel_buf, "{s}/{s}", .{ rel, name }) catch continue;
+
+                var child_fs_buf: [1024]u8 = undefined;
+                const child_fs = std.fmt.bufPrint(&child_fs_buf, "{s}/{s}", .{ fs_prefix, new_rel }) catch continue;
+                const child_fd = posix.openat(posix.AT.FDCWD, child_fs, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+                walkDepTree(child_fd, fs_prefix, new_rel, clean, lib_rel);
+                _ = std.os.linux.close(child_fd);
+            } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
+                // fs path + rel stem for this file.
+                var fs_buf: [1024]u8 = undefined;
+                const fs_path: []const u8 = if (rel.len == 0)
+                    std.fmt.bufPrint(&fs_buf, "{s}/{s}", .{ fs_prefix, name }) catch continue
+                else
+                    std.fmt.bufPrint(&fs_buf, "{s}/{s}/{s}", .{ fs_prefix, rel, name }) catch continue;
+                const stem_len = name.len - ".zag".len;
+
+                // relstem: "sub" or "a/b" (dotted later).
+                var relstem_buf: [512]u8 = undefined;
+                const relstem: []const u8 = if (rel.len == 0)
+                    std.fmt.bufPrint(&relstem_buf, "{s}", .{name[0..stem_len]}) catch continue
+                else
+                    std.fmt.bufPrint(&relstem_buf, "{s}/{s}", .{ rel, name[0..stem_len] }) catch continue;
+
+                addDepModule(clean, relstem, fs_path, lib_rel);
+            }
+        }
+    }
+}
+
+/// Record one dep file: the qualified entry always; the bare
+/// dep-name entry additionally when this file IS the lib root.
+fn addDepModule(clean: []const u8, relstem: []const u8, fs_path: []const u8, lib_rel: []const u8) void {
+    // lib_rel arrives as "src/<...>" (manifest form) or bare;
+    // normalize to src-relative for comparison ("src/lib.zag" →
+    // "lib.zag").
+    const lib_src_rel: []const u8 = if (std.mem.startsWith(u8, lib_rel, "src/"))
+        lib_rel["src/".len..]
+    else
+        lib_rel;
+    // Compare "lib.zag" against relstem+".zag".
+    var want_buf: [512]u8 = undefined;
+    const want: []const u8 = std.fmt.bufPrint(&want_buf, "{s}.zag", .{relstem}) catch return;
+    const is_lib_root = std.mem.eql(u8, want, lib_src_rel);
+
+    addDepModuleRow(clean, relstem, fs_path, false);
+    if (is_lib_root) addDepModuleRow(clean, relstem, fs_path, true);
+}
+
+/// Emit one DepModuleEntry row. `bare` selects the entry name:
+/// qualified ("fakelib.sub") or the bare import root ("fakelib",
+/// lib-root files only).
+fn addDepModuleRow(clean: []const u8, relstem: []const u8, fs_path: []const u8, bare: bool) void {
+    if (depmod_count >= depmod_buf.len) return;
+    // Dotted name into scratch (relstem "a/b" → "a.b" via a
+    // dedicated conversion buffer — never convert in place inside
+    // the destination bufPrint buffer).
+    var conv_buf: [128]u8 = undefined;
+    if (relstem.len > conv_buf.len) return;
+    @memcpy(conv_buf[0..relstem.len], relstem);
+    var k: usize = 0;
+    while (k < relstem.len) : (k += 1) {
+        if (conv_buf[k] == '/') conv_buf[k] = '.';
+    }
+    var dot_buf: [160]u8 = undefined;
+    const dotted: []const u8 = if (bare)
+        std.fmt.bufPrint(&dot_buf, "{s}", .{clean}) catch return
+    else
+        std.fmt.bufPrint(&dot_buf, "{s}.{s}", .{ clean, conv_buf[0..relstem.len] }) catch return;
+    // Flat output stem: "deps.<dotted>".
+    var out_buf: [192]u8 = undefined;
+    const out_name: []const u8 = std.fmt.bufPrint(&out_buf, "deps.{s}", .{dotted}) catch return;
+
+    if (depmod_names_pos + dotted.len + out_name.len > depmod_names_buf.len) return;
+    @memcpy(depmod_names_buf[depmod_names_pos..][0..dotted.len], dotted);
+    const dname = depmod_names_buf[depmod_names_pos..][0..dotted.len];
+    depmod_names_pos += dotted.len;
+    @memcpy(depmod_names_buf[depmod_names_pos..][0..out_name.len], out_name);
+    const oname = depmod_names_buf[depmod_names_pos..][0..out_name.len];
+    depmod_names_pos += out_name.len;
+
+    if (depmod_paths_pos + clean.len + fs_path.len > depmod_paths_buf.len) return;
+    @memcpy(depmod_paths_buf[depmod_paths_pos..][0..clean.len], clean);
+    const cname = depmod_paths_buf[depmod_paths_pos..][0..clean.len];
+    depmod_paths_pos += clean.len;
+    @memcpy(depmod_paths_buf[depmod_paths_pos..][0..fs_path.len], fs_path);
+    const fpath = depmod_paths_buf[depmod_paths_pos..][0..fs_path.len];
+    depmod_paths_pos += fs_path.len;
+
+    depmod_buf[depmod_count] = .{
+        .dep_import_root = cname,
+        .dotted = dname,
+        .zag_path = fpath,
+        .out_name = oname,
+    };
+    depmod_count += 1;
+}
+
+/// Insertion sort depmod_buf[0..depmod_count] by `zag_path`
+/// (mirrors sortByPath/sortTestsByPath).
+fn sortDepModsByPath() void {
+    var i: usize = 1;
+    while (i < depmod_count) : (i += 1) {
+        const cur = depmod_buf[i];
+        var j: usize = i;
+        while (j > 0 and std.mem.lessThan(u8, depmod_buf[j - 1].zag_path, cur.zag_path)) {
+            depmod_buf[j] = depmod_buf[j - 1];
+            j -= 1;
+        }
+        depmod_buf[j] = cur;
+    }
+}
+
 // =====================================================================
 // Dependency-tracking surface (v0.1 pkg CLI).
 // =====================================================================
@@ -546,6 +855,10 @@ pub fn detectProject(root_dir: []const u8) !?ProjectConfig {
 const TomlFields = struct {
     name: ?[]const u8,
     zig: ?[]const u8,
+    /// `[lib] root = "src/lib.zag"` — the dependency entry point
+    /// (which src file `import <dep>.{...}` resolves to). Null when
+    /// the section is absent; consumers default to "src/lib.zag".
+    lib_root: ?[]const u8,
     deps: []const DepEntry = &[_]DepEntry{},
     dev_deps: []const DepEntry = &[_]DepEntry{},
 };
@@ -572,10 +885,11 @@ const TomlFields = struct {
 /// still parses. New scaffolds emit `[package]\nname = "..."`
 /// explicitly (clearer intent, matches the schema doc).
 pub fn parseToml(content: []const u8) ?TomlFields {
-    const Section = enum { package, toolchain, dependencies, dev_dependencies, none };
+    const Section = enum { package, toolchain, lib, dependencies, dev_dependencies, none };
     var section: Section = .package; // backward-compat default
     var name_field: ?[]const u8 = null;
     var zig_field: ?[]const u8 = null;
+    var lib_field: ?[]const u8 = null;
 
     var cursor: usize = 0;
     while (cursor < content.len) {
@@ -603,6 +917,8 @@ pub fn parseToml(content: []const u8) ?TomlFields {
                     if (dev_dep_entry_count > 0) dev_dep_entry_count = 0;
                 } else if (std.mem.eql(u8, sect, "toolchain")) {
                     section = .toolchain;
+                } else if (std.mem.eql(u8, sect, "lib")) {
+                    section = .lib;
                 } else if (std.mem.eql(u8, sect, "dependencies")) {
                     section = .dependencies;
                 } else if (std.mem.eql(u8, sect, "dev-dependencies")) {
@@ -625,6 +941,12 @@ pub fn parseToml(content: []const u8) ?TomlFields {
                             zig_field = cfg_zig_buf[0..v.len];
                         }
                     },
+                    .lib => if (extractQuoted(trimmed, "root")) |v| {
+                        if (v.len <= cfg_lib_buf.len) {
+                            @memcpy(cfg_lib_buf[0..v.len], v);
+                            lib_field = cfg_lib_buf[0..v.len];
+                        }
+                    },
                     .dependencies => parseDepLine(trimmed, false),
                     .dev_dependencies => parseDepLine(trimmed, true),
                     .none => {},
@@ -638,6 +960,7 @@ pub fn parseToml(content: []const u8) ?TomlFields {
     return TomlFields{
         .name = name_field,
         .zig = zig_field,
+        .lib_root = lib_field,
         .deps = dep_entry_buf[0..dep_entry_count],
         .dev_deps = dev_dep_entry_buf[0..dev_dep_entry_count],
     };
@@ -725,6 +1048,24 @@ fn parseDepLine(line: []const u8, is_dev: bool) void {
         break :blk &dep_entry_buf[idx];
     };
 
+    // Initialize EVERY field: the buffers are `undefined` memory, so
+    // absent keys would otherwise leave garbage optionals behind. A
+    // garbage-non-null `path`/`rev`/`branch` reads as "present" and
+    // corrupts downstream consumers (surfaced by `zag pkg add`
+    // panicking in writeLockEntry on a garbage `p.len` — Debug fills
+    // undefined stack with 0xAA, hence the deterministic
+    // 0xAAAAAAAAAAAAAB08 index).
+    dep_target.* = .{
+        .name = "",
+        .git = null,
+        .sha = null,
+        .path = null,
+        .rev = null,
+        .branch = null,
+        .version = null,
+        .optional = false,
+    };
+
     // Copy name into the data-table slot (lock_field_buf shares
     // storage with the parsed [dependencies] name slots; for dep
     // entries we use the dep_field_buf).
@@ -793,12 +1134,17 @@ pub fn parseLockfile(content: []const u8) ?Lockfile {
                 }
             } else {
                 // `<name> = { git = "...", sha = "..." }` — strip the
-                // name = prefix, then split the inner table.
+                // name = prefix, then split the inner table. Names are
+                // DOUBLE-QUOTED in the machine-generated lockfile
+                // (`"fakelib" = {...}` — see writeLockEntry), so the
+                // trim set includes `"`; without it the quotes leak
+                // into entry.name and `zag install` clones into a
+                // literal `deps/"fakelib"/` directory.
                 const eq_idx = std.mem.findScalar(u8, trimmed, '=') orelse {
                     cursor = line_end + 1;
                     continue;
                 };
-                const dep_name = std.mem.trim(u8, trimmed[0..eq_idx], " \t");
+                const dep_name = std.mem.trim(u8, trimmed[0..eq_idx], " \t\"");
                 const lbrace2 = std.mem.findScalarPos(u8, trimmed, eq_idx, '{') orelse {
                     cursor = line_end + 1;
                     continue;
@@ -828,6 +1174,16 @@ pub fn parseLockfile(content: []const u8) ?Lockfile {
                     cursor = line_end + 1;
                     continue;
                 }
+
+                // Initialize EVERY field (same rationale as
+                // parseDepLine's slot init: absent keys must read as
+                // null, not undefined-memory garbage).
+                tgt.?.* = .{
+                    .name = "",
+                    .git = null,
+                    .sha = null,
+                    .path = null,
+                };
 
                 if (dep_name.len > lock_field_buf[lock_field_pos].len) {
                     cursor = line_end + 1;
@@ -1235,6 +1591,13 @@ fn buildDepLine(buf: []u8, dep: DepEntry) !usize {
     }
 
     if (pos + 1 > buf.len) return error.BufferTooSmall;
+    // Space before the closing brace on non-empty bodies
+    // (`{ git = "..." }`, matching the manual + fixture shape) —
+    // the field loop leaves no trailing space itself.
+    if (!first) {
+        buf[pos] = ' ';
+        pos += 1;
+    }
     buf[pos] = '}';
     pos += 1;
     return pos;
@@ -1347,10 +1710,19 @@ pub fn removeDepFromToml(content: []const u8, dep_name: []const u8, is_dev: bool
         // Skip blank + commented-out dep lines (`# foo = { ... }`).
         const is_comment_or_blank = line.len == 0 or line[0] == '#';
 
-        if (!is_comment_or_blank and std.mem.startsWith(u8, line, dep_name)) {
+        // Match `dep_name =` with an OPTIONAL surrounding quote pair
+        // (`"foo" = {...}` — the lockfile + newer manifests quote
+        // names; older tomls are bare). The closing-quote-then-`=`
+        // requirement keeps prefix-boundedness: `"foobar"`/`foobar`
+        // must not match dep "foo".
+        var rest = line;
+        if (rest.len > 0 and rest[0] == '"') rest = rest[1..];
+        const name_hit = std.mem.startsWith(u8, rest, dep_name);
+        if (!is_comment_or_blank and name_hit) {
             var j: usize = dep_name.len;
-            while (j < line.len and (line[j] == ' ' or line[j] == '\t')) : (j += 1) {}
-            if (j < line.len and line[j] == '=') {
+            if (j < rest.len and rest[j] == '"') j += 1;
+            while (j < rest.len and (rest[j] == ' ' or rest[j] == '\t')) : (j += 1) {}
+            if (j < rest.len and rest[j] == '=') {
                 // Match. Splice out content[i..line_end_inclusive].
                 const line_end = if (nl < content.len) nl + 1 else nl;
                 if (content.len - (line_end - i) > writeback_buf.len) return error.BufferTooSmall;
@@ -1418,6 +1790,54 @@ test "parseToml: [toolchain] zig = /path/to/zig parses" {
     const fields = parseToml(content).?;
     try std.testing.expectEqualStrings("myproj", fields.name.?);
     try std.testing.expectEqualStrings("/opt/zig-0.16/zig", fields.zig.?);
+}
+
+test "parseToml: [lib] root = ... (dep entry point) parses" {
+    // The dependency entry point: `[lib].root` decides which file
+    // `import <dep>.{...}` resolves to. Null when the section is
+    // absent (consumers default to "src/lib.zag").
+    const content =
+        \\[package]
+        \\name = "ghlib"
+        \\
+        \\[lib]
+        \\root = "src/lib.zag"
+        \\
+        \\[dependencies]
+        \\other = { git = "https://example.com/other" }
+        \\
+    ;
+    cfg_name_buf = [_]u8{0} ** cfg_name_buf.len;
+    cfg_zig_buf = [_]u8{0} ** cfg_zig_buf.len;
+    cfg_lib_buf = [_]u8{0} ** cfg_lib_buf.len;
+    const fields = parseToml(content).?;
+    try std.testing.expectEqualStrings("src/lib.zag", fields.lib_root.?);
+    // Sections stay independent — the [lib] section does not
+    // disturb dep parsing.
+    try std.testing.expectEqual(@as(usize, 1), fields.deps.len);
+}
+
+test "parseToml: [lib] absent → lib_root is null (default applies)" {
+    const content =
+        \\[package]
+        \\name = "myproj"
+        \\
+    ;
+    cfg_name_buf = [_]u8{0} ** cfg_name_buf.len;
+    cfg_zig_buf = [_]u8{0} ** cfg_zig_buf.len;
+    cfg_lib_buf = [_]u8{0} ** cfg_lib_buf.len;
+    const fields = parseToml(content).?;
+    try std.testing.expect(fields.lib_root == null);
+}
+
+test "cleanDepName: dashes and dots become underscores (import namespace)" {
+    // Dep names carry `-`/`.` (cargo-style: `zag-dep-fixture`,
+    // `internal-tls`) but zag identifiers can't, so the import root
+    // rewrites them (`zag_dep_fixture`).
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("zag_dep_fixture", cleanDepName("zag-dep-fixture", &buf));
+    try std.testing.expectEqualStrings("internal_tls", cleanDepName("internal-tls", &buf));
+    try std.testing.expectEqualStrings("plain", cleanDepName("plain", &buf));
 }
 
 test "parseToml: key = \"value\" whitespace tolerance (extra spaces)" {
@@ -1601,7 +2021,7 @@ test "removeDepFromToml: happy path splices out matching line" {
         \\
         \\[dependencies]
         \\json = { git = "https://github.com/zag/json", rev = "v0.2.4" }
-        \\log  = { git = "https://github.com/zag/log", branch = "main" }
+        \\log = { git = "https://github.com/zag/log", branch = "main" }
         \\
         \\[toolchain]
         \\zig = "/opt/zig/zig"
@@ -1694,4 +2114,68 @@ test "buildDepLine: emits field order git ? rev ? branch ? version ? path ? sha 
         "local = { path = \"../local\", optional = true }",
         buf_b[0..b_len],
     );
+}
+
+test "parseToml: absent dep keys initialize to null (slot init)" {
+    // Regression: parseDepLine claimed slots from `undefined` buffers
+    // without initializing absent keys, so a dep without `path` (the
+    // common git case) carried a garbage-non-null `path` that
+    // corrupted writeLockEntry (`zag pkg add` panicked on a garbage
+    // p.len — deterministic 0xAA-fill in Debug builds).
+    const content =
+        \\[package]
+        \\name = "depproj"
+        \\
+        \\[dependencies]
+        \\fakelib = { git = "/tmp/fakelib", branch = "main", sha = "0c81c5cca14317b6eb7abaf05a5d384cc3c0637b" }
+        \\\
+    ;
+    const fields = parseToml(content).?;
+    try std.testing.expectEqual(@as(usize, 1), fields.deps.len);
+    const dep = fields.deps[0];
+    try std.testing.expectEqualStrings("fakelib", dep.name);
+    try std.testing.expect(dep.git != null);
+    try std.testing.expect(dep.branch != null);
+    try std.testing.expect(dep.sha != null);
+    try std.testing.expect(dep.path == null);
+    try std.testing.expect(dep.rev == null);
+    try std.testing.expect(dep.version == null);
+    try std.testing.expect(!dep.optional);
+}
+
+test "parseLockfile: quoted entry names are stripped" {
+    // writeLockEntry emits `"fakelib" = {...}` (quoted); the reader
+    // must strip the quotes or `zag install` clones into a literal
+    // `deps/"fakelib"/` directory.
+    const content =
+        \\# zag.lock -- auto-generated, do not hand-edit.
+        \\
+        \\[deps]
+        \\"fakelib" = { git = "/tmp/fakelib", sha = "0c81c5cca14317b6eb7abaf05a5d384cc3c0637b" }
+        \\\
+    ;
+    const lockfile = parseLockfile(content).?;
+    try std.testing.expectEqual(@as(usize, 1), lockfile.deps.len);
+    try std.testing.expectEqualStrings("fakelib", lockfile.deps[0].name);
+    try std.testing.expect(lockfile.deps[0].path == null);
+}
+
+test "writeLockfileFromToml: git-only dep round-trips without panic" {
+    // End-to-end lockfile derive over the exact manifest shape
+    // `zag pkg add` produces (no `path` key anywhere) — the
+    // previously-panicking path.
+    const content =
+        \\[package]
+        \\name = "depproj"
+        \\version = "0.1.0"
+        \\[dependencies]
+        \\fakelib = { git = "/tmp/fakelib", branch = "main", sha = "0c81c5cca14317b6eb7abaf05a5d384cc3c0637b" }
+        \\\
+    ;
+    var buf: [4096]u8 = undefined;
+    const n = try writeLockfileFromToml(&buf, content);
+    const out = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, out, "[deps]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "fakelib") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "0c81c5cca14317b6eb7abaf05a5d384cc3c0637b") != null);
 }

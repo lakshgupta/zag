@@ -449,10 +449,110 @@ fn buildProjectModuleTable(modules: []const project_mod.ModuleEntry, buf: []code
     var n: usize = 0;
     for (modules) |m| {
         if (n >= buf.len) break;
-        buf[n] = .{ .name = m.module_name, .path = m.path };
+        // stem: main's flat output is "main.zig", not "main.main.zig".
+        const stem: []const u8 = if (std.mem.eql(u8, m.module_name, "main")) "main" else m.module_name;
+        buf[n] = .{ .name = m.module_name, .stem = stem, .path = m.path };
         n += 1;
     }
     return buf[0..n];
+}
+
+/// Append dependency modules (qualified dotted names — the bare
+/// lib-root rows are included as ordinary rows since their `dotted`
+/// IS the bare import root) to an in-progress sibling table.
+/// Returns the extended slice. Same lifetime contract as
+/// buildProjectModuleTable.
+fn appendDepModulesToTable(depmods: []const project_mod.DepModuleEntry, buf: []codegen_mod.ProjectModule, n: usize) []codegen_mod.ProjectModule {
+    var count = n;
+    for (depmods) |d| {
+        if (count >= buf.len) break;
+        buf[count] = .{ .name = d.dotted, .stem = d.out_name, .path = d.zag_path };
+        count += 1;
+    }
+    return buf[0..count];
+}
+
+/// Flat gen output path for a src module ("build/gen/main.zig" or
+/// "build/gen/<dotted>.zig") — the single spelling every emit site
+/// must use, so collision guards compare identical strings.
+fn srcModuleOutPath(mod: project_mod.ModuleEntry, buf: []u8) []const u8 {
+    if (std.mem.eql(u8, mod.module_name, "main"))
+        return std.fmt.bufPrint(buf, "build/gen/main.zig", .{}) catch "build/gen/main.zig";
+    return std.fmt.bufPrint(buf, "build/gen/{s}.zig", .{mod.module_name}) catch "build/gen/module.zig";
+}
+
+/// Flat gen output path for a test file ("build/gen/tests.<dotted>.zig").
+fn testOutPath(t: project_mod.TestEntry, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "build/gen/tests.{s}.zig", .{t.test_name}) catch "build/gen/tests.test.zig";
+}
+
+/// Transpile every discovered dependency source file (all modes —
+/// exe and test builds alike need dep .zig on disk for path imports
+/// to resolve). Outputs land flat at build/gen/<out_name>.zig.
+///
+/// Scoped tables: each dep file compiles with its OWN dep's bare
+/// stems first (`import sub` inside dep D resolves to D's file,
+/// exactly as when D builds standalone), then the shared base table
+/// (main modules + qualified `dep.mod` rows). Main/test files never
+/// see bare dep stems, so a dep can never shadow a main module in
+/// user code. `tests` (null outside `zag test`) extends the output
+/// collision guard.
+fn transpileDepFiles(
+    depmods: []const project_mod.DepModuleEntry,
+    base_table: []codegen_mod.ProjectModule,
+    modules: []const project_mod.ModuleEntry,
+    tests: ?[]const project_mod.TestEntry,
+) void {
+    for (depmods) |d| {
+        var scoped_buf: [256]codegen_mod.ProjectModule = undefined;
+        var sc: usize = 0;
+        for (depmods) |other| {
+            if (!std.mem.eql(u8, other.dep_import_root, d.dep_import_root)) continue;
+            if (std.mem.eql(u8, other.dotted, other.dep_import_root)) continue;
+            const prefix_len = other.dep_import_root.len + 1;
+            if (other.dotted.len <= prefix_len) continue;
+            if (sc >= scoped_buf.len) break;
+            scoped_buf[sc] = .{ .name = other.dotted[prefix_len..], .stem = other.out_name, .path = other.zag_path };
+            sc += 1;
+        }
+        for (base_table) |b| {
+            if (sc >= scoped_buf.len) break;
+            scoped_buf[sc] = b;
+            sc += 1;
+        }
+
+        const dsource = readFile(d.zag_path) catch {
+            std.debug.print("error: could not read {s}\n", .{d.zag_path});
+            std.process.exit(1);
+        };
+        const dresult = transpileEx(d.zag_path, dsource, true, "std/", scoped_buf[0..sc]) catch |e| {
+            std.debug.print("error: transpile failed for {s}: {s}\n", .{ d.zag_path, @errorName(e) });
+            std.process.exit(1);
+        };
+        var dout_buf: [512]u8 = undefined;
+        const dout_path = std.fmt.bufPrint(&dout_buf, "build/gen/{s}.zig", .{d.out_name}) catch "build/gen/dep.zig";
+        for (modules) |mod| {
+            var mout_buf: [512]u8 = undefined;
+            if (std.mem.eql(u8, dout_path, srcModuleOutPath(mod, &mout_buf))) {
+                std.debug.print("error: dep output {s} collides with src module {s} (rename one)\n", .{ dout_path, mod.path });
+                std.process.exit(1);
+            }
+        }
+        if (tests) |ts| {
+            for (ts) |t| {
+                var tout_buf2: [512]u8 = undefined;
+                if (std.mem.eql(u8, dout_path, testOutPath(t, &tout_buf2))) {
+                    std.debug.print("error: dep output {s} collides with test {s} (rename one)\n", .{ dout_path, t.path });
+                    std.process.exit(1);
+                }
+            }
+        }
+        writeFile(dout_path, dresult.zig) catch {
+            std.debug.print("error: could not write {s}\n", .{dout_path});
+            std.process.exit(1);
+        };
+        if (dresult.map.len > 0) writeMapFile(dout_path, dresult.map) catch {};
+    }
 }
 
 fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8, generate: bool, build_mode: BuildMode) !void {
@@ -484,10 +584,18 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     // Project sibling-module table for dotted non-std imports
     // (`import lib.{x}` — see Codegen.project_modules). Slices point
     // into discoverModules' statics, which stay live for the whole
-    // command (discoverTests below uses SEPARATE buffers, so the
-    // table survives test discovery).
-    var pm_buf: [128]codegen_mod.ProjectModule = undefined;
-    const project_modules = buildProjectModuleTable(modules, pm_buf[0..]);
+    // command (discoverTests/discoverDepModules below use SEPARATE
+    // buffers, so the table survives later discovery).
+    var pm_buf: [256]codegen_mod.ProjectModule = undefined;
+    const base_count = (buildProjectModuleTable(modules, pm_buf[0..])).len;
+    // Dependency modules (qualified `dep.mod` rows plus the bare
+    // lib-root rows, whose `dotted` IS the bare import root) extend
+    // the same table, so `import fakelib.{x}` resolves from src AND
+    // tests with zero extra machinery. Transitive deps (a dep's own
+    // manifest entries) are NOT discovered — v1 resolves only
+    // main-manifest entries, documented in discoverDepModules.
+    const depmods = project_mod.discoverDepModules();
+    const project_modules = appendDepModulesToTable(depmods, pm_buf[0..], base_count);
 
     // Transpile and write each module
     for (modules) |mod| {
@@ -502,10 +610,7 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
 
         // Output path: build/gen/<module>.zig
         var out_buf: [512]u8 = undefined;
-        const out_path = if (std.mem.eql(u8, mod.module_name, "main"))
-            std.fmt.bufPrint(&out_buf, "build/gen/main.zig", .{}) catch "build/gen/main.zig"
-        else
-            std.fmt.bufPrint(&out_buf, "build/gen/{s}.zig", .{mod.module_name}) catch "build/gen/module.zig";
+        const out_path = srcModuleOutPath(mod, &out_buf);
 
         try writeFile(out_path, result.zig);
         if (result.map.len > 0) try writeMapFile(out_path, result.map);
@@ -540,19 +645,17 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
             // Collision guard: a src module like src/tests.zag or
             // src/tests/parse.zag would emit the same flat output
             // path — fail loudly instead of silently overwriting.
+            // Dep outputs collide-guarded inside transpileDepFiles
+            // (called below, after tests are known).
             var tout_buf: [512]u8 = undefined;
-            const tout_path = std.fmt.bufPrint(&tout_buf, "build/gen/tests.{s}.zig", .{t.test_name}) catch "build/gen/tests.test.zig";
+            const tout_path = testOutPath(t, &tout_buf);
             if (std.mem.eql(u8, tout_path, "build/gen/main.zig")) {
                 std.debug.print("error: test output {s} collides with src main module (rename src/tests.zag or tests/{s}.zag)\n", .{ tout_path, t.test_name });
                 std.process.exit(1);
             }
             for (modules) |mod| {
                 var mout_buf: [512]u8 = undefined;
-                const mout_path = if (std.mem.eql(u8, mod.module_name, "main"))
-                    std.fmt.bufPrint(&mout_buf, "build/gen/main.zig", .{}) catch "build/gen/main.zig"
-                else
-                    std.fmt.bufPrint(&mout_buf, "build/gen/{s}.zig", .{mod.module_name}) catch "build/gen/module.zig";
-                if (std.mem.eql(u8, tout_path, mout_path)) {
+                if (std.mem.eql(u8, tout_path, srcModuleOutPath(mod, &mout_buf))) {
                     std.debug.print("error: test output {s} collides with src module {s} (rename one)\n", .{ tout_path, mod.path });
                     std.process.exit(1);
                 }
@@ -560,6 +663,13 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
             try writeFile(tout_path, tresult.zig);
             if (tresult.map.len > 0) try writeMapFile(tout_path, tresult.map);
         }
+        // Dep outputs now that test outputs are known (collision
+        // guard needs both lists).
+        transpileDepFiles(depmods, project_modules, modules, test_entries);
+    } else {
+        // Non-test modes still need dep .zig on disk (exe builds
+        // import deps too) — no test list to guard against.
+        transpileDepFiles(depmods, project_modules, modules, null);
     }
 
     // Generate build.zig for the project
@@ -755,15 +865,17 @@ fn generateProjectFiles() !void {
         std.process.exit(1);
     }
 
-    var gpm_buf: [128]codegen_mod.ProjectModule = undefined;
+    var gpm_buf: [256]codegen_mod.ProjectModule = undefined;
     const gpm_table = buildProjectModuleTable(modules, gpm_buf[0..]);
+    const gpm_depmods = project_mod.discoverDepModules();
+    const gpm_full = appendDepModulesToTable(gpm_depmods, gpm_buf[0..], gpm_table.len);
 
     for (modules) |mod| {
         const source = readFile(mod.path) catch {
             std.debug.print("error: could not read {s}\n", .{mod.path});
             std.process.exit(1);
         };
-        const result = transpileEx(mod.path, source, true, "std/", gpm_table) catch |e| {
+        const result = transpileEx(mod.path, source, true, "std/", gpm_full) catch |e| {
             std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
             std.process.exit(1);
         };
@@ -777,6 +889,8 @@ fn generateProjectFiles() !void {
         try writeFile(out_path, result.zig);
         if (result.map.len > 0) try writeMapFile(out_path, result.map);
     }
+
+    transpileDepFiles(gpm_depmods, gpm_full, modules, null);
 
     try generateBuildZig(modules, &.{}, "main");
 }
@@ -1102,6 +1216,43 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
     }
 }
 
+/// Resolve a bare executable name via $PATH. The fork/execve spawn
+/// sites (runCommand, captureCommand) call the raw syscall, which
+/// performs NO $PATH lookup — passing "git" straight through fails
+/// with 127 for every user, silently breaking `zag pkg add`
+/// (ls-remote), `zag install` (clone/rev-parse/checkout), and any
+/// future bare-name subprocess. Names containing '/' pass through
+/// as-is (already paths). Returns a slice into a static buffer,
+/// valid until the next call — callers copy it into argv storage
+/// immediately. Null on miss: callers fall back to the bare name
+/// (today's behavior).
+var exe_resolve_buf: [4096]u8 = undefined;
+fn resolveExePath(name: []const u8) ?[]const u8 {
+    if (name.len == 0 or name.len > exe_resolve_buf.len) return null;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        @memcpy(exe_resolve_buf[0..name.len], name);
+        return exe_resolve_buf[0..name.len];
+    }
+    const path_var = env_path.getenv("PATH") orelse return null;
+    var it = std.mem.splitScalar(u8, path_var, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        if (dir.len + 1 + name.len > exe_resolve_buf.len) continue;
+        @memcpy(exe_resolve_buf[0..dir.len], dir);
+        exe_resolve_buf[dir.len] = '/';
+        @memcpy(exe_resolve_buf[dir.len + 1 ..][0..name.len], name);
+        const candidate = exe_resolve_buf[0 .. dir.len + 1 + name.len];
+        // Probe readability: weeds out missing hits. (No faccessat/
+        // X_OK probe exists in the sparse zig-0.16 surface; a present but
+        // non-executable hit still fails at execve with EACCES → 127,
+        // identical to today's behavior.)
+        const fd = posix.openat(posix.AT.FDCWD, candidate, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+        _ = std.os.linux.close(fd);
+        return candidate;
+    }
+    return null;
+}
+
 fn runCommandWithArgs(executable: []const u8, extra_args: []const []const u8) !u8 {
     const total_args = 1 + extra_args.len;
     if (total_args > 14) return error.TooManyArgs;
@@ -1169,6 +1320,19 @@ fn runCommand(executable: ?[]const u8, argv: []const []const u8) !u8 {
         @memcpy(buf, arg);
         arg_bufs[i] = buf;
         argv_z[i] = buf.ptr;
+    }
+
+    // Bare program names ("git") need $PATH resolution — raw execve
+    // below performs none (see resolveExePath). Explicit `executable`
+    // callers pass resolved paths already.
+    if (executable == null and argv.len > 0 and std.mem.indexOfScalar(u8, argv[0], '/') == null) {
+        if (resolveExePath(argv[0])) |abs| {
+            std.heap.page_allocator.free(arg_bufs[0].?);
+            const buf = try std.heap.page_allocator.allocSentinel(u8, abs.len, 0);
+            @memcpy(buf, abs);
+            arg_bufs[0] = buf;
+            argv_z[0] = buf.ptr;
+        }
     }
 
     var envp_z: [513]?[*:0]const u8 = .{ null } ** 513;
@@ -2532,6 +2696,19 @@ fn captureCommand(executable: ?[]const u8, argv: []const []const u8) ![]u8 {
         argv_z[i] = buf.ptr;
     }
 
+    // Bare program names ("git") need $PATH resolution — raw execve
+    // below performs none (see resolveExePath). Explicit `executable`
+    // callers pass resolved paths already.
+    if (executable == null and argv.len > 0 and std.mem.indexOfScalar(u8, argv[0], '/') == null) {
+        if (resolveExePath(argv[0])) |abs| {
+            std.heap.page_allocator.free(arg_bufs[0].?);
+            const buf = try std.heap.page_allocator.allocSentinel(u8, abs.len, 0);
+            @memcpy(buf, abs);
+            arg_bufs[0] = buf;
+            argv_z[0] = buf.ptr;
+        }
+    }
+
     var envp_z: [513]?[*:0]const u8 = .{ null } ** 513;
     const env_real_count = @min(env_path.environ_count, envp_z.len - 2);
     for (env_path.environ_entries[0..env_real_count], 0..) |maybe_env, i| envp_z[i] = maybe_env;
@@ -2564,10 +2741,15 @@ fn captureCommand(executable: ?[]const u8, argv: []const []const u8) ![]u8 {
     }
 
     _ = std.os.linux.close(pipefd[1]);
-    var captured: [16384]u8 = undefined;
+    // Static (NOT stack): the returned slice must outlive this call —
+    // a stack-local buffer dangles on return and the caller parses
+    // garbage (surfaced by `zag pkg add` embedding a corrupt SHA into
+    // zag.toml, then panicking downstream on the garbage length).
+    // Single-slot: callers consume the output before the next
+    // captureCommand call (same discipline as exe_resolve_buf).
     var total: usize = 0;
-    while (total < captured.len) {
-        const n = std.os.linux.read(pipefd[0], captured[total..].ptr, captured.len - total);
+    while (total < captureCommandStatic.len) {
+        const n = std.os.linux.read(pipefd[0], captureCommandStatic[total..].ptr, captureCommandStatic.len - total);
         if (n == 0) break;
         if (n < 0) break;
         total += @intCast(n);
@@ -2578,8 +2760,12 @@ fn captureCommand(executable: ?[]const u8, argv: []const []const u8) ![]u8 {
     _ = std.os.linux.waitpid(pid_fork, &status, 0);
     if (!std.os.linux.W.IFEXITED(status)) return error.CmdFailed;
     if (std.os.linux.W.EXITSTATUS(status) != 0) return error.CmdFailed;
-    return captured[0..total];
+    return captureCommandStatic[0..total];
 }
+
+/// Static output slot for captureCommand (see the lifetime note at
+/// the read loop above).
+var captureCommandStatic: [16384]u8 = undefined;
 
 /// Extract the dep name from a git URL. Strips trailing `.git`. Falls
 /// back to `error.InvalidUrl` if the URL has no path segment after the

@@ -89,10 +89,37 @@ The import resolver builds a module DAG and reports an error on cycles. This is 
 Third-party packages live in `deps/`:
 
 ```
-zag install           # fetch dependencies
-zag add json          # add a dependency
-zag remove json       # remove a dependency
+zag pkg add <git-url> [--branch <b>|--rev <sha>|--version <v>] [--save-dev]
+zag install           # clone each pinned dep into deps/<name>
+zag remove <name>     # drop from zag.toml + zag.lock
 ```
+
+`zag pkg add` resolves the ref through `git ls-remote`, writes the
+dep into `[dependencies]` (or `[dev-dependencies]` with
+`--save-dev`), and re-derives `zag.lock`. `zag install` clones each
+git dep to `deps/<name>/` and checks it out at the pinned SHA
+(skipping ones already there).
+
+To **use** a dependency:
+
+```
+import gitlib.{doubled}                 # the dep's [lib].root file
+import gitlib.sub.helper.{bump}         # another module in the dep
+import internal_tls.{tls_marker}        # path dep (../sibling-tls)
+```
+
+- The dep's entry point is its own `[lib] root = "src/lib.zag"`
+  (default when absent). Every `.zag` under the dep's `src/` is
+  addressable as `<dep>.<module path>`; the lib root is
+  additionally addressable by the bare dep name.
+- Dep names containing `-` or `.` are imported with underscores
+  (`zag-dep-fixture` → `zag_dep_fixture`), mirroring cargo.
+- Local sibling packages use `path = "../sibling-tls"` and are
+  compiled from that directory directly — no fetch needed.
+
+Transitive dependencies (a dependency's own `[dependencies]`) are
+**not** resolved in v1 — only the main manifest's entries are.
+Declare anything you import directly.
 
 Packages are resolved from **Git URLs** declared in `zag.toml` — today the protocol is **git-only**, no central registry yet. `zag add` / `zag fetch` populate `deps/` from a remote git rev, and local sibling packages use `path = "..."`. The lock file (`zag.lock`) pins every dependency to an exact git SHA + content hash. A central `zagpm.dev` registry is deferred to v2+ and will be an alias layer over the git protocol. For the full operational guide, see [Project Layout](34-project-layout.md); for the manifest format, see [`zag.toml` Schema](35-zag-toml-schema.md).
 
