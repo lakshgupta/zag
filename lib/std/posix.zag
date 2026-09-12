@@ -67,6 +67,67 @@ pub fun write(fd: i32, buf: []const u8, len: usize) -> isize {
     return n as isize;
 }
 
+## pread — raw `pread(2)`: reads into `buf[0..len]` at absolute file
+## offset `off` WITHOUT moving the fd's file position (the p-variant
+## is what makes random-access page reads race-free under concurrent
+## appenders, and it needs no lseek round trip). Returns bytes read
+## (short reads are legal — EOF returns 0) or negative errno.
+## Storage-engine primitive: page-sized block reads.
+pub fun pread(fd: i32, buf: []u8, len: usize, off: i64) -> isize {
+    let n: usize = std.os.linux.pread(fd, buf.ptr, len, off);
+    if ((n & 0x8000000000000000) != 0) {
+        return 0 -% (n as isize);
+    }
+    return n as isize;
+}
+
+## pwrite — raw `pwrite(2)`: the write twin of pread — writes
+## `buf[0..len]` at `off` without touching the file position.
+## Returns bytes written (partial writes possible — callers loop) or
+## negative errno.
+## Storage-engine primitive: in-place page writes.
+pub fun pwrite(fd: i32, buf: []const u8, len: usize, off: i64) -> isize {
+    let n: usize = std.os.linux.pwrite(fd, buf.ptr, len, off);
+    if ((n & 0x8000000000000000) != 0) {
+        return 0 -% (n as isize);
+    }
+    return n as isize;
+}
+
+## lseek — raw `lseek(2)`. whence: SEEK_SET=0, SEEK_CUR=1,
+## SEEK_END=2. Returns the resulting offset, or negative errno.
+## `lseek(fd, 0, SEEK_END)` is also the size probe: zig 0.16's std
+## has no fstat, so file size comes from seeking to the end (and the
+## caller restores the position afterwards — or just uses pread,
+## which is position-independent).
+pub fun lseek(fd: i32, off: i64, whence: usize) -> isize {
+    let n: usize = std.os.linux.lseek(fd, off, whence);
+    if ((n & 0x8000000000000000) != 0) {
+        return 0 -% (n as isize);
+    }
+    return n as isize;
+}
+
+## ftruncate — raw `ftruncate(2)`: sets the file length (grows with
+## a zero-filled hole, or shrinks). Returns 0 on success,
+## errno-encoded usize on failure. Storage engines use it to
+## pre-extend a file to N pages before writing blocks into it.
+pub fun ftruncate(fd: i32, len: i64) -> usize {
+    return std.os.linux.ftruncate(fd, len);
+}
+
+## fsync / fdatasync — raw `fsync(2)` / `fdatasync(2)`: flush the
+## file's data (and metadata for fsync) to stable storage. Durability
+## primitive for write-ahead logs: a WAL record is only "committed"
+## once this returns 0.
+pub fun fsync(fd: i32) -> usize {
+    return std.os.linux.fsync(fd);
+}
+
+pub fun fdatasync(fd: i32) -> usize {
+    return std.os.linux.fdatasync(fd);
+}
+
 ## close — raw `close(2)`. Returns 0 on success, errno-encoded usize
 ## on failure.
 pub fun close(fd: i32) -> usize {

@@ -1,0 +1,187 @@
+## Storage: an append-only record store (the "flatdb" first chapter,
+## in zag).
+##
+##   import std.fs.{File}
+##   import std.io.{ByteWriter, ByteReader, FileWriter, FileReader}
+##
+## The simplest database is a file you only ever append to. Nothing
+## already on disk is touched, so a crash half way through a write
+## leaves a partial record at the end and everything before it is
+## intact, and a reader can scan while a writer appends.
+##
+## Records are LENGTH-PREFIXED (varint length, then the bytes), not
+## delimiter-separated: a value containing the separator is the bug
+## that delimiter formats get wrong silently, and a length prefix is
+## what makes a record skippable without parsing it.
+##
+## What this proves about the primitive set:
+##   1. std.io.Writer / Reader — cursor-based encode/decode over a
+##      caller-owned buffer (the shape a page is built with).
+##   2. std.bytes varints — 1 byte for small lengths instead of 8.
+##   3. std.io.FileWriter / FileReader — page-buffered streaming out
+##      of / into an fd (many small records, few syscalls).
+##   4. std.fs.File.open_append — O_APPEND makes seek-to-end + write
+##      atomic, so two writers cannot interleave a record.
+##
+## Run: zag run append_only.zag
+
+import std.fs.{File}
+import std.io.{ByteWriter, ByteReader, FileWriter, FileReader}
+import std.bytes.{eq as bytes_eq, varint_len as vi_len}
+
+## On-disk record: [op:u8][key:varint+bytes][value:varint+bytes].
+## op 0 = put, 1 = delete (a tombstone — a file that cannot modify
+## can only remove by writing down that it did).
+const OP_PUT: u8 = 0;
+const OP_DEL: u8 = 1;
+
+fun append_record(w: *FileWriter, op: u8, key: []const u8, value: []const u8) {
+    var head: [512]u8 = undefined;
+    var hw: ByteWriter = ByteWriter.fixed(head[0..]);
+    hw.write_byte(op);
+    hw.write_varint(key.len as u64);
+    hw.write_all(key);
+    hw.write_varint(value.len as u64);
+    hw.write_all(value);
+    w.write_all(hw.buffered());
+}
+
+## Scan the whole log, keeping the last thing said about `key`.
+## Returns true when a live value was found (written into `out`).
+fun lookup(log: []const u8, key: []const u8, out: []u8, out_len: *usize) -> bool {
+    var r: ByteReader = ByteReader.fixed(log);
+    var found: bool = false;
+    var out_slot: [*]usize = out_len as [*]usize;
+    out_slot[0] = 0;
+    while (!r.eof()) {
+        let op: u8 = r.read_byte();
+        let k: []const u8 = r.read_bytes_prefixed();
+        let v: []const u8 = r.read_bytes_prefixed();
+        if (!bytes_eq(k, key)) { continue; }
+        if (op == OP_DEL) {
+            found = false;
+            out_slot[0] = 0;
+        } else {
+            found = true;
+            var i: usize = 0;
+            while (i < v.len) {
+                out[i] = v[i];
+                i = i + 1;
+            }
+            out_slot[0] = v.len;
+        }
+    }
+    return found;
+}
+
+fun main() {
+    let path: str = "/tmp/zag_append_only.log";
+
+    ## Write: buffered appends, then flush + fsync (the record is
+    ## only durable after those two).
+    var f: File = File.create(path);
+    f.close();
+    var fa: File = File.open_append(path);
+
+    var wbuf: [4096]u8 = undefined;
+    var w: FileWriter = FileWriter.init(fa.fd, wbuf[0..]);
+    append_record(&w, OP_PUT, "alice", "engineer");
+    append_record(&w, OP_PUT, "bob", "designer");
+    append_record(&w, OP_PUT, "alice", "architect");
+    append_record(&w, OP_DEL, "bob", "");
+    # A value containing the separator a delimiter format would
+    # split on: length-prefixing makes it a non-event.
+    append_record(&w, OP_PUT, "carol", "a|b\nc");
+    w.flush();
+    fa.sync();
+
+    let byte_len: usize = fa.size();
+    print("wrote {byte_len} bytes to {path}\n");
+
+    ## Read the whole log back through a buffered reader.
+    var log: [8192]u8 = undefined;
+    var fr: File = File.open(path);
+    var rb: [4096]u8 = undefined;
+    var rd: FileReader = FileReader.init(fr.fd, rb[0..]);
+    let total: usize = rd.read(log[0..]);
+    fr.close();
+    fa.close();
+    print("read back {total} bytes\n");
+
+    ## Scan for each key: last-write-wins, and a delete is visible
+    ## as absence.
+    var val: [256]u8 = undefined;
+    var vlen: usize = 0;
+
+    let hit_alice: bool = lookup(log[0..total], "alice", val[0..], addr_of(vlen));
+    assert(hit_alice);
+    assert(bytes_eq(val[0..vlen], "architect"));
+    print("alice -> {val[0..vlen]}\n");
+
+    let hit_bob: bool = lookup(log[0..total], "bob", val[0..], addr_of(vlen));
+    assert(!hit_bob);
+    print("bob -> (absent, deleted by tombstone)\n");
+
+    let hit_carol: bool = lookup(log[0..total], "carol", val[0..], addr_of(vlen));
+    assert(hit_carol);
+    assert(bytes_eq(val[0..vlen], "a|b\nc"));
+    print("carol -> embedded separator survived\n");
+
+    let hit_dave: bool = lookup(log[0..total], "dave", val[0..], addr_of(vlen));
+    assert(!hit_dave);
+    print("dave -> (absent)\n");
+}
+
+@[test]
+fun test_varint_roundtrip() {
+    var buf: [16]u8 = undefined;
+    var w: ByteWriter = ByteWriter.fixed(buf[0..]);
+    w.write_varint(0);
+    w.write_varint(127);
+    w.write_varint(128);
+    w.write_varint(300);
+    w.write_varint(100000);
+    let n: usize = w.tell();
+    assert(vi_len(0) == 1);
+    assert(vi_len(128) == 2);
+
+    var r: ByteReader = ByteReader.fixed(buf[0..n]);
+    assert(r.read_varint() == 0);
+    assert(r.read_varint() == 127);
+    assert(r.read_varint() == 128);
+    assert(r.read_varint() == 300);
+    assert(r.read_varint() == 100000);
+    assert(r.eof());
+}
+
+@[test]
+fun test_record_roundtrip_in_memory() {
+    var buf: [256]u8 = undefined;
+    var w: ByteWriter = ByteWriter.fixed(buf[0..]);
+    w.write_byte(OP_PUT);
+    w.write_bytes_prefixed("key");
+    w.write_bytes_prefixed("value");
+    let n: usize = w.tell();
+
+    var r: ByteReader = ByteReader.fixed(buf[0..n]);
+    let op: u8 = r.read_byte();
+    assert(op == OP_PUT);
+    assert(bytes_eq(r.read_bytes_prefixed(), "key"));
+    assert(bytes_eq(r.read_bytes_prefixed(), "value"));
+    assert(r.eof());
+}
+
+@[test]
+fun test_endian_explicit() {
+    var buf: [16]u8 = undefined;
+    var w: ByteWriter = ByteWriter.fixed(buf[0..]);
+    w.write_u32(0x01020304);
+    w.write_u32_be(0x01020304);
+    # Little-endian puts the low byte first; big-endian last. Both
+    # decode back to the same value through their matching reader.
+    assert(buf[0] == 0x04);
+    assert(buf[4] == 0x01);
+    var r: ByteReader = ByteReader.fixed(buf[0..]);
+    assert(r.read_u32() == 0x01020304);
+    assert(r.read_u32_be() == 0x01020304);
+}

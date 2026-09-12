@@ -11,13 +11,326 @@
 ## the buffer is full or EOF. Both return the byte count read —
 ## panics on read errors, matching std.fs's errno model.
 
-import std.posix.{read, write}
+import std.posix.{read as fd_read, write as fd_write}
+import std.bytes.{put_u16_le, put_u32_le, put_u64_le, put_u32_be, put_u64_be, put_varint, get_u16_le, get_u32_le, get_u64_le, get_u32_be, get_u64_be, read_varint as bytes_read_varint}
+
+## ── Writer: a cursor over a caller-owned buffer ────────────────────────
+##
+## The shape a page is built with: `fixed(page_bytes)` gives a
+## writer over one 4096-byte page, and every `write_*` advances the
+## cursor and bounds-checks against the page end — so a record that
+## doesn't fit is a loud panic here rather than a silent overwrite of
+## the next page. `buffered()` hands back what was written, ready for
+## a single `pwrite` of the whole page.
+pub struct ByteWriter {
+    buf: []u8,
+    pos: usize,
+}
+
+impl ByteWriter {
+    pub fun fixed(buf: []u8) -> ByteWriter {
+        return ByteWriter { buf: buf, pos: 0 };
+    }
+
+    # Bytes written so far (the prefix to persist).
+    pub fun buffered(self: *ByteWriter) -> []const u8 {
+        return self.buf[0..self.pos];
+    }
+
+    pub fun tell(self: *ByteWriter) -> usize {
+        return self.pos;
+    }
+
+    pub fun remaining(self: *ByteWriter) -> usize {
+        return self.buf.len - self.pos;
+    }
+
+    # Rewind to the start (reuse one page buffer for the next page).
+    pub fun reset(self: *ByteWriter) {
+        self.pos = 0;
+    }
+
+    pub fun seek(self: *ByteWriter, off: usize) {
+        if (off > self.buf.len) { __zag_panic("std.io.Writer.seek: past end of buffer"); }
+        self.pos = off;
+    }
+
+    pub fun write_byte(self: *ByteWriter, b: u8) {
+        if (self.pos >= self.buf.len) { __zag_panic("std.io.Writer.write_byte: page full"); }
+        self.buf[self.pos] = b;
+        self.pos = self.pos + 1;
+    }
+
+    # Append a slice — the length-prefixed body of a record, or a
+    # key/value payload. Zones the whole thing in one go.
+    pub fun write_all(self: *ByteWriter, bytes: []const u8) {
+        if (self.pos + bytes.len > self.buf.len) {
+            __zag_panic("std.io.Writer.write_all: does not fit in page");
+        }
+        var i: usize = 0;
+        while (i < bytes.len) {
+            self.buf[self.pos + i] = bytes[i];
+            i = i + 1;
+        }
+        self.pos = self.pos + bytes.len;
+    }
+
+    # Fixed-width little-endian fields (page-local metadata:
+    # counts, offsets, page ids).
+    pub fun write_u16(self: *ByteWriter, v: u16) {
+        self.pos = put_u16_le(self.buf, self.pos, v);
+    }
+
+    pub fun write_u32(self: *ByteWriter, v: u32) {
+        self.pos = put_u32_le(self.buf, self.pos, v);
+    }
+
+    pub fun write_u64(self: *ByteWriter, v: u64) {
+        self.pos = put_u64_le(self.buf, self.pos, v);
+    }
+
+    # Big-endian: for on-disk KEYS, where byte-wise order must
+    # match numeric order (a B-tree compares encoded bytes).
+    pub fun write_u32_be(self: *ByteWriter, v: u32) {
+        self.pos = put_u32_be(self.buf, self.pos, v);
+    }
+
+    pub fun write_u64_be(self: *ByteWriter, v: u64) {
+        self.pos = put_u64_be(self.buf, self.pos, v);
+    }
+
+    # Length prefix + body: the encoding that makes a record
+    # skippable and immune to delimiter-in-value corruption.
+    pub fun write_varint(self: *ByteWriter, v: u64) {
+        self.pos = put_varint(self.buf, self.pos, v);
+    }
+
+    pub fun write_bytes_prefixed(self: *ByteWriter, bytes: []const u8) {
+        self.write_varint(bytes.len as u64);
+        self.write_all(bytes);
+    }
+}
+
+## ── Reader: the symmetric cursor for decoding ──────────────────────────
+##
+## Reads over bytes that already exist (a page read off disk, or a
+## whole log mmapped / slurped into memory). Every read advances the
+## cursor; `remaining()` drives the "while there are more records"
+## loop.
+pub struct ByteReader {
+    bytes: []const u8,
+    pos: usize,
+}
+
+impl ByteReader {
+    pub fun fixed(bytes: []const u8) -> ByteReader {
+        return ByteReader { bytes: bytes, pos: 0 };
+    }
+
+    pub fun tell(self: *ByteReader) -> usize {
+        return self.pos;
+    }
+
+    pub fun remaining(self: *ByteReader) -> usize {
+        return self.bytes.len - self.pos;
+    }
+
+    pub fun eof(self: *ByteReader) -> bool {
+        return self.pos >= self.bytes.len;
+    }
+
+    pub fun seek(self: *ByteReader, off: usize) {
+        if (off > self.bytes.len) { __zag_panic("std.io.Reader.seek: past end"); }
+        self.pos = off;
+    }
+
+    pub fun read_byte(self: *ByteReader) -> u8 {
+        if (self.pos >= self.bytes.len) { __zag_panic("std.io.Reader.read_byte: EOF"); }
+        let b: u8 = self.bytes[self.pos];
+        self.pos = self.pos + 1;
+        return b;
+    }
+
+    # Copy `out.len` bytes into `out`; false (and no advance) when
+    # fewer remain — lets a scanner stop cleanly on a torn tail.
+    pub fun read_exact(self: *ByteReader, out: []u8) -> bool {
+        if (self.remaining() < out.len) { return false; }
+        var i: usize = 0;
+        while (i < out.len) {
+            out[i] = self.bytes[self.pos + i];
+            i = i + 1;
+        }
+        self.pos = self.pos + out.len;
+        return true;
+    }
+
+    # Slice out `n` bytes WITHOUT copying (the bytes live in the
+    # reader's buffer — valid while it is).
+    pub fun take(self: *ByteReader, n: usize) -> []const u8 {
+        if (self.remaining() < n) { __zag_panic("std.io.Reader.take: EOF"); }
+        let out: []const u8 = self.bytes[self.pos..self.pos + n];
+        self.pos = self.pos + n;
+        return out;
+    }
+
+    pub fun read_u16(self: *ByteReader) -> u16 {
+        let v: u16 = get_u16_le(self.bytes, self.pos);
+        self.pos = self.pos + 2;
+        return v;
+    }
+
+    pub fun read_u32(self: *ByteReader) -> u32 {
+        let v: u32 = get_u32_le(self.bytes, self.pos);
+        self.pos = self.pos + 4;
+        return v;
+    }
+
+    pub fun read_u64(self: *ByteReader) -> u64 {
+        let v: u64 = get_u64_le(self.bytes, self.pos);
+        self.pos = self.pos + 8;
+        return v;
+    }
+
+    pub fun read_u32_be(self: *ByteReader) -> u32 {
+        let v: u32 = get_u32_be(self.bytes, self.pos);
+        self.pos = self.pos + 4;
+        return v;
+    }
+
+    pub fun read_u64_be(self: *ByteReader) -> u64 {
+        let v: u64 = get_u64_be(self.bytes, self.pos);
+        self.pos = self.pos + 8;
+        return v;
+    }
+
+    pub fun read_varint(self: *ByteReader) -> u64 {
+        var next: usize = 0;
+        let v: u64 = bytes_read_varint(self.bytes, self.pos, addr_of(next));
+        self.pos = next;
+        return v;
+    }
+
+    # Read a varint length prefix, then slice that many bytes.
+    pub fun read_bytes_prefixed(self: *ByteReader) -> []const u8 {
+        let n: u64 = self.read_varint();
+        return self.take(n as usize);
+    }
+}
+
+## ── FileWriter: buffered streaming OUT to an fd ────────────────────────
+##
+## One page-sized buffer in front of the fd: `write_all` accumulates
+## and only issues a syscall when the buffer fills, so appending a
+## thousand small records costs a handful of writes instead of a
+## thousand. `flush()` must be called before `sync()` — the buffer is
+## the part that isn't durable yet.
+pub struct FileWriter {
+    fd: i32,
+    buf: []u8,
+    len: usize,
+    flushed: usize,
+}
+
+impl FileWriter {
+    pub fun init(fd: i32, buf: []u8) -> FileWriter {
+        return FileWriter { fd: fd, buf: buf, len: 0, flushed: 0 };
+    }
+
+    pub fun write_all(self: *FileWriter, bytes: []const u8) {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            if (self.len == self.buf.len) { self.flush(); }
+            let room: usize = self.buf.len - self.len;
+            var chunk: usize = bytes.len - pos;
+            if (chunk > room) { chunk = room; }
+            var i: usize = 0;
+            while (i < chunk) {
+                self.buf[self.len + i] = bytes[pos + i];
+                i = i + 1;
+            }
+            self.len = self.len + chunk;
+            pos = pos + chunk;
+        }
+    }
+
+    # Push the buffer to the fd (loops: write(2) may be partial).
+    pub fun flush(self: *FileWriter) {
+        var pos: usize = 0;
+        while (pos < self.len) {
+            let n: isize = fd_write(self.fd, self.buf[pos..self.len], self.len - pos);
+            if (n <= 0) { __zag_panic("std.io.FileWriter.flush: write error"); }
+            pos = pos + (n as usize);
+        }
+        self.flushed = self.flushed + self.len;
+        self.len = 0;
+    }
+
+    # Total bytes handed to the kernel so far (logical file offset
+    # after a flush — what an append-only log calls its end).
+    pub fun written(self: *FileWriter) -> usize {
+        return self.flushed + self.len;
+    }
+}
+
+## ── FileReader: buffered streaming IN from an fd ───────────────────────
+##
+## The read side of the same idea: refill one page at a time and hand
+## out bytes from it, so a full scan of a large file is a sequence of
+## page-sized reads rather than one byte per syscall.
+pub struct FileReader {
+    fd: i32,
+    buf: []u8,
+    len: usize,
+    pos: usize,
+}
+
+impl FileReader {
+    pub fun init(fd: i32, buf: []u8) -> FileReader {
+        return FileReader { fd: fd, buf: buf, len: 0, pos: 0 };
+    }
+
+    pub fun eof(self: *FileReader) -> bool {
+        if (self.pos < self.len) { return false; }
+        return !self.fill();
+    }
+
+    # Read the next `out.len` bytes; returns the count actually read
+    # (0 at EOF). Short reads are normal at the end of a file.
+    pub fun read(self: *FileReader, out: []u8) -> usize {
+        var done: usize = 0;
+        while (done < out.len) {
+            if (self.pos >= self.len) {
+                if (!self.fill()) { return done; }
+            }
+            let avail: usize = self.len - self.pos;
+            var chunk: usize = out.len - done;
+            if (chunk > avail) { chunk = avail; }
+            var i: usize = 0;
+            while (i < chunk) {
+                out[done + i] = self.buf[self.pos + i];
+                i = i + 1;
+            }
+            self.pos = self.pos + chunk;
+            done = done + chunk;
+        }
+        return done;
+    }
+
+    # Refill the buffer from the fd. Returns false at EOF.
+    pub fun fill(self: *FileReader) -> bool {
+        let n: isize = fd_read(self.fd, self.buf, self.buf.len);
+        if (n <= 0) { return false; }
+        self.len = n as usize;
+        self.pos = 0;
+        return true;
+    }
+}
 
 ## Read one line (up to and including `\n`) into `buf`. Returns the
 ## line length, or null at EOF. A line longer than the buffer is
 ## truncated (the remainder stays in the fd for the next read).
 pub fun read_line(fd: i32, buf: []u8) -> ?usize {
-    let n: isize = read(fd, buf, buf.len);
+    let n: isize = fd_read(fd, buf, buf.len);
     if (n <= 0) { return null; }
     var i: usize = 0;
     while (i < n as usize) {
@@ -30,7 +343,7 @@ pub fun read_line(fd: i32, buf: []u8) -> ?usize {
 ## Read until the buffer is full or EOF. Returns the byte count
 ## (null on EOF-with-no-bytes — a short read returns Some(short)).
 pub fun read_all(fd: i32, buf: []u8) -> ?usize {
-    let n: isize = read(fd, buf, buf.len);
+    let n: isize = fd_read(fd, buf, buf.len);
     if (n <= 0) { return null; }
     return n as usize;
 }
@@ -39,7 +352,7 @@ pub fun read_all(fd: i32, buf: []u8) -> ?usize {
 pub fun write_all(fd: i32, bytes: []const u8) -> void {
     var pos: usize = 0;
     while (pos < bytes.len) {
-        let n: isize = write(fd, bytes[pos..], bytes.len - pos);
+        let n: isize = fd_write(fd, bytes[pos..], bytes.len - pos);
         if (n <= 0) { __zag_panic("std.io.write_all: write error"); }
         pos = pos + (n as usize);
     }

@@ -1,0 +1,262 @@
+## std.bytes — byte-level serialization primitives (the vocabulary a
+## storage engine is built from).
+##
+##   import std.bytes.{put_u32_le, get_u32_le, put_varint, read_varint}
+##
+## Two families, because a file format has to pick ONE and stick to
+## it (changing it later invalidates every file already on disk):
+##
+##   1. Fixed-width, explicit endianness — `put_u32_le` /
+##      `get_u32_le` (little-endian: the same byte order in the file
+##      as in a register on x86/ARM, so the encode is a memcpy) and
+##      `put_u32_be` / `get_u32_be` (big-endian: "network order",
+##      which is what makes lexicographic byte comparison match
+##      numeric comparison — the property a B-tree key needs).
+##      Every writer returns the next offset so callers chain them.
+##
+##   2. Varint (LEB128, unsigned) — `put_varint` / `read_varint` /
+##      `varint_len`. One to ten bytes instead of eight, so small
+##      record lengths cost one byte. Used for length prefixes and
+##      for the "how long is this record" header an append-only log
+##      needs in order to skip a record without parsing it.
+##
+## Plus the byte-slice utilities: `eq` (content equality, the
+## memcmp a key comparison starts from), `zero` / `fill`, `copy`.
+##
+## Panics on out-of-bounds: every writer bounds-checks before
+## touching the buffer (a storage engine that writes past the end of
+## its page corrupts the NEXT page silently, so the check is not
+## optional).
+
+## ── Fixed-width little-endian ────────────────────────────────────────
+## `put_*` returns `off + width` (the next write position).
+
+pub fun put_u16_le(buf: []u8, off: usize, v: u16) -> usize {
+    if (off + 2 > buf.len) { __zag_panic("std.bytes.put_u16_le: out of bounds"); }
+    buf[off] = (v & 0xFF) as u8;
+    buf[off + 1] = ((v >> 8) & 0xFF) as u8;
+    return off + 2;
+}
+
+pub fun put_u32_le(buf: []u8, off: usize, v: u32) -> usize {
+    if (off + 4 > buf.len) { __zag_panic("std.bytes.put_u32_le: out of bounds"); }
+    buf[off] = (v & 0xFF) as u8;
+    buf[off + 1] = ((v >> 8) & 0xFF) as u8;
+    buf[off + 2] = ((v >> 16) & 0xFF) as u8;
+    buf[off + 3] = ((v >> 24) & 0xFF) as u8;
+    return off + 4;
+}
+
+pub fun put_u64_le(buf: []u8, off: usize, v: u64) -> usize {
+    if (off + 8 > buf.len) { __zag_panic("std.bytes.put_u64_le: out of bounds"); }
+    var i: usize = 0;
+    while (i < 8) {
+        buf[off + i] = ((v >> ((i * 8) as u6)) & 0xFF) as u8;
+        i = i + 1;
+    }
+    return off + 8;
+}
+
+pub fun get_u16_le(buf: []const u8, off: usize) -> u16 {
+    if (off + 2 > buf.len) { __zag_panic("std.bytes.get_u16_le: out of bounds"); }
+    let b0: u16 = buf[off] as u16;
+    let b1: u16 = buf[off + 1] as u16;
+    return b0 | (b1 << 8);
+}
+
+pub fun get_u32_le(buf: []const u8, off: usize) -> u32 {
+    if (off + 4 > buf.len) { __zag_panic("std.bytes.get_u32_le: out of bounds"); }
+    let b0: u32 = buf[off] as u32;
+    let b1: u32 = buf[off + 1] as u32;
+    let b2: u32 = buf[off + 2] as u32;
+    let b3: u32 = buf[off + 3] as u32;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+pub fun get_u64_le(buf: []const u8, off: usize) -> u64 {
+    if (off + 8 > buf.len) { __zag_panic("std.bytes.get_u64_le: out of bounds"); }
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < 8) {
+        v = v | ((buf[off + i] as u64) << ((i * 8) as u6));
+        i = i + 1;
+    }
+    return v;
+}
+
+## ── Fixed-width big-endian (network order) ───────────────────────────
+## Byte order chosen so that memcmp over encoded keys == numeric
+## comparison — the invariant sorted on-disk structures rely on.
+
+pub fun put_u16_be(buf: []u8, off: usize, v: u16) -> usize {
+    if (off + 2 > buf.len) { __zag_panic("std.bytes.put_u16_be: out of bounds"); }
+    buf[off] = ((v >> 8) & 0xFF) as u8;
+    buf[off + 1] = (v & 0xFF) as u8;
+    return off + 2;
+}
+
+pub fun put_u32_be(buf: []u8, off: usize, v: u32) -> usize {
+    if (off + 4 > buf.len) { __zag_panic("std.bytes.put_u32_be: out of bounds"); }
+    buf[off] = ((v >> 24) & 0xFF) as u8;
+    buf[off + 1] = ((v >> 16) & 0xFF) as u8;
+    buf[off + 2] = ((v >> 8) & 0xFF) as u8;
+    buf[off + 3] = (v & 0xFF) as u8;
+    return off + 4;
+}
+
+pub fun put_u64_be(buf: []u8, off: usize, v: u64) -> usize {
+    if (off + 8 > buf.len) { __zag_panic("std.bytes.put_u64_be: out of bounds"); }
+    var i: usize = 0;
+    while (i < 8) {
+        buf[off + i] = ((v >> ((56 - i * 8) as u6)) & 0xFF) as u8;
+        i = i + 1;
+    }
+    return off + 8;
+}
+
+pub fun get_u16_be(buf: []const u8, off: usize) -> u16 {
+    if (off + 2 > buf.len) { __zag_panic("std.bytes.get_u16_be: out of bounds"); }
+    let b0: u16 = buf[off] as u16;
+    let b1: u16 = buf[off + 1] as u16;
+    return (b0 << 8) | b1;
+}
+
+pub fun get_u32_be(buf: []const u8, off: usize) -> u32 {
+    if (off + 4 > buf.len) { __zag_panic("std.bytes.get_u32_be: out of bounds"); }
+    let b0: u32 = buf[off] as u32;
+    let b1: u32 = buf[off + 1] as u32;
+    let b2: u32 = buf[off + 2] as u32;
+    let b3: u32 = buf[off + 3] as u32;
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+pub fun get_u64_be(buf: []const u8, off: usize) -> u64 {
+    if (off + 8 > buf.len) { __zag_panic("std.bytes.get_u64_be: out of bounds"); }
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < 8) {
+        v = (v << 8) | (buf[off + i] as u64);
+        i = i + 1;
+    }
+    return v;
+}
+
+## ── Varint (unsigned LEB128) ─────────────────────────────────────────
+## Seven payload bits per byte, high bit = "more follows".
+
+## Byte count `v` will need once encoded (1..10). Size it before
+## writing when a record header must be written before its body.
+pub fun varint_len(v: u64) -> usize {
+    var n: usize = 1;
+    var rest: u64 = v >> 7;
+    while (rest != 0) {
+        n = n + 1;
+        rest = rest >> 7;
+    }
+    return n;
+}
+
+## Encode `v` at `off`; returns the next offset.
+pub fun put_varint(buf: []u8, off: usize, v: u64) -> usize {
+    var pos: usize = off;
+    var rest: u64 = v;
+    while (true) {
+        if (pos >= buf.len) { __zag_panic("std.bytes.put_varint: out of bounds"); }
+        let byte: u64 = rest & 0x7F;
+        rest = rest >> 7;
+        if (rest == 0) {
+            buf[pos] = byte as u8;
+            return pos + 1;
+        }
+        buf[pos] = (byte | 0x80) as u8;
+        pos = pos + 1;
+    }
+    return pos;
+}
+
+## Decode the varint at `off`, writing the new offset to `next`.
+## A storage engine reads a length prefix this way, then slices the
+## body out — the pair is what makes a record skippable.
+pub fun read_varint(buf: []const u8, off: usize, next: *usize) -> u64 {
+    var v: u64 = 0;
+    var shift: u64 = 0;
+    var pos: usize = off;
+    # Out-param write: a pointer is indexed (`w[0] = ...`), not
+    # deref-written — zag has no `p.* = ...` assignment form (same
+    # constraint lib/std/concurrent/thread.zag documents for its
+    # futex word reads).
+    var next_slot: [*]usize = next as [*]usize;
+    while (true) {
+        if (pos >= buf.len) { __zag_panic("std.bytes.read_varint: truncated varint"); }
+        let b: u8 = buf[pos];
+        pos = pos + 1;
+        v = v | (((b & 0x7F) as u64) << (shift as u6));
+        if ((b & 0x80) == 0) {
+            next_slot[0] = pos;
+            return v;
+        }
+        shift = shift + 7;
+        if (shift >= 64) { __zag_panic("std.bytes.read_varint: varint too long"); }
+    }
+    return v;
+}
+
+## ── Slice utilities ──────────────────────────────────────────────────
+
+## Content equality (the memcmp every key comparison bottoms out in).
+pub fun eq(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i: usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+## Lexicographic comparison: -1 / 0 / 1. The ordering a sorted
+## on-disk structure compares keys with (`std.sort.binary_search`
+## uses `==` and `<`, so this is the total order for keys whose
+## comparison isn't a plain integer compare).
+pub fun cmp(a: []const u8, b: []const u8) -> i32 {
+    let n: usize = a.len;
+    if (b.len < n) { n = b.len; }
+    var i: usize = 0;
+    while (i < n) {
+        if (a[i] < b[i]) { return 0 - 1; }
+        if (a[i] > b[i]) { return 1; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { return 0 - 1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+## Zero a region — a fresh page is zeros, and a deleted slot is
+## zeroed so a stale read can't resurrect old bytes.
+pub fun zero(buf: []u8) {
+    var i: usize = 0;
+    while (i < buf.len) {
+        buf[i] = 0;
+        i = i + 1;
+    }
+}
+
+pub fun fill(buf: []u8, b: u8) {
+    var i: usize = 0;
+    while (i < buf.len) {
+        buf[i] = b;
+        i = i + 1;
+    }
+}
+
+## Copy `src` into a same-length `dst` (bounds-checked).
+pub fun copy(dst: []u8, src: []const u8) -> usize {
+    if (src.len > dst.len) { __zag_panic("std.bytes.copy: destination too small"); }
+    var i: usize = 0;
+    while (i < src.len) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}

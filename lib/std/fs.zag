@@ -78,7 +78,7 @@ pub import std.types.{String}
 ## the five entries this file's real impls route through. Reading
 ## against the retired __zag_openat / __zag_read / __zag_write /
 ## __zag_close / __zag_mkdirat names is the regression signal.
-pub import std.posix.{openat, read, write, close, mkdirat}
+pub import std.posix.{openat, read, write, close, close as posix_close, mkdirat, pread, pwrite, lseek, ftruncate, fsync, fdatasync}
 
 pub fun read_file(path: str) -> String {
     # openat errno convention: high bit of usize set when negative
@@ -156,4 +156,224 @@ pub fun mkdir(path: str) -> i32 {
         return -1;
     }
     return 0;
+}
+
+## ── File: a positioned handle for block/page I/O ──────────────────────
+##
+## `read_file` / `write_file` above are whole-file conveniences. A
+## storage engine needs the positioned primitives instead:
+##
+##   let f: File = File.create("db.pages");
+##   var page: [PAGE_SIZE]u8 = undefined;
+##   f.write_block(0, page[0..]);        # write page 0
+##   f.read_block(0, page[0..]);         # read it back
+##   f.sync();                           # durable
+##   f.close();
+##
+## Why the p-variants (pread/pwrite) rather than seek+read/write:
+## they take the offset as an argument and leave the fd's file
+## position untouched, so a page read can never be corrupted by
+## another writer advancing the position — and there's no seek
+## syscall on the hot path.
+##
+## PAGE_SIZE (4096) is the unit every block method works in: the
+## page is the transfer unit of the disk and of the OS page cache,
+## so a storage engine that reads and writes whole pages gets the
+## cache's behaviour for free.
+##
+## Panic-on-error, matching the rest of std.fs today (v1 has no
+## error-union I/O surface); `try_open` returns -1 instead for
+## callers that need to distinguish "does not exist".
+
+## Open-flag bits for Linux x86-64 — openat takes the raw bitmask.
+const O_RDONLY: u32 = 0;
+const O_WRONLY: u32 = 1;
+const O_RDWR: u32 = 2;
+const O_CREAT: u32 = 0x40;
+const O_TRUNC: u32 = 0x200;
+const O_APPEND: u32 = 0x400;
+
+const PAGE_SIZE: usize = 4096;
+
+## The page size, as a function: zag module-level constants aren't
+## `pub`-exportable across modules yet, so importers that need the
+## value (to size their own page buffers, or to assert agreement)
+## call this. The internal const is what the block methods use.
+pub fun page_size() -> usize {
+    return PAGE_SIZE;
+}
+
+pub struct File {
+    fd: i32,
+}
+
+impl File {
+    # Open an existing file for reading.
+    pub fun open(path: str) -> File {
+        return open_flags(path, O_RDONLY, 0);
+    }
+
+    # Create (or truncate) a read-write file — start a new database.
+    pub fun create(path: str) -> File {
+        return open_flags(path, O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    }
+
+    # Open read-write without truncating — reopen an existing one.
+    pub fun open_rw(path: str) -> File {
+        return open_flags(path, O_RDWR | O_CREAT, 0o644);
+    }
+
+    # Open for append: the kernel makes seek-to-end + write atomic,
+    # so two processes appending records cannot interleave one. This
+    # is what an append-only log (write-ahead log) wants.
+    pub fun open_append(path: str) -> File {
+        return open_flags(path, O_WRONLY | O_CREAT | O_APPEND, 0o644);
+    }
+
+    # Same as `open` but returns fd -1 (a File with fd -1) instead
+    # of panicking when the file is missing.
+    pub fun try_open(path: str) -> File {
+        let fd_raw: usize = openat(std.posix.AT.FDCWD, path, O_RDONLY, 0);
+        if ((fd_raw & 0x8000000000000000) != 0) {
+            return File { fd: 0 - 1 };
+        }
+        return File { fd: fd_raw as i32 };
+    }
+
+    pub fun is_open(self: *File) -> bool {
+        return self.fd >= 0;
+    }
+
+    # Read up to `buf.len` bytes at absolute offset `off`. Returns
+    # the count read (0 at EOF; short reads are legal).
+    pub fun read_at(self: *File, buf: []u8, off: i64) -> usize {
+        let n: isize = pread(self.fd, buf, buf.len, off);
+        if (n < 0) { __zag_panic("std.fs.File.read_at: pread failed"); }
+        return n as usize;
+    }
+
+    # Write `bytes` at absolute offset `off`, looping until all of
+    # it lands (pwrite may write less than asked).
+    pub fun write_at(self: *File, bytes: []const u8, off: i64) -> usize {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            let n: isize = pwrite(self.fd, bytes[pos..bytes.len], bytes.len - pos, off + (pos as i64));
+            if (n <= 0) { __zag_panic("std.fs.File.write_at: pwrite failed"); }
+            pos = pos + (n as usize);
+        }
+        return pos;
+    }
+
+    # Read one whole page. `buf` must be exactly PAGE_SIZE. Returns
+    # false when the page is past EOF (so a scanner can stop); a
+    # short read means a partially written page — treat it as absent
+    # rather than parsing garbage.
+    pub fun read_block(self: *File, block_id: u64, buf: []u8) -> bool {
+        if (buf.len != PAGE_SIZE) {
+            __zag_panic("std.fs.File.read_block: buffer is not one page");
+        }
+        let n: usize = self.read_at(buf, (block_id * (PAGE_SIZE as u64)) as i64);
+        if (n < PAGE_SIZE) {
+            var i: usize = n;
+            while (i < buf.len) {
+                buf[i] = 0;
+                i = i + 1;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    # Write one whole page at `block_id`. Zero-pads a short buffer
+    # to the full page so the on-disk page is always PAGE_SIZE (a
+    # short write would leave the previous contents of that page
+    # behind, which reads back as corrupt data).
+    pub fun write_block(self: *File, block_id: u64, bytes: []const u8) -> void {
+        if (bytes.len > PAGE_SIZE) {
+            __zag_panic("std.fs.File.write_block: payload larger than a page");
+        }
+        if (bytes.len == PAGE_SIZE) {
+            _ = self.write_at(bytes, (block_id * (PAGE_SIZE as u64)) as i64);
+            return;
+        }
+        var page: [PAGE_SIZE]u8 = undefined;
+        var i: usize = 0;
+        while (i < bytes.len) {
+            page[i] = bytes[i];
+            i = i + 1;
+        }
+        while (i < PAGE_SIZE) {
+            page[i] = 0;
+            i = i + 1;
+        }
+        _ = self.write_at(page[0..], (block_id * (PAGE_SIZE as u64)) as i64);
+    }
+
+    # Append at the end (atomic when opened with open_append).
+    pub fun append(self: *File, bytes: []const u8) -> usize {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            let n: isize = write(self.fd, bytes[pos..bytes.len], bytes.len - pos);
+            if (n <= 0) { __zag_panic("std.fs.File.append: write failed"); }
+            pos = pos + (n as usize);
+        }
+        return pos;
+    }
+
+    # File length in bytes (lseek to end — zig 0.16's std has no
+    # fstat binding; position is restored, though pread/pwrite don't
+    # depend on it anyway).
+    pub fun size(self: *File) -> usize {
+        let n: isize = lseek(self.fd, 0, 2);
+        if (n < 0) { __zag_panic("std.fs.File.size: lseek failed"); }
+        return n as usize;
+    }
+
+    # How many whole pages the file currently holds.
+    pub fun block_count(self: *File) -> usize {
+        return self.size() / PAGE_SIZE;
+    }
+
+    # Grow or shrink the file to `n` bytes — pre-extend to N pages
+    # before writing blocks, or reset a database.
+    pub fun truncate(self: *File, n: usize) -> void {
+        let rc: usize = ftruncate(self.fd, n as i64);
+        if ((rc & 0x8000000000000000) != 0) {
+            __zag_panic("std.fs.File.truncate: ftruncate failed");
+        }
+    }
+
+    # Flush to stable storage. A write-ahead-log record is only
+    # committed once this returns.
+    pub fun sync(self: *File) -> void {
+        let rc: usize = fsync(self.fd);
+        if ((rc & 0x8000000000000000) != 0) {
+            __zag_panic("std.fs.File.sync: fsync failed");
+        }
+    }
+
+    # Data-only flush (skips metadata) — cheaper than sync when the
+    # file size is already correct.
+    pub fun datasync(self: *File) -> void {
+        let rc: usize = fdatasync(self.fd);
+        if ((rc & 0x8000000000000000) != 0) {
+            __zag_panic("std.fs.File.datasync: fdatasync failed");
+        }
+    }
+
+    pub fun close(self: *File) -> void {
+        if (self.fd >= 0) {
+            _ = posix_close(self.fd);
+            self.fd = 0 - 1;
+        }
+    }
+}
+
+## Shared open helper (panics on failure, like read_file).
+fun open_flags(path: str, flags: u32, mode: u32) -> File {
+    let fd_raw: usize = openat(std.posix.AT.FDCWD, path, flags, mode);
+    if ((fd_raw & 0x8000000000000000) != 0) {
+        __zag_panic("std.fs.File: openat failed");
+    }
+    return File { fd: fd_raw as i32 };
 }

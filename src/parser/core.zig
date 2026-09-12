@@ -827,6 +827,7 @@ pub const Parser = struct {
         .{ .name = "std.strings", .path = "lib/std/strings/mod.zag" },
         .{ .name = "std.strings.slices", .path = "lib/std/strings/slices.zag" },
         .{ .name = "std.io", .path = "lib/std/io.zag" },
+        .{ .name = "std.bytes", .path = "lib/std/bytes.zag" },
         .{ .name = "std.math", .path = "lib/std/math.zag" },
         .{ .name = "std.json", .path = "lib/std/json.zag" },
         .{ .name = "std.sort", .path = "lib/std/sort.zag" },

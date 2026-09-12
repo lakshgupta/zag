@@ -28,10 +28,60 @@ surface of the modules below.
 | `std.mem` | `alloc` (keyword `free`), `memcpy` | heap |
 | `std.argv` | `get` | heap |
 | `std.env` | `get_env` (borrowed view) | none |
-| `std.fs` | `read_file`, `write_file`, `mkdir` | heap |
+| `std.fs` | `read_file`, `write_file`, `mkdir`, `File` (`open`/`create`/`open_append`, `read_at`, `write_at`, `read_block`, `write_block`, `append`, `size`, `block_count`, `truncate`, `sync`, `page_size`) | heap |
+| `std.bytes` | endian-explicit `put_u{16,32,64}_{le,be}` / `get_u{16,32,64}_{le,be}`, LEB128 varints (`put_varint`, `read_varint`, `varint_len`), `eq`, `cmp`, `zero`, `fill`, `copy` | none |
 | `std.process` | `exec`, `exit` | heap |
-| `std.posix` | `openat`, `read`, `write`, `close`, `mkdirat`, `getdents64`, `clock_gettime`, `getcwd`, `getenv`, `spawn`, `exit` | none |
+| `std.io` | `read_line`, `read_all`, `write_all`, `ByteWriter` / `ByteReader` (cursor over a buffer), `FileWriter` / `FileReader` (page-buffered streams over an fd) | none |
+| `std.posix` | `openat`, `read`, `write`, `close`, `pread`, `pwrite`, `lseek`, `ftruncate`, `fsync`, `fdatasync`, `mkdirat`, `getdents64`, `clock_gettime`, `getcwd`, `getenv`, `spawn`, `exit` | none |
 | `std.debug` | `panic` | none |
+
+## Storage primitives
+
+The set a storage / query engine is built from, in three layers.
+Working examples: `examples/storage/append_only.zag` (append-only
+record log) and `examples/storage/page_file.zag` (page-oriented
+block store with per-page checksums).
+
+**1. Positioned file I/O** — `std.fs.File`, backed by `pread` /
+`pwrite` (offset as an argument, so the fd's file position is never
+shared state and no seek is needed):
+
+```zag
+import std.fs.{File, page_size}
+
+var f: File = File.create("db.pages");
+f.truncate(page_size() * 2);      # pre-extend
+var page: [4096]u8 = undefined;
+f.write_block(0, page[0..]);      # one page at block id 0
+let ok: bool = f.read_block(0, page[0..]);
+f.sync();                         # durability barrier
+f.close();
+```
+
+`open_append` adds `O_APPEND`, which makes seek-to-end + write
+atomic — the property a write-ahead log needs for concurrent
+writers. `size` / `block_count` / `truncate` / `sync` / `datasync`
+manage the file extent and durability.
+
+**2. Byte serialization** — `std.bytes`: explicit-endian fixed-width
+fields (`put_u32_le` / `get_u32_le`, `put_u32_be` / `get_u32_be`, and
+the 16/64-bit variants) and unsigned LEB128 varints
+(`put_varint` / `read_varint` / `varint_len`). Big-endian is for
+on-disk *keys*, where byte-wise order must match numeric order;
+little-endian is for page-local metadata. Length-prefixing (varint
+length, then bytes) is what makes a record skippable and immune to
+delimiter-in-value corruption.
+
+**3. Streaming** — `std.io.ByteWriter` / `ByteReader` are cursors
+over a caller-owned buffer (a page, or a whole log in memory);
+`FileWriter` / `FileReader` put a page-sized buffer in front of an fd
+so many small records cost few syscalls. The same cursor code frames
+log records and the slot directory inside a page.
+
+Checksums come from `std.hash.crc32` / `sha256`; ordering and lookup
+from `std.sort.binary_search` and `std.collections.HashMap`;
+concurrency (a buffer pool, a page latch) from
+`std.concurrent.{mutex, rwlock, once, atomic}`.
 
 ## Directory modules
 
