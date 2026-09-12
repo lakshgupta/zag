@@ -1,0 +1,39 @@
+## stdlib/sleep.zag — std.time.sleep_ms / sleep_us (self-hosting demo).
+##
+## The blocking sleep primitives are pure Zag: posix.nanosleep (raw
+## `nanosleep(2)` facade in lib/std/posix.zag) + the µs→{sec,nsec}
+## decomposition in std.time. The __zag_nanosleep_ms zig preamble
+## shim this retired had the same decomposition written in zig —
+## now the source of truth reads as plain zag:
+##
+##   import std.time.{sleep_ms, now}
+##   sleep_ms(20);
+##
+## Also demonstrated: Timer/elapsed (monotonic delta over the sleep)
+## and the fact that sleeps do NOT burn CPU (kernel blocks the
+## thread; compare with the retired after() busy-wait spin).
+
+import std.time.{sleep_ms, sleep_us, now, Timer}
+
+fun main() {
+    var t: Timer = Timer.start();
+    sleep_ms(20);
+    let ms: u64 = t.elapsed().as_millis();
+    print("slept >= 20ms: {ms}\n");
+
+    # Sub-millisecond granularity.
+    let t2: Timer = Timer.start();
+    sleep_us(500);
+    let ns2: i64 = t2.elapsed().nanos;
+    print("micro-sleep ns: {ns2}\n");
+    assert(ns2 >= 500_000);
+    assert(true);
+}
+
+@[test]
+fun test_sleep_returns() {
+    # The sleep must terminate (a hung shim would fail the suite).
+    sleep_ms(1);
+    sleep_us(1);
+    assert(true);
+}

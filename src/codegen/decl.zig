@@ -8,6 +8,8 @@ const core = @import("core.zig");
 // sites (see emitEscapePrologue in core.zig + the `.new_expr` arm
 // in expr.zig). Mirrors June's "Lifetime Checker" pass shape.
 const escape = @import("escape.zig");
+const lexer = @import("../lexer.zig");
+const parser_mod = @import("../parser.zig");
 
 /// Module-level scratch for `zagTypeToZig`'s generic-instantiation
 /// rebuild (see the recursion branch in the helper) — a stack-local
@@ -1021,21 +1023,62 @@ const Codegen = core.Codegen;
             }
         }
         if (open != null and open.? > 0) {
-            const close = std.mem.lastIndexOfScalar(u8, text, ')');
-            if (close != null and close.? > open.?) {
+            // Shape validation BEFORE splitting: the arg-split exists
+            // for GENERIC-INSTANTIATION text (`Head(A, B)Tail`) — the
+            // text must contain exactly ONE balanced top-level paren
+            // group. Fn-pointer type text (`*const fn (X) callconv(.c)
+            // R`) has TWO top-level groups (the signature parens plus
+            // callconv's) — splitting it mangles the rebuild (the arg
+            // paren's close is NOT the last `)`, which the old
+            // lastIndexOf lookup assumed), and any unbalanced `)` drove
+            // `depth -= 1` on a usize (integer-overflow PANIC — the
+            // compiler crashed outright on fn-pointer annotations).
+            // Non-conforming shapes (2+ groups, unbalanced, or a `)`
+            // before any `(`) fall through to the verbatim/*raw paths —
+            // conservative: no arg-aliasing inside fn signatures, which
+            // zig-native param types (usize, i64, ...) don't need.
+            var depth: isize = 0;
+            var groups: usize = 0;
+            var balanced = true;
+            var match_close: ?usize = null; // close of the first (only) group
+            for (text, 0..) |ch, ti| {
+                if (ch == '(') {
+                    depth += 1;
+                    if (depth == 1) groups += 1;
+                } else if (ch == ')') {
+                    depth -= 1;
+                    if (depth == 0 and groups == 1 and match_close == null) match_close = ti;
+                    if (depth < 0) {
+                        balanced = false;
+                        break;
+                    }
+                }
+            }
+            if (balanced and depth == 0 and groups == 1) {
+                const close = match_close.?;
+                if (close > open.?) {
                 const head = text[0 .. open.? + 1];
-                const tail = text[close.?..];
-                const inner = text[open.? + 1 .. close.?];
+                const tail = text[close..];
+                const inner = text[open.? + 1 .. close];
                 var rl: usize = 0;
                 @memcpy(zag_type_zig_scratch[0..head.len], head);
                 rl = head.len;
-                var depth: usize = 0;
+                // Inner scan: relative depth starts at 0. Shape
+                // validation above guarantees every `)` in `inner`
+                // matches a `(` also in `inner` (only one top-level
+                // group, balanced), so isize depth cannot go negative —
+                // the guard bails to the verbatim path if it ever does.
+                var rdepth: isize = 0;
                 var start: usize = 0;
                 var i: usize = 0;
                 while (i <= inner.len) : (i += 1) {
-                    if (i < inner.len and inner[i] == '(') depth += 1;
-                    if (i < inner.len and inner[i] == ')') depth -= 1;
-                    if (i == inner.len or (depth == 0 and inner[i] == ',')) {
+                    if (i < inner.len and inner[i] == '(') rdepth += 1;
+                    if (i < inner.len and inner[i] == ')') rdepth -= 1;
+                    if (rdepth < 0) {
+                        balanced = false;
+                        break;
+                    }
+                    if (i == inner.len or (rdepth == 0 and inner[i] == ',')) {
                         const part = std.mem.trim(u8, inner[start..i], " ");
                         const mapped = zagTypeToZig(part);
                         if (rl > head.len and rl < zag_type_zig_scratch.len) {
@@ -1053,9 +1096,17 @@ const Codegen = core.Codegen;
                         start = i + 1;
                     }
                 }
+                if (!balanced) {
+                    // Unbalanced inner scan (shouldn't happen given the
+                    // shape check above, but never underflow) — verbatim
+                    // passthrough (the *raw rewrite is skipped; this is
+                    // dead-code defense).
+                    return text;
+                }
                 std.mem.copyForwards(u8, zag_type_zig_scratch[rl..][0..tail.len], tail);
                 rl += tail.len;
                 return zag_type_zig_scratch[0..rl];
+                }
             }
         }
         // v0.1 stdlib migration (String/Writer follow-up commit):
@@ -1080,12 +1131,21 @@ const Codegen = core.Codegen;
             slen += idx;
             @memcpy(scratch[slen..][0..3], "[*]");
             slen += 3;
-            if (std.mem.eql(u8, inner, "c_void")) {
+            // Leading `c_void` word maps to `anyopaque` even when the
+            // text CONTINUES past it (`*raw c_void) callconv(.c) i64`
+            // fn-pointer params, `*raw c_void` as a suffix-bearing
+            // annotation). The old exact-equality check only covered
+            // the bare `*raw c_void` annotation, so fn-pointer text
+            // leaked zig-foreign `c_void` into the emit.
+            var rest = inner;
+            if (std.mem.startsWith(u8, inner, "c_void")) {
                 @memcpy(scratch[slen..][0..9], "anyopaque");
                 slen += 9;
-            } else {
-                @memcpy(scratch[slen..][0..inner.len], inner);
-                slen += inner.len;
+                rest = inner["c_void".len ..];
+            }
+            if (rest.len > 0 and rest.len <= scratch.len - slen) {
+                @memcpy(scratch[slen..][0..rest.len], rest);
+                slen += rest.len;
             }
             return scratch[0..slen];
         }
@@ -1905,6 +1965,31 @@ const Codegen = core.Codegen;
             self.genTestFun(fun);
             return;
         }
+        // Comptime-body fn (`fun NAME(...) = <expr>;`): emit a zig
+        // `pub const NAME = <expr>;` — no runtime fn surface. The
+        // comptime body text is re-lexed/parsed into an expression
+        // AST (the parser captured it verbatim; see parseFunDecl's
+        // comptime-body branch) and emitted through the ordinary
+        // genExpr path so nested casts/calls ride the same lowering
+        // as runtime code. Params/type_params of a comptime fn are
+        // carried on the zig side by the EXPRESSION itself (comptime
+        // zig params are spelled inside the expression — zag just
+        // passes the text through). Self-hosting batch: lets pure-.zag
+        // stdlib helpers (format_any's type-keyed dispatch) spell
+        // comptime tables without a zig file-side shim.
+        if (fun.is_comptime_body) {
+            self.write("pub const ");
+            self.write(fun.name);
+            self.write(" = ");
+            var clex = lexer.Lexer.init(fun.comptime_body_text);
+            const ctoks = clex.tokenize();
+            var carena = ast.Arena.init();
+            var cp = parser_mod.Parser.init(ctoks, &carena);
+            const cexpr = cp.parseExpr();
+            self.genExpr(cexpr);
+            self.write(";\n");
+            return;
+        }
         // Reset destructuring counter at the top of each function so the
         // temp bindings inside this body stay local (avoiding clashes
         // across sibling `pub fn` declarations) and count from `_0`.
@@ -2004,14 +2089,14 @@ const Codegen = core.Codegen;
         // new `pub fn main(init: std.process.Init) !void` signature
         // (the old `pub fn main() void` form is no longer accepted
         // as an OS entry point in zig 0.16). The `init` parameter
-        // is the ONLY way to access argv at runtime via
-        // `init.minimal.args.toSlice(allocator)`; we capture it
-        // into the module-level `__zag_argv` global at the start
-        // of main's body so the `.argv_get` dispatch can return
-        // it without threading `init` through every function that
-        // calls `get()`. The `!void` return type is forced (rather
-        // than inferred from the body) because the `try` on the
-        // `toSlice` call needs a fallible signature.
+        // is where the event-loop handle (`init.io`) is captured
+        // into the module-level `__zag_io` global for the fs/process
+        // dispatches. argv is NOT captured here anymore: the v0.5
+        // self-hosting migration moved it to lib/std/posix.zag's
+        // argv() — a pure-zag /proc/self/cmdline reader needing no
+        // main-entry capture. The `!void` return type stays forced
+        // (rather than inferred from the body) to keep main's
+        // signature stable for the io-capture statement above.
         const is_main = std.mem.eql(u8, fun.name, "main");
         self.write("(");
         if (is_main) self.write("init: std.process.Init");
@@ -2102,20 +2187,14 @@ const Codegen = core.Codegen;
         // (No-op loop: removed to avoid zig 0.16's
         // `pointless discard of capture` warning on a
         // `if (p.is_var) { _ = p; }` marker.)
-        // zig 0.16 main-signature migration: capture argv at main
-        // entry into the module-level `__zag_argv` global. The
-        // `init.minimal.args.toSlice(allocator)` call is the ONLY
-        // way to get argv in zig 0.16 (the old `std.os.argv` /
-        // `std.posix.argv` slices were removed). The
-        // `init.arena.allocator()` returns an arena-backed allocator
-        // that lives for the process lifetime, so the returned
-        // slice needs no manual cleanup. The `try` propagates
-        // `OutOfMemory` through the main signature (forced `!void`
-        // above). Emitted ONLY for the main function; other functions
-        // don't have `init` in scope.
+        // zig 0.16 main-signature migration: capture the event-loop
+        // handle at main entry. (The argv capture that shared this
+        // block retired in the v0.5 self-hosting migration —
+        // lib/std/posix.zag's argv() reads /proc/self/cmdline, no
+        // main-entry state involved.) Emitted ONLY for the main
+        // function; other functions don't have `init` in scope.
         if (is_main) {
-            self.write("    __zag_argv = try init.minimal.args.toSlice(init.arena.allocator());\n");
-                // zig 0.16: also capture the Io event-loop handle from init
+                // zig 0.16: capture the Io event-loop handle from init
                 // so the .fs_write_file / .fs_mkdir / .process_exec dispatches
                 // can pass it to std.Io.Dir.cwd().createFile(io, ...) etc.
                 self.write("    __zag_io = init.io;\n");

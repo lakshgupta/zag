@@ -87,10 +87,108 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                 // or `.ident` (text ident). All other interpolation
                 // shapes (`{x}`, `{a + b}`, `{obj.f()}` etc.) keep the
                 // legacy `.ident` emit so pre-existing behaviour is
-                // preserved exactly. `a + b` and `obj.f()` are still
-                // non-functional templates — that's a pre-existing gap
-                // not introduced by this fix.
+                // preserved exactly.
+                //
+                // String-`+` concat (docs/11): a top-level `+` (depth-0
+                // scan, so `f(a + b)` still routes to the `.call`
+                // builder below) splits the placeholder into an additive
+                // chain of ident/literal operands, emitted as a
+                // left-assoc `.binary` tree so codegen's concat dispatch
+                // fires (`{prefix + name}` widens per operand exactly
+                // like a statement-position concat). `-` is included so
+                // numeric placeholders `{a - b}` compose the same way;
+                // both stay OUT of the way of the `.call` scan (that
+                // builder takes precedence when a top-level `(` exists).
                 var build_expr: ast.Expr = Expr{ .payload = .{ .ident = expr_text }, .loc = start_loc };
+                var additive_handled = false;
+                {
+                    // Depth-0 probe: a top-level `+` claims the
+                    // placeholder for the additive builder below (the
+                    // `.call` builder only fires when a top-level `(`
+                    // exists — handled by its own scan).
+                    var has_toplevel_add = false;
+                    {
+                        var depth: usize = 0;
+                        var si: usize = 0;
+                        while (si < expr_text.len) : (si += 1) {
+                            switch (expr_text[si]) {
+                                '(', '[', '{' => depth += 1,
+                                ')', ']', '}' => {
+                                    if (depth > 0) depth -= 1;
+                                },
+                                '+' => {
+                                    if (depth == 0) has_toplevel_add = true;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    if (has_toplevel_add) {
+                        // Depth-0 `+`/`-` split into operand segments.
+                        var ops_buf: [16]u8 = undefined;
+                        var op_count: usize = 0;
+                        var segs_buf: [17][]const u8 = undefined;
+                        var seg_count: usize = 0;
+                        {
+                            var depth: usize = 0;
+                            var seg_start: usize = 0;
+                            var pos: usize = 0;
+                            while (pos <= expr_text.len) : (pos += 1) {
+                                const at_end = pos == expr_text.len;
+                                const c: u8 = if (at_end) 0 else expr_text[pos];
+                                if (at_end or ((c == '+' or c == '-') and depth == 0)) {
+                                    if (pos > seg_start) {
+                                        segs_buf[seg_count] = std.mem.trim(u8, expr_text[seg_start..pos], " \t");
+                                        seg_count += 1;
+                                        if (op_count > 0 or seg_count > 1) {
+                                            // op recorded between segs
+                                        }
+                                    }
+                                    if (!at_end) {
+                                        ops_buf[op_count] = c;
+                                        op_count += 1;
+                                    }
+                                    seg_start = pos + 1;
+                                } else {
+                                    switch (c) {
+                                        '(', '[', '{' => depth += 1,
+                                        ')', ']', '}' => {
+                                            if (depth > 0) depth -= 1;
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            }
+                        }
+                        if (seg_count >= 2) {
+                            // Operand: int-lit when all digits, else ident.
+                            const mkOperand = struct {
+                                fn go(text: []const u8, loc: ast.Loc) Expr {
+                                    var is_int = text.len > 0;
+                                    for (text) |ch| {
+                                        if (ch < '0' or ch > '9') is_int = false;
+                                    }
+                                    if (is_int) return Expr{ .payload = .{ .int_lit = text }, .loc = loc };
+                                    return Expr{ .payload = .{ .ident = text }, .loc = loc };
+                                }
+                            }.go;
+                            var acc = mkOperand(segs_buf[0], start_loc);
+                            var oi: usize = 0;
+                            while (oi < op_count) : (oi += 1) {
+                                const rhs = mkOperand(segs_buf[oi + 1], start_loc);
+                                const op: ast.Expr.BinaryOp = if (ops_buf[oi] == '+') .add else .sub;
+                                const lhs_slot = self.arena.alloc(Expr, 1);
+                                lhs_slot[0] = acc;
+                                const rhs_slot = self.arena.alloc(Expr, 1);
+                                rhs_slot[0] = rhs;
+                                acc = Expr{ .payload = .{ .binary = .{ .op = op, .lhs = &lhs_slot[0], .rhs = &rhs_slot[0] } }, .loc = start_loc };
+                            }
+                            build_expr = acc;
+                            additive_handled = true;
+                        }
+                    }
+                }
+                if (!additive_handled) {
                 // Scan for the first `(` (top-level; the args segment
                 // is tracked separately with depth-aware comma-split
                 // below, so nested brackets inside `name(...)` don't
@@ -195,6 +293,7 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                         }
                     }
                 }
+                } // end `if (!additive_handled)` — call-shape builder skipped when the additive scan claimed the placeholder
                 parts_buf[part_count] = .{
                     .literal = null,
                     .expr = build_expr,

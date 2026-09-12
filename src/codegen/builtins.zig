@@ -95,8 +95,11 @@ pub const BuiltinDispatch = enum {
     /// arity = 2: `atomic_fetch_add(ptr, val)`.
     builtin_atomic_fetch_add,
 
-    /// `builtin_atomic_compare_exchange` — emit `@cmpxchgStrong(...)`.
-    /// arity = 3: `atomic_compare_exchange(ptr, expected, new)`.
+    /// `builtin_atomic_compare_exchange` — emit `(@cmpxchgStrong(...) == null)`.
+    /// arity = 3: `atomic_compare_exchange(ptr, expected, new)`. The
+    /// `== null` wrap converts zig's `?T` failure-carrying result into a
+    /// plain "CAS succeeded" bool — the surface zag code can loop on
+    /// without optional unwrapping (see std.concurrent.mutex's lock loop).
     builtin_atomic_compare_exchange,
 
     /// `builtin_thread_spawn` — emit `std.Thread.spawn(.{}, fn, args)`.
@@ -258,9 +261,12 @@ pub const builtin_table = [_]BuiltinRoute{
     //   argv}.zag) — itself fully retired into lib/std/posix.zag by
     //   the v0.4 spawn pass. Their call sites now
     //   resolve through the @import+alias fallthrough in
-    //   src/codegen/core.zig's imports loop (Option A pass-through),
-    //   except argv.get which binds preamble-side (__zag_argv lives
-    //   in the user module — see stdlibPreambleName).
+    //   src/codegen/core.zig's imports loop (Option A pass-through).
+    //   argv.get initially bound preamble-side via stdlibPreambleName
+    //   (__zag_argv captured at main entry); that fast path retired
+    //   in the v0.5 self-hosting migration when std.posix.argv's
+    //   /proc/self/cmdline reader made the capture unnecessary —
+    //   it now rides the same fallthrough as its siblings.
     //
     //   Remaining rows below are compiler INTRINSICS (size_of /
     //   align_of / volatile_* / atomic_* / thread_* / mutex_* /
@@ -275,11 +281,22 @@ pub const builtin_table = [_]BuiltinRoute{
     .{ .name = "store", .arity = 2, .receiver = null, .dispatch = .builtin_atomic_store },
     .{ .name = "fetch_add", .arity = 2, .receiver = null, .dispatch = .builtin_atomic_fetch_add },
     .{ .name = "compare_exchange", .arity = 3, .receiver = null, .dispatch = .builtin_atomic_compare_exchange },
-    .{ .name = "spawn", .arity = 2, .receiver = null, .dispatch = .builtin_thread_spawn },
-    .{ .name = "join", .arity = 1, .receiver = null, .dispatch = .builtin_thread_join },
-    .{ .name = "create", .arity = 0, .receiver = null, .dispatch = .builtin_mutex_create },
-    .{ .name = "lock", .arity = 1, .receiver = null, .dispatch = .builtin_mutex_lock },
-    .{ .name = "unlock", .arity = 1, .receiver = null, .dispatch = .builtin_mutex_unlock },
+    // spawn/join RETIRED from the router (v0.5 thread migration):
+    // the `std.Thread.spawn(.{}, fn, args)` / `.join()` emits
+    // SHADOWED lib/std/concurrent/thread.zag's real clone-based
+    // implementation — a user `import std.concurrent.thread.{spawn,
+    // join}` could never reach the module because the name lookup
+    // hit this table first. They now ride the @import+alias
+    // fallthrough like fs/env/time before them.
+    //
+    // create/lock/unlock RETIRED the same way (v2 self-hosting
+    // batch): lib/std/concurrent/mutex.zag is a REAL futex mutex
+    // now — its create/lock/unlock free fns were unreachable while
+    // these rows shadowed them (a user call hit this table first
+    // and got the zig-side std.Thread.Mutex emit, never the
+    // module's fn). Same contract as the spawn/join retirement:
+    // the names ride the @import+alias fallthrough; the router
+    // keeps only names no .zag module can express (intrinsics).
     .{ .name = "assert", .arity = 1, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "assert", .arity = 2, .receiver = null, .dispatch = .builtin_assert },
     .{ .name = "type_name", .arity = 1, .receiver = null, .dispatch = .builtin_type_name },

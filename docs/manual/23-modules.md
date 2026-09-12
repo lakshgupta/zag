@@ -98,7 +98,7 @@ Packages are resolved from **Git URLs** declared in `zag.toml` — today the pro
 
 ## The Standard Library (`std.*`)
 
-> **Status — partial implementation.** The file tree described in the next subsection (`<zag-install>/lib/std/`) is now staged on disk as a first wave of stub files (`lib/std/{mod,string,error,fmt,time,atomic,bench}.zag`, plus `lib/std/{async/stream,arch/x86/avx2}.zag`). Each file declares the planned type surface in zag syntax; the method bodies are stubs pending the real impl (most route through zig's stdlib once the codegen router is wired). The `KNOWN_STD_MODULES` table in `src/parser/decl.zig` has not yet landed — `import std.X` resolves against the local file tree today, the same path a user module would take. Once the table lands, the resolver will recognize `std.X` against these staged stubs and route to them alongside the user program.
+> **Status — self-hosting in progress.** The stdlib tree (`<zag-install>/lib/std/`) is written in Zag itself and grows as the compiler gains the primitives each module needs. Milestones landed so far: pure-Zag float parsing/formatting (`std.fmt.parse_f64` / `format_f64`, powering `std.json`), pure-Zag sleeping (`std.time.sleep_us` via a raw `nanosleep` facade in `std.posix`), pure-Zag argv (`std.argv.get` → `std.posix.argv`'s `/proc/self/cmdline` reader, retiring the `__zag_argv` main-entry capture), a pure-Zag allocator (`std.mem.alloc` / `alloc_raw` / `realloc_raw` / `release` over raw `mmap`/`munmap` facades, retiring the `__zag_page_alloc` family), real future suspension (`Future(T)` carries a futex-addressable done-word — `drive()` parks in the kernel, `complete()` stores + wakes — retiring the `__zag_future_drive`/`__zag_future_ready_void` helpers), string concatenation with `+`, float↔int and int↔pointer casts, and the `format(self) -> str` Display convention for user types. **The zig preamble now carries no stdlib-domain helpers** — every remaining `__zag_*` symbol is a language-level primitive (panic machinery, bench counters, the panic-trace map), which is exactly where the self-hosting boundary sits.
 
 Every zag program starts with `import std.X` — for `String`, `fmt`, atomics, timers, async streams, the canonical `Error` type, the allocator. The `std.*` namespace is resolved differently from user modules: the compiler recognizes the `std.` prefix and routes the request to a translation layer, not the file-tree walk above. This section documents that resolution, where the stdlib lives on disk, and how a maintainer adds a new module.
 
@@ -170,13 +170,51 @@ From the program side, `import std.X` follows exactly the import rules above —
 ```zag
 import std.types                   # whole namespace
 import std.types.{String}          # selective import
-import std.fmt.{Display}           # Display lives in std.fmt
 import std.types as t              # alias the namespace
 
 let greeting: String = new String("hello");
 s.push_str(greeting, ", world");
-Display::write(greeting, &writer);
+let line: str = "hello" + ", " + name;
 ```
+
+#### Bare-name resolution order
+
+When a bare call `name(args)` is compiled, candidates resolve in
+this order (src/codegen/expr.zig's `.call` arm):
+
+1. **Program-local `fun` decls** — a top-level fn declared in the
+   file being compiled outranks everything, including builtin rows.
+   This is what lets a zag-written stdlib module define `assert`,
+   `type_name`, or any other builtin-sounding name without being
+   silently hijacked by the compiler's inline emits.
+2. **The builtin router** (`src/codegen/builtins.zig`) — name+arity
+   rows emit hardware/shim zig directly (atomic primitives, `assert`,
+   `size_of`, …). Imported aliases sit BELOW this on purpose: the
+   atomic intrinsics' importable module bodies are dummies, so an
+   `import std.concurrent.atomic` must not shadow the real
+   implementation.
+3. **Verbatim emission** — including the turbofish shape
+   `name<T, const N>(args)` → `name(T, N, args)`.
+
+Display for user types follows the `format` convention: declare
+`pub fun format(self) -> str` on an impl block and any template slot
+typed as that struct renders through it instead of the raw `{any}`
+dump:
+
+```zag
+struct Point { x: i32, y: i32 }
+
+impl Point {
+    pub fun format(self: *const Point) -> str {
+        return "Point";   # build any text you like here
+    }
+}
+
+let p: Point = Point { x: 1, y: 2 };
+print("p={p}\n");        # p=Point
+```
+
+Types without a `format` impl keep the default `{any}` rendering.
 
 ```zag
 import std.atomic

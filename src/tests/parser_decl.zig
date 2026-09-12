@@ -318,9 +318,16 @@ test "parser: expression operator {a + b} gate accepts spaces and plus" {
     try std.testing.expectEqual(@as(usize, 2), arg.payload.template_lit.parts.len);
     try std.testing.expect(arg.payload.template_lit.parts[0].literal == null);
     try std.testing.expect(arg.payload.template_lit.parts[0].expr != null);
-    // The .ident text carries the full expression verbatim —
-    // codegen's .ident arm emits `a + b` as a Zig binary expression.
-    try std.testing.expectEqualStrings("a + b", arg.payload.template_lit.parts[0].expr.?.payload.ident);
+    // The additive scan builds a REAL left-assoc binary tree from the
+    // placeholder text (docs/11 "Expression content") — `a + b` is
+    // binary(add, ident a, ident b), not the legacy opaque `.ident`
+    // emit. The matching-brace gate still accepts the `+` + spaces;
+    // the additive builder is the new consumer of that text.
+    try std.testing.expect(arg.payload.template_lit.parts[0].expr.?.payload == .binary);
+    const bin = arg.payload.template_lit.parts[0].expr.?.payload.binary;
+    try std.testing.expect(bin.op == .add);
+    try std.testing.expectEqualStrings("a", bin.lhs.payload.ident);
+    try std.testing.expectEqualStrings("b", bin.rhs.payload.ident);
     try std.testing.expect(arg.payload.template_lit.parts[0].spec == null);
 }
 
@@ -1154,4 +1161,87 @@ test "probe: json string escapes lex" {
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
     try std.testing.expect(tokens.len > 3);
+}
+
+test "parser: whole-module import expands to selectors via injected reader" {
+    // Whole-module `import std.mock` (no selector list): with a reader
+    // injected, the expansion sub-parses the resolved target and
+    // synthesizes one selector per top-level decl (fns + structs +
+    // enums + traits + consts), deduped, in source order. @[test] fns
+    // are excluded (harness surface, not API).
+    const target_src =
+        \\pub fun alpha() -> i32 { return 1; }
+        \\fun helper() {}
+        \\pub struct Widget { x: i32 }
+        \\@[test]
+        \\fun t() { assert(true); }
+        \\pub fun alpha() -> i32 { return 2; }
+        \\const LIMIT: i32 = 9;
+    ;
+    const Parser = parser_mod.Parser;
+    // NOTE: the module must be in KNOWN_STD_MODULES for
+    // resolveStdImport to return a path (unknown std.X paths fail
+    // resolution — that's the typo-fails-fast contract). The reader
+    // stubs the module's content regardless.
+    const src = "pub import std.fmt;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = Parser.init(tokens, &arena);
+    p.read_source_file = struct {
+        fn read(path: []const u8) ?[]const u8 {
+            // resolveStdImport resolves std.fmt to lib/std/fmt.zag;
+            // the stub replaces its content for hermeticity.
+            if (std.mem.indexOf(u8, path, "fmt") == null) return null;
+            return target_src;
+        }
+    }.read;
+    const prog = p.parse();
+    try std.testing.expectEqual(@as(usize, 1), prog.imports.len);
+    const imp = prog.imports[0];
+    // Privacy is deferred (the AST doesn't record `pub` on top-level
+    // decls; codegen emits them all pub), so `helper` binds too:
+    // alpha + helper + Widget + LIMIT = 4, with the duplicate `alpha`
+    // deduped to its first occurrence and the @[test] fn excluded.
+    try std.testing.expect(imp.selectors.len == 4);
+    try std.testing.expectEqualStrings("alpha", imp.selectors[0].name);
+    try std.testing.expectEqualStrings("helper", imp.selectors[1].name);
+    try std.testing.expectEqualStrings("Widget", imp.selectors[2].name);
+    try std.testing.expectEqualStrings("LIMIT", imp.selectors[3].name);
+}
+
+test "parser: whole-module import without reader binds nothing (hermetic fallback)" {
+    // Null reader (parser tests, hermetic environments): the import
+    // stays selectorless and codegen's bind-nothing shape applies.
+    // This is the pre-expansion contract, preserved as fallback.
+    const src = "pub import std.types;\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expectEqual(@as(usize, 1), prog.imports.len);
+    try std.testing.expect(prog.imports[0].selectors.len == 0);
+}
+
+test "parser: selective import never triggers expansion" {
+    // Selector lists are user-authored; the expansion must leave
+    // them untouched even when a reader is available.
+    const target_src = "pub fun a() {}\npub fun b() {}\n";
+    const Parser = parser_mod.Parser;
+    const src = "pub import std.fmt.{load};\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = Parser.init(tokens, &arena);
+    p.read_source_file = struct {
+        fn read(path: []const u8) ?[]const u8 {
+            if (std.mem.indexOf(u8, path, "fmt") == null) return null;
+            return target_src;
+        }
+    }.read;
+    const prog = p.parse();
+    try std.testing.expectEqual(@as(usize, 1), prog.imports.len);
+    try std.testing.expectEqual(@as(usize, 1), prog.imports[0].selectors.len);
+    try std.testing.expectEqualStrings("load", prog.imports[0].selectors[0].name);
 }

@@ -1,13 +1,104 @@
 ## std.concurrent.thread — OS thread spawning and joining (docs/21)
 ##
-##   import std.concurrent.thread
+## Real implementation over the raw clone(2) syscall
+## (std.posix.clone — added in this batch). No zig-stdlib Thread
+## involvement: spawn packages (entry, payload) into a heap control
+## block, maps the child stack with std.mem's mmap allocator, and
+## issues the clone; join parks on the kernel's child-tid word via
+## the futex primitives (std.posix.futex_wait/futex_wake).
 ##
-##   spawn(fn, args)   std.Thread.spawn(.{}, fn, args)
-##   join(handle)      handle.join()
+##   import std.concurrent.thread
+##   import std.mem.{alloc, release}
+##
+##   let t: Thread = spawn(body, payload);
+##   join(t);
+##
+## ABI: the kernel starts the child on a fixed zig-side trampoline
+## (`__zag_thread_tramp`, emitted with the preamble) because zag's
+## auto-convention fns cannot cast to `callconv(.c)` pointers ("auto
+## cannot cast into x86_64_sysv"). The trampoline unpacks the control
+## block, calls the user entry (plain zig convention), and returns 0 —
+## zig's clone asm then SYS_exits the thread with it. The child's
+## ctid word is NOT zeroed by the trampoline: the kernel itself
+## clears + futex-wakes it on thread exit (CLONE_CHILD_CLEARTID),
+## which is exactly what join() parks on — a zero-syscall fast path
+## when the child already exited, kernel park otherwise.
 
-pub fun spawn(fn: *raw c_void, args: *raw c_void) -> i32 {
-    return 0;
+import std.posix.{clone as sys_clone, futex_wait_shared, futex_wake, gettid}
+import std.mem.{alloc, release}
+
+## Thread — a joinable kernel thread handle. Fields are usize-stored
+## internals, never read directly by user code (join/spawn/tid do).
+pub struct Thread {
+    ctid_addr: usize,
+    stack: usize,
+    stack_len: usize,
+    ctl: usize,
+    tid: i32,
 }
-pub fun join(handle: *i32) -> i32 {
-    return 0;
+
+## Trampoline bridge — the entry is zig-side (`__zag_thread_tramp`,
+## emitted with the preamble: the clone entry must be a real zig fn
+## pointer, which pure-Zag source cannot synthesize). Users never
+## touch it.
+
+## spawn — start `body(payload)` on a new kernel thread and return
+## its handle. `body` is an ordinary zag fun taking one usize (pass
+## a pointer/integer through `payload`; multiple values go through a
+## pointer to a struct). The handle MUST be joined (no detach yet).
+pub fun spawn(body: *const fn (usize) void, payload: usize) -> Thread {
+    ## Control page layout ([*]usize slots): [0] = tid (the kernel
+    ## CLONE_CHILD_CLEARTID word — cleared+woken by the kernel on
+    ## thread exit; zero means finished), [1] = body fn ptr,
+    ## [2] = payload, [3] = child tid (CLONE_PARENT_SETTID).
+    let ctl_buf: []u8 = alloc(64);
+    let ctl_words: [*]usize = ctl_buf.ptr as [*]usize;
+    ctl_words[0] = 1;
+    ctl_words[1] = body as usize;
+    ctl_words[2] = payload;
+    ## Stack: 128KB of the same mmap allocator — released by join.
+    ## 4KB was a guard-page-less overflow: the __zag_print shim puts
+    ## a 64KB format buffer on the caller's stack, so a print() call
+    ## from a worker silently smashed the mapping below it.
+    let stack_buf: []u8 = alloc(131072);
+    let stack_top: usize = stack_buf.ptr as usize + 131072;
+
+    let flags: u32 = 0x00000100 | 0x00010000 | 0x00000200 | 0x00000400 | 0x00000800 | 0x00040000 | 0x00200000 | 0x00100000;
+    let tid_out: *i32 = (ctl_buf.ptr as usize + 24) as *i32;
+    let rc: usize = sys_clone(ctl_buf.ptr as usize, flags, stack_top, tid_out, ctl_buf.ptr as *i32);
+    if ((rc & 0x8000000000000000) != 0) {
+        __zag_panic("std.concurrent.thread.spawn: clone failed");
+    }
+    let t: Thread = Thread { ctid_addr: ctl_buf.ptr as usize, stack: stack_buf.ptr as usize, stack_len: 131072, ctl: ctl_buf.ptr as usize, tid: rc as i32 };
+    return t;
+}
+
+## join — block until the thread exits, then free its stack and
+## control page. Parks on the ctid word (kernel clears + wakes it on
+## thread exit); the tid word doubles as the wait address, so the
+## futex-park protocol needs no extra synchronization.
+pub fun join(t: Thread) -> void {
+    let words: [*]usize = t.ctl as [*]usize;
+    let waddr: *const u32 = t.ctl as *const u32;
+    ## Park until the kernel clears the ctid word on thread exit.
+    ## Reading through an indexable pointer (`[*]u32[0]`) — plain
+    ## `p.*` deref reads aren't supported in expression position.
+    let wview: [*]u32 = t.ctl as [*]u32;
+    while (true) {
+        let cur: u32 = wview[0];
+        if (cur == 0) { break; }
+        ## SHARED (non-private) wait: the kernel's CLONE_CHILD_CLEARTID
+        ## wake on thread exit is a non-private wake — a private wait
+        ## would never match it and park forever.
+        _ = futex_wait_shared(waddr, cur);
+    }
+    _ = futex_wake(waddr, 1);
+    _ = release(words as [*]u8, 64);
+    let stack_base: [*]u8 = t.stack as [*]u8;
+    _ = release(stack_base, t.stack_len);
+}
+
+## tid — the calling thread's kernel thread id.
+pub fun tid() -> i32 {
+    return gettid();
 }

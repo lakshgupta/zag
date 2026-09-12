@@ -1,0 +1,134 @@
+## std.concurrent.rwlock — reader/writer lock (docs/22)
+##
+##   import std.concurrent.rwlock
+##
+##   var l: RwLock = create();
+##   read_lock(&l);    # many readers hold concurrently
+##   # ... read shared state ...
+##   read_unlock(&l);
+##
+##   write_lock(&l);   # exclusive: drains readers, blocks new ones
+##   # ... mutate shared state ...
+##   write_unlock(&l);
+##
+## Pure Zag: the state word is a futex-addressable i32 driven by the
+## atomic intrinsics (load / compare_exchange / fetch_add — no import
+## needed) and std.posix's FUTEX_WAIT_PRIVATE / FUTEX_WAKE_PRIVATE
+## primitives. No zig-stdlib RwLock involvement.
+##
+## Word layout (i32, all values stay non-negative):
+##   bit 30 (WRITER_BIT) — writer interest: set while a writer holds
+##                         or is draining readers; blocks NEW readers
+##   bits 0..29          — active reader count
+##
+## Writer-preferring: once a writer sets WRITER_BIT, new readers park
+## instead of joining, so a stream of readers cannot starve the
+## writer. Existing readers drain naturally; the writer parks until
+## the count hits 0 (word == WRITER_BIT exactly), then holds.
+##
+## Wake protocol:
+##   read_unlock  — fetch_add(-1); when the LAST reader leaves while
+##                  a writer waits (prev == WRITER_BIT + 1), wake the
+##                  parked writer.
+##   write_unlock — fetch_add(-WRITER_BIT) then wake everything: the
+##                  parked reader queue and any queued writers all
+##                  re-CAS (writer vs. freshly woken readers is an
+##                  equal race — throughput over strict FIFO).
+##
+## All parked waits use the observed word as the futex expected value,
+## so every state transition that matters (reader decrement, writer
+## release) changes the word and wakes the right queue; the kernel's
+## atomic re-check closes the lost-wake window (EAGAIN when the word
+## moved between our load and the park).
+
+import std.posix.{futex_wait, futex_wake}
+
+## Writer-interest flag (bit 30). Kept OFF bit 31 so every state word
+## stays a positive i32 — the `as u32` futex-arg casts below are then
+## plain value casts (no wrap), and fetch_add(-WRITER_BIT) stays in
+## i32 range.
+const WRITER_BIT: i32 = 0x40000000;
+
+## "Wake everything" futex count for write_unlock — the parked reader
+## queue plus any queued writers all re-CAS from a clean word.
+const WAKE_ALL: u32 = 0xFFFFFFFF;
+
+pub struct RwLock {
+    state: i32,
+}
+
+## create — an unlocked rwlock (no readers, no writer).
+pub fun create() -> RwLock {
+    return RwLock { state: 0 };
+}
+
+## read_lock — take a read slot. Parks while a writer holds or
+## drains (WRITER_BIT set); otherwise a single CAS bumps the reader
+## count.
+pub fun read_lock(l: *RwLock) {
+    let w: *i32 = addr_of(l.state);
+    while (true) {
+        let s: i32 = load(w);
+        if ((s & WRITER_BIT) == 0) {
+            # No writer interest: join the readers. A failed CAS is a
+            # concurrent reader or writer transition — re-load.
+            if (compare_exchange(w, s, s + 1)) {
+                return;
+            }
+        }
+        # Writer holds/drains (or we raced). Park until the word
+        # moves off the observed value; EAGAIN when it already moved.
+        _ = futex_wait(w as *const u32, s as u32);
+    }
+}
+
+## read_unlock — release a read slot. Wakes the parked writer iff we
+## were the last reader AND a writer is waiting; zero syscalls
+## otherwise (readers leaving while readers remain need no wake).
+pub fun read_unlock(l: *RwLock) {
+    let w: *i32 = addr_of(l.state);
+    let prev: i32 = fetch_add(w, -1);
+    if (prev == WRITER_BIT + 1) {
+        # Last reader out with a writer parked on the drained word.
+        _ = futex_wake(w as *const u32, 1);
+    }
+}
+
+## write_lock — take exclusive access. Sets WRITER_BLOCKED (blocking
+## new readers), parks until active readers drain to zero.
+pub fun write_lock(l: *RwLock) {
+    let w: *i32 = addr_of(l.state);
+    while (true) {
+        let s: i32 = load(w);
+        if ((s & WRITER_BIT) == 0) {
+            # Claim writer interest (works from both the unlocked word
+            # and a readers-active word). No reader can join after
+            # this lands; holders drain below.
+            if (compare_exchange(w, s, s + WRITER_BIT)) {
+                while (true) {
+                    let cur: i32 = load(w);
+                    if (cur == WRITER_BIT) {
+                        # Readers fully drained: we hold exclusive.
+                        return;
+                    }
+                    # Park until the next reader departure changes
+                    # the word (each read_unlock's fetch_add wakes
+                    # us to re-check).
+                    _ = futex_wait(w as *const u32, cur as u32);
+                }
+            }
+        }
+        # Another writer holds interest/queue slot — park until its
+        # write_unlock changes the word, then re-CAS.
+        _ = futex_wait(w as *const u32, s as u32);
+    }
+}
+
+## write_unlock — release exclusive access and wake everything: the
+## parked readers (and any queued writer) re-CAS against the clean
+## word. Exactly one fetch_add + one wake syscall per release.
+pub fun write_unlock(l: *RwLock) {
+    let w: *i32 = addr_of(l.state);
+    _ = fetch_add(w, 0 - WRITER_BIT);
+    _ = futex_wake(w as *const u32, WAKE_ALL);
+}

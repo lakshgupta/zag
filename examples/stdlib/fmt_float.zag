@@ -1,0 +1,57 @@
+## stdlib/fmt_float.zag — std.fmt float surface (self-hosting demo).
+##
+## format_f64 / parse_f64 are pure Zag — the old __zag_atof /
+## __zag_ftoa zig preamble shims retired into lib/std/fmt.zag once
+## the compiler learned float<->int casts:
+##
+##   f as u64   ->  @as(u64, @intFromFloat(f))   # truncate toward 0
+##   i as f64   ->  @as(f64, @floatFromInt(i))
+##
+## The same casts are what users write; the stdlib no longer needs a
+## zig-side shim its own source can't spell.
+
+import std.fmt.{format_f64, parse_f64};
+
+fun main() {
+    # Format: integer digits + '.' + 6 fractional digits.
+    var buf: [64]u8 = undefined;
+    let n: usize = format_f64(3.5, buf[0..]);
+    let view: str = buf[0..n];
+    print("format: {view}\n");
+
+    # Parse: sign / integer / fraction / e-E exponent.
+    let v: f64 = parse_f64("2.25e1");
+    print("parse: {v}\n");
+
+    let neg: f64 = parse_f64("-0.125");
+    print("neg: {neg}\n");
+
+    # Float -> int truncates toward zero (zig @intFromFloat semantics).
+    let big: f64 = 1e15;
+    let iv: u64 = big as u64;
+    print("int: {iv}\n");
+
+    # Int -> float widens losslessly for small magnitudes.
+    let count: u64 = 42;
+    let ratio: f64 = count as f64 / 100.0;
+    print("ratio: {ratio}\n");
+}
+
+@[test]
+fun test_float_roundtrip() {
+    var buf: [64]u8 = undefined;
+    let n: usize = format_f64(3.5, buf[0..]);
+    assert(n == 8);
+
+    let v: f64 = parse_f64("2.25e1");
+    assert(v == 22.5);
+
+    let big: f64 = 1e15;
+    let iv: u64 = big as u64;
+    assert(iv == 1000000000000000);
+
+    let d: u8 = '7';
+    let digit: i32 = (d - '0') as i32;
+    assert(digit == 7);
+    assert(true);
+}

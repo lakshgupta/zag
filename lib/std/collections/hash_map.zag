@@ -22,6 +22,8 @@
 ##
 ## Ownership: the container owns its heap buffers; `deinit` releases
 ## them.
+import std.mem.{alloc_raw, release}
+
 pub struct HashMap<K, V> {
     keys: [*]K,
     values: [*]V,
@@ -69,9 +71,9 @@ impl HashMap<K, V> {
 
     pub fun deinit(self: *HashMap<K, V>) {
         if (self.cap > 0) {
-            __zag_page_free(self.keys as [*]u8, self.cap * size_of(K));
-            __zag_page_free(self.values as [*]u8, self.cap * size_of(V));
-            __zag_page_free(self.used as [*]u8, self.cap);
+            release(self.keys as [*]u8, self.cap * size_of(K));
+            release(self.values as [*]u8, self.cap * size_of(V));
+            release(self.used as [*]u8, self.cap);
             self.cap = 0;
             self.len = 0;
         }
@@ -92,9 +94,9 @@ impl HashMap<K, V> {
         let old_keys: [*]K = self.keys;
         let old_values: [*]V = self.values;
         let old_used: [*]bool = self.used;
-        var nk: [*]K = __zag_page_alloc(new_cap * size_of(K)) as [*]K;
-        var nv: [*]V = __zag_page_alloc(new_cap * size_of(V)) as [*]V;
-        var nu: [*]bool = __zag_page_alloc(new_cap) as [*]bool;
+        var nk: [*]K = alloc_raw(new_cap * size_of(K)) as [*]K;
+        var nv: [*]V = alloc_raw(new_cap * size_of(V)) as [*]V;
+        var nu: [*]bool = alloc_raw(new_cap) as [*]bool;
         if (old_cap > 0) {
             var i: usize = 0;
             while (i < old_cap) {
@@ -110,9 +112,9 @@ impl HashMap<K, V> {
                 }
                 i = i + 1;
             }
-            __zag_page_free(old_keys as [*]u8, old_cap * size_of(K));
-            __zag_page_free(old_values as [*]u8, old_cap * size_of(V));
-            __zag_page_free(old_used as [*]u8, old_cap);
+            release(old_keys as [*]u8, old_cap * size_of(K));
+            release(old_values as [*]u8, old_cap * size_of(V));
+            release(old_used as [*]u8, old_cap);
         }
         self.keys = nk;
         self.values = nv;

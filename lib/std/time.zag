@@ -13,7 +13,7 @@
 ## inline as a blk-expression; retired in the Tier-1 migration —
 ## this .zag body chain is the single source of truth.
 
-pub import std.posix.{clock_gettime}
+pub import std.posix.{clock_gettime, nanosleep}
 
 pub fun now() -> i64 {
     return clock_gettime(1);
@@ -27,26 +27,47 @@ impl Duration {
     pub fun from_millis(ms: u64) -> Duration {
         return Duration { nanos: (ms as i64) * 1_000_000 };
     }
-    pub fun as_millis(self: *Duration) -> u64 {
+    pub fun as_millis(self: *const Duration) -> u64 {
         let ms: i64 = self.nanos / 1_000_000;
         return ms as u64;
     }
 }
 
-## Async v1 (docs/manual/00-overview.md "Zero-cost async"): the
-## timer surface an async fn can await on. `after(ms)` busy-waits
-## on CLOCK_MONOTONIC until the duration elapses, then returns an
-## already-completed Future(void) — the v1 synchronous driver runs
-## the await inline (see __zag_future_drive in the preamble), so the
-## sleep happens inside the call. A real event-loop timer (no
-## busy-wait) is the documented follow-up alongside real future
-## suspension.
+## sleep_us — block the calling thread for `us` microseconds via the
+## posix.nanosleep facade (raw `nanosleep(2)`). The __zag_nanosleep_ms
+## preamble helper retired here: the µs→{sec,nsec} decomposition is
+## plain zag arithmetic and the syscall itself needs no zig-side
+## spelling (see posix.zag's nanosleep docblock). Sub-microsecond
+## requests (us <= 0) return immediately.
+pub fun sleep_us(us: i64) {
+    if (us <= 0) { return; }
+    let sec: i64 = us / 1_000_000;
+    let nsec: i64 = (us % 1_000_000) * 1_000;
+    _ = nanosleep(sec, nsec);
+}
 
+## sleep_ms — millisecond convenience over sleep_us.
+pub fun sleep_ms(ms: i64) {
+    sleep_us(ms * 1_000);
+}
+
+## after — async timer surface (docs/manual/00-overview.md
+## "Zero-cost async"): sleeps via nanosleep (NO busy-wait — the
+## previous spin-on-clock_gettime form burned CPU for the whole
+## duration), then returns an already-completed Future(void). The
+## await site's drive() sees state == 1 and takes the zero-cost
+## no-syscall path. A real event-loop timer rides std.async's
+## EventLoop; cross-thread producers park their awaiters through
+## the same Future.drive() futex wait.
 pub fun after(ms: i64) -> Future(void) {
-    let start: i64 = now();
-    let target: i64 = start + ms * 1_000_000;
-    while (now() < target) {}
-    return __zag_future_ready_void();
+    sleep_ms(ms);
+    # Ready-future construction without the retired
+    # __zag_future_ready_void helper: undefined + complete() builds
+    # the completed state in place (the futex wake in complete() is
+    # harmless — no waiter is ever parked on this local).
+    var f: Future(void) = undefined;
+    f.complete();
+    return f;
 }
 
 pub struct Timer {
@@ -57,7 +78,7 @@ impl Timer {
     pub fun start() -> Timer {
         return Timer { start_ns: now() };
     }
-    pub fun elapsed(self: *Timer) -> Duration {
+    pub fun elapsed(self: *const Timer) -> Duration {
         return Duration { nanos: now() - self.start_ns };
     }
 }

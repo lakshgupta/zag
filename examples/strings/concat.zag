@@ -1,0 +1,58 @@
+## strings/concat.zag — string concatenation with `+` (docs/11).
+##
+## Zag lowers `a + b` on string operands to a fresh heap buffer
+## holding the two byte sequences back-to-back. All three operand
+## mixes work:
+##
+##   literal + ident   — "hello, " + name
+##   ident + ident     — first + last
+##   ident + literal   — msg + "!"
+##
+## Chains are left-associative ("a" + s + "!" concatenates in
+## source order), and the template placeholder `{a + b}` accepts
+## the same operator (docs/11 "Expression content" — the braces
+## hold any value-yielding expression). Numeric `+` is untouched:
+## `1 + 2` still emits zig's plain add.
+
+fun main() {
+    let name: str = "world";
+    let greeting: str = "hello, " + name;
+    print("{greeting}\n");
+
+    let first: str = "ada";
+    let last: str = "lovelace";
+    let full: str = first + " " + last;
+    print("{full}\n");
+
+    # Concat in a template placeholder — no intermediate binding needed.
+    let a: str = "abc";
+    let b: str = "def";
+    print("joined: {a + b}\n");
+
+    # Numeric addition is unaffected by the string dispatch.
+    let n: i32 = 1 + 2;
+    print("n={n}\n");
+
+    # Length composes: (a + b).len == a.len + b.len.
+    let joined_len: usize = (a + b).len;
+    print("len={joined_len}\n");
+}
+
+@[test]
+fun test_concat_basics() {
+    let name: str = "world";
+    let greeting: str = "hello, " + name;
+    assert(greeting.len == 7);
+    assert(greeting == "hello, world");
+
+    let a: str = "abc";
+    let b: str = "def";
+    let joined: str = a + b;
+    assert(joined.len == 6);
+    assert(joined == "abcdef");
+
+    # Left-assoc chain.
+    let chain: str = "x" + a + "y";
+    assert(chain == "xabcy");
+    assert(true);
+}

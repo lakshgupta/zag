@@ -1,26 +1,58 @@
-## std.concurrent.atomic — lock-free atomic operations (docs/21)
+## std.concurrent.atomic — atomic operations (docs/22)
 ##
-## Atomic operations are single-instruction primitives for shared-memory
-## concurrency. Each operates on a pointer to a primitive type. All use
-## seq_cst ordering by default. The pointer type is inferred from
-## `@TypeOf(ptr.*)` at zig compile time.
+## The four primitives — load, store, fetch_add, compare_exchange —
+## are COMPILER INTRINSICS: the builtin router (src/codegen/builtins.zig)
+## intercepts calls by name+arity and emits the hardware instruction
+## (`@atomicLoad` / `@atomicStore` / `@atomicRmw` / `@cmpxchgStrong`,
+## all seq_cst) directly at the call site. No import is needed; this
+## module exists so the surface has a documented home and imports
+## RESOLVE (whole-module `import std.concurrent.atomic` binds these
+## names via alias constants, and zig analyzes imported aliases' fns —
+## so the bodies must COMPILE, never execute).
 ##
-##   import std.concurrent.atomic
+## Body note: the router is the only caller — no zag call site ever
+## reaches these bodies. They discard their params and return a zero
+## value purely to satisfy zig's unused-parameter / missing-return
+## checks when the import aliases force body analysis. (`return
+## unreachable;` was tried and rejected: zig 0.16 flags
+## `return unreachable` as unreachable code, and plain stubs trip the
+## unused-parameter check.)
 ##
-##   load(ptr)                     @atomicLoad(T, ptr, .seq_cst)
-##   store(ptr, val)               @atomicStore(T, ptr, val, .seq_cst)
-##   fetch_add(ptr, val)           @atomicRmw(T, ptr, .Add, val, .seq_cst)
-##   compare_exchange(ptr, o, n)   @cmpxchgStrong(T, ptr, o, n, ...)
+## Signatures:
+##
+##   load(ptr)              -> T        @atomicLoad(T, ptr, .seq_cst)
+##   store(ptr, val)        void        @atomicStore(T, ptr, val, .seq_cst)
+##   fetch_add(ptr, val)    -> T        @atomicRmw(T, ptr, .Add, val, .seq_cst)
+##   compare_exchange(p,o,n) -> bool    (@cmpxchgStrong(T, p, o, n, ...) == null)
+##
+## compare_exchange returns the CAS SUCCESS flag (true = swapped).
+## zig's raw cmpxchg returns `?T` (null on success, the witnessed
+## value on failure); the intrinsic wraps it with `== null` so the
+## bool is nameable in zag — lock loops build directly on it (see
+## std.concurrent.mutex.lock).
+##
+## Type note: the *i32 annotations are the load-bearing minimum —
+## the router emits `@TypeOf(ptr.*)` at every site, so any
+## integer-pointer type works at the hardware level. The decls
+## below keep i32 because the router fires on name+arity before
+## these signatures are ever consulted.
 
 pub fun load(ptr: *i32) -> i32 {
+    _ = ptr;
     return 0;
 }
 pub fun store(ptr: *i32, val: i32) {
-    return;
+    _ = ptr;
+    _ = val;
 }
 pub fun fetch_add(ptr: *i32, val: i32) -> i32 {
+    _ = ptr;
+    _ = val;
     return 0;
 }
-pub fun compare_exchange(ptr: *i32, old: i32, new: i32) -> i32 {
-    return 0;
+pub fun compare_exchange(ptr: *i32, expected: i32, replacement: i32) -> bool {
+    _ = ptr;
+    _ = expected;
+    _ = replacement;
+    return false;
 }

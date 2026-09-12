@@ -1753,6 +1753,85 @@ const TranspileResult = struct {
     map: []const u8,
 };
 
+/// Whole-module import expansion reader (v2 self-hosting): resolves
+/// `lib/std/...` paths against the same root chain as the stdlib
+/// materializer (cwd-relative → $ZAG_HOME → distro fallback) and
+/// returns the file's bytes from compile-scoped static storage. The
+/// expansion pass only ever asks for paths produced by
+/// resolveStdImport (`lib/std/<rel>.zag`), so the root lookup is the
+/// only path handling needed here. Returns null on any miss — the
+/// expansion degrades to the pre-expansion bind-nothing shape.
+// One slot per imported module: the parsed token slices in the
+// synthesized selectors point INTO the returned text, so each file's
+// bytes must stay live (and unmodified) for the whole compile. A
+// single shared buffer would be clobbered by the second import — its
+// first file's tokens would silently re-parse as the second file's
+// text (observed as mangled selector names). Slots are keyed by path
+// so repeat imports of the same module reuse their buffer. 16 slots ×
+// 64KB ≈ 1MB static; files larger than a slot degrade to no
+// expansion (bind-nothing, pre-expansion behavior).
+const ExpansionSlot = struct {
+    used: bool = false,
+    path_len: usize = 0,
+    path: [512]u8 = undefined,
+    len: usize = 0,
+    buf: [65536]u8 = undefined,
+};
+var expansion_slots: [16]ExpansionSlot = undefined;
+var expansion_slots_init = false;
+var expansion_next_slot: usize = 0;
+var expansion_root_buf: [512]u8 = undefined;
+fn readSourceForExpansion(path: []const u8) ?[]const u8 {
+    if (!expansion_slots_init) {
+        // BSS starts zeroed; just flip the init flag (comptime-known
+        // defaults above are only for documentation).
+        expansion_slots_init = true;
+    }
+    // Hit: same path served from its slot.
+    for (&expansion_slots) |*slot| {
+        if (slot.used and slot.path_len == path.len and
+            std.mem.eql(u8, slot.path[0..slot.path_len], path))
+        {
+            return slot.buf[0..slot.len];
+        }
+    }
+    // resolveStdImport paths carry the lib/std/ prefix; the root tiers
+    // resolve to the lib/std DIRECTORY itself (cwd tier returns the
+    // literal "lib/std"), so the prefix is stripped before the join.
+    // std.mem.cutPrefix (zig 0.16's prefix-strip) returns null when
+    // the prefix is absent — a non-stdlib path degrades to no
+    // expansion.
+    const rel = std.mem.cutPrefix(u8, path, "lib/std/") orelse return null;
+    if (rel.len == 0) return null;
+    const root_path = resolveStdlibRoot(&expansion_root_buf) orelse return null;
+    var full_buf: [1024]u8 = undefined;
+    const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ root_path, rel }) catch return null;
+    const fd = posix.openat(posix.AT.FDCWD, full, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.os.linux.close(fd);
+
+    // Claim a slot (round-robin; 16 covers any real program's
+    // distinct stdlib imports).
+    const slot = &expansion_slots[expansion_next_slot];
+    expansion_next_slot = (expansion_next_slot + 1) % expansion_slots.len;
+    slot.used = true;
+    if (path.len > slot.path.len) return null;
+    @memcpy(slot.path[0..path.len], path);
+    slot.path_len = path.len;
+
+    var total: usize = 0;
+    while (total < slot.buf.len) {
+        const n = std.os.linux.read(fd, slot.buf[total..].ptr, slot.buf.len - total);
+        if (n == 0) break;
+        // High bit set on raw-syscall failure (errno encoding) — a
+        // read error mid-file degrades to "no expansion".
+        if (n & 0x8000000000000000 != 0) return null;
+        total += n;
+    }
+    if (total == slot.buf.len) return null; // truncated: oversized file
+    slot.len = total;
+    return slot.buf[0..total];
+}
+
 fn transpile(path: []const u8, source: []const u8, use_hybrid: bool) !TranspileResult {
     return transpileEx(path, source, use_hybrid, "std/");
 }
@@ -1763,6 +1842,15 @@ fn transpileEx(path: []const u8, source: []const u8, use_hybrid: bool, import_st
 
     var arena = ast.Arena.init();
     var p = parser_mod.Parser.init(tokens, &arena);
+    // Whole-module import expansion (v2 self-hosting): inject the
+    // compile-scoped file reader so `import std.mem` (no selector
+    // list) parses the target module and binds its full top-level
+    // surface. Must land BEFORE p.parse() — the expansion runs during
+    // parseImportDecl. The buffers are static because the returned
+    // slices live as long as the compile (token text + decl names in
+    // the synthesized selectors). Disabled in parser tests (null
+    // reader = hermetic), see Parser.read_source_file.
+    p.read_source_file = readSourceForExpansion;
     const prog = p.parse();
 
     var cg = codegen_mod.Codegen.init();

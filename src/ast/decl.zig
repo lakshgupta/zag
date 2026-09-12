@@ -75,6 +75,20 @@ pub const FunDecl = struct {
     /// True when `@[test]` annotation precedes the function.
     /// Codegen emits `test "name" { ... }` instead of `pub fn name(...)`.
     is_test: bool = false,
+    /// True when the body is a COMPTIME expression (no runtime
+    /// surface): `fun NAME(...) = <expr>;` — codegen emits a zig
+    /// `pub const NAME = <expr>;` and the parser skips the braced
+    /// body. Built for the self-hosting batch so pure-.zag
+    /// comptime-dispatch helpers (format_any's type-keyed format
+    /// table) can be spelled without a zig file-side shim.
+    is_comptime_body: bool = false,
+    /// Verbatim source text of the comptime body expression (the
+    /// `= <expr>;` payload). Codegen re-lexes/parses this text into
+    /// an expression AST at the emit site (the parser mini-pass that
+    /// captures it has no codegen context) — keeping the TEXT (not a
+    /// pre-built AST) avoids arena-lifetime entanglement between the
+    /// throwaway parse arena and the program arena.
+    comptime_body_text: []const u8 = "",
     /// True for `async fun NAME(...)` (docs/manual/18-traits.md
     /// §"Async Trait Methods"): the emitted zig fn returns
     /// `Future(T)` (the wrapped return type) and the body's `await`

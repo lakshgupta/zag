@@ -1,0 +1,82 @@
+## std.concurrent.once — run a function exactly once (docs/22)
+##
+##   import std.concurrent.once
+##   import std.concurrent.thread.{spawn, join, Thread}
+##
+##   var o: Once = create();
+##   # on any number of threads:
+##   #   call_once(&o, init_state, payload);
+##
+## Pure Zag: the state word is a futex-addressable u32 driven by the
+## atomic intrinsics (compare_exchange / load / store — no import
+## needed) and std.posix's private futex primitives. No zig-stdlib
+## Once involvement.
+##
+## State machine (the classic 3-state protocol):
+##   0 = INCOMPLETE  — nobody has started (or all starters failed)
+##   1 = RUNNING     — one thread owns the run; others park
+##   2 = COMPLETE    — the fn finished; late callers return fast
+##
+## - The first thread to CAS 0→1 becomes the runner: it calls `f(p)`.
+##   On return it stores 2 and FUTEX_WAKE_PRIVATEs the wait queue
+##   (u32::MAX — wake everything, the queue is small in practice).
+## - Every other thread either parks on the word (expected RUNNING)
+##   until the runner completes, or — if it saw INCOMPLETE after the
+##   runner already flipped the word — re-checks in the loop.
+## - If `f` panics, the runner resets the state word to 0 and wakes
+##   the queue, letting another thread retry the fn (same semantics
+##   as zig std.Thread.Once: a panic means "not done", not "done").
+##
+## The fn ABI is the thread-body ABI (`*const fn (usize) void`,
+## docs/22 §Threads) so state can be passed by pointer without
+## closures — `f` typically receives `&mut` to a struct it fills.
+
+import std.posix.{futex_wait, futex_wake}
+
+pub struct Once {
+    state: u32,
+}
+
+## Sentinel: "wake everything" for the futex wake — the wait queue on
+## a Once is bounded by the thread count, so an exhaustive wake is
+## the simple correct choice.
+const WAKE_ALL: u32 = 0xFFFFFFFF;
+
+## create — a fresh, never-run Once.
+pub fun create() -> Once {
+    return Once { state: 0 };
+}
+
+## call_once — run `f(payload)` exactly once across all threads that
+## share `o`. Concurrent callers block until the run completes; later
+## callers return immediately. Panicking runs reset the Once so a
+## later call can retry.
+pub fun call_once(o: *Once, f: *const fn (usize) void, payload: usize) {
+    let w: *u32 = addr_of(o.state);
+    while (true) {
+        # Fast path: already completed by an earlier call.
+        if (load(w) == 2) {
+            return;
+        }
+        # Claim the run: INCOMPLETE (0) → RUNNING (1). The winner
+        # executes; losers fall to the park path below.
+        if (compare_exchange(w, 0, 1)) {
+            f(payload);
+            # Release: mark COMPLETE and wake every parked waiter.
+            store(w, 2);
+            _ = futex_wake(w as *const u32, WAKE_ALL);
+            return;
+        }
+        # Lost the race. Either RUNNING (park until complete) or the
+        # word moved under us (COMPLETE / back to INCOMPLETE after a
+        # panic — re-check at the top of the loop).
+        if (load(w) == 1) {
+            _ = futex_wait(w as *const u32, 1);
+        }
+    }
+}
+
+## is_complete — non-blocking probe (rarely needed; test surface).
+pub fun is_complete(o: *Once) -> bool {
+    return load(addr_of(o.state)) == 2;
+}

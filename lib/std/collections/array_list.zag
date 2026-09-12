@@ -23,6 +23,8 @@
 ##
 ## Ownership: the container owns its heap buffer; `deinit` releases
 ## it (call it in long-lived programs).
+import std.mem.{alloc_raw, release}
+
 pub struct ArrayList<T> {
     # Typed many-pointer field: the thunk body must REFERENCE T
     # somewhere (zig rejects an unused `comptime T: type` thunk
@@ -70,7 +72,7 @@ impl ArrayList<T> {
 
     pub fun deinit(self: *ArrayList<T>) {
         if (self.cap > 0) {
-            __zag_page_free(self.items as [*]u8, self.cap * size_of(T));
+            release(self.items as [*]u8, self.cap * size_of(T));
             self.cap = 0;
             self.len = 0;
         }
@@ -79,14 +81,14 @@ impl ArrayList<T> {
     fun grow(self: *ArrayList<T>) {
         let new_cap: usize = if (self.cap == 0) { 4 } else { self.cap * 2 };
         let old_len: usize = self.len;
-        var p: [*]T = __zag_page_alloc(new_cap * size_of(T)) as [*]T;
+        var p: [*]T = alloc_raw(new_cap * size_of(T)) as [*]T;
         if (self.cap > 0) {
             var i: usize = 0;
             while (i < old_len) {
                 p[i] = self.items[i];
                 i = i + 1;
             }
-            __zag_page_free(self.items as [*]u8, self.cap * size_of(T));
+            release(self.items as [*]u8, self.cap * size_of(T));
         }
         self.items = p;
         self.cap = new_cap;

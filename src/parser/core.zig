@@ -36,6 +36,14 @@ pub fn init(tokens: []const Token, arena: *ast.Arena) Parser {
             // fresh — same pattern as the variant table reset above.
             .known_struct_names = undefined,
             .known_struct_count = 0,
+            // Whole-module import expansion (v2 self-hosting): injectable
+            // file reader the expansion pass uses to parse the target
+            // stdlib module and synthesize selectors from its top-level
+            // decls. Null (default: tests) disables expansion — a
+            // whole-module import then binds nothing (the pre-expansion
+            // behavior). main.zig injects a posix open/read wrapper so
+            // production transpiles get the expansion.
+            .read_source_file = null,
         };
     }
 
@@ -575,6 +583,16 @@ pub const Parser = struct {
     tokens: []const Token,
     pos: u32,
     arena: *ast.Arena,
+    /// Whole-module import expansion (v2 self-hosting): injectable file
+    /// reader used by `expandWholeModuleImport` (decl.zig) to parse the
+    /// target stdlib module and synthesize import selectors from its
+    /// top-level decls. Null (the init() default) DISABLES expansion —
+    /// whole-module imports then bind nothing, the pre-expansion
+    /// behavior every existing test pins. main.zig's transpileEx
+    /// injects a posix open/read wrapper so production transpiles
+    /// expand. Injectable rather than hardwired so parser tests can
+    /// run hermetically without a stdlib tree on disk.
+    read_source_file: ?*const fn (path: []const u8) ?[]const u8 = null,
     /// Parse-context flag for struct-literal disambiguation in
     /// `parsePrimary`. True (default) in every expression position
     /// EXCEPT those where `{` MUST mean block-start: if-condition,
@@ -803,6 +821,9 @@ pub const Parser = struct {
         .{ .name = "std.concurrent.atomic", .path = "lib/std/concurrent/atomic.zag" },
         .{ .name = "std.concurrent.thread", .path = "lib/std/concurrent/thread.zag" },
         .{ .name = "std.concurrent.mutex", .path = "lib/std/concurrent/mutex.zag" },
+        .{ .name = "std.concurrent.rwlock", .path = "lib/std/concurrent/rwlock.zag" },
+        .{ .name = "std.concurrent.once", .path = "lib/std/concurrent/once.zag" },
+        .{ .name = "std.concurrent.semaphore", .path = "lib/std/concurrent/semaphore.zag" },
     };
 
     pub fn resolveStdImport(dotted: []const u8) ?[]const u8 {

@@ -1,28 +1,114 @@
 ## std.mem — heap allocation + byte-copy primitives
 ## (docs/manual/20-memory.md).
 ##
-## `alloc(N)` returns a heap-allocated byte slice backed by the
-## always-emitted `__zag_page_alloc` preamble helper
-## (src/codegen/core.zig → std.heap.page_allocator). The caller MUST
-## free with the `free` keyword (`defer free(buf)`), which emits the
-## matching `std.heap.page_allocator.free(buf)` for slice targets —
-## same allocator, so the ownership contract is unchanged from the
-## pre-migration shape.
+## v0.5 self-hosting migration: the allocator surface is PURE ZAG,
+## built over std.posix.mmap/munmap — the __zag_page_alloc /
+## __zag_page_realloc / __zag_page_free preamble helpers (zig-side
+## std.heap.page_allocator wrappers) are retired. The kernel mmap
+## primitive is the true base of the page allocator, so no
+## zig-stdlib allocator is involved anymore.
 ##
-## v0.1 Tier-1 migration: the pre-migration `builtin_alloc` router
-## row emitted `(std.heap.page_allocator.alloc(u8, N) catch
-## @panic("OOM"))` inline. Retired — this real .zag body is the
-## single source of truth. Callers must now `import std.mem.{alloc}`
-## (the bare-name router no longer rewrites the call site).
+## ## Two-tier surface
+##   PUBLIC (slice tier — examples/user code):
+##     alloc(n) -> []u8         data slice over a fresh mapping
+##   RAW (many-pointer tier — stdlib internals that track `cap`
+##   alongside the pointer, the header-free layout the retired
+##   helpers used — String/{cap}, ArrayList/{cap}, HashMap/{cap}):
+##     alloc_raw(n) -> [*]u8    max-aligned base, ≥ n bytes
+##     realloc_raw(p, cap, n)   grow/shrink to n, preserving
+##                              min(cap, n) bytes (copy path —
+##                              zig's PageAllocator.realloc moves
+##                              across pages too)
+##     release(p, cap)          munmap the page-rounded mapping
+##   Named `release` (not `free`) because the `free` KEYWORD
+##   hijacks that identifier at statement level: `free x, cap`
+##   rewrites to zig's page_allocator.destroy. The keyword path
+##   STAYS for slice-typed `free buf` sites — its emit is
+##   page_allocator.free(ptr[0..len]), pure page math (round len
+##   to page size, munmap), so it unmaps an alloc/alloc_raw
+##   mapping bit-identically.
 ##
-## The body also charges the std.bench allocation counter
-## (__zag_bench_alloc) so `Counters.snapshot()` accounts for
-## `alloc(N)` buffers alongside `new T(v)` sites.
+## The caller tracks `cap` alongside the pointer for the raw tier
+## (String/{cap}, ArrayList/{cap}, HashMap/{cap} — every existing
+## call site already carries the bookkeeping, so the raw surface
+## is a drop-in for the retired helpers).
+##
+## `free` KEYWORD compatibility: its slice-shaped emit is
+## `std.heap.page_allocator.free(ptr[0..len])` — and zig's
+## PageAllocator.free is itself pure page math (round len to page
+## size, munmap). An mmap-backed alloc freed through that path
+## unmaps the identical address range, so `free buf` on an
+## `alloc`-produced slice works unchanged.
+##
+## Alignment: the kernel returns page-aligned (max-aligned)
+## addresses — the same guarantee the retired helpers' contract
+## relied on (`__zag_page_alloc(...) as [*]i32` etc.).
+##
+## OOM panics via __zag_panic — matching the retired helpers'
+## `catch @panic(...)` behavior.
 
+import std.posix.{mmap, munmap}
+
+## alloc — `n` usable bytes as a data slice (public tier; the
+## mapping is page-rounded, so `free buf` via the keyword munmaps
+## it correctly).
 pub fun alloc(n: usize) -> []u8 {
-    let p: *raw u8 = __zag_page_alloc(n);
-    __zag_bench_alloc(n);
+    let p: [*]u8 = alloc_raw(n);
     return p[0..n];
+}
+
+## alloc_raw — a mapping holding `n` usable bytes, max-aligned.
+pub fun alloc_raw(n: usize) -> [*]u8 {
+    let page: usize = 4096;
+    var mapped: usize = (n + page - 1) & ~(page - 1);
+    if (mapped == 0) { mapped = page; }
+    let rc: usize = mmap(null, mapped, 3, 34, -1, 0);
+    if ((rc & 0x8000000000000000) != 0) {
+        __zag_panic("std.mem.alloc: mmap failed (OOM)");
+    }
+    __zag_bench_alloc(n);
+    return rc as [*]u8;
+}
+
+## realloc_raw — grow/shrink to `n` usable bytes preserving
+## min(old_cap, n) bytes of content. Fresh mapping + copy + unmap:
+## zig's PageAllocator.realloc takes exactly this path when the
+## region must move, and mremap's arch-varying flag word plus
+## MAP_FIXED placement juggling isn't worth the surface.
+pub fun realloc_raw(p: [*]u8, old_cap: usize, n: usize) -> [*]u8 {
+    let page: usize = 4096;
+    var old_mapped: usize = (old_cap + page - 1) & ~(page - 1);
+    if (old_mapped == 0) { old_mapped = page; }
+    var new_mapped: usize = (n + page - 1) & ~(page - 1);
+    if (new_mapped == 0) { new_mapped = page; }
+    let rc: usize = mmap(null, new_mapped, 3, 34, -1, 0);
+    if ((rc & 0x8000000000000000) != 0) {
+        __zag_panic("std.mem.realloc: mmap failed (OOM)");
+    }
+    let np: [*]u8 = rc as [*]u8;
+    var keep: usize = old_mapped;
+    if (new_mapped < keep) { keep = new_mapped; }
+    var k: usize = 0;
+    while (k < keep) {
+        np[k] = p[k];
+        k = k + 1;
+    }
+    _ = munmap(p, old_mapped);
+    return np;
+}
+
+## release — release a mapping of `cap` caller-tracked bytes
+## (page-rounded here; munmap length must match the mapping).
+## Named `release` (not `free`) because the `free` KEYWORD hijacks
+## that identifier at statement level (`free x, cap` rewrites to
+## zig's page_allocator.destroy — the keyword path stays for
+## slice-typed `free buf` sites, where its page-math munmap is
+## bit-compatible with alloc's mappings).
+pub fun release(p: [*]u8, cap: usize) -> void {
+    let page: usize = 4096;
+    var mapped: usize = (cap + page - 1) & ~(page - 1);
+    if (mapped == 0) { mapped = page; }
+    _ = munmap(p, mapped);
 }
 
 ## memcpy — byte-for-byte copy `dst[0..len] ← src[0..len]` (callers

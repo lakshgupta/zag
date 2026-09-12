@@ -237,10 +237,12 @@ test "codegen: alloc call without std.mem import emits verbatim (router retired)
     // v0.1 Tier-1 migration: the builtin_alloc router row is retired
     // — `alloc(1024)` now falls through to the verbatim emit unless
     // `pub import std.mem.{alloc}` wires the @import+alias
-    // fallthrough (lib/std/mem.zag's real impl, backed by
-    // __zag_page_alloc). This test pins the no-import fallback:
-    // the call site is emitted verbatim, and the retired router
-    // emit surface (page_allocator / OOM catch) is absent.
+    // fallthrough (lib/std/mem.zag's real impl — PURE ZAG over
+    // std.posix.mmap since the v0.5 self-hosting batch; the
+    // __zag_page_alloc preamble helper is retired). This test pins
+    // the no-import fallback: the call site is emitted verbatim,
+    // and the retired router emit surface (page_allocator / OOM
+    // catch) is absent.
     const src = "fun main() { let buf: []u8 = alloc(1024); }\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -251,11 +253,12 @@ test "codegen: alloc call without std.mem import emits verbatim (router retired)
     const zig = cg.generate(prog);
     // Verbatim call site survives.
     try std.testing.expect(std.mem.indexOf(u8, zig, "alloc(1024)") != null);
-    // Retired router emit surface is gone. NOTE: the preamble always
-    // contains the __zag_page_alloc helper body (`page_allocator.alloc`)
-    // and its own `@panic("__zag: page_alloc OOM")`, so the negatives
-    // pin the ROUTER's distinctive shapes: the arg-baked alloc call
-    // with the bare "OOM" message.
+    // Retired router emit surface is gone. NOTE: the preamble no
+    // longer carries any page_allocator helper (the v0.5
+    // self-hosting batch retired __zag_page_alloc into
+    // lib/std/mem.zag), so the negatives pin BOTH the router's
+    // shapes and the retired helper's body: the arg-baked alloc
+    // call, the bare "OOM" message, and the page_allocator symbol.
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.alloc(u8, 1024)") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@panic(\"OOM\")") == null);
 }
@@ -265,8 +268,8 @@ test "codegen: alloc routes through @import+alias fallthrough (no builtin_alloc 
     // fallthrough emits `const __zag_imported_<i> = @import(
     // "lib/std/mem.zag");` plus `const alloc = __zag_imported_<i>.alloc;`
     // and the bare-name alloc(1024) call site is emitted verbatim.
-    // The real impl body (lib/std/mem.zag) does the
-    // __zag_page_alloc call at the .zag level.
+    // The real impl body (lib/std/mem.zag) is pure zag — mmap over
+    // std.posix — with no preamble helper involved.
     const src =
         \\pub import std.mem.{alloc}
         \\fun main() {
@@ -622,4 +625,65 @@ test "codegen: enum_from_int(v) emits @enumFromInt(v) for the clockid boundary" 
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "@enumFromInt(id)") != null);
+}
+
+test "codegen: user fn shadows router row (assert arity-2)" {
+    // User-fn precedence: a program-local `fun assert(...)` resolves to
+    // the USER fn — the bare call emits verbatim — even though the
+    // router also has `assert` rows. The router's inline emit
+    // (`std.testing.expect(...)`) must NOT appear at the call site.
+    const src =
+        \\fun assert(ok: bool, msg: str) { print("c"); }
+        \\fun main() { assert(true, "x"); }
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig, "assert(true, \"x\")") != null);
+    // The router's inline assert emit is `if (!(cond)) __zag_panic_at(...)`;
+    // the user fn must have displaced it at the call site.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (!(true)) __zag_panic_at(") == null);
+}
+
+test "codegen: router still fires without a user fn of the same name" {
+    // No program-local `assert`: the router row wins and the inline
+    // emit (`if (!(cond)) __zag_panic_at(msg, file, line)`) appears.
+    const src =
+        \\fun main() { assert(true); }
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (!(true)) __zag_panic_at(") != null);
+}
+
+test "codegen: imported atomic alias stays routed (aliases below router)" {
+    // Importing std.concurrent.atomic synthesizes alias bindings named
+    // load/store/... — those are IMPORTS, not program decls, so they
+    // must NOT outrank the router (the module bodies are dummies; the
+    // intrinsic emit is the only real implementation).
+    const src =
+        \\import std.concurrent.atomic
+        \\fun main() { let p: *i32 = new i32(0); store(p, 7); }
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@atomicStore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "store(p, 7)") == null);
 }

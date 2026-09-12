@@ -1,0 +1,50 @@
+## stdlib/futures.zag — real future suspension over Future(T) (docs/00).
+##
+## Future(T) — the type behind `async fun` / `await` — carries a
+## futex-addressable done-word (`state`: 0 = pending, 1 = complete):
+##
+##   drive()     park until complete (kernel futex WAIT when pending;
+##               zero syscalls when already complete)
+##   complete()  atomic store 1 + futex WAKE (resumes parked drivers)
+##   take()      unwrap the payload (void futures skip the read)
+##
+## The __zag_future_drive / __zag_future_ready_void preamble helpers
+## are retired into these methods. The manual surface below is what
+## a producer uses to complete a future it handed to someone else
+## (another thread, an event loop) — the loop's poll drives timers
+## exactly this way.
+
+import std.async.{EventLoop, sleep, now_ms}
+import std.time.{Timer}
+
+async fun tick(label: str) -> void {
+    var t1: Future(void) = undefined;
+    var t2: Future(void) = undefined;
+    var loop: EventLoop = EventLoop.new();
+    # wait() IS the loop driver: it polls with nanosleep ticks and
+    # completes each future as its deadline passes (complete() =
+    # atomic store + futex WAKE). A bare `await` on a registered
+    # future only works AFTER some driver ran — awaiting with no
+    # driver would park forever, which is the point of suspension.
+    loop.set_timeout(20, &t1 as *raw u8);
+    loop.set_timeout(50, &t2 as *raw u8);
+    let w1: bool = loop.wait(&t1 as *raw u8, 500);
+    await t1;                       # already complete: zero-syscall take
+    print("[{label}] t1 fired: {w1}\n");
+    let w2: bool = loop.wait(&t2 as *raw u8, 500);
+    await t2;
+    print("[{label}] t2 fired: {w2}\n");
+    return;
+}
+
+fun main() {
+    var timer: Timer = Timer.start();
+    await tick("loop");
+    let ms: u64 = timer.elapsed().as_millis();
+    print("both timers fired after ~{ms}ms\n");
+
+    # sleep() itself returns a completed future — the await takes
+    # the zero-syscall path.
+    await sleep(5);
+    print("sleep await done\n");
+}

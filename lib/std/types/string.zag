@@ -12,19 +12,19 @@
 ## so a stray `import std.string.{String}` fails resolution instead
 ## of binding a second path to the same type).
 ##
-## Real impl — methods compose against the always-emitted
-## `__zag_page_alloc` / `__zag_page_realloc` / `__zag_page_free`
-## / `__zag_panic` family primitives in the generated zig preamble
-## (see src/codegen/core.zig's preamble block); the byte copies use
-## std.mem's `memcpy` (the `__zag_memcpy` preamble helper retired
-## there in the v0.4 pass). After zag's transpile pass,
+## Real impl — methods compose against std.mem's pure-zag allocator
+## surface (alloc_raw/realloc_raw over posix.mmap; the
+## __zag_page_alloc/__zag_page_realloc preamble helpers retired in
+## the v0.5 self-hosting pass) and `__zag_panic` for bounds. The
+## byte copies use std.mem's `memcpy` (the `__zag_memcpy` preamble
+## helper retired there in the v0.4 pass). After zag's transpile pass,
 ## build/gen/std/types.zig is the source of truth at runtime — this
 ## .zag surface matches its emitted zig shape 1:1, with method
 ## names in snake_case (the codegen router arms in
 ## src/codegen/expr.zig emit `__zag_String.with_capacity(N)` as the
 ## migrated call site, so impl-block method names must match).
 
-import std.mem.{memcpy}
+import std.mem.{memcpy, alloc_raw, realloc_raw}
 ##
 ## Layout { ptr: [*]u8, len: usize, cap: usize }. The `*u8` raw
 ## pointer shape rewrites through zagTypeToZig's `*raw T` rule
@@ -39,7 +39,7 @@ pub struct String {
 
 impl String {
     pub fun with_capacity(cap: usize) -> String {
-        let p: *raw u8 = __zag_page_alloc(cap);
+        let p: *raw u8 = alloc_raw(cap);
         return String { ptr: p, len: 0, cap: cap };
     }
 
@@ -53,7 +53,7 @@ impl String {
             var new_cap: usize = self.cap;
             if (new_cap == 0) { new_cap = 16; }
             while (new_cap < needed) { new_cap = new_cap * 2; }
-            self.ptr = __zag_page_realloc(self.ptr, self.cap, new_cap);
+            self.ptr = realloc_raw(self.ptr, self.cap, new_cap);
             self.cap = new_cap;
         }
         memcpy(self.ptr[self.len..self.len + s.len], s, s.len);
@@ -66,7 +66,7 @@ impl String {
             var new_cap: usize = self.cap;
             if (new_cap == 0) { new_cap = 16; }
             while (new_cap < needed) { new_cap = new_cap * 2; }
-            self.ptr = __zag_page_realloc(self.ptr, self.cap, new_cap);
+            self.ptr = realloc_raw(self.ptr, self.cap, new_cap);
             self.cap = new_cap;
         }
         self.ptr[self.len] = ch;
@@ -90,7 +90,7 @@ impl String {
             var new_cap: usize = self.cap;
             if (new_cap == 0) { new_cap = 16; }
             while (new_cap < needed) { new_cap = new_cap * 2; }
-            self.ptr = __zag_page_realloc(self.ptr, self.cap, new_cap);
+            self.ptr = realloc_raw(self.ptr, self.cap, new_cap);
             self.cap = new_cap;
         }
         var i: usize = self.len;

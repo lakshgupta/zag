@@ -1,0 +1,78 @@
+## std.concurrent.semaphore — counting semaphore (docs/22)
+##
+##   import std.concurrent.semaphore
+##
+##   var sem: Semaphore = create(0);
+##   # producer thread: post(&sem);   — signals one unit
+##   # consumer thread: wait(&sem);   — takes one unit (parks when 0)
+##
+## Pure Zag: the count is a futex-addressable u32 driven by the atomic
+## intrinsics (load / compare_exchange / fetch_add — no import needed)
+## and std.posix's FUTEX_WAIT_PRIVATE / FUTEX_WAKE_PRIVATE primitives.
+## No zig-stdlib Semaphore involvement.
+##
+## Protocol:
+##   wait()  — take one unit. Fast path is a single CAS (cur → cur-1)
+##             while the count is positive; at 0 the caller parks in
+##             the kernel with FUTEX_WAIT_PRIVATE on the count word
+##             (expected 0) until a post() raises it.
+##   post()  — give one unit. fetch_add(1) then FUTEX_WAKE_PRIVATE(1):
+##             one parked waiter resumes, re-checks the count in its
+##             CAS loop, and takes the unit. Surplus posts (more posts
+##             than waiters) simply raise the count — the wake is a
+##             no-op on an empty wait queue.
+##
+## Lost-wake safety: wait() parks with expected 0 only after loading
+## 0. If a post()'s fetch_add lands between that load and the park,
+## the kernel's atomic re-check sees *w != 0 and the park returns
+## EAGAIN immediately — the loop retries and takes the CAS. The
+## post-side fetch_add is the linearization point; the wake after it
+## only covers waiters that actually parked.
+##
+## The u32 word (not i32) is deliberate: the count never goes
+## negative, and u32 matches the futex-word width — no casts at any
+## boundary. compare_exchange's router emit keys on @TypeOf(ptr.*),
+## so u32 sites emit u32 cmpxchg directly.
+
+import std.posix.{futex_wait, futex_wake}
+
+pub struct Semaphore {
+    count: u32,
+}
+
+## create — a semaphore holding `initial` units.
+pub fun create(initial: u32) -> Semaphore {
+    return Semaphore { count: initial };
+}
+
+## wait — take one unit. Parks in the kernel while the count is 0.
+## (Also spelled acquire/down/P in the literature.)
+pub fun wait(s: *Semaphore) {
+    let w: *u32 = addr_of(s.count);
+    while (true) {
+        let cur: u32 = load(w);
+        if (cur > 0) {
+            # Take a unit. A failed CAS means a concurrent waiter or
+            # post changed the count — re-load and retry.
+            if (compare_exchange(w, cur, cur - 1)) {
+                return;
+            }
+        } else {
+            # Count is 0. Park until a post() raises it. futex_wait
+            # re-checks *w == 0 atomically in the kernel: a post that
+            # landed before we parked returns EAGAIN and the loop
+            # retries — no lost wake.
+            _ = futex_wait(w as *const u32, 0);
+        }
+    }
+}
+
+## post — give one unit, waking one parked waiter if any.
+## (Also spelled release/up/V in the literature.)
+pub fun post(s: *Semaphore) {
+    let w: *u32 = addr_of(s.count);
+    _ = fetch_add(w, 1);
+    # Wake at most one waiter; surplus units stay in the count for
+    # later waiters. Waking a queue with no parked threads is a no-op.
+    _ = futex_wake(w as *const u32, 1);
+}

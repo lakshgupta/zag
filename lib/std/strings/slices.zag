@@ -7,7 +7,7 @@
 ## NOT slice descriptors.
 
 import std.collections.{ArrayList}
-import std.mem.{memcpy}
+import std.mem.{memcpy, alloc_raw}
 
 
 ## Content equality of two borrowed views (the missing `==` for
@@ -115,7 +115,7 @@ pub fun join(parts: ArrayList(str), sep: str) -> []u8 {
         if (i + 1 < parts.len) { total = total + sep.len; }
         i = i + 1;
     }
-    let out: *raw u8 = __zag_page_alloc(total);
+    let out: *raw u8 = alloc_raw(total);
     __zag_bench_alloc(total);
     var pos: usize = 0;
     var k: usize = 0;
@@ -136,7 +136,7 @@ pub fun join(parts: ArrayList(str), sep: str) -> []u8 {
 ## Single-pass builder (no quadratic re-scan).
 pub fun replace(s: str, from: str, to: str) -> []u8 {
     if (from.len == 0) {
-        let out: *raw u8 = __zag_page_alloc(s.len);
+        let out: *raw u8 = alloc_raw(s.len);
         __zag_bench_alloc(s.len);
         memcpy(out[0..s.len], s[0..], s.len);
         return out[0..s.len];
@@ -153,7 +153,7 @@ pub fun replace(s: str, from: str, to: str) -> []u8 {
         if (matched) { count = count + 1; i = i + from.len; } else { i = i + 1; }
     }
     let out_len: usize = (s.len + count * to.len) - count * from.len;
-    let out: *raw u8 = __zag_page_alloc(out_len);
+    let out: *raw u8 = alloc_raw(out_len);
     __zag_bench_alloc(out_len);
     var pos: usize = 0;
     var k: usize = 0;
@@ -202,7 +202,7 @@ pub fun trim_end(s: str) -> []const u8 {
 
 ## ASCII case conversion — heap copies, non-ASCII bytes untouched.
 pub fun to_upper(s: str) -> []u8 {
-    let out: *raw u8 = __zag_page_alloc(s.len);
+    let out: *raw u8 = alloc_raw(s.len);
     __zag_bench_alloc(s.len);
     var i: usize = 0;
     while (i < s.len) {
@@ -218,7 +218,7 @@ pub fun to_upper(s: str) -> []u8 {
 }
 
 pub fun to_lower(s: str) -> []u8 {
-    let out: *raw u8 = __zag_page_alloc(s.len);
+    let out: *raw u8 = alloc_raw(s.len);
     __zag_bench_alloc(s.len);
     var i: usize = 0;
     while (i < s.len) {
@@ -236,7 +236,7 @@ pub fun to_lower(s: str) -> []u8 {
 ## `s` repeated `n` times. Heap result.
 pub fun repeat(s: str, n: usize) -> []u8 {
     let out_len: usize = s.len * n;
-    let out: *raw u8 = __zag_page_alloc(out_len);
+    let out: *raw u8 = alloc_raw(out_len);
     __zag_bench_alloc(out_len);
     var i: usize = 0;
     while (i < n) {

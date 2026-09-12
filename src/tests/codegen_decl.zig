@@ -613,25 +613,14 @@ test "codegen: float-precision {pi:.5} emit spans format string and args tuple" 
     try std.testing.expect(std.mem.indexOf(u8, zig, "pi:.5,") == null);
 }
 
-test "codegen: expression {a + b} emits verbatim a + b in args tuple" {
-    // Unblocked-pattern pin for the matching-brace gate. The pre-fix
-    // char-class gate bailed on space + `+` (both non-alphanumeric, not
-    // `_`/`:`) so the gate returned false and the string emitted as a
-    // plain `.string_lit`. The new gate matches `{...}` to its closing
-    // `}` at the same brace depth, so `a + b` reaches buildTemplate
-    // which stores the inner text `a + b` as the `.ident` payload
-    // (buildTemplate was intentionally NOT changed — it was already
-    // working). genTemplateLit's args-tuple emit calls
-    // `args_cg.genExpr(expr)` on the `.ident` payload, and the
-    // genExpr `.ident` arm at src/codegen/expr.zig:147-149 does
-    // `self.write(name)` — emitting the text VERBATIM. So `a + b`
-    // surfaces in the generated zig as a valid binary expression at
-    // the format-arg site — now wrapped in the runtime-comptime
-    // `__zag_auto_fmt(...)` (the `{f}` + wrapper path for
-    // statically-unresolvable types): the wrapper's `{any}` fallback
-    // renders the i32 sum identically, and the inner text is still
-    // emitted verbatim, so this remains the load-bearing pin for the
-    // `.ident` arm not wrapping the text in `()`/`@as(...)`/etc.
+test "codegen: expression {a + b} builds additive chain in args tuple" {
+    // docs/11 "Expression content": the placeholder text reaches
+    // buildTemplate's additive scan, which builds a real left-assoc
+    // `.binary` tree from the operands. For NUMERIC operands (no
+    // string-ish leaf) codegen keeps the plain `(a + b)` emit and the
+    // arg routes through the runtime-comptime `__zag_auto_fmt`
+    // wrapper — byte-identical output to the legacy verbatim-ident
+    // shape, but now through the typed additive path.
     const src = "fun f() {\n    let a: i32 = 1;\n    let b: i32 = 2;\n    print(\"sum = {a + b}\\n\");\n}\n";
     var l = lexer_mod.Lexer.init(src);
     const tokens = l.tokenize();
@@ -640,22 +629,21 @@ test "codegen: expression {a + b} emits verbatim a + b in args tuple" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Format string half: `{f}` — the unknown-typed `.ident` payload
-    // `a + b` routes through the runtime-comptime wrap (no spec — the
-    // spec split on `:`, there is no `:` inside the `{...}`).
+    // Format string half: `{f}` — the numeric `.binary` payload has no
+    // static string-ness, so the runtime-comptime wrap fires (no spec —
+    // the spec splits on `:`, there is no `:` inside the `{...}`).
     try std.testing.expect(std.mem.indexOf(u8, zig, "\"sum = {f}\\n\"") != null);
-    // Args tuple half: `a + b` appears verbatim (unwrapped) INSIDE the
-    // `__zag_auto_fmt(...)` wrapper in the args list — the verbatim
-    // inner-emit path is the whole point of this test's design. A
-    // regression that wrapped the text in `()` (e.g.
-    // `.{__zag_auto_fmt(@as(i32, a + b)),})` for a hypothetical
-    // type-coercion path) would surface as the wrapped form in the
-    // negative-substring path (the positive substring IS
-    // `, .{__zag_auto_fmt(a + b),})` with the inner text unwrapped).
-    try std.testing.expect(std.mem.indexOf(u8, zig, ", .{__zag_auto_fmt(a + b),})") != null);
+    // Args tuple half: the additive tree emits as plain `(a + b)`
+    // inside the wrapper — no concat lowering for numeric operands.
+    try std.testing.expect(std.mem.indexOf(u8, zig, ".{__zag_auto_fmt((a + b)),})") != null);
+    // No concat CALL in the user fn body — the helper's definition
+    // always rides the preamble, so the negative scopes to the region
+    // after the preamble (the helper sits at ~line 190 of the output).
+    const body_pos = std.mem.indexOf(u8, zig, "fn f() ") orelse 0;
+    try std.testing.expect(std.mem.indexOf(u8, zig[body_pos..], "__zag_str_concat(") == null);
     // Sanity: the spec-split machinery is not engaged here (no `:` inside
-    // the `{...}`), so the format string stays plain `{any}` and the
-    // args tuple doesn't grow a `.5`/`:5`/etc. spec suffix.
+    // the `{...}`), so the format string stays plain and the args tuple
+    // doesn't grow a `.5`/`:5`/etc. spec suffix.
     try std.testing.expect(std.mem.indexOf(u8, zig, "{any:.5}") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "{any:5}") == null);
 }
@@ -2319,16 +2307,15 @@ test "codegen: builtin router does NOT fire on user helpers with builtin-like na
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
 }
 
-test "codegen: get routes through __zag_argv-backed real impl (no argv_get router)" {
-    // v0.1 Tier-1 migration of std.argv.get from the argv_get
-    // codegen-router inline emit. The router row is retired; the
-    // imports loop's FAST path now binds the selector DIRECTLY to
-    // the user module's `__zag_argv` global via stdlibPreambleName
-    // (`const get = __zag_argv;`). The binding must NOT go through
-    // the @import + alias slow path: the materialized std/argv.zig
-    // is a separate zig module with its own preamble copy of
-    // `__zag_argv`, which is never assigned (genFun's is_main
-    // special case captures argv into the USER module's global).
+test "codegen: get routes through @import+alias (no __zag_argv fast path)" {
+    // v0.5 self-hosting migration of std.argv.get from the
+    // stdlibPreambleName fast path (`const get = __zag_argv;` — a
+    // zig-0.16 main-signature capture at main entry) to the standard
+    // @import+alias fallthrough: lib/std/argv.zag delegates to
+    // std.posix.argv, whose /proc/self/cmdline reader needs no
+    // main-entry capture. The fast-path binding and the `__zag_argv`
+    // preamble global are both retired — a re-appearance of either
+    // is the regression signal.
     const src =
         \\pub import std.argv.{get}
         \\fun f() {
@@ -2343,12 +2330,12 @@ test "codegen: get routes through __zag_argv-backed real impl (no argv_get route
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Positive: verbatim call site + the preamble-side binding.
+    // Positive: verbatim call site.
     try std.testing.expect(std.mem.indexOf(u8, zig, "= get();") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const get = __zag_argv;") != null);
-    // Negative: no @import alias for get (the broken cross-module
-    // global path) and no retired per-call blk walker surface.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const get = __zag_imported_") == null);
+    // Negative: no preamble fast path, no preamble global, and no
+    // retired per-call blk walker surface.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const get = __zag_argv;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_argv") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "[32][]const u8") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.argv") == null);
 }
@@ -2730,9 +2717,15 @@ test "codegen: raw pointer .add on wrong arity falls through to verbatim" {
     const zig = cg.generate(prog);
     // Sanity: the @ptrFromInt rewrite MUST NOT fire on wrong-arity
     // sites (the fall-through preserves the verbatim form so zig
-    // can reject with a clean error message).
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrFromInt") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr") == null);
+    // can reject with a clean error message). The pins are
+    // call-site-EXACT (`@as(@TypeOf(p), @ptrFromInt(` is the
+    // rewrite's literal emit prefix for target ident `p`) rather
+    // than whole-output absence: the shared preamble's
+    // `__zag_thread_tramp` legitimately contains bare `@ptrFromInt`
+    // (thread ABI glue), so a whole-output pin would false-fail on
+    // programs that never touch raw-pointer arithmetic.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(@TypeOf(p), @ptrFromInt(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr(p)") == null);
     // Positive: the verbatim `p.add(1, 2)` form MUST appear so zig
     // gets a chance to report `no method named 'add'` to the user.
     try std.testing.expect(std.mem.indexOf(u8, zig, "p.add(1, 2)") != null);
@@ -2753,9 +2746,14 @@ test "codegen: raw pointer method other than add/offset falls through to verbati
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    // Sanity: the fallback rewrite MUST NOT fire.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@ptrFromInt") == null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr") == null);
+    // Sanity: the fallback rewrite MUST NOT fire. Same call-site-
+    // exact pinning rationale as the wrong-arity `.add` test above:
+    // the preamble's `__zag_thread_tramp` owns a legitimate bare
+    // `@ptrFromInt`, so absence is asserted on the rewrite's literal
+    // emit prefix + the receiver's `@intFromPtr(p)` — not the whole
+    // output.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(@TypeOf(p), @ptrFromInt(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr(p)") == null);
     // Positive: verbatim form preserved.
     try std.testing.expect(std.mem.indexOf(u8, zig, "p.someMethod(2)") != null);
 }
@@ -3748,6 +3746,12 @@ test "codegen: __zag_posix preamble pins all 13 helpers + locks out steered-arou
         "fn __zag_waitpid",
         "fn __zag_process_spawn",
         "fn __zag_memcpy",
+        "fn __zag_nanosleep_ms",
+        "fn __zag_format_val",
+        "__zag_argv",
+        "fn __zag_page_alloc",
+        "fn __zag_page_realloc",
+        "fn __zag_page_free",
         "var __zag_env_buf",
     };
     inline for (forbidden) |substr| {
@@ -3912,10 +3916,11 @@ test "codegen: async fun emits Future(T) signature and done-wrapped return" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn greet(name: []const u8) Future([]const u8) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "return .{ .done = true, .value = ") != null);
-    // The preamble Future(T) + drive helper.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return .{ .state = 1, .value = ") != null);
+    // The preamble Future(T) with the on-type suspension methods.
     try std.testing.expect(std.mem.indexOf(u8, zig, "fn Future(comptime T: type) type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_future_drive(comptime T: type, fut: *T) void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn drive(self: *@This()) void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub fn complete(self: *@This()) void") != null);
 }
 
 test "codegen: await lowers to the inline-drive form" {
@@ -3934,9 +3939,11 @@ test "codegen: await lowers to the inline-drive form" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_future_drive(@TypeOf(__fut_0), &__fut_0)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __fut_0.value.?;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const x: i32 = (blk: { var __fut_1 = h(); __zag_future_drive(@TypeOf(__fut_1), &__fut_1); break :blk __fut_1.value.?; });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fut_0.drive(); break :blk __fut_0.take();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const x: i32 = (blk: { var __fut_1 = h(); __fut_1.drive(); break :blk __fut_1.take(); });") != null);
+    // Retired free-fn helpers must not reappear.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_future_drive(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_future_ready_void(") == null);
 }
 
 test "codegen: import std.types.{String} binds the preamble String type" {
@@ -4039,4 +4046,237 @@ test "codegen: module-level var emits zig `var` (mutable global)" {
     // The fn body mutates the global through the plain identifier
     // (binary operands parenthesize in emission).
     try std.testing.expect(std.mem.indexOf(u8, zig, "counter = (counter + by);") != null);
+}
+
+test "codegen: string + concatenation emits __zag_str_concat" {
+    // docs/11 string `+` operator: literal + string-ident lowering
+    // routes through the always-emitted __zag_str_concat preamble
+    // helper (a ++ b into a fresh heap buffer). Numeric adds must
+    // stay untouched (`n = a + 1` keeps the plain zig `+`).
+    const src =
+        \\\\fun f() {
+        \\\\    let name: str = "world";
+        \\\\    let msg: str = "hello, " + name;
+        \\\\    let n: i32 = 1 + 2;
+        \\\\}
+        \\\\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(__zag_str_concat(\"hello, \", name))") != null);
+    // The numeric add is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(1 + 2)") != null);
+    // The helper definition is always emitted.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_str_concat(a: []const u8, b: []const u8) []u8") != null);
+}
+
+test "codegen: template {a + b} placeholder builds additive concat" {
+    // The docs/11 "expression content" contract: `{a + b}` in a
+    // template literal parses into a real additive chain (not the
+    // legacy verbatim `.ident` emit), so codegen's concat dispatch
+    // fires and the format spec widens to `{s}` (both operands
+    // statically string-ish).
+    const src =
+        \\\\fun f() {
+        \\\\    let a: str = "x";
+        \\\\    let b: str = "y";
+        \\\\    print("{a + b}\n");
+        \\\\}
+        \\\\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(__zag_str_concat(a, b))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "{s}") != null);
+}
+
+test "codegen: float-to-int cast emits @intFromFloat" {
+    // `f as u64` where f: f64 — zig 0.16 rejects @as(u64, f64_var);
+    // the canonical lowering is @as(T, @intFromFloat(v)). The
+    // int-leaf guard keeps digit math (`d - '0'`) on the @intCast
+    // path (the stdlib's dominant cast-operand shape).
+    const src =
+        \\\\fun f() {
+        \\\\    let v: f64 = 3.7;
+        \\\\    let d: u8 = '7';
+        \\\\    let a: u64 = v as u64;
+        \\\\    let b: i32 = (d - '0') as i32;
+        \\\\}
+        \\\\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(u64, @intFromFloat(v))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(i32, @intCast((d - '0')))") != null);
+}
+
+test "codegen: __zag_atof/__zag_ftoa retired from preamble" {
+    // The float parse/format shims moved into lib/std/fmt.zag as
+    // pure .zag fns (parse_f64/format_f64) once float<->int casts
+    // lowered. A re-added preamble definition is a regression.
+    const src = "fun f() {}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_atof") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_ftoa") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_fd_write") == null);
+    // The new concat helper IS present.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_str_concat") != null);
+}
+
+test "codegen: __zag_format_val retired from preamble" {
+    // The any-to-string shim had zero remaining call sites once
+    // std.json moved to std.fmt's pure-zag format_f64 and print/
+    // template args settled on the __zag_auto_fmt/{any} paths. A
+    // re-added preamble definition is a regression.
+    const src = "fun f() {}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_format_val") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_format_buf") == null);
+}
+
+test "codegen: Display impl drives {any} slot via format(self) -> str" {
+    // docs/23-modules Display convention: `pub fun format(self) -> str`
+    // on an impl block routes struct-typed template args through the
+    // __zag_auto_fmt wrapper, whose comptime @hasDecl(TT, "format")
+    // hook writes the returned text instead of the raw `{any}` dump.
+    // Non-Display structs must stay on the untouched `{any}` path.
+    const src =
+        \\struct Point {
+        \\    x: i32,
+        \\    y: i32,
+        \\}
+        \\
+        \\impl Point {
+        \\    pub fun format(self: *const Point) -> str {
+        \\        return "Point<display>";
+        \\    }
+        \\}
+        \\
+        \\fun f() {
+        \\    let p: Point = Point { x: 1, y: 2 };
+        \\    print("p={p}\n");
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The wrapper's Display hook: writes the user format() result.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "w.writeAll(self.value.format());") != null);
+    // The struct-typed slot wraps through __zag_auto_fmt.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_auto_fmt(p)") != null);
+}
+
+test "codegen: mmap allocator surface emits through std.mem (no preamble helper)" {
+    // v0.5 self-hosting batch: `pub import std.mem.{alloc}` binds the
+    // lib/std/mem.zag pure-zag impl (alloc_raw over std.posix.mmap).
+    // The generated call site resolves through the @import alias; the
+    // retired __zag_page_alloc helper must not reappear.
+    const src =
+        \\pub import std.mem.{alloc}
+        \\fun main() {
+        \\    let buf: []u8 = alloc(64);
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "alloc(64)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@import(\"std/mem.zig\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_page_alloc") == null);
+}
+
+test "codegen: int<->pointer casts lower to @ptrFromInt/@intFromPtr" {
+    // v0.5 self-hosting batch: the address-math casts the pure-zag
+    // allocator needs. `rc as [*]u8` (usize ident → many-pointer)
+    // emits @ptrFromInt — zig 0.16 rejects @ptrCast on int sources —
+    // and the symmetric pointer→int direction emits @intFromPtr.
+    const src =
+        \\fun main() {
+        \\    let rc: usize = 4096;
+        \\    let p: [*]u8 = rc as [*]u8;
+        \\    let q: *const u8 = &rc;
+        \\    let addr: usize = q as usize;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as([*]u8, @ptrFromInt(rc))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@intFromPtr(q)") != null);
+}
+
+test "codegen: Future suspension emits futex park + wake" {
+    // v2 self-hosting batch: real future suspension. Future(T) is a
+    // futex-addressable done-word — complete() stores 1 (seq-cst) and
+    // issues futex WAKE; drive() spin-checks then parks in futex WAIT.
+    // The retired free-fn helpers (__zag_future_drive,
+    // __zag_future_ready_void) must not reappear.
+    const src =
+        \\async fun f() {
+        \\    let x: i32 = await g();
+        \\    return x;
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // The park + wake pair lives in the Future type body.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.linux.futex_4arg(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "std.os.linux.futex_3arg(") != null);
+    // The done-word is futex-addressable (u32) and atomically driven.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "state: u32 = 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@atomicStore(u32, &self.state, 1, .seq_cst)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@atomicLoad(u32, &self.state, .seq_cst)") != null);
+    // Void take() fabricates the zero-sized payload without reading
+    // the undefined optional.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (T == void) return {};") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_future_ready_void") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "fn __zag_future_drive") == null);
 }

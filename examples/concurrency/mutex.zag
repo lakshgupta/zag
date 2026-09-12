@@ -1,0 +1,117 @@
+## Mutex via std.concurrent.mutex (docs/22)
+##
+##   import std.concurrent.mutex
+##
+##   var m: Mutex = create();
+##   lock(&m);      # CAS 0→1 fast path, futex park when contended
+##   # critical section
+##   unlock(&m);    # fetch_add -1; kernel wake only if waiters
+##
+## Pure Zag: the mutex is a futex-addressable i32 driven by the
+## compiler's atomic intrinsics (compare_exchange / fetch_add / load /
+## store — no import needed) and std.posix's FUTEX_WAIT_PRIVATE /
+## FUTEX_WAKE_PRIVATE primitives.
+##
+## What this example proves:
+##   1. Mutual exclusion — the workers do a NON-atomic
+##      load-then-store increment under the lock. Without a working
+##      mutex the two steps interleave and updates are lost; the
+##      exact total is the proof.
+##   2. Kernel parking — a child holds the lock across a 150ms sleep
+##      while main tries to acquire at t≈50ms. main's acquire must
+##      PARK (FUTEX_WAIT on the word) until the child's unlock at
+##      t≈150ms wakes it; elapsed >= 100ms is the park evidence (a
+##      lost wake hangs, a failed park returns instantly).
+##
+## Run: zag run mutex.zag
+
+import std.concurrent.mutex
+import std.concurrent.thread.{spawn, join, Thread}
+import std.time.{Timer, sleep_ms}
+
+## load / store / fetch_add / assert are language intrinsics (no
+## import): their rows live in the compiler's builtin router
+## (docs/22 §Atomics).
+
+struct Shared {
+    mu: Mutex,
+    value: i32,
+}
+
+## Non-atomic read-modify-write under the lock: racy without a
+## working mutex (lost updates), exact with one.
+fun worker_rmw(ptr_state: usize) {
+    let st: *Shared = ptr_state as *Shared;
+    lock(addr_of(st.mu));
+    let cur: i32 = load(addr_of(st.value));
+    store(addr_of(st.value), cur + 1);
+    unlock(addr_of(st.mu));
+}
+
+## Hold the lock across a sleep so the main thread's acquire is
+## guaranteed to hit the contended (park) path.
+fun worker_hold(ptr_state: usize) {
+    let st: *Shared = ptr_state as *Shared;
+    lock(addr_of(st.mu));
+    sleep_ms(150);
+    unlock(addr_of(st.mu));
+}
+
+fun main() {
+    let st: *Shared = new Shared(Shared { mu: Mutex { word: 0 }, value: 0 });
+    defer free(st);
+
+    ## 1. Mutual exclusion: h1 + main's 50 loop iterations + h2 + h3
+    ## = 53 non-atomic increments under the lock.
+    let h1: Thread = spawn(worker_rmw, st as usize);
+    var i: i32 = 0;
+    while (i < 50) {
+        worker_rmw(st as usize);
+        i = i + 1;
+    }
+    join(h1);
+
+    let h2: Thread = spawn(worker_rmw, st as usize);
+    let h3: Thread = spawn(worker_rmw, st as usize);
+    join(h2);
+    join(h3);
+
+    let total: i32 = load(addr_of(st.value));
+    assert(total == 53);
+    print("exact total = {total} (53 expected — no lost updates)\n");
+
+    ## 2. Park path: main acquires while a holder sleeps 150ms.
+    let t: Timer = Timer.start();
+    let hp: Thread = spawn(worker_hold, st as usize);
+    sleep_ms(50);
+    lock(addr_of(st.mu));
+    let elapsed: u64 = t.elapsed().as_millis();
+    unlock(addr_of(st.mu));
+    join(hp);
+    assert(elapsed >= 100);
+    print("contended acquire elapsed = {elapsed}ms (parked ≥100ms)\n");
+}
+
+@[test]
+fun test_mutex_serial() {
+    var m: Mutex = create();
+    lock(&m);
+    m.word = 7;
+    unlock(&m);
+    assert(m.word == 7);
+}
+
+@[test]
+fun test_mutex_contended() {
+    let st: *Shared = new Shared(Shared { mu: Mutex { word: 0 }, value: 0 });
+    defer free(st);
+
+    let h1: Thread = spawn(worker_rmw, st as usize);
+    let h2: Thread = spawn(worker_rmw, st as usize);
+
+    join(h1);
+    join(h2);
+
+    let val: i32 = load(addr_of(st.value));
+    assert(val == 2);
+}

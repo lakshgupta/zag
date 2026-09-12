@@ -83,10 +83,12 @@ Removes `~/.zag` and the `# Zag Language` / `# zag` PATH entry from your shell p
 - **Predictable performance** — no garbage collector, no surprise pauses
 - **Safety by tools** — the core language is unsafe by default; safety checks are opt-in
 - **Zero-cost async** — async/await compiles to state machines; no heap allocation per task
-  > v1 status: `async fun` + `await` land (Future<T> wrap + inline-drive
-  > lowering — the awaited call's body runs eagerly, so awaits block
-  > until the future completes). Real suspension (resume-on-completion)
-  > is the documented follow-up; the Future surface is stable across it.
+  > Status: `async fun` + `await` land (Future<T> wrap + inline-drive
+  > lowering). Suspension is real: Future(T) carries a futex-addressable
+  > done-word — drive() parks in the kernel (futex WAIT) when the future
+  > is pending and resumes on the producer's complete() (atomic store +
+  > futex WAKE); the eager same-thread path takes a zero-syscall spin
+  > check. No polling, no busy-wait.
 - **First-class SIMD** — vector types for AI kernels and game hot paths
 
 ## Memory Philosophy

@@ -193,6 +193,28 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     {
                         return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = true };
                     }
+                    // Display dispatch (self-hosting batch): a struct-typed
+                    // binding routes through the `__zag_auto_fmt` wrapper so
+                    // the wrapper's @hasDecl(TT, "format") hook can fire the
+                    // user's Display impl when one exists, keeping the raw
+                    // `{any}` dump when it doesn't (the wrapper's fallback is
+                    // byte-identical `{any}`, so non-Display structs render
+                    // exactly as before — the wrap only costs one
+                    // pass-through call). Generic instances (`Box(i32)`)
+                    // strip the paren args to the base name before the
+                    // struct-table walk.
+                    {
+                        const stripped = if (tn.len > 0 and tn[0] == '*') tn[1..] else tn;
+                        const base = if (std.mem.indexOfScalar(u8, stripped, '(')) |lp| stripped[0..lp] else stripped;
+                        for (self.prog.impls) |impl| {
+                            if (!std.mem.eql(u8, impl.target_type, base)) continue;
+                            for (impl.methods) |m| {
+                                if (std.mem.eql(u8, m.name, "format")) {
+                                    return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = true };
+                                }
+                            }
+                        }
+                    }
                 }
             }
             return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = !found_ident };
@@ -259,6 +281,31 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             expr.payload == .null_lit)
         {
             return .{ .spec = "any", .is_optional_byte_slice = false, .wrap_auto = false };
+        }
+        // String-`+` concat placeholders (`{a + b}`, `{pfx + name}`):
+        // when BOTH operands are statically-known string-ish (literals
+        // or byte-slice-typed bindings), the emitted concat call yields
+        // `[]u8` — a plain `{s}` slot formats it, matching the
+        // statement-position concat's rendering. Literal operands are
+        // `[]const u8` by construction; ident operands consult the
+        // typed-binding table. Any other operand mix falls through to
+        // the wrapper below.
+        if (expr.payload == .binary) {
+            const b = expr.payload.binary;
+            if (b.op == .add) {
+                const is_str_operand = struct {
+                    fn go(cg: *Codegen, e: *const ast.Expr) bool {
+                        return switch (e.payload) {
+                            .string_lit, .byte_string_lit => true,
+                            .ident => |n| cg.isStringishIdent(n),
+                            else => false,
+                        };
+                    }
+                }.go;
+                if (is_str_operand(self, b.lhs) and is_str_operand(self, b.rhs)) {
+                    return .{ .spec = "s", .is_optional_byte_slice = false, .wrap_auto = false };
+                }
+            }
         }
         // All other shapes (.call, .method_call, .binary, .unary,
         // .cast, ...): no static type info — the arg may well be a

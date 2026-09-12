@@ -491,15 +491,21 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // `pub fn main() !void` body return shape.
                 // async fun (docs/manual/18 §"Async Trait Methods"):
                 // wrap the value into the emitted Future(T) —
-                // `return .{ .done = true, .value = EXPR };` (bare
-                // return → `return .{ .done = true };`).
+                // `return .{ .state = 1, .value = EXPR };` (bare
+                // return → `return .{ .state = 1 };`). The state word
+                // (0 = pending, 1 = complete) is the futex-addressable
+                // done-word Future.drive() parks on; a direct store is
+                // the correct completion here because the eager
+                // same-thread model runs the async body BEFORE any
+                // awaiter can drive() — no waiter can be parked on a
+                // future that hasn't escaped this frame yet.
                 if (self.fn_is_async) {
                     if (r.value) |v| {
-                        self.write("    return .{ .done = true, .value = ");
+                        self.write("    return .{ .state = 1, .value = ");
                         self.genExpr(v);
                         self.write(" };\n");
                     } else {
-                        self.write("    return .{ .done = true };\n");
+                        self.write("    return .{ .state = 1 };\n");
                     }
                     return;
                 }

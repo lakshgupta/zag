@@ -1,17 +1,74 @@
-## std.concurrent.mutex — mutual exclusion (docs/21)
+## std.concurrent.mutex — futex mutex (docs/22)
 ##
-##   import std.concurrent.mutex
+##   import std.concurrent.mutex.{create, lock, unlock}
 ##
-##   create()     std.Thread.Mutex{}
-##   lock(m)      m.lock()
-##   unlock(m)    m.unlock()
+##   var m: Mutex = create();
+##   lock(&m);
+##   # critical section
+##   unlock(&m);
+##
+## Pure Zag: the lock word is a futex-addressable i32 driven by the
+## atomic intrinsics (compare_exchange / fetch_add / load / store —
+## no import needed) and std.posix's private futex primitives. No
+## zig-stdlib Mutex involvement.
+##
+## Word states (Drepper "Futexes Are Tricky" Type-2):
+##   0 = unlocked
+##   1 = locked, no waiters
+##   2 = locked, waiters parked on the word
+##
+## lock() fast path is a single CAS (0→1); the slow path flips the
+## word to 2 (so unlock knows to wake) and parks in the kernel with
+## FUTEX_WAIT_PRIVATE. unlock() fetch_adds -1 and only wakes when it
+## witnessed 2 — a zero-syscall release when nobody ever contended.
 
-pub fun create() {
-    return;
+import std.posix.{futex_wait, futex_wake}
+
+pub struct Mutex {
+    word: i32,
 }
-pub fun lock(m: *i32) {
-    return;
+
+## create — an unlocked mutex.
+pub fun create() -> Mutex {
+    return Mutex { word: 0 };
 }
-pub fun unlock(m: *i32) {
-    return;
+
+## lock — acquire the mutex. Parks in the kernel while contended.
+pub fun lock(m: *Mutex) {
+    let w: *i32 = addr_of(m.word);
+    while (true) {
+        # Fast path: unlocked (0) → locked-no-waiters (1).
+        if (compare_exchange(w, 0, 1)) {
+            return;
+        }
+        # Contended. Flip 1→2 so the holder's unlock witnesses a
+        # waiter and issues the wake. If the CAS fails the word is
+        # already 2 (another thread flipped it) — either way the
+        # loop continues with the word in state 2 or 0.
+        if (compare_exchange(w, 1, 2)) {
+            # Park until the word leaves 2. futex_wait re-checks
+            # *w == 2 atomically in the kernel: if unlock already
+            # stored 0 before we parked, this returns EAGAIN
+            # immediately and the outer loop retries the CAS — no
+            # lost-wake deadlock.
+            _ = futex_wait(w as *const u32, 2);
+        } else {
+            # Word is 0 (released between our two CASes) or 2
+            # (someone else is parked). Park only if it's still 2.
+            if (load(w) == 2) {
+                _ = futex_wait(w as *const u32, 2);
+            }
+        }
+    }
+}
+
+## unlock — release the mutex. Wakes one parked waiter iff the
+## release is contended (witnessed state 2); zero syscalls otherwise.
+pub fun unlock(m: *Mutex) {
+    let w: *i32 = addr_of(m.word);
+    let old: i32 = fetch_add(w, -1);
+    if (old == 2) {
+        store(w, 0);
+        _ = futex_wake(w as *const u32, 1);
+    }
 }

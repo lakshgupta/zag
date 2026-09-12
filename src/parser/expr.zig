@@ -273,8 +273,15 @@ pub fn collectCastType(self: *Parser) []const u8 {
                     }
                 }
                 if (closed) {
-                    // Copy the inner token texts joined with spaces
-                    // (`void` → `void`; `T, E` → `T, E`).
+                    // Copy the inner token texts. Zig-0.16 prefix forms
+                    // are SINGLE tokens whose pieces must be joined
+                    // without spaces (`* raw` → `*raw` — zig rejects
+                    // the spaced form — and `. c` → `.c`, which would
+                    // otherwise terminate the type with a bogus `. "c"`
+                    // member access). Space-glue only BETWEEN two
+                    // ident-ish tokens (`T U`, `const T`); every other
+                    // junction (star/question/dot + next, next + star/
+                    // question/dot) concatenates directly.
                     const inner_start = self.pos + 1;
                     const inner_end = p;
                     if (len + 1 <= buf.len) {
@@ -289,11 +296,32 @@ pub fn collectCastType(self: *Parser) []const u8 {
                                 buf[len] = ',';
                                 len += 1;
                             }
+                            prev_was_ptr = false;
                             continue;
                         }
-                        if (len > 0 and buf[len - 1] != '(' and len + 1 <= buf.len) {
-                            buf[len] = ' ';
-                            len += 1;
+                        // Space rule: insert a separator only when the
+                        // PREVIOUS byte and the NEXT token are both
+                        // ident-ish. `*`/`?`/`.` always glue onto the
+                        // following token (zig single-token prefixes);
+                        // a `*`/`?`/`.` always glues onto what came
+                        // before (`x *raw`, `x ?T`).
+                        const glue_prev = len > 0 and buf[len - 1] != '(' and buf[len - 1] != ',' and
+                            buf[len - 1] != '*' and buf[len - 1] != '?' and buf[len - 1] != '.';
+                        // Only a PLAIN identifier gets the space
+                        // separator. Symbols (`*`, `?`, `.`) always glue
+                        // onto the previous byte (zig single-token
+                        // prefixes: `*raw`, `?T`), and lparen groups
+                        // append starting with `(` (no space →
+                        // `callconv(.c)`). Identifiers lexing from
+                        // keywords (`fn`, `callconv`) are still plain
+                        // identifiers — the space is what zig expects
+                        // between them and the preceding ident.
+                        const identish = it.tag == .identifier;
+                        if (glue_prev and identish) {
+                            if (len + 1 <= buf.len) {
+                                buf[len] = ' ';
+                                len += 1;
+                            }
                         }
                         if (len + it.text.len <= buf.len) {
                             @memcpy(buf[len..][0..it.text.len], it.text);

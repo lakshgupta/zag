@@ -222,8 +222,10 @@ pub const Codegen = struct {
     /// NOTE (v0.1 Tier-1 migration): the Phase 0-3 router counters
     /// (argv_counter, env_counter, write_file_counter, mkdir_counter,
     /// exec_counter) have ALL been retired — the remaining routed
-    /// dispatches either reference a module-level global (`.argv_get`
-    /// → `__zag_argv`, no per-call temp) or emit self-contained
+    /// dispatches either referenced a module-level global (the
+    /// `.argv_get` → `__zag_argv` pairing retired in the v0.5
+    /// self-hosting migration — argv resolves through std.posix now)
+    /// or emit self-contained
     /// inline `blk:` expressions (`.fs_mkdir`, `.process_exec`) with
     /// no temp names that can collide. Only `alloc_counter`
     /// (`new`-heap-local temps) and `destructure_counter` /
@@ -326,7 +328,7 @@ pub const Codegen = struct {
     suppress_panic_override: bool = false,
     /// True while emitting the body of an `async fun` (docs/manual/18
     /// §"Async Trait Methods"): the return_stmt arm wraps `return
-    /// EXPR;` into `return .{ .done = true, .value = EXPR };` so the
+    /// EXPR;` into `return .{ .state = 1, .value = EXPR };` so the
     /// emitted Future(T) carries the value. Reset false at every
     /// function-body entry (genFun/genMethod/genFreeMethod/genTestFun).
     fn_is_async: bool = false,
@@ -442,6 +444,9 @@ pub const MapEntry = struct {
     pub const isClosureBound = @import("core.zig").isClosureBound;
     pub const isFloatIdentType = @import("core.zig").isFloatIdentType;
     pub const isIntTypeName = @import("core.zig").isIntTypeName;
+    pub const isStringishTypeText = @import("core.zig").isStringishTypeText;
+    pub const isStringishIdent = @import("core.zig").isStringishIdent;
+    pub const binaryHasFloatLeaf = @import("core.zig").binaryHasFloatLeaf;
     pub const isTrackedTrait = @import("core.zig").isTrackedTrait;
     pub const writeCond = @import("stmt.zig").writeCond;
     pub const isGenericStructName = @import("core.zig").isGenericStructName;
@@ -527,6 +532,13 @@ pub const MapEntry = struct {
     pub const setFnRetType = @import("core.zig").setFnRetType;
     pub const pushCtorAnchor = @import("core.zig").pushCtorAnchor;
     pub const popCtorAnchor = @import("core.zig").popCtorAnchor;
+    // User-fn precedence (router retirement): bare-call dispatch in
+    // expr.zig consults `self.isProgramFn(name)` BEFORE the router
+    // table so a program-local fun decl with a router-row name
+    // resolves to the user fn. Free-fn in the CORE_INLINE bucket
+    // below; re-exported here so `self.` addressing works (same
+    // pattern as the re-exports above).
+    pub const isProgramFn = @import("core.zig").isProgramFn;
 
     pub const needsIntDivShim = @import("primary.zig").needsIntDivShim;
     // Gap #6 widening helper (`typeAwareFmtSpec`): intentionally
@@ -829,26 +841,12 @@ pub const MapEntry = struct {
             \\// The `__zag_` prefix reserves the name against user identifiers.
             \\var __zag_interp_buf: [4096]u8 = undefined;
             \\
-            // Module-level argv snapshot (zig 0.16 migration). The
-            // new zig 0.16 main signature is `pub fn main(init:
-            // std.process.Init) !void`; argv is only available via
-            // `init.minimal.args.toSlice(allocator)` at main entry.
-            // Since zag's codegen doesn't thread `init` through every
-            // function that might call `get()` (the argv accessor
-            // builtin), we capture the args into this module-level
-            // global at main entry and have `.argv_get` dispatch
-            // return it directly. The arena-allocator-backed slice
-            // lives for the process lifetime, so no manual cleanup
-            // is needed. Type is `[]const []const u8` (slice of
-            // string slices) matching the `.argv_get` codegen's
-            // per-call array element type; `toSlice` returns
-            // `[]const [:0]const u8` (sentinel-terminated) which
-            // implicitly coerces to `[]const []const u8` on store.
-            // Declared as `var` (not `const`) because it's
-            // reassigned at main entry; the `__zag_` prefix reserves
-            // the name against user identifiers.
-            \\var __zag_argv: []const []const u8 = &[_][]const u8{};
-            \\
+            // __zag_argv — RETIRED (v0.5 self-hosting migration): the
+            // module-level argv snapshot (zig-0.16 main-signature
+            // capture via init.minimal.args.toSlice) moved into
+            // lib/std/posix.zag's argv() — a pure-zag /proc/self/
+            // cmdline reader, no main-entry capture needed. Reading
+            // the name is the regression signal.
             // zig 0.16: the std.Io event-loop handle is now the canonical
             // way to do file/process operations. Store it at main entry
             // (see genFun's is_main special-case in decl.zig) so the
@@ -931,17 +929,12 @@ pub const MapEntry = struct {
             \\// @emit from materializeStdlib's use_hybrid_stdlib=false
             \\// codegen pass) — zig's per-file module namespace
             \\// keeps duplicates scoped to their respective files;
-            \\// user code referencing `__zag_page_alloc(...)`
-            \\// directly (rare) resolves via this preamble.
-            \\fn __zag_page_alloc(n: usize) [*]u8 {
-            \\    return (std.heap.page_allocator.alloc(u8, n) catch @panic("__zag: page_alloc OOM")).ptr;
-            \\}
-            \\fn __zag_page_realloc(p: [*]u8, old_cap: usize, new_cap: usize) [*]u8 {
-            \\    return (std.heap.page_allocator.realloc(p[0..old_cap], new_cap) catch @panic("__zag: page_realloc OOM")).ptr;
-            \\}
-            \\fn __zag_page_free(p: [*]u8, cap: usize) void {
-            \\    std.heap.page_allocator.free(p[0..cap]);
-            \\}
+            \\// __zag_page_alloc / __zag_page_realloc / __zag_page_free —
+            \\// RETIRED (v0.5 self-hosting batch): the page-allocator
+            \\// wrappers moved into lib/std/mem.zag as pure-zag fns over
+            \\// std.posix.mmap/munmap (alloc/alloc_raw/realloc_raw/
+            \\// release). Reading any of the three names is the
+            \\// regression signal.
             \\// __zag_bench_* — std.bench allocation counters. Every
             \\// `new` / `alloc` site emits __zag_bench_alloc(@sizeOf(T));
             \\// the matching destroy/free sites emit __zag_bench_free.
@@ -1000,13 +993,24 @@ pub const MapEntry = struct {
             \\// pure .zag (type_eq<K, str> comptime dispatch + addr_of
             \\// byte-walk), so str keys get CONTENT semantics and value
             \\// keys get byte semantics without a preamble presence.
-            \\fn __zag_fd_write(fd: i32, bytes: []const u8) void {
-            \\    var pos: usize = 0;
-            \\    while (pos < bytes.len) {
-            \\        const n = std.os.linux.write(fd, bytes.ptr + pos, bytes.len - pos);
-            \\        if (n <= 0) return;
-            \\        pos += @intCast(n);
-            \\    }
+            \\
+            \\// __zag_str_concat — string `+` operator lowering (docs/11).
+            \\// Allocates a fresh page-allocator buffer holding a ++ b;
+            \\// the result is `[]u8` (coerces to `str` / `[]const u8` at
+            \\// every binding/arg position). Never mutates its operands,
+            \\// so string literals (static data) are safe inputs. The
+            \\// bench charge keeps std.bench counters honest for
+            \\// allocation-reporting examples. Bootstrapping note: this
+            \\// helper stays in the preamble because lib/std's own
+            \\// allocator (std.mem.alloc_raw over posix.mmap) is written
+            \\// in .zag — the concat lowering cannot import it without a
+            \\// circular stdlib dependency.
+            \\fn __zag_str_concat(a: []const u8, b: []const u8) []u8 {
+            \\    const out = std.heap.page_allocator.alloc(u8, a.len + b.len) catch @panic("__zag: str_concat OOM");
+            \\    @memcpy(out[0..a.len], a);
+            \\    @memcpy(out[a.len..], b);
+            \\    __zag_bench_alloc(a.len + b.len);
+            \\    return out;
             \\}
             \\
             \\// __zag_String — heap-allocated mutable UTF-8 string.
@@ -1151,37 +1155,107 @@ pub const MapEntry = struct {
                 );
             }
             self.write(
-            \\// Future(T) — async/await v1 (docs/manual/00-overview.md
+            \\// Future(T) — async/await (docs/manual/00-overview.md
             \\// "Zero-cost async"): `async fun` returns `Future(T)`
-            \\// wrapping the declared return type; `await EXPR` drives
-            \\// the future to completion and unwraps `value`. The v1
-            \\// driver is SYNCHRONOUS: an awaited async call's body
-            \\// runs eagerly inside the call, so a future returned to
-            \\// an await site is already `done` (or is completed by
-            \\// its producer's own drive loop — e.g. a timer
-            \\// busy-wait); a future that never completes would block
-            \\// forever. Real suspension (resume-on-completion without
-            \\// a blocked thread) is the documented follow-up; the
-            \\// Future surface and the await lowering are stable
-            \\// across it.
+            \\// wrapping the declared return type; `await EXPR` calls
+            \\// the future's drive() (parking until completion) and
+            \\// take()s the value.
+            \\//
+            \\// Suspension contract (v2 self-hosting batch): `state`
+            \\// is a futex-addressable done-word — 0 = pending, 1 =
+            \\// complete. drive() spin-checks once (the eager
+            \\// same-thread path: an awaited async body ran before the
+            \\// call, so state is already 1 and NO syscall happens),
+            \\// then parks in the kernel via futex WAIT on the word;
+            \\// complete() stores 1 with a seq-cst atomic and issues
+            \\// futex WAKE, resuming the parked driver. That is real
+            \\// suspension — resume-on-completion, no polling, no
+            \\// busy-wait — for cross-thread producers; the eager
+            \\// same-thread model stays zero-cost.
+            \\//
+            \\// The methods live on the TYPE (not free preamble fns —
+            \\// __zag_future_drive/__zag_future_ready_void retired) so
+            \\// the await lowering is `fut.drive()` / `fut.take()`
+            \\// regardless of which module's preamble instantiated the
+            \\// generic: Future is a per-module preamble type and a
+            \\// user-module await on a std module's future (e.g.
+            \\// std.time's `after`) would otherwise name the wrong
+            \\// module's type in a free-fn signature.
             \\fn Future(comptime T: type) type {
             \\    return struct {
-            \\        done: bool = false,
+            \\        state: u32 = 0,
             \\        value: ?T = null,
+            \\
+            \\        pub fn complete(self: *@This()) void {
+            \\            @atomicStore(u32, &self.state, 1, .seq_cst);
+            \\            _ = std.os.linux.futex_3arg(
+            \\                @ptrCast(&self.state),
+            \\                .{ .cmd = .WAKE, .private = true },
+            \\                1,
+            \\            );
+            \\        }
+            \\
+            \\        pub fn drive(self: *@This()) void {
+            \\            while (@atomicLoad(u32, &self.state, .seq_cst) == 0) {
+            \\                // Park until the word changes (complete()'s
+            \\                // store). A spurious wake or a lost race
+            \\                // (state flipped between the load and the
+            \\                // wait) re-loops; the kernel returns
+            \\                // EWOULDBLOCK immediately when the word is no
+            \\                // longer 0, so the loop self-corrects.
+            \\                _ = std.os.linux.futex_4arg(
+            \\                    @ptrCast(&self.state),
+            \\                    .{ .cmd = .WAIT, .private = true },
+            \\                    0,
+            \\                    null,
+            \\                );
+            \\            }
+            \\        }
+            \\
+            \\        pub fn take(self: *@This()) T {
+            \\            // Void futures complete without a payload —
+            \\            // their `value` stays undefined and take()
+            \\            // fabricates the zero-sized payload comptime-
+            \\            // statically (reading the undefined optional
+            \\            // would be UB).
+            \\            if (T == void) return {};
+            \\            return self.value.?;
+            \\        }
             \\    };
             \\}
-            \\fn __zag_future_drive(comptime T: type, fut: *T) void {
-            \\    // v1 synchronous driver: the awaited future is
-            \\    // completed by its producer before the drive returns
-            \\    // (see the Future(T) docblock for the contract).
-            \\    // `f: *T` (not *Future(T)): Future is a per-module
-            \\    // preamble type, and a user-module await on a std
-            \\    // module's Future (e.g. std.time's `after`) must not
-            \\    // name the wrong module's Future in the signature.
-            \\    _ = fut;
+            \\
+            \\fn __zag_thread_tramp(payload: usize) callconv(.c) u8 {
+            \\    // Thread entry ABI glue (std.concurrent.thread). The
+            \\    // kernel starts the child on THIS trampoline with the
+            \\    // control-page address as its sole argument (zig's clone
+            \\    // trampoline pops it into rdi and `call`s the entry); the
+            \\    // control page's slot [1] holds the user body as a ZIG-
+            \\    // convention fn pointer — the one convention this glue
+            \\    // exists for, since zag's auto-convention fns cannot cast
+            \\    // to callconv(.c) pointers ("calling convention 'auto'
+            \\    // cannot cast into calling convention 'x86_64_sysv'").
+            \\    // Returning the u8 status lets zig's clone asm SYS_exit the
+            \\    // thread with it. The child's ctid word is NOT touched
+            \\    // here — the kernel clears+wakes it on exit
+            \\    // (CLONE_CHILD_CLEARTID), which is what join parks on.
+            \\    // Locals are __zag_-prefixed: the trampoline is module-
+            \\    // scope glue in every generated file, and a bare local
+            \\    // name here (e.g. `const body`) would collide with a
+            \\    // user fn of the same name (zig 0.16's strict-shadow
+            \\    // check rejects "local constant shadows declaration").
+            \\    const tramp_words: [*]usize = @ptrFromInt(payload);
+            \\    const tramp_body: *const fn (usize) void = @ptrFromInt(tramp_words[1]);
+            \\    tramp_body(tramp_words[2]);
+            \\    return 0;
             \\}
-            \\fn __zag_future_ready_void() Future(void) {
-            \\    return .{ .done = true, .value = {} };
+            \\fn __zag_thread_start(payload: usize, flags: u32, stack: usize, ptid: *i32, ctid: *i32) usize {
+            \\    // Drives zig's clone wrapper with the trampoline above as
+            \\    // the entry — the func MUST be a compile-time-known zig fn
+            \\    // here (the raw sys_clone takes no function argument; the
+            \\    // child resumes at the wrapper's asm continuation, which
+            \\    // pops func/arg from the stack this wrapper sets up).
+            \\    // tls = 0 (CLONE_SETTLS is not in the spawn flag mask).
+            \\    return std.os.linux.clone(__zag_thread_tramp, stack, flags, payload, ptid, 0, ctid);
             \\}
             \\
             \\// __zag_err_to_result — bridge from zig error unions to zag's Result.
@@ -1215,116 +1289,22 @@ pub const MapEntry = struct {
             \\    }
             \\};
             \\
-            \\// __zag_format_val — format any value to a stack-allocated string.
-            \\const __zag_format_buf: [4096]u8 = undefined;
-            \\var __zag_format_buf_idx: usize = 0;
-            \\fn __zag_format_val(value: anytype) []const u8 {
-            \\    const idx = __zag_format_buf_idx;
-            \\    const buf = __zag_format_buf[idx..][0..4096];
-            \\    __zag_format_buf_idx = (idx + 4096) % (__zag_format_buf.len);
-            \\    return std.fmt.bufPrint(buf, "{any}", .{value}) catch "(fmt overflow)";
-            \\}
-            \\
-            \\// __zag_atof — libc-free float parse for std.json: scans a
-            \\// sign, integer digits, fractional digits, then an optional
-            \\// e/E exponent (the v1 subset json.zag produces).
-            \\fn __zag_atof(s: []const u8) f64 {
-            \\    var i: usize = 0;
-            \\    var neg = false;
-            \\    if (i < s.len and (s[i] == '-' or s[i] == '+')) {
-            \\        neg = s[i] == '-';
-            \\        i += 1;
-            \\    }
-            \\    var result: f64 = 0;
-            \\    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-            \\        result = result * 10.0 + @as(f64, @floatFromInt(s[i] - '0'));
-            \\    }
-            \\    if (i < s.len and s[i] == '.') {
-            \\        i += 1;
-            \\        var scale: f64 = 0.1;
-            \\        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-            \\            result += @as(f64, @floatFromInt(s[i] - '0')) * scale;
-            \\            scale *= 0.1;
-            \\        }
-            \\    }
-            \\    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
-            \\        i += 1;
-            \\        var eneg = false;
-            \\        if (i < s.len and (s[i] == '-' or s[i] == '+')) {
-            \\            eneg = s[i] == '-';
-            \\            i += 1;
-            \\        }
-            \\        var exp: i32 = 0;
-            \\        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-            \\            exp = exp * 10 + @as(i32, s[i] - '0');
-            \\        }
-            \\        if (eneg) exp = -exp;
-            \\        while (exp > 0) : (exp -= 1) result *= 10.0;
-            \\        while (exp < 0) : (exp += 1) result *= 0.1;
-            \\    }
-            \\    return if (neg) -result else result;
-            \\}
-            \\// __zag_ftoa — libc-free float formatting for std.json:
-            \\// writes integer digits, a '.', and 6 fractional digits
-            \\// into `buf`, returning the byte length.
-            \\fn __zag_ftoa(value: f64, buf: []u8) usize {
-            \\    var v = value;
-            \\    var neg = false;
-            \\    if (v < 0) {
-            \\        neg = true;
-            \\        v = -v;
-            \\    }
-            \\    var int_part: u64 = @intFromFloat(v);
-            \\    var frac = v - @as(f64, @floatFromInt(int_part));
-            \\    var pos: usize = 0;
-            \\    if (neg) {
-            \\        if (pos < buf.len) buf[pos] = '-';
-            \\        pos += 1;
-            \\    }
-            \\    var digits: [32]u8 = undefined;
-            \\    var nd: usize = 0;
-            \\    if (int_part == 0) {
-            \\        digits[0] = '0';
-            \\        nd = 1;
-            \\    } else {
-            \\        while (int_part > 0) : (int_part /= 10) {
-            \\            digits[nd] = @intCast('0' + int_part % 10);
-            \\            nd += 1;
-            \\        }
-            \\    }
-            \\    var d = nd;
-            \\    while (d > 0) {
-            \\        d -= 1;
-            \\        if (pos < buf.len) buf[pos] = digits[d];
-            \\        pos += 1;
-            \\    }
-            \\    if (pos < buf.len) buf[pos] = '.';
-            \\    pos += 1;
-            \\    var k: usize = 0;
-            \\    while (k < 6) : (k += 1) {
-            \\        frac *= 10.0;
-            \\        const digit: u8 = @intFromFloat(frac);
-            \\        frac -= @as(f64, @floatFromInt(digit));
-            \\        if (pos < buf.len) buf[pos] = '0' + digit;
-            \\        pos += 1;
-            \\    }
-            \\    return pos;
-            \\}
-            \\
-            \\// __zag_nanosleep_ms — blocking nanosleep for std.async's
-            \\// timer loop (sleep/wait/run_for tick at 1ms granularity;
-            \\// no busy-wait). Decomposes ms into sec + nsec so long
-            \\// sleeps stay accurate.
-            \\fn __zag_nanosleep_ms(ms: i64) void {
-            \\    var req = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
-            \\    if (ms >= 1000) {
-            \\        req.sec = @intCast(@divFloor(ms, 1000));
-            \\        req.nsec = @intCast(@rem(ms, 1000) * 1_000_000);
-            \\    } else if (ms > 0) {
-            \\        req.nsec = @intCast(ms * 1_000_000);
-            \\    }
-            \\    _ = std.os.linux.nanosleep(&req, null);
-            \\}
+            \\// __zag_format_val — RETIRED (self-hosting batch): had zero
+            \\// remaining call sites once std.json moved to std.fmt's
+            \\// pure-zag format_f64 and print/template args settled on
+            \\// __zag_auto_fmt/{any} paths. Deleted; reading the name is
+            \\// the regression signal.
+            \\// __zag_atof / __zag_ftoa — RETIRED into lib/std/fmt.zag as
+            \\// pure .zag fns (parse_f64 / format_f64) once float<->int
+            \\// casts (`f as u64` -> @as(T, @intFromFloat(v))) lowered.
+            \\// std.json routes through the std.fmt imports now; reading
+            \\// the retired names is the regression signal.
+
+            \\// __zag_nanosleep_ms — RETIRED into lib/std/time.zag as a
+            \\// pure .zag fn (sleep_us via posix.nanosleep's raw syscall
+            \\// facade) once std.async's loop imported it. The ms→{sec,
+            \\// nsec} decomposition is plain zag arithmetic; reading the
+            \\// retired name in lib/std/ is the regression signal.
 \\// __zag_posix family — RETIRED (v0.3 + v0.4): the twelve
              \\// raw syscall wrappers (__zag_openat / __zag_read /
              \\// __zag_write / __zag_close / __zag_mkdirat /
@@ -1665,14 +1645,17 @@ pub const MapEntry = struct {
                     // resolve at the zig level through zig's own
                     // type-alias mechanism — no codegen-side AST
                     // rewrite needed. Whole-module imports
-                    // (`selectors.len == 0`) skip this pass; users
-                    // access those bindings via the bare
-                    // `__zag_imported_<i>.Foo` form until a future
-                    // Phase adds macro-/reflection-based namespace
-                    // emission (deferred — would require knowing the
-                    // source module's decl list at codegen-emit
-                    // time, which is not available at this point in
-                    // the pipeline).
+                    // (`selectors.len == 0`) are expanded at PARSE
+                    // time (expandWholeModuleImport in
+                    // src/parser/decl.zig): the target module is
+                    // sub-parsed and its top-level decls synthesized
+                    // into selectors, so by the time codegen runs
+                    // every import has selectors and this pass binds
+                    // all of them. (Historically whole-module imports
+                    // reached here unexpanded and bound nothing; the
+                    // parser-side expansion replaced that shape —
+                    // see the expandWholeModuleImport docblock for
+                    // the why-at-parse-time rationale.)
                     //
                     // The canonical name on the RHS is `sel.name`
                     // (the source-side identifier from the source
@@ -2398,6 +2381,21 @@ pub const MapEntry = struct {
                 \\                    return w.writeAll("");
                 \\                }
                 \\            }
+                \\            // Display dispatch (self-hosting batch): when the
+                \\            // VALUE's type declares `pub fun format(self) -> str`
+                \\            // — the zag-side Display impl convention, emitted as a
+                \\            // plain nested fn by the struct impl walker — route to
+                \\            // it INSTEAD of the raw `{any}` dump; the returned text is
+                \\            // written verbatim. This makes
+                \\            // `print("{p}\n")` on a Display-impl'ing struct render
+                \\            // the user's format body. The @hasDecl guard keeps
+                \\            // non-Display types on the byte-identical `{any}` path.
+                \\            if (comptime @typeInfo(TT) == .@"struct") {
+                \\                if (comptime @hasDecl(TT, "format")) {
+                \\                    try w.writeAll(self.value.format());
+                \\                    return;
+                \\                }
+                \\            }
                 \\            if (comptime !__zag_is_byte_slice(TT)) {
                 \\                return w.print("{any}", .{self.value});
                 \\            }
@@ -2469,6 +2467,69 @@ pub const MapEntry = struct {
         return false;
     }
 
+    /// Byte-slice type predicate for the string-`+` concat dispatch:
+    /// true for `str` and any `[]const u8` / `[]u8` spelling. Used by
+    /// the `.binary` add path to decide between `__zag_str_concat`
+    /// lowering and the plain numeric emit. The raw-pointer many-
+    /// item form `[*]u8` is intentionally EXCLUDED (no len — not a
+    /// string). Cheap scan, no allocation: slices pass verbatim,
+    /// everything else fails fast on byte 1.
+    pub     fn isStringishTypeText(type_name: []const u8) bool {
+        if (std.mem.eql(u8, type_name, "str")) return true;
+        if (type_name.len < 2 or type_name[0] != '[') return false;
+        if (type_name[1] != ']') return false;
+        // `[]u8` vs `[]const u8`: the element type after `[]` must
+        // start with `u8` (covers `[]u8`, `[]const u8`;
+        // `[]const u8`'s element scan starts at `const u8`).
+        const elem = type_name[2..];
+        if (std.mem.startsWith(u8, elem, "const u8")) return true;
+        return std.mem.eql(u8, elem, "u8");
+    }
+
+    /// Ident convenience wrapper: looks the binding up in the tracked
+    /// typed-binding table, then applies isStringishTypeText.
+    pub     fn isStringishIdent(self: *Codegen, name: []const u8) bool {
+        if (self.getSourceTypeName(name)) |tn| {
+            return isStringishTypeText(tn);
+        }
+        return false;
+    }
+
+    /// Leaf scan for float-typed operands under a cast (float→int
+    /// lowering): true when any ident leaf in the binary tree carries
+    /// a tracked float type. Used to route `f2 - f1 as u64` to
+    /// `@intFromFloat` while keeping int arithmetic (`d - '0'`, the
+    /// digit-cast shape) on the `@intCast` path. Untracked leaves
+    /// (comptime literals, params absent from the binding table)
+    /// conservatively report false — zig then surfaces the mismatch
+    /// at compile time if the guess was wrong, so no silent
+    /// truncation can slip through.
+    pub     fn binaryHasFloatLeaf(self: *Codegen, b: ast.Expr.BinaryExpr) bool {
+        switch (b.lhs.payload) {
+            .ident => |n| {
+                if (self.getSourceTypeName(n)) |tn| {
+                    if (isFloatTypeName(tn)) return true;
+                }
+            },
+            .binary => |ib| {
+                if (self.binaryHasFloatLeaf(ib)) return true;
+            },
+            else => {},
+        }
+        switch (b.rhs.payload) {
+            .ident => |n| {
+                if (self.getSourceTypeName(n)) |tn| {
+                    if (isFloatTypeName(tn)) return true;
+                }
+            },
+            .binary => |ib| {
+                if (self.binaryHasFloatLeaf(ib)) return true;
+            },
+            else => {},
+        }
+        return false;
+    }
+
     pub     fn isFloatTypeName(type_name: []const u8) bool {
         return std.mem.eql(u8, type_name, "f64") or
             std.mem.eql(u8, type_name, "f32") or
@@ -2508,6 +2569,31 @@ pub const MapEntry = struct {
             if (std.mem.eql(u8, ti.name, name)) {
                 return ti.is_closure;
             }
+        }
+        return false;
+    }
+
+    /// User-fn precedence (bare-name resolution order, docs/23
+    /// §"Bare-name resolution order"): true iff `name` is a top-level
+    /// fun decl in the program being generated. The bare-call dispatch
+    /// chain consults this BEFORE `builtins.lookup` so a program-local
+    /// fn with a router-row name (`assert`, `type_name`, …) resolves
+    /// to the USER fn — emitting the verbatim call — instead of being
+    /// silently hijacked by the router's inline zig emit. This is
+    /// what lets stdlib modules written in zag define functions with
+    /// builtin-sounding names.
+    ///
+    /// Imported aliases deliberately stay BELOW the router: the
+    /// atomic primitives (load/store/fetch_add/compare_exchange) are
+    /// compiler intrinsics whose importable module bodies are dummies
+    /// (see lib/std/concurrent/atomic.zag) — a program that imports
+    /// them must keep getting the hardware emit, not a call to the
+    /// dummy body. Program-local decls are the one surface that can
+    /// meaningfully outrank the router (the author opted into the
+    /// name in the same file that gets compiled).
+    pub     fn isProgramFn(self: *Codegen, name: []const u8) bool {
+        for (self.prog.functions) |f| {
+            if (std.mem.eql(u8, f.name, name)) return true;
         }
         return false;
     }
@@ -2925,8 +3011,18 @@ pub const MapEntry = struct {
     /// `self.timers.push(...)` (a member-access receiver whose base
     /// resolves to a generic-typed field) to the orphan free fn.
     pub     fn structFieldType(self: *Codegen, struct_name: []const u8, field_name: []const u8) ?[]const u8 {
+        // Pointer-base auto-deref (docs/08 §"Field access on pointer
+        // bindings"): `st.sem` where `st: *Probe` looks the field up
+        // on Probe. Without this strip the lookup fails and the
+        // addr_of cast emit can't type the field — surfaced by the
+        // concurrency examples' `addr_of(st.sem) as usize`
+        // payload-thunk shape (unknown type → @intCast on a pointer,
+        // which zig rejects).
+        var base = struct_name;
+        if (std.mem.startsWith(u8, base, "*const ")) base = base["*const ".len..];
+        if (std.mem.startsWith(u8, base, "*")) base = base[1..];
         for (self.prog.structs) |sd| {
-            if (!std.mem.eql(u8, sd.name, struct_name)) continue;
+            if (!std.mem.eql(u8, sd.name, base)) continue;
             for (sd.fields) |f| {
                 switch (f.kind) {
                     .named => |nf| {
@@ -2954,6 +3050,78 @@ pub const MapEntry = struct {
             if (std.mem.eql(u8, ti.name, name)) return ti.type_name;
         }
         return null;
+    }
+
+    /// Static type text for an EXPRESSION source, for cast-site
+    /// detection: bare idents resolve via the typed-binding table;
+    /// member-access chains (`t.ctl`, `a.b.c`) resolve the BASE
+    /// binding through the table, then walk field-by-field via
+    /// structFieldType. Returns null for anything unresolvable (the
+    /// cast emit then takes its conservative default route).
+    /// Surfaced by std.concurrent.thread's join — `t.ctl as [*]usize`
+    /// was emitting `@ptrCast` on an int source (zig: "expected
+    /// pointer type, found usize") because the int→pointer carve-out
+    /// only recognized bare idents.
+    pub     fn getSourceTypeNameOfExpr(self: *Codegen, e: ast.Expr) ?[]const u8 {
+        switch (e.payload) {
+            .ident => |name| return self.getSourceTypeName(name),
+            .member_access => |ma| {
+                const base = getSourceTypeNameOfExpr(self, ma.target.*) orelse return null;
+                // Slice-shaped bases have no zag-side struct decl —
+                // their builtins map directly: `.ptr` is the many-
+                // pointer (matching ptr_src prefix detection for
+                // `buf.ptr as usize` → @intFromPtr), `.len` is usize.
+                if (std.mem.startsWith(u8, base, "[") or std.mem.eql(u8, base, "str")) {
+                    if (std.mem.eql(u8, ma.name, "ptr")) return base;
+                    if (std.mem.eql(u8, ma.name, "len")) return "usize";
+                    return null;
+                }
+                return self.structFieldType(base, ma.name);
+            },
+            // A cast HAS its target's type (`ctl_buf.ptr as usize` is
+            // a usize) — needed so integer-arithmetic chains over cast
+            // results (`(p as usize + 24) as *i32`, the ctid address
+            // computation in std.concurrent.thread.spawn) still
+            // resolve to an int and take the @ptrFromInt route.
+            .cast => |c| return c.type_text,
+            // Integer-arithmetic sources (`(p as usize + 24) as *i32` —
+            // pointer math at the syscall boundary): the LHS's tracked
+            // type flows through — + - & | << >> and their wrapping
+            // twins keep int-ness (the RHS operand's comptime-int
+            // literal can't change it). Surfaced by
+            // std.concurrent.thread.spawn's ctid address computation.
+            .binary => |b| {
+                switch (b.op) {
+                    .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .bitand, .bitor, .bitxor, .shl, .shr => {
+                        const lt = getSourceTypeNameOfExpr(self, b.lhs.*) orelse return null;
+                        if (isIntTypeName(lt)) return lt;
+                        return null;
+                    },
+                    else => return null,
+                }
+            },
+            .call => |c| {
+                // `addr_of(x)` — the address-of intrinsic — has type
+                // `*T` where `x: T`. Surfaced by the concurrency
+                // examples' `addr_of(st.sem) as usize` payload-thunk
+                // shape: the cast emit's ptr-source detection queries
+                // THIS fn for the cast operand, and without a .call
+                // arm the addr_of result type is unknown → the cast
+                // falls to @intCast, which zig rejects on a pointer
+                // source. The synthesized `*T` text is heap-owned for
+                // the compile's duration (page_allocator, matching
+                // out_buf's allocator; the strings are tiny and few).
+                if (c.args.len == 1 and std.mem.eql(u8, c.name, "addr_of")) {
+                    const inner = getSourceTypeNameOfExpr(self, c.args[0]) orelse return null;
+                    const joined = std.heap.page_allocator.alloc(u8, inner.len + 1) catch return null;
+                    joined[0] = '*';
+                    @memcpy(joined[1..], inner);
+                    return joined;
+                }
+                return null;
+            },
+            else => return null,
+        }
     }
 
     /// True when `name`'s tracked binding is a `var` (mutable kind).
@@ -3325,18 +3493,12 @@ fn stdlibPreambleName(name: []const u8) []const u8 {
     // that on the moved types.
     if (std.mem.eql(u8, name, "String")) return "__zag_String";
     if (std.mem.eql(u8, name, "Writer")) return "__zag_Writer";
-    // std.argv.get (v0.1 Tier-1 migration): `pub import std.argv.{get}`
-    // aliases DIRECTLY to the module-level `__zag_argv` global (the
-    // fast path in the imports loop emits `const get = __zag_argv;`).
-    // This must NOT go through the @import + alias slow path: the
-    // materialized std/argv.zig is a separate zig module with its OWN
-    // self-contained preamble (use_hybrid = false), so its `__zag_argv`
-    // copy is never assigned — genFun's is_main special case captures
-    // argv into the USER module's global at main entry. lib/std/argv.zag
-    // keeps the reference body for documentation + scaffold parsing,
-    // but the binding is preamble-side, mirroring the String/Writer
-    // hardcoded-coupling rationale above.
-    if (std.mem.eql(u8, name, "get")) return "__zag_argv";
+    // std.argv.get (v0.5 self-hosting migration): the `__zag_argv`
+    // fast-path alias is RETIRED — lib/std/argv.zag now delegates to
+    // std.posix.argv's /proc/self/cmdline reader, so `pub import
+    // std.argv.{get}` resolves through the standard @import+alias
+    // fallthrough like every other std module. Reading `__zag_argv`
+    // or the "get" row here is the regression signal.
     if (std.mem.eql(u8, name, "Display")) return "";
     if (std.mem.eql(u8, name, "ErrorExt")) return "";
     if (std.mem.eql(u8, name, "Error")) return "__zag_Error";

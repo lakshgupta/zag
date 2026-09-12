@@ -1,0 +1,116 @@
+## Call-once via std.concurrent.once (docs/22)
+##
+##   import std.concurrent.once
+##
+##   var o: Once = create();
+##   call_once(&o, init_fn, payload);   # runs init_fn(payload) once
+##
+## Pure Zag: 3-state futex protocol (INCOMPLETE → RUNNING → COMPLETE)
+## over the atomic intrinsics and std.posix's private futex
+## primitives.
+##
+## What this example proves:
+##   1. Exactly-one execution — 8 threads race call_once with a
+##      counting fn; the run count is exactly 1.
+##   2. Waiter blocking — the winner's fn sleeps 150ms; every other
+##      thread's call_once must BLOCK until the run completes, so all
+##      threads observe initialized == true and main's wall time
+##      spans the sleep (a caller that returned early would read the
+##      pre-init value and fail).
+##   3. Latecomer fast path — a second call after completion returns
+##      without re-running (count still 1).
+##
+## Run: zag run once.zag
+
+import std.concurrent.once
+import std.concurrent.thread.{spawn, join, Thread}
+import std.time.{Timer, sleep_ms}
+
+## load / store / fetch_add / assert are language intrinsics (no
+## import) — see docs/22 §Atomics.
+
+const RACERS: i32 = 8;
+
+struct InitState {
+    once: Once,
+    run_count: i32,
+    initialized: i32,
+    value: i32,
+}
+
+## The once-only initializer: counts its invocations (must be 1) and
+## fills the shared state. The 150ms sleep makes any non-blocking
+## caller observable.
+fun do_init(ptr_payload: usize) {
+    let st: *InitState = ptr_payload as *InitState;
+    _ = fetch_add(addr_of(st.run_count), 1);
+    sleep_ms(150);
+    store(addr_of(st.value), 42);
+    store(addr_of(st.initialized), 1);
+}
+
+## Racer body: call_once and then assert the observed state is
+## post-init (any caller that escaped the once-block early fails
+## here).
+fun racer(ptr_state: usize) {
+    let st: *InitState = ptr_state as *InitState;
+    call_once(addr_of(st.once), do_init, ptr_state);
+    assert(load(addr_of(st.initialized)) == 1);
+}
+
+fun main() {
+    let st: *InitState = new InitState(InitState {
+        once: Once { state: 0 },
+        run_count: 0,
+        initialized: 0,
+        value: 0,
+    });
+    defer free(st);
+
+    let t: Timer = Timer.start();
+
+    var handles: [RACERS]Thread = undefined;
+    var i: usize = 0;
+    while (i < RACERS) {
+        handles[i] = spawn(racer, st as usize);
+        i = i + 1;
+    }
+
+    ## Main races too (the winner is any single thread).
+    call_once(addr_of(st.once), do_init, st as usize);
+
+    i = 0;
+    while (i < RACERS) {
+        join(handles[i]);
+        i = i + 1;
+    }
+
+    let runs: i32 = load(addr_of(st.run_count));
+    let val: i32 = load(addr_of(st.value));
+    let elapsed: u64 = t.elapsed().as_millis();
+    assert(runs == 1);
+    assert(val == 42);
+    ## Waiter blocking: the whole race must span the 150ms init
+    ## sleep (every thread blocks until the winner's run completes).
+    assert(elapsed >= 150);
+    print("run_count = {runs}, value = {val}, race span = {elapsed}ms\n");
+
+    ## Latecomer fast path: completes without re-running.
+    call_once(addr_of(st.once), do_init, st as usize);
+    assert(load(addr_of(st.run_count)) == 1);
+    print("latecomer call: still run_count = 1\n");
+}
+
+@[test]
+fun test_once_runs_exactly_once() {
+    var st: InitState = InitState {
+        once: Once { state: 0 },
+        run_count: 0,
+        initialized: 0,
+        value: 0,
+    };
+    call_once(addr_of(st.once), do_init, addr_of(st) as usize);
+    call_once(addr_of(st.once), do_init, addr_of(st) as usize);
+    assert(st.run_count == 1);
+    assert(st.value == 42);
+}

@@ -728,6 +728,56 @@ pub fn parseFunDecl(self: *Parser) ast.FunDecl {
         // consults indices 0..closure_binding_count; array contents
         // beyond the count are ignored.
         self.closure_binding_count = 0;
+        // Comptime-body form: `fun NAME(params) = <expr>;` — the body
+        // is a single expression evaluated at comptime (self-hosting
+        // batch: lets pure-.zag stdlib helpers spell comptime
+        // type-dispatch tables). Body text is captured VERBATIM and
+        // re-parsed as an expression through a mini-lexer so the AST
+        // payload is a real expr (codegen emits `pub const NAME =
+        // <expr>;`). The `=` here is a distinct token from `==` (the
+        // lexer splits multi-char operators first), so the probe is
+        // unambiguous against a braced body.
+        if (self.peek().tag == .equals) {
+            self.advance();
+            var text_buf: [4096]u8 = undefined;
+            var text_len: usize = 0;
+            while (self.peek().tag != .newline and self.peek().tag != .eof) {
+                const tok = self.peek();
+                if (text_len + 1 < text_buf.len) {
+                    text_buf[text_len] = ' ';
+                    text_len += 1;
+                }
+                if (text_len + tok.text.len < text_buf.len) {
+                    @memcpy(text_buf[text_len..text_len + tok.text.len], tok.text);
+                    text_len += tok.text.len;
+                }
+                self.advance();
+            }
+            // Statement termination is NEWLINE-based (the lexer emits
+            // newline tokens; there is no `;` token). Consume the
+            // terminator so the decl loop sees a clean boundary.
+            if (self.peek().tag == .newline) { self.advance(); }
+            const expr_text = std.mem.trim(u8, text_buf[0..text_len], " \t\n");
+            var lex = lexer.Lexer.init(expr_text);
+            const toks = lex.tokenize();
+            var expr_arena = ast.Arena.init();
+            var ep = core.Parser.init(toks, &expr_arena);
+            const expr = ep.parseExpr();
+            _ = expr;
+            const params = self.arena.alloc(ast.MethodParam, param_count);
+            @memcpy(params, params_buf[0..param_count]);
+            return .{
+                .name = name,
+                .params = params,
+                .body = &[_]ast.Stmt{},
+                .loc = start,
+                .doc = null,
+                .return_type = return_type,
+                .type_params = type_params,
+                .is_comptime_body = true,
+                .comptime_body_text = self.arena.dupe(u8, expr_text),
+            };
+        }
         const body = self.parseBlock();
         const params = self.arena.alloc(ast.MethodParam, param_count);
         @memcpy(params, params_buf[0..param_count]);
@@ -1012,6 +1062,142 @@ pub fn parseStructDecl(self: *Parser) ast.StructDecl {
     }
 
 
+/// Whole-module import expansion (v2 self-hosting).
+///
+/// `import std.mem` — the whole-module form — binds NOTHING at codegen
+/// time (the selective `{A, B}` form emits `__zag_imported_<i>.A`
+/// aliases; `selectors.len == 0` skips that pass entirely, because
+/// codegen cannot introspect the source module's decl list at emit
+/// time). Every stdlib consumer therefore had to enumerate selectors
+/// by hand, and any module surface the consumer forgot was simply
+/// unreachable.
+///
+/// This pass closes that gap AT PARSE TIME, where the information is
+/// available: for a whole-module import whose dotted path resolves via
+/// `resolveStdImport`, read the target .zag source, parse it with a
+/// fresh sub-Parser, and collect the names of its top-level decls
+/// (functions, structs, impl blocks, enums, unions, traits, consts).
+/// Those names become synthesized `ImportSelector`s on the importer's
+/// ImportDecl, so codegen's existing selective-import pass emits the
+/// full binding set unchanged — zero codegen changes, and `import
+/// std.mem` behaves like `import std.mem.{alloc, release, ...}` with
+/// the surface kept in lockstep with the module file itself.
+///
+/// Expansion is enabled only when `read_source_file` is injected (the
+/// hermetic-test default keeps the old bind-nothing shape); a read
+/// failure or parse failure expands to zero selectors (the import
+/// then binds nothing — same graceful degradation as before, no hard
+/// error for a missing optional surface).
+///
+/// The synthesized selectors SHARE the target module's source-text
+/// slices and the importer's arena — no copies: the sub-parse's token
+/// buffer is scratch (names are token-text slices into the read
+/// buffer, which stays alive for the whole compile because the
+/// reader's buffer is compile-scoped static storage, mirroring
+/// main.zig's other file_bufs).
+///
+/// `pub` (re-export) semantics: for `pub import std.X`, the expansion
+/// sets the aliased binding `pub` at the IMPORT level (ImportDecl
+/// .is_pub drives `pub const` emission per selector, unchanged) — the
+/// module re-exports the full surface of X, the docs/23 §Barrels use
+/// case.
+fn expandWholeModuleImport(self: *Parser, imp: *ast.ImportDecl) void {
+    // Selective form (or already-expanded): nothing to do.
+    if (imp.selectors.len != 0) return;
+    // No injected reader (hermetic tests): no expansion.
+    const read_fn = self.read_source_file orelse return;
+    // Join + resolve the dotted path. Unresolvable paths bind nothing
+    // (same null-on-miss contract as codegen's import loop).
+    var dotted_buf: [256]u8 = undefined;
+    var dotted_len: usize = 0;
+    for (imp.path_nodes, 0..) |node, i| {
+        if (i > 0) {
+            dotted_buf[dotted_len] = '.';
+            dotted_len += 1;
+        }
+        if (dotted_len + node.len > dotted_buf.len) return;
+        @memcpy(dotted_buf[dotted_len..][0..node.len], node);
+        dotted_len += node.len;
+    }
+    const dotted = dotted_buf[0..dotted_len];
+    const resolved_path = core.Parser.resolveStdImport(dotted) orelse return;
+    const source = read_fn(resolved_path) orelse return;
+
+    // Sub-parse the target module.
+    var l = lexer.Lexer.init(source);
+    const toks = l.tokenize();
+    var sub = Parser.init(toks, self.arena);
+    const sub_prog = sub.parse();
+
+    // Collect top-level decl names, IN SOURCE ORDER, deduped (a
+    // module could re-export a name twice via selective imports of
+    // its own; a duplicate binding would trip zig's redeclaration
+    // check at the alias emit).
+    var names_buf: [256][]const u8 = undefined;
+    var name_count: usize = 0;
+    var i: usize = 0;
+    while (i < sub_prog.functions.len) : (i += 1) {
+        const f = sub_prog.functions[i];
+        // Skip @[test] fns — they are per-module harness surface,
+        // not API. Test bodies reference module-internal helpers
+        // the importer shouldn't bind.
+        if (f.is_test) continue;
+        names_buf[name_count] = f.name;
+        name_count += 1;
+    }
+    i = 0;
+    while (i < sub_prog.structs.len) : (i += 1) {
+        names_buf[name_count] = sub_prog.structs[i].name;
+        name_count += 1;
+    }
+    i = 0;
+    while (i < sub_prog.impls.len) : (i += 1) {
+        // impl blocks re-declare their target type's methods as
+        // orphan fns; the TYPE name is what callers bind, and it is
+        // already captured from `structs` — skip impl blocks here.
+        _ = sub_prog.impls[i];
+    }
+    i = 0;
+    while (i < sub_prog.enums.len) : (i += 1) {
+        names_buf[name_count] = sub_prog.enums[i].name;
+        name_count += 1;
+    }
+    i = 0;
+    while (i < sub_prog.traits.len) : (i += 1) {
+        names_buf[name_count] = sub_prog.traits[i].name;
+        name_count += 1;
+    }
+    i = 0;
+    while (i < sub_prog.consts.len) : (i += 1) {
+        names_buf[name_count] = sub_prog.consts[i].name;
+        name_count += 1;
+    }
+
+    // Dedup, preserving first occurrence.
+    var sel_buf: [256]ast.ImportSelector = undefined;
+    var sel_count: usize = 0;
+    i = 0;
+    while (i < name_count) : (i += 1) {
+        const name = names_buf[i];
+        var dup = false;
+        var j: usize = 0;
+        while (j < sel_count) : (j += 1) {
+            if (std.mem.eql(u8, sel_buf[j].name, name)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            sel_buf[sel_count] = .{ .name = name, .alias = null };
+            sel_count += 1;
+        }
+    }
+
+    const selectors = self.arena.alloc(ast.ImportSelector, sel_count);
+    if (sel_count > 0) @memcpy(selectors, sel_buf[0..sel_count]);
+    imp.selectors = selectors;
+}
+
 pub fn parseImportDecl(self: *Parser, is_pub: bool) ast.ImportDecl {
         // Resolves one of three surface shapes:
         //   1. `import std.string`             (whole-module, no `pub`)
@@ -1085,12 +1271,19 @@ pub fn parseImportDecl(self: *Parser, is_pub: bool) ast.ImportDecl {
         @memcpy(path_arena, path_buf[0..path_count]);
         const selectors = self.arena.alloc(ast.ImportSelector, selector_count);
         if (selector_count > 0) @memcpy(selectors, selectors_buf[0..selector_count]);
-        return .{
+        var imp = ast.ImportDecl{
             .is_pub = is_pub,
             .path_nodes = path_arena,
             .selectors = selectors,
             .loc = start_loc,
         };
+        // Whole-module expansion runs here, at the AST-construction
+        // boundary: the importer's ImportDecl leaves the parser with
+        // the target module's full pub surface already in .selectors,
+        // so codegen needs zero changes. Disabled (no-op) when
+        // read_source_file is null — the hermetic-test default.
+        expandWholeModuleImport(self, &imp);
+        return imp;
     }
 
 

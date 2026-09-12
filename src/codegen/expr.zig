@@ -387,6 +387,27 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         self.genExpr(arg);
                     }
                     self.write(")");
+                } else if (c.type_args.len == 0 and self.isProgramFn(c.name)) {
+                    // User-fn precedence (see isProgramFn docblock): a
+                    // program-local fun decl with this name resolves
+                    // to the USER fn even when the name+arity also
+                    // matches a router row (`assert`, `type_name`,
+                    // …). Emit the plain call — zig's own overload/
+                    // arity checking applies from here. Imported
+                    // aliases never reach this branch (they are not
+                    // program decls) and stay routed, keeping the
+                    // atomic intrinsics working for programs that
+                    // import std.concurrent.atomic. Turbofish calls
+                    // (c.type_args.len > 0) fall through even for
+                    // program fns — the comptime type-arg expansion
+                    // below owns that shape.
+                    self.write(c.name);
+                    self.write("(");
+                    for (c.args, 0..) |arg, i| {
+                        if (i > 0) self.write(", ");
+                        self.genExpr(arg);
+                    }
+                    self.write(")");
                 } else if (builtins.lookup(c.name, c.args.len)) |dispatch| {
                     // Phase 0 codegen-router: when the call name +
                     // arity match a builtin route, fire the
@@ -716,7 +737,94 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // int-target cast would be rejected by zig at compile
                 // time (loud, not silent) — no such shape exists in
                 // the stdlib surface.
+                // Float-source → int-target carve-out (`f as u64` where
+                // f: f64): zig 0.16 rejects `@as(u64, f64_var)`
+                // ("expected type 'u64', found 'f64'") and the only
+                // canonical lowering is `@as(T, @intFromFloat(value))`
+                // (truncates toward zero; UB-safety is the source
+                // program's range contract, mirroring zig's own
+                // semantics). Surfaced by the pure-.zag std.fmt
+                // migration — format_f64 / parse_f64 need
+                // `int_part: u64 = @intFromFloat(v)` / digit casts that
+                // .zag can only spell as `as` casts. Operand shapes
+                // mirror the int-source table below (ident via tracked
+                // type, binary/unary/index/call/method_call
+                // int-by-construction under a float target).
                 if (core.isIntTypeName(target_zig)) {
+                    const is_float_source = switch (c.expr.payload) {
+                        .ident => blk: {
+                            const op_ident = c.expr.payload.ident;
+                            if (self.getSourceTypeName(op_ident)) |source_type| {
+                                break :blk core.isFloatTypeName(source_type);
+                            }
+                            break :blk false;
+                        },
+                        // CAUTION: a `.binary` operand is float-source
+                        // ONLY when one of its leaves is a tracked float
+                        // ident — int arithmetic (`d - '0'` digit math,
+                        // the stdlib's dominant cast-operand shape)
+                        // arrives as `.binary` too. Optimistically
+                        // routing every `.binary` to @intFromFloat broke
+                        // digit casts with "expected float type, found
+                        // 'u8'", so the check walks the leaves; an
+                        // untracked leaf keeps the conservative false
+                        // (falls through to the @intCast path below).
+                        .binary => |ib| blk: {
+                            break :blk self.binaryHasFloatLeaf(ib);
+                        },
+                        else => false,
+                    };
+                    if (is_float_source) {
+                        self.write("@as(");
+                        self.writeType(c.type_text);
+                        self.write(", @intFromFloat(");
+                        self.genExpr(c.expr.*);
+                        self.write("))");
+                        return;
+                    }
+                }
+                if (core.isIntTypeName(target_zig)) {
+                    // Pointer→int carve-out (v0.5 self-hosting): zig 0.16
+                    // rejects @intCast on a pointer SOURCE ("expected int,
+                    // found pointer") — the canonical lowering is
+                    // @intFromPtr. Surfaced by std.mem's allocator header
+                    // math (`(buf.ptr - 16) as usize` for the mapped-length
+                    // store) — the symmetric twin of the int→pointer
+                    // @ptrFromInt carve-out in the pointer-target branch
+                    // below. Detection is source-type-informed: pointer-
+                    // shaped tracked types (`*T`, `[*]T`, `[*:0]T`,
+                    // `[]T`…) route here; pointer-typed COMPTIME forms
+                    // (`null`, string literals) also carry pointer source
+                    // text — `null` must NOT go through @intFromPtr
+                    // (it's not a pointer value zig accepts there), so
+                    // the literal-null ident case is excluded by the
+                    // tracked-type lookup (untyped nulls fall through to
+                    // the generic @as emit, where zig surfaces the
+                    // mismatch loudly).
+                    var ptr_src = false;
+                    {
+                        const st_opt = core.getSourceTypeNameOfExpr(self, c.expr.*);
+                        if (st_opt) |st| {
+                            ptr_src = std.mem.startsWith(u8, st, "*") or
+                                std.mem.startsWith(u8, st, "[") or
+                                std.mem.eql(u8, st, "str");
+                            // Fn-pointer sources (`*const fn (…) …` —
+                            // std.concurrent.thread stores the entry
+                            // address as the control block's first
+                            // word): zig's canonical int form is
+                            // @intFromPtr, identical to the pointer
+                            // case.
+                            if (!ptr_src and std.mem.startsWith(u8, st, "*const fn")) ptr_src = true;
+                        }
+                    }
+                    if (ptr_src) {
+                        self.write("@as(");
+                        self.writeType(c.type_text);
+                        self.write(", @intFromPtr(");
+                        self.genExpr(c.expr.*);
+                        self.write("))");
+                        return;
+                    }
                     const is_ident_int = switch (c.expr.payload) {
                         .ident => blk: {
                             const op_ident = c.expr.payload.ident;
@@ -784,11 +892,43 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             const_src = std.mem.eql(u8, st, "str") or std.mem.startsWith(u8, st, "[]const");
                         }
                     }
-                    if (const_src) self.write("@constCast(");
-                    self.write("@alignCast(@ptrCast(");
-                    self.genExpr(c.expr.*);
-                    self.write("))");
-                    if (const_src) self.write(")");
+                    // Int→pointer carve-out (v0.5 self-hosting): zig 0.16
+                    // rejects @ptrCast on an int SOURCE ("expected pointer,
+                    // found usize") — the canonical lowering is
+                    // @ptrFromInt. Surfaced by std.posix.mmap's address
+                    // return (`let p: [*]u8 = rc as [*]u8;`), the base of
+                    // the pure-zag allocator. @alignCast still wraps (page
+                    // mappings are max-aligned; no-op for byte targets).
+                    // Detection is source-type-informed: only idents
+                    // tracked as int-family (usize/isize/iN/uN) route
+                    // here; comptime-int literals (null deref checks,
+                    // `0 as [*]u8`) stay on the @ptrCast route — zig
+                    // accepts those via the comptime-known-null path and
+                    // the guess can't silently misfire.
+                    var int_src = false;
+                    {
+                        const st_opt = core.getSourceTypeNameOfExpr(self, c.expr.*);
+                        if (st_opt) |st| {
+                            int_src = core.isIntTypeName(st);
+                        }
+                    }
+                    if (int_src) {
+                        // No @alignCast: its operand type is unconstrained,
+                        // which strands @ptrFromInt's result inference
+                        // ("must have a known result type"). The @as
+                        // wrapper supplies the target directly.
+                        // @alignCast was a no-op here anyway — page
+                        // mappings are max-aligned by the kernel.
+                        self.write("@ptrFromInt(");
+                        self.genExpr(c.expr.*);
+                        self.write(")");
+                    } else {
+                        if (const_src) self.write("@constCast(");
+                        self.write("@alignCast(@ptrCast(");
+                        self.genExpr(c.expr.*);
+                        self.write("))");
+                        if (const_src) self.write(")");
+                    }
                 } else {
                     self.genExpr(c.expr.*);
                 }
@@ -1912,16 +2052,22 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             },
             .await_expr => |ae| {
                 // `await EXPR` (docs/manual/00-overview.md "Zero-cost
-                // async"): v1 inline-drive lowering. The awaited
-                // expression produces a `Future(T)`; the callee's
-                // async body already ran eagerly, so the drive is the
-                // completion contract (see __zag_future_drive) and the
-                // value unwraps:
+                // async"): the awaited expression produces a `Future(T)`;
+                // drive() parks until completion (zero syscalls on the
+                // eager same-thread path — state is already 1 — and a
+                // kernel futex wait for cross-thread producers) and
+                // take() unwraps the payload:
                 //   (blk: { var __fut_<N> = <expr>;
-                //          __zag_future_drive(@TypeOf(__fut_<N>), &__fut_<N>);
-                //          break :blk __fut_<N>.value.?; })
-                // The `.?` unwrap panics on a never-completed future —
-                // the v1 driver never produces one.
+                //          __fut_<N>.drive();
+                //          break :blk __fut_<N>.take(); })
+                // The methods live on the Future type itself (the
+                // __zag_future_drive free fn is retired) so the lowering
+                // is module-agnostic — a user-module await on a std
+                // module's future names its own preamble's Future
+                // instance through the receiver, never a free-fn
+                // signature. take() panics only on a pending non-void
+                // future the caller take()s without driving; drive()
+                // always precedes take() in this lowering.
                 const id = self.blk_counter;
                 self.blk_counter += 1;
                 var name_buf: [16]u8 = undefined;
@@ -1930,13 +2076,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(name);
                 self.write(" = ");
                 self.genExpr(ae.expr.*);
-                self.write("; __zag_future_drive(@TypeOf(");
+                self.write("; ");
                 self.write(name);
-                self.write("), &");
+                self.write(".drive(); break :blk ");
                 self.write(name);
-                self.write("); break :blk ");
-                self.write(name);
-                self.write(".value.?; })");
+                self.write(".take(); })");
             },
             .asm_expr => |a| {
                 // Inline assembly (docs/manual/24-simd.md §"Inline
@@ -2134,6 +2278,68 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         return;
                     }
                 }
+                // String concatenation with `+` (docs/11 "Owned
+                // Strings" + "String Builder" — the manual's
+                // builder-free join surface). Heuristic dispatch: when
+                // the operator is `.add` AND at least one operand is
+                // string-ish (a `.string_lit` / `.byte_string_lit`, or
+                // an ident whose tracked binding type is a byte-slice:
+                // `str` / `[]const u8` / `[]u8`), lower to the
+                // always-emitted `__zag_str_concat(a, b)` preamble
+                // helper — a fresh heap buffer holding a ++ b. Left-assoc
+                // chains (`"a" + s + "!"`) work because the inner
+                // binary already emitted a concat call and the outer
+                // level re-fires on the remaining string-ish operand
+                // (the nested-`.binary` operand is string-ish whenever
+                // its SIBLING at this level is). Non-string numeric
+                // adds fall through to the plain `(a + b)` emit;
+                // mixing an int with a string operand is a zig-side
+                // type error (loud, not silent) — the manual's
+                // int-to-string surface is `{}` interpolation.
+                if (b.op == .add) {
+                    const lhs_str = switch (b.lhs.payload) {
+                        .string_lit, .byte_string_lit => true,
+                        .ident => |n| self.isStringishIdent(n),
+                        // Left-assoc chains: `"a" + s + "!"` parses as
+                        // binary(add, binary(add, "a", s), "!") — the
+                        // nested binary is string-ish when THIS level's
+                        // sibling is (the level that sees a literal/
+                        // ident pair fires the emit; outer levels
+                        // cascade off it).
+                        .binary => |inner| blk: {
+                            if (inner.op != .add) break :blk false;
+                            const il = switch (inner.lhs.payload) {
+                                .string_lit, .byte_string_lit => true,
+                                .ident => |n| self.isStringishIdent(n),
+                                else => false,
+                            };
+                            const ir = switch (inner.rhs.payload) {
+                                .string_lit, .byte_string_lit => true,
+                                .ident => |n| self.isStringishIdent(n),
+                                else => false,
+                            };
+                            break :blk il or ir;
+                        },
+                        else => false,
+                    };
+                    const rhs_str = switch (b.rhs.payload) {
+                        .string_lit, .byte_string_lit => true,
+                        .ident => |n| self.isStringishIdent(n),
+                        else => false,
+                    };
+                    if (lhs_str or rhs_str) {
+                        // Outer parens keep the every-`.binary`-emit-is-
+                        // parenthesized invariant the eq/ne shim restored
+                        // (see its comment below) — call-site arg slots
+                        // rely on the shape.
+                        self.write("(__zag_str_concat(");
+                        self.genExpr(b.lhs.*);
+                        self.write(", ");
+                        self.genExpr(b.rhs.*);
+                        self.write("))");
+                        return;
+                    }
+                }
                 // zig 0.16 shim (see `needsIntDivShim` doc above). When the
                 // predicate fires for `.div`/`.mod` we route through
                 // `@divTrunc`/`@rem` instead of emitting the bare
@@ -2280,7 +2486,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(", .seq_cst)");
             },
             .builtin_atomic_compare_exchange => {
-                self.write("@cmpxchgStrong(@TypeOf(");
+                // (@cmpxchgStrong(...) == null) — zig's cmpxchg
+                // returns ?T (null on SUCCESS, Some(actual) on
+                // failure), so the `== null` test converts it to the
+                // "CAS succeeded" bool the zag surface declares.
+                // Lock loops (`while (!compare_exchange(&w, 0, 1))
+                // futex_wait(...);`) need exactly this shape; the
+                // raw ?T form leaked zig's optional into zag source,
+                // which no zag type annotation can name.
+                self.write("(@cmpxchgStrong(@TypeOf(");
                 self.genExpr(args[0]);
                 self.write(".*), ");
                 self.genExpr(args[0]);
@@ -2288,7 +2502,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.genExpr(args[1]);
                 self.write(", ");
                 self.genExpr(args[2]);
-                self.write(", .seq_cst, .seq_cst)");
+                self.write(", .seq_cst, .seq_cst) == null)");
             },
             .builtin_thread_spawn => {
                 // thread_spawn(fn_name, args_tuple)

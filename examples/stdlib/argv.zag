@@ -1,0 +1,35 @@
+## stdlib/argv.zag — command-line arguments via std.argv.get (docs/23).
+##
+## v0.5 self-hosting: `get()` is pure Zag — it delegates to
+## std.posix.argv, which reads /proc/self/cmdline directly. No
+## main-entry capture is involved, so any function at any call
+## depth can call it (the old __zag_argv global only worked when
+## the compiler hoisted a capture into main's body).
+##
+## Elements are borrowed from posix.zag's argv_buf: the next
+## get() call overwrites them (same contract as getcwd/getenv).
+## argv[0] is the program path; run-time args follow after the
+## harness `--` (`zag run file.zag -- arg1 arg2`).
+
+import std.argv.{get}
+
+fun print_count() {
+    let args: []const []const u8 = get();
+    let n: usize = args.len;
+    print("from helper: {n} args\n");
+}
+
+fun main() {
+    let args: []const []const u8 = get();
+    let n: usize = args.len;
+    print("argc={n}\n");
+
+    var i: usize = 0;
+    while (i < n) {
+        print("arg[{i}]: {args[i]}\n");
+        i = i + 1;
+    }
+
+    # Callable from any function, not just main's call tree:
+    print_count();
+}

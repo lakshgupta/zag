@@ -3,27 +3,35 @@
 ## From docs/spec.md §6.4 (System Surfaces): argv is exposed as a
 ## free-fn form after the user writes `pub import std.argv.{get}`.
 ##
-## v0.1 Tier-1 migration: REAL impl — with one architectural caveat.
-## The reference body below is `return __zag_argv;` (the module-level
-## global captured by genFun's `is_main` special case via
-## `init.minimal.args.toSlice(allocator)` at main entry, because zig
-## 0.16 retired `std.os.argv` / `std.posix.argv` entirely).
+## v0.5 self-hosting migration: REAL pure-zag impl. The previous
+## binding was PREAMBLE-side: `stdlibPreambleName("get")` returned
+## `__zag_argv` so the imports loop's fast path emitted
+## `const get = __zag_argv;` IN THE USER MODULE — the @import slow
+## path could not work because the materialized std/argv.zig was a
+## separate zig module whose own preamble copy of `__zag_argv` was
+## never assigned (only the user module's global was captured at
+## main entry by genFun's is_main special case). Mirrored the
+## String/Writer hardcoded-coupling rationale.
 ##
-## The body lives here for documentation + scaffold parsing, but the
-## actual binding is PREAMBLE-side: `stdlibPreambleName("get")`
-## returns `__zag_argv` (src/codegen/core.zig), so the imports loop's
-## fast path emits `const get = __zag_argv;` IN THE USER MODULE —
-## the @import + per-selector-alias slow path would resolve `get` to
-## this file's materialized std/argv.zig, a separate zig module whose
-## OWN self-contained preamble copy of `__zag_argv` is never assigned
-## (only the user module's global gets captured at main entry).
-## Mirrors the String/Writer hardcoded-coupling rationale; the
-## pre-migration `argv_get` router row emitted the same `__zag_argv`
-## reference inline and is retired.
+## That whole apparatus retires now: lib/std/posix.zag's argv()
+## reads /proc/self/cmdline directly (kernel-provided, identical
+## NUL-separated encoding to the /proc/self/environ walk getenv
+## already does), so no main-entry capture, no `init` threading,
+## and no preamble global are needed. This module is a plain
+## delegation through the standard @import+alias fallthrough —
+## exactly the shape process.zag's exit/exec use. Reading the
+## `__zag_argv` name anywhere is the regression signal.
 ##
-## The slice is bounded by the actual argc (toSlice returns exactly
-## argc entries), so no 32-slot cap or per-call blk walker is needed.
+## The slice is the actual argv (argv[0] included, bounded by the
+## kernel's own layout); elements are borrowed from posix.zag's
+## argv_buf — the next argv() call overwrites them, matching the
+## getcwd/getenv contract. `get()` takes no arguments: the old
+## per-call blk-walker form took an optional index, but the
+## docs/spec.md §6.4 surface and every call site use the bare
+## whole-vector form (`let args = get(); args[i]`).
+
+pub import std.posix.{argv as sys_argv}
 
 pub fun get() -> []const []const u8 {
-    return __zag_argv;
+    return sys_argv();
 }

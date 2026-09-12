@@ -14,6 +14,28 @@ let greeting: []const u8 = "hello";
 let owned = new String("hello");     # String — heap allocated
 ```
 
+## Concatenation with `+`
+
+The `+` operator concatenates two strings. Operands can be literals,
+`str` bindings, `[]const u8` / `[]u8` bindings, or any mix — the result
+is a fresh heap buffer holding both byte sequences:
+
+```
+let name: str = "world";
+let greeting: str = "hello, " + name;   # literal + ident
+let full: str = first + " " + last;     # chains are left-assoc
+print("{a + b}\n");                      # also valid in `{...}` placeholders
+```
+
+**Memory:** each `+` allocates a new buffer (page allocator, charged to
+std.bench counters); operands are never mutated, so literals (static
+data) are safe inputs. Building a long string piece by piece in a loop
+is O(n²) — prefer `String.push_str` for accumulation.
+
+**Numeric `+` is untouched:** when neither operand is string-typed, the
+operator lowers to zig's plain add. Mixing an int with a string operand
+is a compile error — use `{}` interpolation to render numbers as text.
+
 ## String Literals
 
 String literals produce `[]const u8`:

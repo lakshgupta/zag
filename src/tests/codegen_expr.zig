@@ -111,7 +111,7 @@ test "codegen: template interpolation of binary expr wraps in __zag_auto_fmt" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "\"sum: {f}\\n\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_auto_fmt(a + b)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_auto_fmt((a + b))") != null);
 }
 
 test "codegen: print(call returning ?str) wraps optional in __zag_auto_fmt" {

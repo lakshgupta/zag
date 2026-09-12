@@ -21,7 +21,8 @@
 ## in this iteration (the `##` block above is the new module-level
 ## rationale + carries migration context).
 
-import std.mem.{memcpy}
+import std.mem.{memcpy, alloc_raw}
+pub import std.io.{write_all as fd_write_all}
 
 pub trait Display {
     fun write(self: *const Self, writer: *Writer);
@@ -47,7 +48,11 @@ impl Writer {
     }
 
     pub fun write_all(self: *const Writer, bytes: []const u8) -> void {
-        __zag_fd_write(self.fd, bytes);
+        # Backed by std.io.write_all (lib/std/io.zag) — the
+        # __zag_fd_write preamble helper retired into pure .zag in the
+        # self-hosting batch. The alias `fd_write_all` keeps this body
+        # a one-liner while leaving io.write_all's public name intact.
+        fd_write_all(self.fd, bytes);
     }
 
     pub fun print(self: *const Writer, fmt: str) -> void {
@@ -100,8 +105,7 @@ pub fun format_u64(value: u64, base: u32) -> []u8 {
         buf[n - 1 - i] = t;
         i = i + 1;
     }
-    let out: *raw u8 = __zag_page_alloc(n);
-    __zag_bench_alloc(n);
+    let out: *raw u8 = alloc_raw(n);
     memcpy(out[0..n], buf[0..n], n);
     return out[0..n];
 }
@@ -110,8 +114,7 @@ pub fun format_i64(value: i64, base: u32) -> []u8 {
     if (value < 0) {
         let mag: u64 = (0 - value) as u64;
         let digits: []u8 = format_u64(mag, base);
-        let out: *raw u8 = __zag_page_alloc(digits.len + 1);
-        __zag_bench_alloc(digits.len + 1);
+        let out: *raw u8 = alloc_raw(digits.len + 1);
         out[0] = '-';
         memcpy(out[1 .. digits.len + 1], digits[0..], digits.len);
         free(digits);
@@ -151,4 +154,109 @@ pub fun parse_i64(s: []const u8) -> ?i64 {
     }
     if (neg) { return 0 - result; }
     return result;
+}
+
+## Float parsing + formatting — the __zag_atof / __zag_ftoa preamble
+## helpers retired into pure .zag (self-hosting batch). The zig
+## preamble shims existed only because .zag couldn't spell float<->int
+## casts; `x as u64` now lowers to `@as(T, @intFromFloat(x))` and
+## `(d as f64)` handles the int-to-float direction, so the same
+## algorithms live here where users (and std.json) can read them.
+##
+##   import std.fmt.{format_f64, parse_f64}
+##
+##   let buf: [32]u8 = undefined;
+##   let n: usize = format_f64(3.5, buf[0..]);   # "3.500000"
+##   let v: f64 = parse_f64("2.25e1");           # 22.5
+##
+## parse_f64 scans sign / integer / fraction / e-E exponent (the same
+## grammar json.zag's number scanner produces). format_f64 writes
+## integer digits, '.', then 6 fractional digits into `buf`,
+## returning the byte length (truncated at buf.len).
+
+pub fun parse_f64(s: []const u8) -> f64 {
+    var i: usize = 0;
+    var neg: bool = false;
+    if (i < s.len && (s[i] == '-' || s[i] == '+')) {
+        neg = s[i] == '-';
+        i = i + 1;
+    }
+    var result: f64 = 0.0;
+    while (i < s.len && s[i] >= '0' && s[i] <= '9') {
+        result = result * 10.0 + ((s[i] - '0') as f64);
+        i = i + 1;
+    }
+    if (i < s.len && s[i] == '.') {
+        i = i + 1;
+        var scale: f64 = 0.1;
+        while (i < s.len && s[i] >= '0' && s[i] <= '9') {
+            result = result + ((s[i] - '0') as f64) * scale;
+            scale = scale * 0.1;
+            i = i + 1;
+        }
+    }
+    if (i < s.len && (s[i] == 'e' || s[i] == 'E')) {
+        i = i + 1;
+        var eneg: bool = false;
+        if (i < s.len && (s[i] == '-' || s[i] == '+')) {
+            eneg = s[i] == '-';
+            i = i + 1;
+        }
+        var exp: i32 = 0;
+        while (i < s.len && s[i] >= '0' && s[i] <= '9') {
+            exp = exp * 10 + ((s[i] - '0') as i32);
+            i = i + 1;
+        }
+        if (eneg) { exp = 0 - exp; }
+        while (exp > 0) { result = result * 10.0; exp = exp - 1; }
+        while (exp < 0) { result = result * 0.1; exp = exp + 1; }
+    }
+    if (neg) { return 0.0 - result; }
+    return result;
+}
+
+pub fun format_f64(value: f64, buf: []u8) -> usize {
+    var v: f64 = value;
+    var neg: bool = false;
+    if (v < 0.0) {
+        neg = true;
+        v = 0.0 - v;
+    }
+    var int_part: u64 = v as u64;
+    var frac: f64 = v - (int_part as f64);
+    var pos: usize = 0;
+    if (neg) {
+        if (pos < buf.len) { buf[pos] = '-'; }
+        pos = pos + 1;
+    }
+    var digits: [32]u8 = undefined;
+    var nd: usize = 0;
+    if (int_part == 0) {
+        digits[0] = '0';
+        nd = 1;
+    } else {
+        while (int_part > 0) {
+            digits[nd] = ((int_part % 10) as u8) + '0';
+            nd = nd + 1;
+            int_part = int_part / 10;
+        }
+    }
+    var d: usize = nd;
+    while (d > 0) {
+        d = d - 1;
+        if (pos < buf.len) { buf[pos] = digits[d]; }
+        pos = pos + 1;
+    }
+    if (pos < buf.len) { buf[pos] = '.'; }
+    pos = pos + 1;
+    var k: usize = 0;
+    while (k < 6) {
+        frac = frac * 10.0;
+        let digit: u64 = frac as u64;
+        frac = frac - (digit as f64);
+        if (pos < buf.len) { buf[pos] = (digit as u8) + '0'; }
+        pos = pos + 1;
+        k = k + 1;
+    }
+    return pos;
 }

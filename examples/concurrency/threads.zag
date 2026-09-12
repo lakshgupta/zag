@@ -1,42 +1,71 @@
-## Threads via std.concurrent.thread (docs/21)
+## Threads via std.concurrent.thread (docs/22)
 ##
-##   import std.concurrent.thread
+##   import std.concurrent.thread.{spawn, join, Thread}
 ##
-## Simple names: spawn, join.
+## Real clone(2) threads: spawn(body, payload) starts `body(payload)`
+## on a new kernel thread; join(handle) parks the caller on the
+## kernel's child-tid futex (CLONE_CHILD_CLEARTID) — zero syscalls
+## when the child already exited, kernel park otherwise.
+##
+## ABI: the body is `fun (usize)` — one usize payload word. Pass a
+## pointer through it (multiple values go through a pointer to a
+## struct).
 ##
 ## Run: zag run threads.zag
 
-import std.concurrent.thread
-import std.concurrent.atomic
+import std.concurrent.thread.{spawn, join, Thread}
+import std.time.{Timer, sleep_ms}
 
-fun worker_hello() {
+## fetch_add / load / assert are language intrinsics (no import):
+## std.concurrent.atomic is still a stub — its rows live in the
+## compiler's builtin router (docs/22 §Atomics).
+
+fun worker_hello(_: usize) {
     print("hello from thread\n");
 }
 
-fun worker_increment(ptr: *i32) {
+fun worker_increment(ptr_word: usize) {
+    let ptr: *i32 = ptr_word as *i32;
     _ = fetch_add(ptr, 1);
 }
 
+fun worker_sleep(ms_word: usize) {
+    let ms: i64 = ms_word as i64;
+    sleep_ms(ms);
+}
+
 fun main() {
-    let h1: std.Thread = spawn(worker_hello, ());
+    let h1: Thread = spawn(worker_hello, 0);
     join(h1);
 
     let counter: *i32 = new i32(0);
     defer free(counter);
 
-    let h2: std.Thread = spawn(worker_increment, (counter,));
-    let h3: std.Thread = spawn(worker_increment, (counter,));
+    let h2: Thread = spawn(worker_increment, counter as usize);
+    let h3: Thread = spawn(worker_increment, counter as usize);
 
     join(h2);
     join(h3);
 
     let val: i32 = load(counter);
     print("counter = {val}\n");
+
+    ## Park-path check: join() waits on the child-tid futex wake, so
+    ## the wall time of main must track the child's 200ms sleep plus
+    ## the 100ms lead-in — a spin-wait or a lost wake would show up
+    ## as elapsed < 200ms (or a hang on a never-arriving wake).
+    let t: Timer = Timer.start();
+    let hp: Thread = spawn(worker_sleep, 200);
+    sleep_ms(100);
+    join(hp);
+    let elapsed: u64 = t.elapsed().as_millis();
+    assert(elapsed >= 200);
+    print("parked-join elapsed = {elapsed}ms\n");
 }
 
 @[test]
 fun test_thread_spawn_join() {
-    let h1: std.Thread = spawn(worker_hello, ());
+    let h1: Thread = spawn(worker_hello, 0);
     join(h1);
     assert(true);
 }
@@ -46,8 +75,8 @@ fun test_thread_increment() {
     let counter: *i32 = new i32(0);
     defer free(counter);
 
-    let h2: std.Thread = spawn(worker_increment, (counter,));
-    let h3: std.Thread = spawn(worker_increment, (counter,));
+    let h2: Thread = spawn(worker_increment, counter as usize);
+    let h3: Thread = spawn(worker_increment, counter as usize);
 
     join(h2);
     join(h3);

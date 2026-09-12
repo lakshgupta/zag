@@ -1,0 +1,37 @@
+## stdlib/alloc.zag — the pure-Zag allocator surface (docs/20, docs/23).
+##
+## v0.5 self-hosting: std.mem's allocator is written in Zag itself,
+## over std.posix.mmap/munmap raw syscall facades. The
+## __zag_page_alloc preamble family (zig-side page_allocator
+## wrappers) is retired.
+##
+##   alloc(n)      -> []u8     data slice over a fresh mapping
+##   release(p, n)             munmap the page-rounded mapping
+##
+## The kernel returns page-aligned (max-aligned) addresses, so the
+## result can be cast to any aligned pointer type. `free buf` (the
+## keyword) also works on alloc'd slices — its page-math munmap is
+## bit-compatible with release.
+
+import std.mem.{alloc, release}
+
+fun main() {
+    # Slice tier — the user-facing shape.
+    let buf: []u8 = alloc(10);
+    buf[0] = 'z';
+    buf[9] = 'g';
+    print("first={buf[0]} last={buf[9]}\n");
+
+    # Page-aligned base: cast to a typed many-pointer.
+    let nums: [*]i32 = buf.ptr as [*]i32;
+    nums[0] = 424242;
+    print("typed: {nums[0]}\n");
+
+    # Explicit release with the caller-tracked byte length.
+    release(buf.ptr, 10);
+
+    # The `free` keyword path works too (page-math munmap).
+    let buf2: []u8 = alloc(32);
+    free(buf2);
+    print("released both\n");
+}

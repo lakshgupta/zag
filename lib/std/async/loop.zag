@@ -12,16 +12,15 @@
 ##   await t2;
 ##
 ## Model: the loop owns a sorted timer list; `set_timeout` registers
-## the caller's Future pointer; `poll` (called by wait/run_for) flips
-## `.done` when the deadline passes. The v1 async driver is eager —
-## the awaited future's producer completes it before the drive
-## returns, so `await` on a loop-completed future unwraps directly.
-## Real future SUSPENSION (resume-on-completion without a blocked
-## caller) remains the documented follow-up; the timer surface is
-## stable across it.
+## the caller's Future pointer; `poll` (called by wait/run_for)
+## completes due futures via Future.complete() — the seq-cst store
+## makes drive()'s spin-check succeed and the futex WAKE resumes any
+## parked cross-thread awaiter. Same-thread `await` on a loop-completed
+## future still unwraps with zero syscalls (state already 1 when
+## drive() first checks).
 
 import std.collections.{ArrayList}
-import std.time.{clock_gettime}
+import std.time.{clock_gettime, sleep_ms}
 
 ## Clock now in milliseconds (CLOCK_MONOTONIC).
 pub fun now_ms() -> i64 {
@@ -29,11 +28,17 @@ pub fun now_ms() -> i64 {
 }
 
 ## Blocking sleep via nanosleep — returns an already-completed
-## Future(void) so `await sleep(ms)` works in the v1 eager model
-## without burning CPU (time.after busy-waits; this does not).
+## Future(void) so `await sleep(ms)` works without burning CPU.
+## Backed by std.time.sleep_ms → posix.nanosleep (the
+## __zag_nanosleep_ms preamble helper retired into .zag — reading
+## it here is the regression signal).
 pub fun sleep(ms: i64) -> Future(void) {
-    __zag_nanosleep_ms(ms);
-    return __zag_future_ready_void();
+    sleep_ms(ms);
+    # Ready-future construction without the retired
+    # __zag_future_ready_void helper (see std.time.after).
+    var f: Future(void) = undefined;
+    f.complete();
+    return f;
 }
 
 struct TimerEntry {
@@ -41,7 +46,7 @@ struct TimerEntry {
     # Opaque future pointer: Future(T) is a PER-MODULE preamble type
     # (main.Future(void) != std.async.loop.Future(void)), so the loop
     # stores the raw pointer and type-puns to its own Future for the
-    # `.done` flip — the layouts are identical ({ done, value }).
+    # completion call — the layouts are identical ({ state, value }).
     fut: *raw u8,
 }
 
@@ -56,13 +61,20 @@ impl EventLoop {
 
     # Register `fut` to complete after `ms` from now. The caller
     # owns the future (a local binding); the loop stores a pointer
-    # and flips `.done` when the deadline passes.
+    # and completes each due future via Future.complete().
     pub fun set_timeout(self: *EventLoop, ms: i64, fut: *raw u8) {
+        # Defensive init: the caller's future binding may be
+        # `undefined` (the documented registration pattern), so the
+        # pending state must be established HERE — before any poll
+        # can complete it. Registration happens-before every poll in
+        # the owning thread, so a plain store is race-free.
+        let f: *Future(void) = fut as *Future(void);
+        f.state = 0;
         let deadline: i64 = now_ms() + ms;
         self.timers.push(TimerEntry { deadline_ms: deadline, fut: fut });
     }
 
-    # Fire every due timer (sets the registered futures' `.done`).
+    # Fire every due timer (completes the registered futures).
     # Called by wait/run_for between nanosleep ticks.
     pub fun poll(self: *EventLoop) {
         let now: i64 = now_ms();
@@ -71,7 +83,7 @@ impl EventLoop {
             let entry: TimerEntry = self.timers.get(i);
             if (entry.deadline_ms <= now) {
                 let f: *Future(void) = entry.fut as *Future(void);
-                f.done = true;
+                f.complete();
                 self.timers.set(i, self.timers.get(self.timers.len - 1));
                 self.timers.len = self.timers.len - 1;
             } else {
@@ -85,10 +97,10 @@ impl EventLoop {
     pub fun wait(self: *EventLoop, fut: *raw u8, timeout_ms: i64) -> bool {
         let deadline: i64 = now_ms() + timeout_ms;
         let f: *Future(void) = fut as *Future(void);
-        while (!f.done) {
+        while (f.state == 0) {
             self.poll();
             if (now_ms() >= deadline) { return false; }
-            __zag_nanosleep_ms(1);
+            sleep_ms(1);
         }
         return true;
     }
@@ -98,7 +110,7 @@ impl EventLoop {
         let deadline: i64 = now_ms() + ms;
         while (now_ms() < deadline) {
             self.poll();
-            __zag_nanosleep_ms(1);
+            sleep_ms(1);
         }
     }
 }

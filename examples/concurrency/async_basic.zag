@@ -1,7 +1,7 @@
 ## Async/await basic example
 ##
 ## v1 (synchronous driver): `async fun` returns Future<T>; `await`
-## drives the awaited future inline — `after(ms)` busy-waits on
+## drives the awaited future inline — `after(ms)` nanosleeps on
 ## CLOCK_MONOTONIC inside the call, then completes its future.
 ##
 ## Run: zag run async_basic.zag

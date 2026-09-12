@@ -18,6 +18,7 @@
 ## propagates them.
 
 import std.types.{String}
+import std.fmt.{parse_f64, format_f64}
 import std.collections.{ArrayList}
 
 pub struct JsonPair {
@@ -117,7 +118,7 @@ impl ParserState {
         }
         if (self.pos == start) { return Err("json: invalid number"); }
         let span: str = self.s[start..self.pos];
-        let f: f64 = __zag_atof(span);
+        let f: f64 = parse_f64(span);
         return Ok(Json.Number(f));
     }
 
@@ -230,7 +231,7 @@ fun stringify_into(out: *String, v: Json) {
         },
         Json.Number(f) => {
             var buf: [64]u8 = undefined;
-            let n: usize = __zag_ftoa(f, buf[0..]);
+            let n: usize = format_f64(f, buf[0..]);
             out.push_str(buf[0..n]);
         },
         Json.Str(s) => {

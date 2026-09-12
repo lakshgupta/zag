@@ -20,8 +20,10 @@
 ##   iterates 4 KiB at a time and `push_str`-es into a heap
 ##   `String` until read returns 0 (EOF) or negative (errno).
 ##   The `String` accumulator comes from `String.with_capacity` in
-##   lib/std/types.zag's String, itself backed by __zag_page_alloc
-##   in the preamble — same heap ownership contract as before.
+##   lib/std/types.zag's String, itself backed by std.mem's
+##   pure-zag mmap allocator (the __zag_page_alloc preamble helper
+##   retired in the v0.5 self-hosting batch) — same heap ownership
+##   contract as before.
 ##
 ##   Error model: openat / read errno values (returned as
 ##   high-bit-set usize / negative isize respectively) collapse into

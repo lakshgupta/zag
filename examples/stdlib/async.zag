@@ -13,8 +13,9 @@
 ##
 ## The loop stores the caller's Future pointer, polls it against
 ## CLOCK_MONOTONIC deadlines between 1ms nanosleep ticks (no
-## busy-wait), and flips `.done` when the deadline passes. wait()
-## returns true when the future completed in time.
+## busy-wait), and completes each due future via Future.complete()
+## (atomic store + futex WAKE). wait() returns true when the future
+## completed in time.
 
 import std.async.{EventLoop, sleep, now_ms}
 
@@ -27,9 +28,10 @@ fun main() {
     loop.set_timeout(80, &t2 as *raw u8);
     let ok1: bool = loop.wait(&t2 as *raw u8, 500);
     let elapsed: i64 = now_ms() - start;
-    let t1done: bool = t1.done;
-    let t2done: bool = t2.done;
+    let t1done: bool = t1.state == 1;
+    let t2done: bool = t2.state == 1;
     print("waited {elapsed}ms ok={ok1} t1done={t1done} t2done={t2done}\n");
-    # await unwraps the already-completed future in the v1 eager model.
+    # await unwraps the already-completed future (drive() takes the
+    # zero-syscall path when state is already 1).
     await t2;
 }

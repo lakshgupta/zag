@@ -160,6 +160,50 @@ pub fun getenv(name: str) -> ?str {
     return null;
 }
 
+## argv — the process argument vector from /proc/self/cmdline. Pure
+## self-contained impl mirroring getenv's /proc walk: the kernel lays
+## out cmdline as argv[0] NUL argv[1] NUL ... argv[argc-1] NUL (the
+## exact same NUL-separated encoding as environ), so the same
+## openat/read into a module-level `var` buffer + NUL-split works
+## unchanged. This RETIRES the __zag_argv preamble global — whose
+## value only existed via the zig-0.16 main-signature capture
+## (`init.minimal.args.toSlice(init.arena.allocator())` hoisted to
+## main entry by genFun's is_main special case), a hard coupling to
+## the generated zig main signature. /proc/self/cmdline needs no
+## main-entry capture at all: any function, any call depth, reads
+## fresh kernel state. Elements point into argv_buf (borrowed —
+## next call overwrites, same contract as getcwd/getenv); the
+## element slices alias the buffer directly, so no per-element copy
+## pass is needed. The count is unbounded short of the 32 KiB
+## buffer (ARG_MAX is 128 KiB but a single page covers every real
+## invocation; oversized command lines silently truncate at the
+## buffer edge — fail-visible via the missing tail, not a crash).
+var argv_buf: [32768]u8 = undefined;
+var argv_elems: [512][]const u8 = undefined;
+pub fun argv() -> []const []const u8 {
+    let fd_raw: usize = openat(std.posix.AT.FDCWD, "/proc/self/cmdline", 0, 0);
+    let fd_signed: isize = fd_raw as isize;
+    if (fd_signed < 0) { return argv_elems[0..0]; }
+    let fd: i32 = fd_signed as i32;
+    let n: isize = read(fd, argv_buf[0..argv_buf.len], argv_buf.len);
+    _ = close(fd);
+    if (n <= 0) { return argv_elems[0..0]; }
+    let buf_len: usize = n as usize;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < buf_len) {
+        let start: usize = i;
+        while (i < buf_len) {
+            if (argv_buf[i] == 0) { break; }
+            i = i + 1;
+        }
+        argv_elems[count] = argv_buf[start..i];
+        count = count + 1;
+        if (i < buf_len) { i = i + 1; }
+    }
+    return argv_elems[0..count];
+}
+
 ## spawn — fork/execve/waitpid in .zag: the last __zag_posix-family
 ## preamble resident (__zag_process_spawn) retires here. The old
 ## zig-side helper wrapped std.process.spawn(+SpawnOptions literal)/
@@ -188,14 +232,14 @@ pub fun getenv(name: str) -> ?str {
 var arg_arena: [16384]u8 = undefined;
 var arg_ptrs: [64:null]?[*:0]const u8 = undefined;
 var env_ptrs: [256:null]?[*:0]const u8 = undefined;
-pub fun spawn(argv: []const []const u8) -> i32 {
-    let nargs: usize = argv.len;
+pub fun spawn(cmd: []const []const u8) -> i32 {
+    let nargs: usize = cmd.len;
     if (nargs == 0) { return 255; }
     if (nargs >= arg_ptrs.len) { return 255; }
     var off: usize = 0;
     var i: usize = 0;
     while (i < nargs) {
-        let a: []const u8 = argv[i];
+        let a: []const u8 = cmd[i];
         if (off + a.len + 1 > arg_arena.len) { return 255; }
         memcpy(arg_arena[off .. off + a.len], a, a.len);
         arg_arena[off + a.len] = 0;
@@ -247,6 +291,99 @@ pub fun spawn(argv: []const []const u8) -> i32 {
 ## exit — `_exit(2)`. noreturn.
 pub fun exit(code: i32) -> noreturn {
     std.os.linux.exit(code);
+}
+
+## nanosleep — raw `nanosleep(2)` sleeping `sec` seconds + `nsec`
+## nanoseconds (blocks; no signal handling — EINTR retries are the
+## caller's policy). The __zag_nanosleep_ms preamble helper retired
+## into .zag through this entry + std.time.sleep_us's decomposition:
+## the ms→{sec,nsec} math is plain zag arithmetic, and the syscall
+## needs no anonymous-struct spelling zag can't produce (the timespec
+## is a std.os.linux type annotation, passing through type-text
+## verbatim like the spawn pointers did). Returns the raw usize rc
+## (0 on success, errno-encoded otherwise) — mirrors clock_gettime's
+## discard-the-rc shape internally; callers wanting the errno test it
+## via the sign bit.
+pub fun nanosleep(sec: i64, nsec: i64) -> usize {
+    var req: std.os.linux.timespec = undefined;
+    req.sec = sec as isize;
+    req.nsec = nsec as isize;
+    return std.os.linux.nanosleep(addr_of(req), null);
+}
+
+## mmap — raw `mmap(2)`. `addr` is normally null (kernel picks the
+## page-aligned slot); prot/flags are the kernel numeric values
+## (PROT_READ|WRITE = 3, MAP_PRIVATE|MAP_ANONYMOUS = 0x22 on Linux).
+## fd = -1 + offset = 0 for anonymous mappings. Returns the raw rc:
+## the mapped address, or an errno-encoded (high-bit) usize.
+pub fun mmap(addr: ?[*]u8, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> usize {
+    let p: std.os.linux.PROT = bitcast(prot);
+    let f: std.os.linux.MAP = bitcast(flags);
+    return std.os.linux.mmap(addr, len, p, f, fd, offset);
+}
+
+## munmap — raw `munmap(2)`. Returns the raw rc (0 on success).
+pub fun munmap(addr: [*]u8, len: usize) -> usize {
+    return std.os.linux.munmap(addr, len);
+}
+
+## clone — raw `clone(2)` for thread creation (std.concurrent.thread).
+## `payload` (the new thread's sole argument) is the address of the
+## control page; `flags` carries the sharing mask — CLONE_CHILD_CLEARTID
+## makes the kernel clear+wake `*ctid` on child exit (the futex word
+## `join` parks on), CLONE_PARENT_SETTID writes the child tid to
+## `*ptid`. Returns the raw rc: child tid in the caller, 0 in the
+## child (the child continues on the fixed zig-side trampoline,
+## `__zag_thread_tramp`, which unpacks the control page and calls the
+## user body — an auto-convention zag fun cannot be the clone entry
+## directly).
+pub fun clone(payload: usize, flags: u32, stack: usize, ptid: *i32, ctid: *i32) -> usize {
+    return __zag_thread_start(payload, flags, stack, ptid, ctid);
+}
+
+## wait4 — raw `wait4(2)` (thread join). `flags` passes __WALL (0x40000000)
+## so a non-CLONE_THREAD child's exit is reaped by a threaded parent too.
+## Returns the raw rc: pid on success, errno-encoded (high-bit) usize.
+pub fun wait4(pid: i32, status: *u32, flags: u32) -> usize {
+    return std.os.linux.wait4(pid, status, flags, null);
+}
+
+## gettid — thread id of the caller (gettid(2); the kernel-assigned
+## tid of this execution context).
+pub fun gettid() -> i32 {
+    return std.os.linux.gettid();
+}
+
+## futex_wait / futex_wake — the parking primitives under Future
+## suspension and thread join, exposed so pure-Zag code can block
+## cross-thread without zig-side preamble helpers. `addr` must point
+## to a naturally-aligned u32. WAIT parks while `*addr == expected`
+## (returns immediately with EWOULDBLOCK otherwise — the caller
+## re-checks state in a loop); WAKE resumes `count` parked waiters.
+## Returns the raw rc (0 on wake, errno-encoded otherwise).
+pub fun futex_wait(addr: *const u32, expected: u32) -> usize {
+    ## FUTEX_WAIT_BITSET-less v1 op word: cmd=WAIT(0) | PRIVATE(1<<7)
+    ## — bitcast needs a runtime-typed source, so the literal binds
+    ## to a u32 first (comptime_int has no bit pattern to cast).
+    let opv: u32 = 128;
+    let op: std.os.linux.FUTEX_OP = bitcast(opv);
+    return std.os.linux.futex_4arg(addr, op, expected, null);
+}
+
+pub fun futex_wake(addr: *const u32, count: u32) -> usize {
+    let opv: u32 = 129;
+    let op: std.os.linux.FUTEX_OP = bitcast(opv);
+    return std.os.linux.futex_3arg(addr, op, count);
+}
+
+## futex_wait_shared — non-private (process-wide) WAIT. The kernel's
+## CLONE_CHILD_CLEARTID wake on thread exit is NOT a private wake, so
+## parking on a ctid word (thread join) MUST use this variant — a
+## private wait never matches the kernel's wake and parks forever.
+pub fun futex_wait_shared(addr: *const u32, expected: u32) -> usize {
+    let opv: u32 = 0;
+    let op: std.os.linux.FUTEX_OP = bitcast(opv);
+    return std.os.linux.futex_4arg(addr, op, expected, null);
 }
 
 ## slice_eq — byte-equality over two slices (the std.mem.eql

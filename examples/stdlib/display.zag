@@ -1,0 +1,37 @@
+## stdlib/display.zag — the format(self) -> str Display convention (docs/23).
+##
+## A struct that declares `pub fun format(self) -> str` on an impl block
+## gets custom rendering in every template slot typed as that struct.
+## The compiler routes the value through the __zag_auto_fmt wrapper,
+## whose comptime @hasDecl hook calls the user's format body and writes
+## the returned text instead of the raw `{any}` dump.
+##
+## Types without a format impl keep the default `{any}` rendering, so
+## this is purely additive.
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Point {
+    pub fun format(self: *const Point) -> str {
+        return "Point<display>";
+    }
+}
+
+struct Plain {
+    v: i32,
+}
+
+fun main() {
+    let p: Point = Point { x: 1, y: 2 };
+    print("p={p}\n");                 # p=Point<display>
+
+    let q: Point = Point { x: 3, y: 4 };
+    print("q={q}\n");                 # q=Point<display>
+
+    # No format impl — raw {any} dump, byte-identical to pre-Display output.
+    let r: Plain = Plain { v: 7 };
+    print("r={r}\n");                 # r=.{ .v = 7 }
+}

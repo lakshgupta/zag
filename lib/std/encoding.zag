@@ -1,7 +1,7 @@
 ## std.encoding — base64, hex, and UTF-8 helpers over byte slices.
 ##
 ## All encode/decode functions return HEAP-allocated slices (backed
-## by __zag_page_alloc) — the caller owns them and must `free` (the
+## by std.mem.alloc_raw) — the caller owns them and must `free` (the
 ## escape analysis warns on unpaired `new`/`alloc`-style returns, and
 ## these count as escaping by design).
 ##
@@ -26,11 +26,12 @@ const HEX_ALPHA: [16]u8 = [16]u8 {
 
 ## RFC 4648 standard-alphabet base64 encode. Output size
 ## ceil(n / 3) * 4; padding `=` added for the final partial group.
+import std.mem.{alloc_raw}
+
 pub fun base64_encode(data: []const u8) -> []u8 {
     let n: usize = data.len;
     let out_len: usize = (n + 2) / 3 * 4;
-    let buf: *raw u8 = __zag_page_alloc(out_len);
-    __zag_bench_alloc(out_len);
+    let buf: *raw u8 = alloc_raw(out_len);
     var i: usize = 0;
     var o: usize = 0;
     while (i + 3 <= n) {
@@ -73,8 +74,7 @@ pub fun base64_decode(data: []const u8) -> []u8 {
     if (n > 0 && data[n - 1] == '=') { pad = pad + 1; }
     if (n > 1 && data[n - 2] == '=') { pad = pad + 1; }
     let out_len: usize = n / 4 * 3 - pad;
-    let buf: *raw u8 = __zag_page_alloc(out_len);
-    __zag_bench_alloc(out_len);
+    let buf: *raw u8 = alloc_raw(out_len);
     var i: usize = 0;
     var o: usize = 0;
     while (i < n) {
@@ -105,8 +105,7 @@ fun b64_val(c: u8) -> u32 {
 ## Lowercase hex encode — 2 output bytes per input byte.
 pub fun hex_encode(data: []const u8) -> []u8 {
     let n: usize = data.len;
-    let buf: *raw u8 = __zag_page_alloc(n * 2);
-    __zag_bench_alloc(n * 2);
+    let buf: *raw u8 = alloc_raw(n * 2);
     var i: usize = 0;
     while (i < n) {
         buf[i * 2] = HEX_ALPHA[(data[i] >> 4) as usize];
@@ -120,8 +119,7 @@ pub fun hex_encode(data: []const u8) -> []u8 {
 pub fun hex_decode(data: []const u8) -> []u8 {
     let n: usize = data.len;
     if (n % 2 != 0) { __zag_panic("std.encoding.hex_decode: odd length"); }
-    let buf: *raw u8 = __zag_page_alloc(n / 2);
-    __zag_bench_alloc(n / 2);
+    let buf: *raw u8 = alloc_raw(n / 2);
     var i: usize = 0;
     while (i < n) {
         let hi: u8 = hex_val(data[i]);

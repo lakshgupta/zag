@@ -1,0 +1,150 @@
+## Semaphore via std.concurrent.semaphore (docs/22)
+##
+##   import std.concurrent.semaphore
+##
+##   var sem: Semaphore = create(n);
+##   wait(&sem);   # take a unit (parks at 0)
+##   post(&sem);   # give a unit (wakes one parked waiter)
+##
+## Pure Zag: the count is a futex-addressable u32 driven by the
+## atomic intrinsics and std.posix's private futex primitives.
+##
+## What this example proves:
+##   1. Bounded concurrency — 6 workers gate on a 3-unit semaphore
+##      around a NON-atomic concurrent-increment probe. The observed
+##      peak of workers inside the section can never exceed 3: if the
+##      semaphore over-issued, the peak would exceed 3 and the assert
+##      fires.
+##   2. Exact unit accounting — every worker takes exactly one unit
+##      (wait) and returns exactly one (post); the final count equals
+##      the initial count.
+##   3. Kernel parking — main waits on a 0-count semaphore for a
+##      worker that posts after a 150ms sleep. The wait must PARK
+##      (FUTEX_WAIT_PRIVATE until the post's wake): elapsed >= 100ms
+##      is the park evidence (a lost wake hangs; a failed park
+##      returns instantly and under-shoots).
+##
+## Run: zag run semaphore.zag
+
+import std.concurrent.semaphore
+import std.concurrent.thread.{spawn, join, Thread}
+import std.time.{Timer, sleep_ms}
+
+## load / store / fetch_add / compare_exchange / assert are language
+## intrinsics (no import) — see docs/22 §Atomics.
+
+const WORKERS: i32 = 6;
+const UNITS: i32 = 3;
+
+struct Probe {
+    sem: Semaphore,
+    active: i32,
+    active_max: i32,
+}
+
+## Track the observed peak of `active` with a CAS max-loop (lock-free
+## maxima: re-read and retry when another thread won the race).
+fun raise_max(m: *i32, v: i32) {
+    let p: *i32 = m;
+    while (true) {
+        let cur: i32 = load(p);
+        if (v <= cur) {
+            return;
+        }
+        if (compare_exchange(p, cur, v)) {
+            return;
+        }
+    }
+}
+
+fun worker_gate(ptr_state: usize) {
+    let st: *Probe = ptr_state as *Probe;
+    ## Gate on the semaphore: at most UNITS workers can be between
+    ## the wait and the post at any instant.
+    wait(addr_of(st.sem));
+    let prev: i32 = fetch_add(addr_of(st.active), 1);
+    raise_max(addr_of(st.active_max), prev + 1);
+    sleep_ms(80);
+    _ = fetch_add(addr_of(st.active), 0 - 1);
+    post(addr_of(st.sem));
+}
+
+## Signal-after-delay worker for the park-path probe.
+fun worker_signal(ptr_sem: usize) {
+    let s: *Semaphore = ptr_sem as *Semaphore;
+    sleep_ms(200);
+    post(s);
+}
+
+fun main() {
+    let st: *Probe = new Probe(Probe {
+        sem: Semaphore { count: UNITS as u32 },
+        active: 0,
+        active_max: 0,
+    });
+    defer free(st);
+
+    ## 1+2. Bounded concurrency + exact accounting.
+    var handles: [WORKERS]Thread = undefined;
+    var i: usize = 0;
+    while (i < WORKERS) {
+        handles[i] = spawn(worker_gate, st as usize);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < WORKERS) {
+        join(handles[i]);
+        i = i + 1;
+    }
+
+    let peak: i32 = load(addr_of(st.active_max));
+    let left: u32 = load(addr_of(st.sem.count));
+    assert(peak <= UNITS);
+    assert(peak >= 2);
+    assert(left == UNITS as u32);
+    print("peak in section = {peak} (cap {UNITS}), final count = {left}\n");
+
+    ## 3. Park path: wait on a FRESH 0-unit semaphore (st.sem still
+    ## holds section-1 units — a wait there would return instantly)
+    ## until the delayed post arrives. Main leads by 100ms, the post
+    ## lands at ~200ms, so the wait must PARK for ~100ms — elapsed
+    ## >= 150ms is the park evidence with margin on both sides (a
+    ## failed park returns at ~100ms; a lost wake hangs forever).
+    var park_sem: Semaphore = Semaphore { count: 0 };
+    let t: Timer = Timer.start();
+    let hsig: Thread = spawn(worker_signal, addr_of(park_sem) as usize);
+    sleep_ms(100);
+    wait(addr_of(park_sem));
+    let elapsed: u64 = t.elapsed().as_millis();
+    assert(elapsed >= 150);
+    print("parked wait elapsed = {elapsed}ms (posted at ~200ms)\n");
+    join(hsig);
+}
+
+@[test]
+fun test_semaphore_serial() {
+    var s: Semaphore = create(1);
+    wait(&s);
+    assert(s.count == 0);
+    post(&s);
+    assert(s.count == 1);
+}
+
+@[test]
+fun test_semaphore_gates_threads() {
+    let st: *Probe = new Probe(Probe {
+        sem: Semaphore { count: 1 },
+        active: 0,
+        active_max: 0,
+    });
+    defer free(st);
+
+    let h1: Thread = spawn(worker_gate, st as usize);
+    let h2: Thread = spawn(worker_gate, st as usize);
+
+    join(h1);
+    join(h2);
+
+    let peak: i32 = load(addr_of(st.active_max));
+    assert(peak == 1);
+}
