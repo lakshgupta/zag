@@ -114,10 +114,10 @@ test "codegen: if-stmt with else-if chain emits chained zig emission" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "    __zag_print(\"other\\n\", .{});") != null);
 }
 
-test "codegen: if-expression emits labeled blk + break :blk" {
+test "codegen: if-expression emits labeled block + break" {
     // The expression form must surface as a labeled block yielding a value:
-    // `(blk: { if (cond) break :blk <then> else break :blk <else>; })`.
-    // The outer `(blk: { … })` makes the rhs parenthesised so it can sit in
+    // `(__blk_N: { if (cond) break :__blk_N <then> else break :__blk_N <else>; })`.
+    // The outer parens make the rhs parenthesised so it can sit in
     // any expression position (e.g. RHS of a `let` binding).
     const src =
         \\fun f() {
@@ -132,7 +132,7 @@ test "codegen: if-expression emits labeled blk + break :blk" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk: { if (x > 0) break :blk 1 else break :blk 0; })") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(__blk_0: { if (x > 0) break :__blk_0 1 else break :__blk_0 0; })") != null);
 }
 
 test "codegen: while-stmt emits zig while verbatim" {
@@ -225,7 +225,7 @@ test "codegen: for-iter non-range emits verbatim iter call" {
 }
 
 test "codegen: match-stmt emits labeled laddered if-else" {
-    // Each arm gets emitted as an `if (<cond>) { break :blk <body>; }`,
+    // Each arm gets emitted as an `if (<cond>) { break :<lbl> <body>; }`,
     // chained via `else`. The scrutinee is bound to a `__m_<N>` temp so
     // arm conditions can refer to the value without re-evaluation.
     const src =
@@ -245,10 +245,12 @@ test "codegen: match-stmt emits labeled laddered if-else" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk: { const __m_0 = n;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "if (__m_0 == 1) { break :blk \"one\"; }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "if (__m_0 == 2) { break :blk \"two\"; }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "if (true) { break :blk \"other\"; }") != null);
+    // The match's labeled block is uniquely named (`__blk_0`) so a nested
+    // match can't collide on a literal `blk`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(__blk_0: { const __m_0 = n;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (__m_0 == 1) { break :__blk_0 \"one\"; }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (__m_0 == 2) { break :__blk_0 \"two\"; }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (true) { break :__blk_0 \"other\"; }") != null);
     // Sanity: trail is appended as a `;` (stmt-position append in
     // genStmt `.match_stmt` arm).
     try std.testing.expect(std.mem.indexOf(u8, zig, "});") != null);
@@ -327,7 +329,7 @@ test "codegen: match-stmt with range arm emits bounds check" {
 
 test "codegen: match-stmt identifies ident arm emits const binding" {
     // An ident-pattern arm (`x => x + 1`) must emit
-    // `const x = __m_<N>;` BEFORE the arm body's `break :blk` so the
+    // `const x = __m_<N>;` BEFORE the arm body's `break :<lbl>` so the
     // body can reference `x`.
     const src =
         \\fun f() {
@@ -345,7 +347,7 @@ test "codegen: match-stmt identifies ident arm emits const binding" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "if (true) { const x = __m_0; break :blk (x + 1); }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "if (true) { const x = __m_0; break :__blk_0 (x + 1); }") != null);
 }
 
 test "codegen: match-counter increments per match" {
@@ -375,12 +377,73 @@ test "codegen: match-counter increments per match" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "const __m_1 = b") != null);
 }
 
+test "codegen: nested same-name match captures do not shadow" {
+    // zig 0.16 rejects an inner local that shadows an outer one, so two
+    // matches nested with the SAME capture name cannot both emit
+    // `const x = ...`. The arm bodies must keep referring to the source
+    // name, so the inner capture is emitted under a unique
+    // `__zag_shadow_<N>` spelling and the lookup in `identEmitName`
+    // rewrites the body's references to match. Without the rename the
+    // generated zig fails with a diagnostic pointing INTO generated code
+    // (surfaced while building examples/error-handling/io_robustness.zag,
+    // which nests `Err(e)` arms).
+    const src =
+        \\fun f(a: i32, b: i32) {
+        \\    match a {
+        \\        x => {
+        \\            match b {
+        \\                x => x,
+        \\                _ => 0,
+        \\            };
+        \\        },
+        \\        _ => 0,
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Outer capture keeps the source spelling...
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const x = __m_0;") != null);
+    // ...the inner one is renamed, and the inner body's reference follows.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const __zag_shadow_0 = __m_1;") != null);
+}
+
+test "codegen: non-colliding match capture emits no shadow rename" {
+    // The rename is drawn only on an actual collision, so an ordinary
+    // single-level match emits exactly what it did before the fix. This
+    // is the property every other pinned match test rests on.
+    const src =
+        \\fun f(a: i32) {
+        \\    match a {
+        \\        x => x + 1,
+        \\        _ => 0,
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const x = __m_0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_shadow_") == null);
+}
+
 test "codegen: match { 3 => 99, _ => 0 } yields 99 for scrutinee 3 and 0 otherwise" {
     // Pairs with examples/control-flow/match_expr.zag's `safe` block:
     //   let safe: i32 = match val { 3 => 99, _ => 0 };
     // Pins the non-wildcard literal arm BEFORE the wildcard — codegens
-    // to `if (__m_0 == 3) { break :blk 99; }` (literal arm) followed by
-    // `break :blk 0;` (wildcard fallback). Mirrors the established
+    // to `if (__m_0 == 3) { break :__blk_0 99; }` (literal arm) followed
+    // by `break :__blk_0 0;` (wildcard fallback). Mirrors the established
     // match-stmt codegen test convention but specifically targets the
     // new non-wildcard-literal-arm shape that was added to the example
     // to exercise scrutinee capture (and to confirm the `3` arm doesn't
@@ -409,13 +472,13 @@ test "codegen: match { 3 => 99, _ => 0 } yields 99 for scrutinee 3 and 0 otherwi
     // The non-wildcard literal arm emits an equality check against the
     // literal `3` — the load-bearing pin (see docstring above).
     try std.testing.expect(std.mem.indexOf(u8, zig, "__m_0 == 3") != null);
-    // Literal arm body emits `break :blk 99` so the match expression
+    // Literal arm body emits `break :__blk_0 99` so the match expression
     // yields 99 when x == 3.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk 99") != null);
-    // Wildcard fallback emits `break :blk 0` — no equality test (the
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_0 99") != null);
+    // Wildcard fallback emits `break :__blk_0 0` — no equality test (the
     // wildcard matches any value, no condition needed). The presence
-    // of `break :blk 0` distinguishes this arm from the literal arm above.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk 0") != null);
+    // of `break :__blk_0 0` distinguishes this arm from the literal arm above.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_0 0") != null);
     // Negative pins (closes reviewer finding's rigor gap):
     // - "literal 3 actually reached codegen" — a regression that
     //   substituted the scrutinee identifier `__m_0` for the
@@ -428,6 +491,66 @@ test "codegen: match { 3 => 99, _ => 0 } yields 99 for scrutinee 3 and 0 otherwi
     //   within a single init() would surface as `__m_1` (or higher)
     //   appearing in the output despite only one match being present.
     try std.testing.expect(std.mem.indexOf(u8, zig, "__m_1") == null);
+}
+
+test "codegen: nested match emits distinct block labels" {
+    // A match inside another match's arm must not reuse the match block's
+    // label — a literal `blk` produced zig's "redefinition of label
+    // 'blk'". Each match now draws a unique `__blk_<N>` from the shared
+    // per-function counter, so the inner match gets `__blk_1`.
+    const src =
+        \\fun f() {
+        \\    match a {
+        \\        1 => match b {
+        \\            2 => 20,
+        \\            _ => 0,
+        \\        },
+        \\        _ => 0,
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__blk_0: { const __m_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__blk_1: { const __m_1") != null);
+    // No literal `blk:` label survives the rename.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk:") == null);
+}
+
+test "codegen: match arm with tail return emits a real return" {
+    // A `return` inside an arm returns from the FUNCTION, not from the
+    // match block. The old code lowered a tail `return EXPR` to
+    // `break :blk EXPR`, which made a statement-position match whose arms
+    // disagreed on value type (returning arm vs void arm) miscompile.
+    const src =
+        \\fun f() {
+        \\    match a {
+        \\        1 => {
+        \\            return 7;
+        \\        },
+        \\        _ => {
+        \\            print("x");
+        \\        },
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "return 7;") != null);
+    // The returning arm must NOT be turned into a match-value break.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_0 7") == null);
 }
 
 test "codegen: break-stmt emits zig break;" {
@@ -493,6 +616,93 @@ test "codegen: bare return emits `return;`" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     try std.testing.expect(std.mem.indexOf(u8, zig, "    return;") != null);
+}
+
+/// Count non-overlapping occurrences of `needle` in `haystack`.
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var rest = haystack;
+    while (std.mem.indexOf(u8, rest, needle)) |pos| {
+        count += 1;
+        rest = rest[pos + needle.len ..];
+    }
+    return count;
+}
+
+test "codegen: match whose arms all end in real statements emits an UNLABELED block" {
+    // A match arm only emits `break :<lbl>` when it carries the match's
+    // VALUE. When every arm ends in a real statement instead — an
+    // assignment, a `return`/`break`/`continue` — nothing breaks the
+    // label, and zig rejects the leftover one with "unused block
+    // label". That made an ordinary statement-position match fail to
+    // compile:
+    //
+    //   match r {
+    //       Ok(n) => { total = total + n; },
+    //       Err(e) => { return Err(e); },
+    //   }
+    //
+    // The fix emits `({ ... })` with no label at all in that case.
+    const src =
+        \\fun f() {
+        \\    match a {
+        \\        1 => {
+        \\            x = 1;
+        \\        },
+        \\        _ => {
+        \\            x = 2;
+        \\        },
+        \\    };
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // Unlabeled: `({ const __m_0 = ...`
+    try std.testing.expect(std.mem.indexOf(u8, zig, "({ const __m_0") != null);
+    // And no label was invented for it.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__blk_0: { const __m_0") == null);
+    // Both arms are still emitted in full.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "x = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "x = 2;") != null);
+}
+
+test "codegen: match with more than 16 arms emits every arm" {
+    // parseMatchExpr's arm buffer was a hardcoded `[16]`, indexed without
+    // a bounds check: a match with 17+ arms — an ordinary thing to write,
+    // e.g. one arm per variant of an enum — ran past the end of the
+    // buffer and aborted the COMPILER with `index out of bounds` and no
+    // diagnostic. The cap is now the same 256 the parser uses for other
+    // list-shaped constructs, with a guard that reports a parse error.
+    var src_buf: [1024]u8 = undefined;
+    var n: usize = 0;
+    n += (std.fmt.bufPrint(src_buf[n..], "fun f() -> i32 {{\n    return match a {{\n", .{}) catch unreachable).len;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        n += (std.fmt.bufPrint(src_buf[n..], "        {d} => {d},\n", .{ i, i * 2 }) catch unreachable).len;
+    }
+    n += (std.fmt.bufPrint(src_buf[n..], "        _ => 0,\n    }};\n}}\n", .{}) catch unreachable).len;
+    const src = src_buf[0..n];
+
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    // All 20 numbered arms were parsed and emitted as scrutinee tests.
+    try std.testing.expectEqual(@as(usize, 20), countOccurrences(zig, "__m_0 == "));
+    // 21 value breaks: the 20 numbered arms plus the `_ => 0` arm, which
+    // yields a value too (only real-statement tails skip the break).
+    try std.testing.expectEqual(@as(usize, 21), countOccurrences(zig, "break :__blk_0 "));
+    // And the highest-numbered literal arm really was emitted.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__m_0 == 19") != null);
 }
 
 test "codegen: defer stmt emits defer verbatim" {

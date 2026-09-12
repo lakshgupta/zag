@@ -125,6 +125,16 @@ pub const ExprPayload = union(enum) {
     /// early-returns `None`. Emits a labeled block + switch at codegen time.
     /// Built by `Parser.parsePostfix` when a `?` token follows an expression.
     try_op: TryOp,
+    /// `expr!` — postfix PANICKING unwrap, the mirror of `expr?`. On a
+    /// `Result<T,E>` it yields the `Ok(T)` value and panics on `Err(E)`;
+    /// on an `Option<T>` it yields `Some(T)` and panics on `None`. Where
+    /// `?` is the propagate-on-error form and `catch` the recover-with-a-
+    /// fallback form, `!` is the fail-fast form — which is what lets a
+    /// library publish ONE fallible method instead of a checked name plus
+    /// a `*_or_panic` twin (`f.read_at(buf, off)` / `f.read_at(buf, off)!`).
+    /// Built by the postfix chain when a `!` token follows an expression
+    /// (`!=` lexes as one token, so the two never collide).
+    unwrap_op: UnwrapOp,
     /// `expr catch HANDLER` — error-handling expression. Evaluates `expr`;
     /// if it is `Ok(T)`, yields the `T` value; if it is `Err(E)`, evaluates
     /// `handler` (an expression serving as the default value) or, when
@@ -530,6 +540,13 @@ pub const ExprPayload = union(enum) {
     /// `BinaryExpr.lhs` — the Expr union's size would explode if every
     /// variant carried a value-typed Expr child.
     pub const TryOp = struct {
+        expr: *Expr,
+    };
+
+    /// Backing struct for `Expr.unwrap_op` — `expr!` postfix panicking
+    /// unwrap. `expr` is `*Expr` for the same cycle-breaking reason as
+    /// `TryOp.expr`.
+    pub const UnwrapOp = struct {
         expr: *Expr,
     };
 

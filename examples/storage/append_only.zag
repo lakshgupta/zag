@@ -20,12 +20,15 @@
 ##   2. std.bytes varints — 1 byte for small lengths instead of 8.
 ##   3. std.io.FileWriter / FileReader — page-buffered streaming out
 ##      of / into an fd (many small records, few syscalls).
-##   4. std.fs.File.open_append — O_APPEND makes seek-to-end + write
-##      atomic, so two writers cannot interleave a record.
+##   4. std.fs.File.open(path, FileMode.Append) — O_APPEND makes
+##      seek-to-end + write atomic, so two writers cannot interleave a
+##      record. Every fallible File method returns a Result and the
+##      caller spells the failure policy at the call site with postfix
+##      `!` (`fa.sync()!`), `?`, `catch`, or `match` (docs/manual/19).
 ##
 ## Run: zag run append_only.zag
 
-import std.fs.{File}
+import std.fs.{File, FileMode}
 import std.io.{ByteWriter, ByteReader, FileWriter, FileReader}
 import std.bytes.{eq as bytes_eq, varint_len as vi_len}
 
@@ -78,9 +81,9 @@ fun main() {
 
     ## Write: buffered appends, then flush + fsync (the record is
     ## only durable after those two).
-    var f: File = File.create(path);
-    f.close();
-    var fa: File = File.open_append(path);
+    var f: File = File.open(path, FileMode.Create)!;
+    f.close()!;
+    var fa: File = File.open(path, FileMode.Append)!;
 
     var wbuf: [4096]u8 = undefined;
     var w: FileWriter = FileWriter.init(fa.fd, wbuf[0..]);
@@ -92,19 +95,19 @@ fun main() {
     # split on: length-prefixing makes it a non-event.
     append_record(&w, OP_PUT, "carol", "a|b\nc");
     w.flush();
-    fa.sync();
+    fa.sync()!;
 
-    let byte_len: usize = fa.size();
+    let byte_len: usize = fa.size()!;
     print("wrote {byte_len} bytes to {path}\n");
 
     ## Read the whole log back through a buffered reader.
     var log: [8192]u8 = undefined;
-    var fr: File = File.open(path);
+    var fr: File = File.open(path, FileMode.Read)!;
     var rb: [4096]u8 = undefined;
     var rd: FileReader = FileReader.init(fr.fd, rb[0..]);
     let total: usize = rd.read(log[0..]);
-    fr.close();
-    fa.close();
+    fr.close()!;
+    fa.close()!;
     print("read back {total} bytes\n");
 
     ## Scan for each key: last-write-wins, and a delete is visible

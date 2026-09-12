@@ -25,9 +25,15 @@
 ##   5. std.fs.File.size / truncate / sync / block_count — file
 ##      extent management and the durability barrier.
 ##
+## Every fallible File method returns Result(_, Error) and the caller
+## spells the failure policy at the call site with postfix `!`
+## (`f.sync()!`), `?`, `catch`, or `match` (docs/manual/19). The old
+## `*_or_panic` twins are gone; `File.open(path, mode)` is the single
+## constructor (docs/manual/30).
+##
 ## Run: zag run page_file.zag
 
-import std.fs.{File, PAGE_SIZE}
+import std.fs.{File, FileMode, PAGE_SIZE}
 import std.io.{ByteWriter, ByteReader}
 import std.bytes.{eq as bytes_eq, get_u32_le as read_u32_at}
 import std.hash.{crc32}
@@ -126,12 +132,12 @@ fun page_verify(page: []const u8) -> bool {
 
 fun main() {
     let path: str = "/tmp/zag_page_file.pages";
-    var f: File = File.create(path);
+    var f: File = File.open(path, FileMode.Create)!;
 
     ## Pre-extend to 2 pages: a real store grows the file in extents
     ## rather than one write at a time.
-    f.truncate(PAGE_SIZE * 2);
-    print("pre-extended to {f.size()} bytes ({f.block_count()} pages)\n");
+    f.truncate(PAGE_SIZE * 2)!;
+    print("pre-extended to {f.size()!} bytes ({f.block_count()!} pages)\n");
 
     ## Build page 0 in memory, then write it as one block.
     var page: [PAGE_SIZE]u8 = undefined;
@@ -143,12 +149,12 @@ fun main() {
     count = page_add(page[0..], "beta");
     count = page_add(page[0..], "gamma");
     assert(count == 3);
-    f.write_block(0, page[0..]);
-    f.sync();
+    f.write_block(0, page[0..])!;
+    f.sync()!;
 
     ## Read page 0 back by block id and verify + decode it.
     var back: [PAGE_SIZE]u8 = undefined;
-    let ok: bool = f.read_block(0, back[0..]);
+    let ok: bool = f.read_block(0, back[0..])!;
     assert(ok);
     assert(page_verify(back[0..]));
 
@@ -183,22 +189,22 @@ fun main() {
         i = i + 1;
     }
     assert(full);
-    f.write_block(1, page1[0..]);
-    f.sync();
+    f.write_block(1, page1[0..])!;
+    f.sync()!;
     print("page 1: held {added} x 64B rows before it filled (rolled over)\n");
 
-    f.close();
+    f.close()!;
 
     ## Reopen read-only: pages are still there (durability check).
-    var g: File = File.open(path);
-    assert(g.block_count() == 2);
+    var g: File = File.open(path, FileMode.Read)!;
+    assert(g.block_count()! == 2);
     var again: [PAGE_SIZE]u8 = undefined;
-    assert(g.read_block(0, again[0..]));
+    assert(g.read_block(0, again[0..])!);
     assert(page_verify(again[0..]));
     let n1: usize = page_get(again[0..], 1, val[0..]);
     assert(bytes_eq(val[0..n1], "beta"));
-    print("reopened: {g.block_count()} pages, slot1={val[0..n1]}\n");
-    g.close();
+    print("reopened: {g.block_count()!} pages, slot1={val[0..n1]}\n");
+    g.close()!;
 }
 
 @[test]
@@ -218,21 +224,21 @@ fun test_page_add_get_roundtrip() {
 
 @[test]
 fun test_block_write_read_file() {
-    var f: File = File.create("/tmp/zag_page_test.pages");
-    f.truncate(PAGE_SIZE);
+    var f: File = File.open("/tmp/zag_page_test.pages", FileMode.Create)!;
+    f.truncate(PAGE_SIZE)!;
     var page: [PAGE_SIZE]u8 = undefined;
     var i: usize = 0;
     while (i < PAGE_SIZE) { page[i] = 0; i = i + 1; }
     _ = page_add(page[0..], "block");
-    f.write_block(3, page[0..]);
+    f.write_block(3, page[0..])!;
 
     var back: [PAGE_SIZE]u8 = undefined;
-    assert(f.read_block(3, back[0..]));
+    assert(f.read_block(3, back[0..])!);
     assert(page_verify(back[0..]));
     var out: [64]u8 = undefined;
     let n: usize = page_get(back[0..], 0, out[0..]);
     assert(bytes_eq(out[0..n], "block"));
     # Reading a block past EOF reports absent rather than garbage.
-    assert(!f.read_block(9, back[0..]));
-    f.close();
+    assert(!f.read_block(9, back[0..])!);
+    f.close()!;
 }

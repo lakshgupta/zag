@@ -10,7 +10,8 @@
 ## overridden with `seed_from(entropy: u64)` for reproducibility.
 ## Not cryptographically secure — use for tests, shuffles, jitter.
 
-import std.posix.{openat, read}
+import std.posix.{openat, close, read_full}
+import std.errno.{Errno}
 
 pub struct XorShift64Star {
     state: u64,
@@ -55,11 +56,30 @@ impl XorShift64Star {
 }
 
 fun urandom_u64() -> u64 {
+    const FALLBACK: u64 = 0x9E3779B97F4A7C15;
     var buf: [8]u8 = undefined;
-    const fd: usize = openat(std.posix.AT.FDCWD, "/dev/urandom", 0, 0);
-    let n: isize = read(fd as i32, buf[0..], 8);
-    if (n < 8) {
-        return 0x9E3779B97F4A7C15;
+    # posix.openat returns Result(i32, Errno): a failed open is an `Err`,
+    # not a high-bit-set usize that a `fd as i32` would TRAP on (the old
+    # shape aborted the process instead of falling back to the seed).
+    let fr: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/dev/urandom", 0, 0);
+    if let Err(_) = fr { return FALLBACK; }
+    var fd: i32 = 0;
+    if let Ok(v) = fr { fd = v; }
+    # read_full retries EINTR and accumulates short reads, so a signal
+    # or a partial transfer can no longer masquerade as "not enough
+    # bytes". Anything short of a full 8 — a real errno or EOF — falls
+    # back to the fixed seed. Close on every path so a failure cannot
+    # leak the fd.
+    let r: Result(usize, Errno) = read_full(fd, buf[0..]);
+    if let Err(_) = r {
+        _ = close(fd); # deliberate discard: read-only fd on a failure path; the read errno is the primary failure.
+        return FALLBACK;
+    }
+    var have: usize = 0;
+    if let Ok(n) = r { have = n; }
+    if (have < 8) {
+        _ = close(fd); # deliberate discard: read-only fd; a short /dev/urandom read is not a durability failure.
+        return FALLBACK;
     }
     var out: u64 = 0;
     # Build little-endian via a running byte weight: zig 0.16 requires
@@ -73,6 +93,6 @@ fun urandom_u64() -> u64 {
         if (i < 7) { place = place * 256; }
         i = i + 1;
     }
-    _ = std.os.linux.close(fd as i32);
+    _ = close(fd); # deliberate discard: /dev/urandom was opened read-only, so there is no write-back to lose.
     return out;
 }

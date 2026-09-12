@@ -84,7 +84,7 @@ A comprehensive guide to the Zag programming language.
 | Arrays `[N]T` | Stack | Automatic | Automatic |
 | Tuples | Stack | Automatic | Automatic |
 | Slices `[]T` | Stack (ptr+len) | Automatic | Automatic |
-| `String` | Heap | `new String(...)` | `free(s)` |
+| `String` | Heap | `String.from_str(...)` / `String.with_capacity(n)` | `s.deinit()` |
 | `new T(...)` | Heap | `new T(...)` | `free(p)` |
 | Arena | Heap | `new(arena, T(...))` | `arena.free_all()` |
 | `const` | Static | Compile-time | Never |

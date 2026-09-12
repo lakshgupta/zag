@@ -52,12 +52,12 @@ String literals produce `[]const u8` — a borrowed view with no allocation:
 
 ```
 let greeting: []const u8 = "hello";
-let owned    = new String("hello"); # String — heap-allocated, must be free'd
+var owned: String = String.from_str("hello");  # String — heap-allocated copy
 ```
 
 **Memory:**
 - `"hello"` — stack-allocated pointer + length. No heap allocation. The character bytes live in static read-only memory.
-- `new String("hello")` — heap allocation via global allocator. Must be `free`d.
+- `String.from_str("hello")` — heap allocation through `std.mem`'s mmap-backed raw tier. Release it with `owned.deinit()`; the binding must be `var`, because `deinit` takes `*String`. There is no `new String(...)` form.
 
 String interpolation:
 
@@ -67,7 +67,7 @@ let msg: []u8 = "hello, {name}";
 print("{msg}\n");
 ```
 
-**Memory:** Interpolation allocates a new `String` via `Display.write`. Inside `print` / `eprint`, interpolation is **zero-alloc** — values are written directly to the writer buffer. Outside `print`, use `String.with_writer(|w| { ... })` for zero-alloc formatting into a pre-allocated buffer.
+**Memory:** Inside `print` / `eprint`, interpolation is **zero-alloc** — values are written straight to the output writer. Assigned to a slice binding, the bytes are materialized in that binding. To build an owned `String` from formatted pieces, `push_str` / `push_ch` them and release the buffer with `deinit` (see the strings chapter); there is no `String.with_writer`.
 
 ## Byte String Literals
 

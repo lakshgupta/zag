@@ -49,15 +49,38 @@ const Codegen = core.Codegen;
         var i: u32 = 0;
         while (i < er.site_count) : (i += 1) {
             if ((er.leaks >> @intCast(i)) & 1 == 0) continue;
+            const site = er.sites[i];
             const loc = er.site_locs[i];
             const symbol = if (self.current_symbol.len > 0) self.current_symbol else "<top>";
-            std.debug.print("warning: `new {s}` at {s}:{d}:{d} in {s} is never freed (leak) — add an explicit `free` or `defer free`\n", .{
-                er.sites[i].type_name,
-                if (self.source_path.len > 0) self.source_path else "<source>",
-                loc.line,
-                loc.col,
-                symbol,
-            });
+            const src = if (self.source_path.len > 0) self.source_path else "<source>";
+            if (site.kind == .alloc_fn) {
+                // The deallocator depends on which member of the
+                // std.mem family this is: `alloc(n)` returns a `[]u8`
+                // (`free buf` — the keyword's slice overload), while
+                // `alloc_raw(n)` returns a `[*]u8`, which the `free`
+                // keyword would route through its POINTER overload; the
+                // raw tier's documented pairing is `release(p, n)`.
+                const hint: []const u8 = if (std.mem.eql(u8, site.fn_name, "alloc"))
+                    "— add an explicit `free` or `defer free`"
+                else
+                    "— add an explicit `release(p, n)` or `defer release(p, n)`";
+                std.debug.print("warning: `{s}` at {s}:{d}:{d} in {s} is never freed (leak) {s}\n", .{
+                    site.fn_name,
+                    src,
+                    loc.line,
+                    loc.col,
+                    symbol,
+                    hint,
+                });
+            } else {
+                std.debug.print("warning: `new {s}` at {s}:{d}:{d} in {s} is never freed (leak) — add an explicit `free` or `defer free`\n", .{
+                    site.type_name,
+                    src,
+                    loc.line,
+                    loc.col,
+                    symbol,
+                });
+            }
         }
     }
 
@@ -348,6 +371,7 @@ const Codegen = core.Codegen;
                     for (cl.body) |bs| self.walkStmt(bs);
                 },
                 .try_op => |t| self.walkExpr(t.expr.*),
+                .unwrap_op => |u| self.walkExpr(u.expr.*),
                 .catch_expr => |c| {
                     self.walkExpr(c.expr.*);
                     self.walkExpr(c.handler.*);
@@ -431,6 +455,11 @@ const Codegen = core.Codegen;
         self.alloc_counter = 0;
         self.match_counter = 0;
         self.blk_counter = 0;
+        // Fresh function body: no synthetic-binding rename is in scope
+        // (scopes are balanced by construction, so this is a guard, not a
+        // repair), and shadow renames restart at `__zag_shadow_0`.
+        self.rename_len = 0;
+        self.shadow_counter = 0;
         self.current_symbol = m.name;
         self.type_info_count = 0;
         // v1.7 param-type seeding (mirror of genFun's): the generic-
@@ -622,8 +651,22 @@ const Codegen = core.Codegen;
                     if (!std.mem.eql(u8, impl.target_type, embed_type)) continue;
                     for (impl.methods) |m4| {
                         if (m4.trait_name != null) continue;
+                        // Shadowing (docs/manual/30 "Embedded Methods"):
+                        // the outer type's own method wins over a promoted
+                        // one with the same name and arity -- `c.show()`
+                        // calls Child.show, not Base.show. Without this
+                        // skip the forwarder and the outer method are two
+                        // struct members with one name, which zig rejects
+                        // with "duplicate struct member name". The base's
+                        // other signatures of that name stay reachable
+                        // through the named embed field (`c.Base.show()`).
+                        if (self.outerShadowsPromoted(sd.name, m4.name, m4.params.len)) continue;
                         self.write("    pub fn ");
-                        self.write(m4.name);
+                        // A base method that is itself overloaded carries a
+                        // mangled name, and its forwarder has to match --
+                        // otherwise two base overloads would forward under
+                        // one spelling and collide in the outer struct.
+                        self.write(self.methodZigName(embed_type, m4));
                         self.write("(");
                         // Rewrite the first param (self) to the outer type.
                         // The receiver constness mirrors the EMBEDDED
@@ -661,7 +704,7 @@ const Codegen = core.Codegen;
                         self.write("self.");
                         self.write(embed_type);
                         self.write(".");
-                        self.write(m4.name);
+                        self.write(self.methodZigName(embed_type, m4));
                         self.write("(");
                         // p5[0] is the embedded receiver: the inner call
                         // is a METHOD call on `self.<Embed>` — zig's
@@ -733,7 +776,11 @@ const Codegen = core.Codegen;
                     // Phase 2 tail: thread impl-level type_params so the
                     // nested method emits `comptime X: type` BEFORE its
                     // own params. Mirrors genFreeMethod's call update.
-                    self.genMethod(m, impl.type_params);
+                    // Overload mangling (docs/manual/30): the EMITTED name
+                    // is signature-encoded when the type overloads the
+                    // name, so two same-name methods land as distinct
+                    // struct members.
+                    self.genMethod(m, impl.type_params, self.methodZigName(sd.name, m));
                     self.current_receiver_struct_name = null;
                 }
             }
@@ -763,7 +810,11 @@ fn structHasFieldNamed(sd: ast.StructDecl, name: []const u8) bool {
     return false;
 }
 
-    pub     fn genMethod(self: *Codegen, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
+    /// `zig_name` is the name the method is EMITTED under: `m.name` for a
+    /// unique method, or the signature-encoded overload spelling from
+    /// `methodZigName` (docs/manual/30). The call site computes it the
+    /// same way from the same MethodDecl, so the two cannot drift.
+    pub     fn genMethod(self: *Codegen, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam, zig_name: []const u8) void {
         // Doc comment on the method (`## ...` before it in the impl
         // body) — emitted as zig `///` lines, same as genFun.
         if (m.doc) |d| self.genDocComment(d);
@@ -773,7 +824,7 @@ fn structHasFieldNamed(sd: ast.StructDecl, name: []const u8) bool {
         // when NOT already tracking; the caller's reset handles the
         // restore.
         self.write("    pub fn ");
-        self.write(m.name);
+        self.write(zig_name);
         self.write("(");
         // Generics impl-level type_params preamble. Mirrors genFun
         // — emits `comptime X: type` (or `comptime X: TYPE`) for each
@@ -817,6 +868,11 @@ fn structHasFieldNamed(sd: ast.StructDecl, name: []const u8) bool {
         self.alloc_counter = 0;
         self.match_counter = 0;
         self.blk_counter = 0;
+        // Fresh function body: no synthetic-binding rename is in scope
+        // (scopes are balanced by construction, so this is a guard, not a
+        // repair), and shadow renames restart at `__zag_shadow_0`.
+        self.rename_len = 0;
+        self.shadow_counter = 0;
         self.current_symbol = m.name;
         // Re-populate the per-function type-info map for any locally-
         // declared typed bindings inside the method body so the
@@ -1984,7 +2040,7 @@ fn structHasFieldNamed(sd: ast.StructDecl, name: []const u8) bool {
                     // the nested-on-enum method emits `comptime X:
                     // type` BEFORE its own params. Same path as
                     // genStructDecl.
-                    self.genMethod(m, impl.type_params);
+                    self.genMethod(m, impl.type_params, self.methodZigName(impl.target_type, m));
                     self.current_receiver_struct_name = null;
                 }
             }
@@ -2052,6 +2108,11 @@ fn structHasFieldNamed(sd: ast.StructDecl, name: []const u8) bool {
         // their own counters to start fresh at `_0`.
         self.match_counter = 0;
         self.blk_counter = 0;
+        // Fresh function body: no synthetic-binding rename is in scope
+        // (scopes are balanced by construction, so this is a guard, not a
+        // repair), and shadow renames restart at `__zag_shadow_0`.
+        self.rename_len = 0;
+        self.shadow_counter = 0;
         // Top-level `fun` is parsed for return_type in Phase 2, but
         // `fn_returns_value` is only relevant for impl-block methods
         // where the typed-return drives tail-position match emission.
@@ -2293,6 +2354,11 @@ fn structHasFieldNamed(sd: ast.StructDecl, name: []const u8) bool {
         self.alloc_counter = 0;
         self.match_counter = 0;
         self.blk_counter = 0;
+        // Fresh function body: no synthetic-binding rename is in scope
+        // (scopes are balanced by construction, so this is a guard, not a
+        // repair), and shadow renames restart at `__zag_shadow_0`.
+        self.rename_len = 0;
+        self.shadow_counter = 0;
 
         // Type-info seeding (mirror of genFun): the `as`-cast
         // lowerings (pointer→int @intFromPtr, float→int

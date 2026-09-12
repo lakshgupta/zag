@@ -65,4 +65,10 @@ comptime {
     // parsing, lockfile derive, toml splicing. Imports only std,
     // so no build_options/toolchain coupling rides along.
     _ = @import("project.zig");
+    // Shared syscall layer (src/sys.zig) — errno decoding + EINTR-safe
+    // transfers for the compiler's own IO. Imports only std, so this
+    // adds no build_options/toolchain coupling either. Without this
+    // entry sys.zig's callers (all in main.zig, which the test module
+    // does NOT import) would leave this layer untested.
+    _ = @import("tests/sys.zig");
 }

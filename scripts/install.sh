@@ -7,10 +7,10 @@
 ## source-clone + zig-bundling logic; the user-facing one-liner is
 ## `zag-install.sh` at the repo root):
 ##
-##   curl -fsSL https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh | bash
+##   curl -fsSL https://raw.githubusercontent.com/lakshgupta/zag/main/zag-install.sh | bash
 ##
 ## Or with options:
-##   curl -sSO https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh && bash zag-install.sh --version v0.1.0
+##   curl -sSO https://raw.githubusercontent.com/lakshgupta/zag/main/zag-install.sh && bash zag-install.sh --version v0.1.0
 ##
 ## Environment variables:
 ##   ZAG_HOME        Install directory (default: ~/.zag)
@@ -22,7 +22,9 @@ set -euo pipefail
 
 ZAG_HOME="${ZAG_HOME:-$HOME/.zag}"
 ZAG_BIN_DIR="${ZAG_HOME}/bin"
-ZAG_REPO="zag-lang/zag"
+# GitHub repo slug (`owner/repo`) whose Releases host the archives.
+# Overridable via ZAG_REPO for forks / mirrors.
+ZAG_REPO="${ZAG_REPO:-lakshgupta/zag}"
 GITHUB_DOWNLOAD="https://github.com/${ZAG_REPO}/releases"
 ZAG_VERSION="${ZAG_VERSION:-latest}"
 
@@ -422,6 +424,31 @@ done
 
 # ── Platform detection ───────────────────────────────────────────────────────
 
+# Resolve the exact release tag this install targets. Sets RELEASE_TAG
+# (the `v`-prefixed git tag) and RELEASE_BARE (tag without the `v`).
+# `latest` is resolved via the GitHub API because archive filenames embed
+# the version (`zag-0.2.0-...`), which isn't knowable statically.
+# An explicit tag (`--version v0.1.0`) is used verbatim. Defined before
+# detect_platform because that function builds the versioned filename.
+resolve_release_version() {
+    if [ "$ZAG_VERSION" = "latest" ]; then
+        RELEASE_TAG=""
+        if command -v curl >/dev/null 2>&1; then
+            RELEASE_TAG="$(curl -fsSL --retry 3 "https://api.github.com/repos/${ZAG_REPO}/releases/latest" 2>/dev/null | grep -oE '"tag_name": *"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+        elif command -v wget >/dev/null 2>&1; then
+            RELEASE_TAG="$(wget -qO- --tries=3 "https://api.github.com/repos/${ZAG_REPO}/releases/latest" 2>/dev/null | grep -oE '"tag_name": *"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+        fi
+        if [ -z "$RELEASE_TAG" ]; then
+            error "Could not resolve the latest Zag release from GitHub."
+            echo "  Check your network, or pin a tag with --version v0.X.Y."
+            exit 1
+        fi
+    else
+        RELEASE_TAG="$ZAG_VERSION"
+    fi
+    RELEASE_BARE="${RELEASE_TAG#v}"
+}
+
 detect_platform() {
     local os arch
 
@@ -456,8 +483,6 @@ detect_platform() {
     else
         PLATFORM_EXT="tar.gz"
     fi
-
-    PLATFORM_FILE="zag-${os}-${arch}.${PLATFORM_EXT}"
 }
 
 detect_platform
@@ -566,11 +591,17 @@ info "Install to:  ${ZAG_BIN_DIR}"
 # Setup directories
 mkdir -p "$ZAG_BIN_DIR"
 
+# Resolve the release tag + build the versioned archive filename. Done
+# lazily here (not in detect_platform) so `--check` / `--uninstall` /
+# already-installed short-circuits never hit the network for `latest`.
+resolve_release_version
+PLATFORM_FILE="zag-${RELEASE_BARE}-${PLATFORM_OS}-${PLATFORM_ARCH}.${PLATFORM_EXT}"
+
 # Download URL
 if [ "$ZAG_VERSION" = "latest" ]; then
     DOWNLOAD_URL="${GITHUB_DOWNLOAD}/latest/download/${PLATFORM_FILE}"
 else
-    DOWNLOAD_URL="${GITHUB_DOWNLOAD}/download/${ZAG_VERSION}/${PLATFORM_FILE}"
+    DOWNLOAD_URL="${GITHUB_DOWNLOAD}/download/${RELEASE_TAG}/${PLATFORM_FILE}"
 fi
 
 # Download and extract

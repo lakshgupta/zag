@@ -1,0 +1,386 @@
+## error-handling/io_robustness.zag — the fail-closed IO contract.
+##
+## Every IO entry point in lib/std/ now has a defined failure story:
+##
+##   * EOF (a 0-byte read) is NOT an error — the stream fns report it
+##     as null/false. A real read errno is an Err instead of being
+##     collapsed into a silent short read (the old bug).
+##   * EINTR is a signal interrupting a syscall before any bytes
+##     moved. It is retried internally everywhere (read/write/pread/
+##     pwrite) and never surfaces as a failure to the caller.
+##   * write_file returns Ok only once the bytes AND the directory
+##     entry are durable (file fsync + close check + parent-dir
+##     fsync). Any failure is an Err — a durability failure is never
+##     reported as success.
+##   * File.close checks close(2)'s deferred writeback error instead
+##     of discarding it.
+##   * File (P2 rebuild) returns Result from every fallible method,
+##     retains its parent directory, and exposes a `close_durable`
+##     that flushes contents + directory entry. There is exactly ONE
+##     spelling of each operation: the `*_or_panic` twins are gone,
+##     and the failure policy lives at the CALL SITE — `f.sync()!`
+##     panics, `?` propagates, `catch` falls back, `match` branches
+##     (docs/manual/19). `try_open` is gone too: `open` returns a
+##     Result, so there is no `fd == -1` sentinel to misread.
+##   * The errno-encoded `usize` syscall returns are decoded in exactly
+##     one place (std.posix's Result tier), so a failed openat cannot
+##     trap with "integer does not fit in destination type" and no call
+##     site hand-tests a sign bit. See posix_tier.zag for that contract.
+##   * Injected errnos land on the canonical Error variants rather than
+##     collapsing into a generic failure: a write-opened 0o444 file is
+##     Error.Permission, a directory fd is Error.Io (NOT a 0-byte
+##     "success" from read_at), and /dev/full fails the durable write
+##     instead of reporting the bytes as durable. Each row skips itself
+##     on a host that cannot inject it (root bypasses the mode bits; a
+##     non-Linux host has no /dev/full).
+##
+## This fixture keeps those paths covered at RUNTIME. It must never
+## panic: every failure below is handled, not asserted away.
+##
+## Run: zag run io_robustness.zag
+
+import std.fs.{write_file, read_file, File, FileMode, PARENT_CAP}
+import std.posix.{openat, close}
+import std.errno.{ErrnoKind}
+import std.mem.{alloc, release}
+import std.random.{XorShift64Star}
+import std.types.{String}
+import std.error.{Error}
+
+fun main() {
+    # ── write_file: durable success + a real failure as a value ──
+    let path: str = "/tmp/zag_io_robustness.txt";
+    match write_file(path, "durable bytes\n") {
+        Ok(n) => print("write_file ok -> {n} bytes\n"),
+        Err(e) => print("write_file FAILED\n"),
+    }
+
+    match write_file("/nonexistent-dir-xyz/f.txt", "x") {
+        Ok(n) => print("write_file bad path -> unexpected Ok\n"),
+        Err(e) => print("write_file bad path -> Err (correct)\n"),
+    }
+
+    # Read it back through the recoverable reader.
+    let back: Result(String, Error) = read_file(path);
+    match back {
+        Ok(data) => print("read back {data.as_str().len} bytes\n"),
+        Err(e) => print("read back FAILED\n"),
+    }
+
+    # ── File handle: create / append / sync / close / reopen ────────
+    var f: File = File.open("/tmp/zag_io_robustness_h.bin", FileMode.Create)!;
+    let wrote: usize = f.append("abcdef")!;
+    f.sync()!;
+    f.close()!;
+    print("append {wrote}, is_open {f.is_open()}\n");
+
+    var g: File = File.open("/tmp/zag_io_robustness_h.bin", FileMode.Read)!;
+    let sz: usize = g.size()!;
+    g.close()!;
+    print("reopened size {sz}\n");
+
+    # ── injected errnos land on the canonical Error variants ───────
+    # A 0o444 file: the read bit is set, the write bit is not. There is
+    # no chmod binding in std.posix, but openat passes the mode at
+    # creation time, so the mode IS the injection.
+    # 0xC1 is O_WRONLY|O_CREAT|O_EXCL: the first run creates the 0o444
+    # file, and every later run reuses it (EEXIST) instead of re-opening
+    # it for writing — which would itself be EACCES and look like a
+    # failure to set up the fixture.
+    let ro: str = "/tmp/zag_io_robustness_ro.txt";
+    # The result is deliberately discarded: created on the first run,
+    # EEXIST (the same 0o444 end state) on every later one.
+    _ = openat(std.posix.AT.FDCWD, ro, 0xC1, 0o444);
+    match write_file(ro, "denied\n") {
+        Ok(n) => print("write_file on a 0o444 file -> unexpectedly Ok\n"),
+        Err(e) => print("write_file on a 0o444 file -> Err (Permission, or skipped as root)\n"),
+    }
+    match File.open(ro, FileMode.Rw) {
+        Ok(h) => { _ = h.close(); print("open Rw on 0o444 -> skipped (root)\n"); },
+        Err(e) => match e {
+            Error.Permission => print("open Rw on 0o444 -> Error.Permission\n"),
+            _ => print("open Rw on 0o444 -> other error variant\n"),
+        },
+    }
+    # Reading is still allowed, which is what makes the denial above a
+    # permission failure rather than a missing/unreadable path.
+    match File.open(ro, FileMode.Read) {
+        Ok(h) => { _ = h.close(); print("read 0o444 still ok\n"); },
+        Err(e) => print("read 0o444 failed?!\n"),
+    }
+
+    # A directory fd: read_at is Error.Io, never a 0-byte success.
+    match File.open("/tmp", FileMode.Read) {
+        Ok(h) => {
+            var dbuf: [16]u8 = undefined;
+            let dr: Result(usize, Error) = h.read_at(dbuf[0..], 0);
+            match dr {
+                Ok(n) => print("read_at on a dir returned {n}?!\n"),
+                Err(e) => match e {
+                    Error.Io => print("read_at on a dir -> Error.Io\n"),
+                    _ => print("read_at on a dir -> WRONG error variant\n"),
+                },
+            }
+            _ = h.close();
+        },
+        Err(e) => print("File.open on /tmp failed\n"),
+    }
+
+    # /dev/full: the durable write reports ENOSPC as an Err, not
+    # success.
+    match write_file("/dev/full", "x") {
+        Ok(n) => print("write_file(/dev/full) -> unexpectedly Ok\n"),
+        Err(e) => print("write_file(/dev/full) -> Err (correct)\n"),
+    }
+
+    # ── alloc/release: a checked munmap, not a discarded one ────────
+    let buf: []u8 = alloc(64);
+    buf[0] = 'z';
+    buf[63] = 'g';
+    print("heap {buf[0]}..{buf[63]}\n");
+    release(buf.ptr, 64);
+
+    # ── random: seeds from /dev/urandom; a failed openat falls back
+    #    to the fixed constant instead of trapping on the cast ───────
+    var rng: XorShift64Star = XorShift64Star.new();
+    let r: u64 = rng.next_u64();
+    print("urandom seed ok, next {r != 0}\n");
+}
+
+@[test]
+fun test_write_file_is_durable_and_fails_closed() {
+    let p: str = "/tmp/zag_io_robustness_t.txt";
+    # The success path returns the byte count; `!` is the fail-fast
+    # spelling of the very same call.
+    assert(write_file(p, "hello")! == 5);
+    # A path whose parent doesn't exist cannot be made durable.
+    match write_file("/nonexistent-dir-xyz/f.txt", "x") {
+        Ok(n) => assert(false),
+        Err(e) => assert(true),
+    }
+}
+
+@[test]
+fun test_recoverable_read_round_trip() {
+    let p: str = "/tmp/zag_io_robustness_t2.txt";
+    assert(write_file(p, "round trip")! == 10);
+    let r: Result(String, Error) = read_file(p);
+    match r {
+        Ok(data) => assert(data.as_str().len == 10),
+        Err(e) => assert(false),
+    }
+    # Missing file is an Err VALUE, never a panic.
+    let miss: Result(String, Error) = read_file("/tmp/zag_definitely_absent_xyz");
+    match miss {
+        Ok(data) => assert(false),
+        Err(e) => assert(true),
+    }
+}
+
+@[test]
+fun test_file_handle_round_trip() {
+    var f: File = File.open("/tmp/zag_io_robustness_t3.bin", FileMode.Create)!;
+    assert(f.append("abcdef")! == 6);
+    f.sync()!;
+    f.close()!;
+    assert(f.is_open() == false);
+    var g: File = File.open("/tmp/zag_io_robustness_t3.bin", FileMode.Read)!;
+    assert(g.size()! == 6);
+    g.close()!;
+}
+
+@[test]
+fun test_file_contract_is_result_shaped() {
+    # A missing file is an Err VALUE from `open`, not a panic and not
+    # an `fd == -1` sentinel (that was `try_open`, removed in P2).
+    let miss: Result(File, Error) = File.open("/tmp/zag_definitely_absent_p2", FileMode.Read);
+    match miss {
+        Ok(h) => assert(false),
+        Err(e) => assert(true),
+    }
+
+    # Create -> Ok, and the handle knows it created the entry and
+    # retained the parent directory, which is what makes the durable
+    # close below possible.
+    let cr: Result(File, Error) = File.open("/tmp/zag_io_robustness_p2.bin", FileMode.Create);
+    var f: File = File { fd: (0 - 1), parent: undefined, parent_len: 0, created: false };
+    match cr {
+        Ok(h) => { f = h; },
+        Err(e) => assert(false),
+    }
+    assert(f.is_open());
+    assert(f.created);
+    assert(f.parent_len == 4);                       # "/tmp"
+    assert(f.parent_len <= PARENT_CAP);
+
+    # Positioned write, then the durable close: fsync contents, check
+    # the close, flush the directory entry. Ok means all three landed.
+    let wa: Result(usize, Error) = f.write_at("abcdef", 0);
+    match wa {
+        Ok(n) => assert(n == 6),
+        Err(e) => assert(false),
+    }
+    let sz: Result(usize, Error) = f.size();
+    match sz {
+        Ok(n) => assert(n == 6),
+        Err(e) => assert(false),
+    }
+    let dc: Result(void, Error) = f.close_durable();
+    match dc {
+        Ok(_) => assert(true),
+        Err(e) => assert(false),
+    }
+    assert(f.is_open() == false);
+
+    # Every operation on a closed handle is an Err value rather than a
+    # panic or a garbage result... except closing again, whose
+    # postcondition (no open fd) already holds.
+    let after: Result(usize, Error) = f.size();
+    match after {
+        Ok(n) => assert(false),
+        Err(e) => assert(true),
+    }
+    let again: Result(void, Error) = f.close();
+    match again {
+        Ok(_) => assert(true),
+        Err(e) => assert(false),
+    }
+}
+
+@[test]
+fun test_file_block_contract_rejects_wrong_buffer() {
+    # A block API whose buffer is not one page is a CONTRACT violation.
+    # It is an Err value now instead of a panic, so a caller that
+    # computed a buffer size wrongly can recover.
+    var f: File = File.open("/tmp/zag_io_robustness_p2b.bin", FileMode.Create)!;
+    var small: [16]u8 = undefined;
+    let rb: Result(bool, Error) = f.read_block(0, small[0..]);
+    match rb {
+        Ok(b) => assert(false),
+        Err(e) => assert(true),
+    }
+    let wb: Result(void, Error) = f.write_block(0, small[0..]);
+    match wb {
+        Ok(_) => assert(true),            # <= one page: zero-padded, legal
+        Err(e) => assert(false),
+    }
+    f.close()!;
+}
+
+@[test]
+fun test_write_file_reports_failure_as_value() {
+    # The recoverable durable write: a missing parent directory is an
+    # Err, and a good path returns the byte count.
+    let bad: Result(usize, Error) = write_file("/nonexistent-dir-xyz/w.txt", "x");
+    match bad {
+        Ok(n) => assert(false),
+        Err(e) => assert(true),
+    }
+    let good: Result(usize, Error) = write_file("/tmp/zag_io_robustness_p2c.txt", "durable");
+    match good {
+        Ok(n) => assert(n == 7),
+        Err(e) => assert(false),
+    }
+    # And the fail-fast spelling is the same call with postfix `!`.
+    assert(write_file("/tmp/zag_io_robustness_p2c.txt", "durable")! == 7);
+}
+
+@[test]
+fun test_alloc_release() {
+    # A checked munmap: if release's unmap were rejected it would panic
+    # here instead of silently leaking the mapping.
+    let buf: []u8 = alloc(64);
+    buf[0] = 7;
+    release(buf.ptr, 64);
+    assert(true);
+}
+
+@[test]
+fun test_permission_error_is_a_named_variant() {
+    # The EACCES -> Error.Permission mapping is the whole point of having
+    # a canonical Error: the caller can tell "denied" from "missing"
+    # without inspecting a raw errno.
+    #
+    # 0xC1 = O_WRONLY|O_CREAT|O_EXCL, so the row is idempotent: a re-run
+    # gets EEXIST (a previous run already left the same 0o444 file)
+    # rather than the EACCES that re-opening it for writing would return.
+    let p: str = "/tmp/zag_io_robustness_perm.txt";
+    match openat(std.posix.AT.FDCWD, p, 0xC1, 0o444) {
+        Ok(fd) => { _ = close(fd); },
+        Err(e) => assert(e.is(ErrnoKind.Eexist)),
+    }
+
+    # Readable first. If it is not, the fixture is not in the state this
+    # row assumes, so skip instead of reporting a false failure.
+    let ro: Result(File, Error) = File.open(p, FileMode.Read);
+    let usable: bool = match ro {
+        Ok(h) => { _ = h.close(); true },
+        Err(e) => false,
+    };
+
+    # Root bypasses the mode bits (CAP_DAC_OVERRIDE), and so would a
+    # file with a writable mode; in either case there is nothing to
+    # assert, so the row degrades to a skip.
+    if (usable) {
+        let rw: Result(File, Error) = File.open(p, FileMode.Rw);
+        match rw {
+            Ok(h) => { _ = h.close(); assert(true); },
+            Err(e) => match e {
+                Error.Permission => {
+                    # The fs tier maps EACCES to the named variant AND
+                    # the durable write fails closed.
+                    match write_file(p, "denied") {
+                        Ok(n) => assert(false),
+                        Err(e) => assert(true),
+                    }
+                },
+                _ => assert(false),
+            },
+        }
+    }
+}
+
+@[test]
+fun test_read_on_a_directory_is_io_not_a_zero_read() {
+    # read_at on a directory fd must be an Err, not Ok(0): a 0-byte
+    # "success" would make a caller treat the directory as an empty
+    # file. EISDIR is not ENOENT/EPERM/EACCES, so it maps to Error.Io.
+    let d: Result(File, Error) = File.open("/tmp", FileMode.Read);
+    match d {
+        Ok(h) => {
+            var b: [16]u8 = undefined;
+            let r: Result(usize, Error) = h.read_at(b[0..], 0);
+            match r {
+                Ok(n) => assert(false),
+                Err(e) => match e {
+                    Error.Io => assert(true),
+                    _ => assert(false),
+                },
+            }
+            _ = h.close();
+        },
+        Err(e) => assert(false),
+    }
+}
+
+@[test]
+fun test_write_file_to_full_device_fails_closed() {
+    # ENOSPC must never be reported as a successful durable write.
+    # /dev/full reports it on Linux; on a host without the node the
+    # open fails and the same Err holds, so this row is host-independent.
+    match write_file("/dev/full", "x") {
+        Ok(n) => assert(false),
+        Err(e) => assert(true),
+    }
+}
+
+@[test]
+fun test_random_seed_never_traps() {
+    # Seeding must not trap whichever path it takes (/dev/urandom, or
+    # the constant fallback when openat fails). A zero seed would make
+    # xorshift64* stick, so two distinct draws prove the seed landed.
+    var fresh: XorShift64Star = XorShift64Star.new();
+    let first: u64 = fresh.next_u64();
+    let second: u64 = fresh.next_u64();
+    assert(first != second);
+}

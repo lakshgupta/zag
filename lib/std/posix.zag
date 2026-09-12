@@ -1,4 +1,4 @@
-## lib/std/posix.zag — raw POSIX/linux syscall facade
+## lib/std/posix.zag — POSIX/linux syscall facade
 ##
 ## The syscall-FFI migration (v0.3): the always-emitted __zag_posix
 ## preamble helpers (src/codegen/core.zig) retire one-by-one into this
@@ -28,154 +28,485 @@
 ## no anonymous SpawnOptions literal / term-union switch needed).
 ## The posix family is now COMPLETELY out of the preamble.
 ##
-## Error convention: uint-returning syscalls follow the kernel's
-## errno-encoding (high bit set = negative errno); callers test the
-## sign bit or cast to isize. read/write return signed isize directly
-## (bytes transferred, or negative errno).
+## ── Two tiers, one error convention ───────────────────────────────
+##
+## Every entry point exists twice:
+##
+##   name()      — canonical. Returns `Result(T, Errno)`. This is what
+##                 a caller should use; the errno decode lives here and
+##                 nowhere else.
+##   raw_name()  — the kernel's value verbatim: a `usize` whose bit 63
+##                 is set on failure, or an `isize` that is negative.
+##                 Documented escape hatch, for loops that own their own
+##                 errno policy (the EINTR retry in read_some/write_full
+##                 below, and hot paths that must not branch twice).
+##
+## The raw conventions the canonical tier hides:
+##
+##   isize  — read / write / pread / pwrite / lseek. The value IS the
+##            byte count (or offset), or a negative -errno.
+##   usize  — openat / close / fsync / mkdirat / mmap / ... . Bit 63 is
+##            the sign; set means the value is -errno.
+##
+## Before the split, EVERY call site re-implemented the test by hand —
+## and got it wrong often enough to matter: `openat` fabricated
+## 0xFFFFFFFFFFFFFFFF for an over-long path (which decodes as EPERM, so
+## a too-long path reported itself as a permission error), `close`
+## results were compared against the wrong sign in some places and
+## discarded in others, and `getcwd` treated an errno-encoded return as
+## a length and indexed past its own buffer.
+##
+## Two entries have no raw twin because they cannot usefully expose one:
+## `clock_gettime` and `getcwd` need a success-side out-parameter the raw
+## shape cannot carry, and `spawn` is a composition rather than a single
+## syscall. `gettid` has no raw twin because it cannot fail.
+##
+## Callers that must discard a result spell it `_ = name(...)`; the
+## Result is non-void, so the discard is explicit and greppable, and the
+## planned audit (see docs/architecture.md §Testing Strategy) can flag
+## any discard that is not named as deliberate.
 
 pub import std.mem.{memcpy}
+## Shared errno vocabulary — the one place a syscall failure is named.
+## `is_err` / `errno_of` / `errno_of_signed` are the decoders the
+## canonical tier below is built on.
+import std.errno.{Errno, EINVAL, EINTR, ENOMEM, is_err, errno_of, errno_of_signed}
 
-## openat — raw `openat(2)` on a path slice. Copies the path into a
-## sentinel-terminated stack buffer (fs.zag's caller-side pattern
-## moved here so callers pass plain `str`), then hands the buffer to
-## the syscall with the trailing NUL satisfying the `[*:0]const u8`
-## sentinel contract. Returns fd (high-bit-clear) or an errno-encoded
-## usize (0xFFFFFFFFFFFFFFFF for the over-long-path guard — also
-## sign-bit-set, so callers' existing checks catch it).
-pub fun openat(dirfd: i32, path: str, flags: u32, mode: u32) -> usize {
+## ── Decode helpers ───────────────────────────────────────────────────
+##
+## The canonical tier routes every result through one of these, so the
+## two raw conventions are decoded in exactly three places instead of at
+## every call site.
+
+## check_void — decode a `usize`-convention success/failure result
+## (fsync / close / mkdirat / mmap-freeing / nanosleep / futex family).
+fun check_void(rc: usize) -> Result(void, Errno) {
+    if is_err(rc) { return Err(errno_of(rc)); }
+    return Ok(undefined);
+}
+
+## check_count — decode an `isize`-convention transfer result (read /
+## pread), where the failing value is negative and `0` is EOF.
+fun check_count(rc: isize) -> Result(usize, Errno) {
+    if (rc < 0) { return Err(errno_of_signed(rc)); }
+    return Ok(rc as usize);
+}
+
+## check_written — the write family's decode. Same as check_count plus
+## the one case where a 0 is NOT success: `write(2)` returning 0 for a
+## non-zero request is outside its contract (0 is defined only for a
+## zero-byte count) and no errno describes it, so it is reported as EIO
+## rather than as a successful empty write. Without this, a caller
+## looping on `write` would spin forever on a sink that reports 0.
+fun check_written(rc: isize, len: usize) -> Result(usize, Errno) {
+    if (rc < 0) { return Err(errno_of_signed(rc)); }
+    if (rc == 0) {
+        if (len > 0) { return Err(errno_of_signed(0)); }
+    }
+    return Ok(rc as usize);
+}
+
+## err_rc — the `usize`-convention encoding of the positive errno `e`.
+## `bitcast` (not `as`) because the high bit is set, which a checked
+## @intCast would trap on. The raw path helpers use this for the one
+## failure the kernel never sees: a path too long for the sentinel
+## buffer.
+fun err_rc(e: isize) -> usize {
+    let neg: isize = 0 - e;
+    return bitcast(neg);
+}
+
+## ── openat ────────────────────────────────────────────────────────────
+
+## raw_openat — `openat(2)` on a path slice. Copies the path into a
+## sentinel-terminated stack buffer (fs.zag's caller-side pattern moved
+## here so callers pass plain `str`), then hands the buffer to the
+## syscall with the trailing NUL satisfying the `[*:0]const u8` sentinel
+## contract. Returns fd (high-bit-clear) or an errno-encoded usize.
+## A path that does not fit the buffer reports ENAMETOOLONG's sibling
+## EINVAL (22) — it previously fabricated 0xFFFFFFFFFFFFFFFF, which
+## decodes as EPERM and made an over-long path look like a permission
+## error at every caller.
+pub fun raw_openat(dirfd: i32, path: str, flags: u32, mode: u32) -> usize {
     var path_z: [4096]u8 = undefined;
     let n: usize = path.len;
     if (n + 1 > path_z.len) {
-        return 0xFFFFFFFFFFFFFFFF;
+        return err_rc(EINVAL);
     }
     memcpy(path_z[0..n], path, n);
     path_z[n] = 0;
     return std.os.linux.openat(dirfd, &path_z[0] as [*:0]const u8, bitcast(flags), mode);
 }
 
-## read — raw `read(2)` into `buf[0..len]`. Returns bytes read
-## (partial reads possible) or negative errno.
-pub fun read(fd: i32, buf: []u8, len: usize) -> isize {
+## openat — the canonical entry. Ok(fd) or Err(errno).
+pub fun openat(dirfd: i32, path: str, flags: u32, mode: u32) -> Result(i32, Errno) {
+    let rc: usize = raw_openat(dirfd, path, flags, mode);
+    if is_err(rc) { return Err(errno_of(rc)); }
+    return Ok(rc as i32);
+}
+
+## ── transfers ─────────────────────────────────────────────────────────
+
+## raw_read — `read(2)` into `buf[0..len]`. Returns bytes read (partial
+## reads possible) or negative errno.
+## The errno reinterpretation MUST be `bitcast` (= zig `@bitCast`),
+## not `as isize`: Zag codegens `as` as a CHECKED `@intCast`, so a
+## high-bit-set errno usize traps with "integer does not fit in
+## destination type" before the caller can ever see -errno. bitcast
+## is the total same-width reinterpretation the doc contract wants.
+pub fun raw_read(fd: i32, buf: []u8, len: usize) -> isize {
     let n: usize = std.os.linux.read(fd, buf.ptr, len);
-    return n as isize;
+    return bitcast(n);
 }
 
-## write — raw `write(2)` of `buf[0..len]`. Returns bytes written
-## (partial writes possible) or negative errno.
-pub fun write(fd: i32, buf: []const u8, len: usize) -> isize {
+## read — the canonical entry. Ok(bytes) with 0 at EOF, or Err(errno).
+## Ok(0) is EOF, never a failure: that distinction is the whole point of
+## the split (a truncated transfer used to be indistinguishable from a
+## finished file).
+pub fun read(fd: i32, buf: []u8, len: usize) -> Result(usize, Errno) {
+    return check_count(raw_read(fd, buf, len));
+}
+
+## raw_write — `write(2)` of `buf[0..len]`. Returns bytes written
+## (partial writes possible) or negative errno. bitcast (not `as`)
+## for the same reason as read above — an errno must reach the
+## caller as -errno so partial-write loops can stop and report
+## failure instead of trapping at the cast.
+pub fun raw_write(fd: i32, buf: []const u8, len: usize) -> isize {
     let n: usize = std.os.linux.write(fd, buf.ptr, len);
-    return n as isize;
+    return bitcast(n);
 }
 
-## pread — raw `pread(2)`: reads into `buf[0..len]` at absolute file
+## write — the canonical entry. Ok(bytes) or Err(errno). Unlike `read`,
+## a 0-byte return for a non-zero `len` is a failure (see
+## check_written), so `Ok(0)` only ever means an empty request.
+pub fun write(fd: i32, buf: []const u8, len: usize) -> Result(usize, Errno) {
+    return check_written(raw_write(fd, buf, len), len);
+}
+
+## raw_pread — `pread(2)`: reads into `buf[0..len]` at absolute file
 ## offset `off` WITHOUT moving the fd's file position (the p-variant
 ## is what makes random-access page reads race-free under concurrent
 ## appenders, and it needs no lseek round trip). Returns bytes read
 ## (short reads are legal — EOF returns 0) or negative errno.
 ## Storage-engine primitive: page-sized block reads.
-pub fun pread(fd: i32, buf: []u8, len: usize, off: i64) -> isize {
+## bitcast (not `as`) for the errno reinterpretation — see `read`
+## above. The old high-bit guard + `0 -% (n as isize)` never worked:
+## the cast trapped on errno, and had it not, the negation would have
+## turned -errno into +errno.
+pub fun raw_pread(fd: i32, buf: []u8, len: usize, off: i64) -> isize {
     let n: usize = std.os.linux.pread(fd, buf.ptr, len, off);
-    if ((n & 0x8000000000000000) != 0) {
-        return 0 -% (n as isize);
-    }
-    return n as isize;
+    return bitcast(n);
 }
 
-## pwrite — raw `pwrite(2)`: the write twin of pread — writes
+## pread — the canonical positioned read.
+pub fun pread(fd: i32, buf: []u8, len: usize, off: i64) -> Result(usize, Errno) {
+    return check_count(raw_pread(fd, buf, len, off));
+}
+
+## raw_pwrite — `pwrite(2)`: the write twin of pread — writes
 ## `buf[0..len]` at `off` without touching the file position.
 ## Returns bytes written (partial writes possible — callers loop) or
 ## negative errno.
 ## Storage-engine primitive: in-place page writes.
-pub fun pwrite(fd: i32, buf: []const u8, len: usize, off: i64) -> isize {
+## bitcast for the errno reinterpretation — see `read` above.
+pub fun raw_pwrite(fd: i32, buf: []const u8, len: usize, off: i64) -> isize {
     let n: usize = std.os.linux.pwrite(fd, buf.ptr, len, off);
-    if ((n & 0x8000000000000000) != 0) {
-        return 0 -% (n as isize);
-    }
-    return n as isize;
+    return bitcast(n);
 }
 
-## lseek — raw `lseek(2)`. whence: SEEK_SET=0, SEEK_CUR=1,
+## pwrite — the canonical positioned write (a 0-byte return for a
+## non-zero `len` is a failure, same as `write`).
+pub fun pwrite(fd: i32, buf: []const u8, len: usize, off: i64) -> Result(usize, Errno) {
+    return check_written(raw_pwrite(fd, buf, len, off), len);
+}
+
+## ── offsets and lengths ───────────────────────────────────────────────
+
+## raw_lseek — `lseek(2)`. whence: SEEK_SET=0, SEEK_CUR=1,
 ## SEEK_END=2. Returns the resulting offset, or negative errno.
 ## `lseek(fd, 0, SEEK_END)` is also the size probe: zig 0.16's std
 ## has no fstat, so file size comes from seeking to the end (and the
 ## caller restores the position afterwards — or just uses pread,
 ## which is position-independent).
-pub fun lseek(fd: i32, off: i64, whence: usize) -> isize {
+## bitcast for the errno reinterpretation — see `read` above.
+pub fun raw_lseek(fd: i32, off: i64, whence: usize) -> isize {
     let n: usize = std.os.linux.lseek(fd, off, whence);
-    if ((n & 0x8000000000000000) != 0) {
-        return 0 -% (n as isize);
-    }
-    return n as isize;
+    return bitcast(n);
 }
 
-## ftruncate — raw `ftruncate(2)`: sets the file length (grows with
+## lseek — the canonical entry. Ok(offset) or Err(errno). A resulting
+## offset of 0 is success (a legitimate seek to the start), so the
+## canonical form returns i64 rather than reusing the negative test's
+## ambiguity.
+pub fun lseek(fd: i32, off: i64, whence: usize) -> Result(i64, Errno) {
+    let n: isize = raw_lseek(fd, off, whence);
+    if (n < 0) { return Err(errno_of_signed(n)); }
+    return Ok(n as i64);
+}
+
+## raw_ftruncate — `ftruncate(2)`: sets the file length (grows with
 ## a zero-filled hole, or shrinks). Returns 0 on success,
 ## errno-encoded usize on failure. Storage engines use it to
 ## pre-extend a file to N pages before writing blocks into it.
-pub fun ftruncate(fd: i32, len: i64) -> usize {
+pub fun raw_ftruncate(fd: i32, len: i64) -> usize {
     return std.os.linux.ftruncate(fd, len);
 }
 
-## fsync / fdatasync — raw `fsync(2)` / `fdatasync(2)`: flush the
+## ftruncate — the canonical entry.
+pub fun ftruncate(fd: i32, len: i64) -> Result(void, Errno) {
+    return check_void(raw_ftruncate(fd, len));
+}
+
+## ── durability ────────────────────────────────────────────────────────
+
+## raw_fsync / raw_fdatasync — `fsync(2)` / `fdatasync(2)`: flush the
 ## file's data (and metadata for fsync) to stable storage. Durability
 ## primitive for write-ahead logs: a WAL record is only "committed"
 ## once this returns 0.
-pub fun fsync(fd: i32) -> usize {
+pub fun raw_fsync(fd: i32) -> usize {
     return std.os.linux.fsync(fd);
 }
 
-pub fun fdatasync(fd: i32) -> usize {
+pub fun raw_fdatasync(fd: i32) -> usize {
     return std.os.linux.fdatasync(fd);
 }
 
-## close — raw `close(2)`. Returns 0 on success, errno-encoded usize
+## fsync / fdatasync — the canonical entries. A buffered write can
+## report its full length while the real failure (ENOSPC/EIO) only
+## surfaces here, which is why the Result exists.
+pub fun fsync(fd: i32) -> Result(void, Errno) {
+    return check_void(raw_fsync(fd));
+}
+
+pub fun fdatasync(fd: i32) -> Result(void, Errno) {
+    return check_void(raw_fdatasync(fd));
+}
+
+## ── close ─────────────────────────────────────────────────────────────
+
+## raw_close — `close(2)`. Returns 0 on success, errno-encoded usize
 ## on failure.
-pub fun close(fd: i32) -> usize {
+pub fun raw_close(fd: i32) -> usize {
     return std.os.linux.close(fd);
 }
 
-## mkdirat — raw `mkdirat(2)`. Path handling mirrors openat (stack
-## sentinel copy). Returns 0 on success, errno-encoded usize on
-## failure (EEXIST = 17, which lib/std/fs.zag's mkdir coalesces to 0
-## for "mkdir -p" semantics).
-pub fun mkdirat(dirfd: i32, path: str, mode: u32) -> usize {
+## close — the canonical entry. A deferred writeback error
+## (ENOSPC/EIO) can be reported ONLY here, so the Result is not
+## cosmetic: a caller that needs the durability guarantee must check
+## it. EINTR is deliberately NOT retried — Linux may already have
+## released (and another thread reused) the fd.
+pub fun close(fd: i32) -> Result(void, Errno) {
+    return check_void(raw_close(fd));
+}
+
+## ── directories ───────────────────────────────────────────────────────
+
+## raw_mkdirat — `mkdirat(2)`. Path handling mirrors openat (stack
+## sentinel copy); an over-long path is EINVAL. Returns 0 on success,
+## errno-encoded usize on failure (EEXIST = 17, which the caller
+## coalesces for "mkdir -p" semantics).
+pub fun raw_mkdirat(dirfd: i32, path: str, mode: u32) -> usize {
     var path_z: [4096]u8 = undefined;
     let n: usize = path.len;
     if (n + 1 > path_z.len) {
-        return 0xFFFFFFFFFFFFFFFF;
+        return err_rc(EINVAL);
     }
     memcpy(path_z[0..n], path, n);
     path_z[n] = 0;
     return std.os.linux.mkdirat(dirfd, &path_z[0] as [*:0]const u8, mode);
 }
 
-## getdents64 — raw `getdents64(2)` directory-entry dump into
+## mkdirat — the canonical entry. EEXIST comes back as
+## `Err(Errno.of(EEXIST))`, a typed value the caller decides about
+## (`mkdir -p` coalesces it; a caller creating a lock directory treats
+## it as "someone else won"). It is NOT silently swallowed here.
+pub fun mkdirat(dirfd: i32, path: str, mode: u32) -> Result(void, Errno) {
+    return check_void(raw_mkdirat(dirfd, path, mode));
+}
+
+## raw_getdents64 — `getdents64(2)` directory-entry dump into
 ## `buf[0..len]`. Returns bytes written (0 = EOF); caller walks
 ## entries via the canonical `d_reclen` offset walk.
-pub fun getdents64(fd: i32, buf: []u8, len: usize) -> usize {
+pub fun raw_getdents64(fd: i32, buf: []u8, len: usize) -> usize {
     return std.os.linux.getdents64(fd, buf.ptr, len);
 }
+
+## getdents64 — the canonical entry. Ok(0) is end-of-directory; a
+## failed listing is Err(errno). Before the split the walkers compared
+## the raw value against `maxInt(isize)`, so an errno-encoded return
+## read as "directory exhausted" and silently produced a partial
+## listing.
+pub fun getdents64(fd: i32, buf: []u8, len: usize) -> Result(usize, Errno) {
+    let rc: usize = raw_getdents64(fd, buf, len);
+    if is_err(rc) { return Err(errno_of(rc)); }
+    return Ok(rc);
+}
+
+## ── time ──────────────────────────────────────────────────────────────
 
 ## clock_gettime — nanoseconds since the clock-id epoch
 ## (CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1 on Linux). zig 0.16's
 ## `clockid_t` is an enum, so the enum_from_int builtin does the
 ## boundary conversion the preamble's __zag_clock_gettime owned.
-pub fun clock_gettime(clockid: i32) -> i64 {
+## No raw twin: the raw shape would have to carry the timespec out
+## through an out-parameter as well as the rc, and no caller needs it
+## (the previous body discarded the rc entirely, which is why a failing
+## clock read used to return a garbage timespec as a valid timestamp).
+pub fun clock_gettime(clockid: i32) -> Result(i64, Errno) {
     var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(enum_from_int(clockid), addr_of(ts));
-    return (ts.sec as i64) * 1000000000 + (ts.nsec as i64);
+    let rc: usize = std.os.linux.clock_gettime(enum_from_int(clockid), addr_of(ts));
+    if is_err(rc) { return Err(errno_of(rc)); }
+    return Ok((ts.sec as i64) * 1000000000 + (ts.nsec as i64));
 }
 
-## getcwd — current working directory written into the module-level
-## cwd_buf (a `var`, since zig's getcwd takes `[*]u8`); returns a
-## borrowed slice of it without the trailing NUL. Two calls in the
-## same expression will alias (next call overwrites the buffer).
+## nanosleep_retry — sleep the full duration, resuming after a signal
+## with the kernel-reported REMAINDER. nanosleep is the one syscall
+## whose EINTR handling cannot move into a generic `*_full` loop,
+## because the remainder only exists in the `rem` out-parameter the
+## canonical entry hides — so the retry lives next to the syscall that
+## produces it rather than being re-derived by each caller (the
+## previous shape discarded rem and let a signal shorten the sleep).
+pub fun nanosleep_retry(sec: i64, nsec: i64) -> Result(void, Errno) {
+    var rem: std.os.linux.timespec = undefined;
+    var rs: i64 = sec;
+    var rn: i64 = nsec;
+    while (true) {
+        var req: std.os.linux.timespec = undefined;
+        req.sec = rs as isize;
+        req.nsec = rn as isize;
+        let rc: usize = std.os.linux.nanosleep(addr_of(req), addr_of(rem));
+        if (!is_err(rc)) { return Ok(undefined); }
+        let e: Errno = errno_of(rc);
+        if (e.code != EINTR) { return Err(e); }
+        rs = rem.sec as i64;
+        rn = rem.nsec as i64;
+    }
+}
+
+## ── getcwd ────────────────────────────────────────────────────────────
+
+## Module-level path buffer, a `var` because zig's getcwd takes
+## `[*]u8` (a const buffer would yield `[*]const u8`).
 var cwd_buf: [4096]u8 = undefined;
-pub fun getcwd() -> []const u8 {
+
+## getcwd — current working directory written into the module-level
+## cwd_buf (a `var`, since zig's getcwd takes `[*]u8`); the Ok slice is
+## a borrowed view of it without the trailing NUL. Two calls in the same
+## expression alias (the next call overwrites the buffer).
+## `std.os.linux.getcwd` is the RAW syscall2 wrapper, so failure is
+## errno-encoded and NOT signalled by a 0 return — the previous body
+## tested `n == 0` and then indexed `cwd_buf[n - 1]` with the
+## errno-encoded value, an out-of-bounds read on any failure.
+pub fun getcwd() -> Result([]const u8, Errno) {
     let n: usize = std.os.linux.getcwd(addr_of(cwd_buf), 4096);
-    if (n == 0) { return ""; }
+    if is_err(n) { return Err(errno_of(n)); }
+    # getcwd(2) returning 0 with a non-zero buffer is outside its
+    # contract; no errno describes it, so report EIO rather than
+    # inventing an index into cwd_buf.
+    if (n == 0) { return Err(errno_of_signed(0)); }
     let eff: usize = if (cwd_buf[n - 1] == 0) { n - 1 } else { n };
-    return cwd_buf[0..eff];
+    return Ok(cwd_buf[0..eff]);
+}
+
+## ── Shared EINTR-safe transfer helpers ────────────────────────────
+##
+## A signal can interrupt read(2)/write(2)/pread(2)/pwrite(2) before
+## any bytes move; the kernel reports EINTR, which is not a failure.
+## These helpers are the ONE place that retry lives — io.zag, fs.zag,
+## random.zag, and this file's own /proc readers all route through
+## them instead of each keeping a private loop (and each private loop
+## was a place to get the retry, the short-transfer handling, or the
+## errno decode subtly wrong).
+##
+##   *_some  — a SINGLE syscall with EINTR retried. A short transfer
+##             is the caller's business (a line-oriented reader wants
+##             whatever one read gives it, and must NOT be drained).
+##   *_full  — loop until the request is complete, because the
+##             syscall may transfer less than asked.
+##
+## These are the "loops that own their errno policy" the raw_* escape
+## hatch exists for: they call raw_read/raw_write directly so the retry
+## decision is made in the same place as the decode, with no second
+## Result round trip per iteration.
+##
+## Ok(0) from the read family means EOF. Every failure comes back as
+## an `Errno`, so no caller needs to know whether this level spells
+## failure as a negative isize or a high-bit-set usize.
+
+## The value the read/write family returns for EINTR (`0 - 4` is this
+## compiler's spelling for a negative constant).
+const EINTR_RC: isize = 0 - EINTR;
+
+## read_some — one read(2), EINTR retried. Ok(0) is EOF.
+pub fun read_some(fd: i32, buf: []u8) -> Result(usize, Errno) {
+    while (true) {
+        const n: isize = raw_read(fd, buf, buf.len);
+        if (n >= 0) { return Ok(n as usize); }
+        if (n == EINTR_RC) { continue; }
+        return Err(errno_of_signed(n));
+    }
+}
+
+## read_full — read_some in a loop until `buf` is full or EOF.
+## Retrying EINTR and accumulating short reads is what stops a signal
+## or a partial transfer from looking like "the file ended here":
+## before this, a `getenv`/`argv` caller silently saw an unset
+## variable or a vanishing argument instead of the real environment.
+pub fun read_full(fd: i32, buf: []u8) -> Result(usize, Errno) {
+    var total: usize = 0;
+    while (total < buf.len) {
+        let r: Result(usize, Errno) = read_some(fd, buf[total..buf.len]);
+        match r {
+            Ok(n) => {
+                if (n == 0) { break; }
+                total = total + n;
+            },
+            Err(e) => { return Err(e); },
+        }
+    }
+    return Ok(total);
+}
+
+## write_full — write(2) in a loop until the whole slice lands.
+## Ok(bytes.len) on success. A write(2) returning 0 for a non-zero
+## request is outside POSIX's contract (0 is defined only for a
+## zero-byte count) and no errno describes it; errno_of_signed reports
+## that as EIO rather than inventing a code.
+pub fun write_full(fd: i32, bytes: []const u8) -> Result(usize, Errno) {
+    var pos: usize = 0;
+    while (pos < bytes.len) {
+        const n: isize = raw_write(fd, bytes[pos..bytes.len], bytes.len - pos);
+        if (n == EINTR_RC) { continue; }
+        if (n <= 0) { return Err(errno_of_signed(n)); }
+        pos = pos + (n as usize);
+    }
+    return Ok(pos);
+}
+
+## pread_some — one pread(2) at absolute offset `off`, EINTR retried.
+## Ok(0) is EOF. The positioned counterpart of read_some; a page read
+## is one transfer, not a drain.
+pub fun pread_some(fd: i32, buf: []u8, off: i64) -> Result(usize, Errno) {
+    while (true) {
+        const n: isize = raw_pread(fd, buf, buf.len, off);
+        if (n >= 0) { return Ok(n as usize); }
+        if (n == EINTR_RC) { continue; }
+        return Err(errno_of_signed(n));
+    }
+}
+
+## pwrite_full — pwrite(2) in a loop until the whole slice lands at
+## `off`. The positioned counterpart of write_full.
+pub fun pwrite_full(fd: i32, bytes: []const u8, off: i64) -> Result(usize, Errno) {
+    var pos: usize = 0;
+    while (pos < bytes.len) {
+        const n: isize = raw_pwrite(fd, bytes[pos..bytes.len], bytes.len - pos, off + (pos as i64));
+        if (n == EINTR_RC) { continue; }
+        if (n <= 0) { return Err(errno_of_signed(n)); }
+        pos = pos + (n as usize);
+    }
+    return Ok(pos);
 }
 
 ## getenv — scans /proc/self/environ for `name=value\0`. Pure
@@ -183,18 +514,25 @@ pub fun getcwd() -> []const u8 {
 ## across zig versions and zig 0.16 has no libc-getenv bridge at
 ## all). Reads env fresh on each call into the module-level env_buf
 ## (`var` — a const buffer would yield `[*]const u8` and reject
-## posix.read's `[]u8` buf); hot-path callers should cache. Returns a
+## raw_read's `[]u8` buf); hot-path callers should cache. Returns a
 ## borrowed value slice (without the NUL) or null when unset.
+## Keeps its `?str` shape rather than a Result: "unset" is a normal
+## answer, not a syscall failure, and `?str` is already the documented
+## borrowed-view contract.
 var env_buf: [32768]u8 = undefined;
 pub fun getenv(name: str) -> ?str {
-    let fd_raw: usize = openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
-    let fd_signed: isize = fd_raw as isize;
-    if (fd_signed < 0) { return null; }
-    let fd: i32 = fd_signed as i32;
-    let n: isize = read(fd, env_buf[0..env_buf.len], env_buf.len);
-    _ = close(fd);
-    if (n <= 0) { return null; }
-    let env_len: usize = n as usize;
+    let fr: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
+    if let Err(_) = fr { return null; }
+    var fd: i32 = 0;
+    if let Ok(v) = fr { fd = v; }
+    # read_full retries EINTR and accumulates short reads, so the only
+    # way to reach "not found" below is a real read failure or a
+    # genuinely empty environment — never a truncated transfer.
+    let r: Result(usize, Errno) = read_full(fd, env_buf[0..env_buf.len]);
+    _ = close(fd); # deliberate discard: /proc/self/environ was opened read-only, so close(2) has no buffered write to report.
+    var env_len: usize = 0;
+    if let Ok(n) = r { env_len = n; }
+    if (env_len == 0) { return null; }
     let name_len: usize = name.len;
     if (name_len == 0) { return null; }
     var i: usize = 0;
@@ -239,17 +577,22 @@ pub fun getenv(name: str) -> ?str {
 ## buffer (ARG_MAX is 128 KiB but a single page covers every real
 ## invocation; oversized command lines silently truncate at the
 ## buffer edge — fail-visible via the missing tail, not a crash).
+## Like getenv, a failed read degrades to an empty vector rather than
+## a Result: "no arguments" is a defensible degradation for a borrowed
+## best-effort view, and a Result here would push the /proc failure
+## policy onto every `argv()` caller.
 var argv_buf: [32768]u8 = undefined;
 var argv_elems: [512][]const u8 = undefined;
 pub fun argv() -> []const []const u8 {
-    let fd_raw: usize = openat(std.posix.AT.FDCWD, "/proc/self/cmdline", 0, 0);
-    let fd_signed: isize = fd_raw as isize;
-    if (fd_signed < 0) { return argv_elems[0..0]; }
-    let fd: i32 = fd_signed as i32;
-    let n: isize = read(fd, argv_buf[0..argv_buf.len], argv_buf.len);
-    _ = close(fd);
-    if (n <= 0) { return argv_elems[0..0]; }
-    let buf_len: usize = n as usize;
+    let fr: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/proc/self/cmdline", 0, 0);
+    if let Err(_) = fr { return argv_elems[0..0]; }
+    var fd: i32 = 0;
+    if let Ok(v) = fr { fd = v; }
+    let r: Result(usize, Errno) = read_full(fd, argv_buf[0..argv_buf.len]);
+    _ = close(fd); # deliberate discard: /proc/self/cmdline was opened read-only, so close(2) has no buffered write to report.
+    var buf_len: usize = 0;
+    if let Ok(n) = r { buf_len = n; }
+    if (buf_len == 0) { return argv_elems[0..0]; }
     var count: usize = 0;
     var i: usize = 0;
     while (i < buf_len) {
@@ -265,6 +608,42 @@ pub fun argv() -> []const []const u8 {
     return argv_elems[0..count];
 }
 
+## ── memory ────────────────────────────────────────────────────────────
+
+## raw_mmap — `mmap(2)`. `addr` is normally null (kernel picks the
+## page-aligned slot); prot/flags are the kernel numeric values
+## (PROT_READ|WRITE = 3, MAP_PRIVATE|MAP_ANONYMOUS = 0x22 on Linux).
+## fd = -1 + offset = 0 for anonymous mappings. Returns the raw rc:
+## the mapped address, or an errno-encoded (high-bit) usize.
+pub fun raw_mmap(addr: ?[*]u8, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> usize {
+    let p: std.os.linux.PROT = bitcast(prot);
+    let f: std.os.linux.MAP = bitcast(flags);
+    return std.os.linux.mmap(addr, len, p, f, fd, offset);
+}
+
+## mmap — the canonical entry. Ok(pointer) or Err(errno). The pointer
+## is returned as `[*]u8` rather than the raw usize so a caller cannot
+## mistake the failure encoding for an address.
+pub fun mmap(addr: ?[*]u8, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> Result([*]u8, Errno) {
+    let rc: usize = raw_mmap(addr, len, prot, flags, fd, offset);
+    if is_err(rc) { return Err(errno_of(rc)); }
+    return Ok(rc as [*]u8);
+}
+
+## raw_munmap — `munmap(2)`. Returns the raw rc (0 on success).
+pub fun raw_munmap(addr: [*]u8, len: usize) -> usize {
+    return std.os.linux.munmap(addr, len);
+}
+
+## munmap — the canonical entry. A rejected unmap LEAKS the mapping,
+## which a manual-memory language must not swallow, so the Result is
+## the reason this pair exists.
+pub fun munmap(addr: [*]u8, len: usize) -> Result(void, Errno) {
+    return check_void(raw_munmap(addr, len));
+}
+
+## ── spawn ─────────────────────────────────────────────────────────────
+##
 ## spawn — fork/execve/waitpid in .zag: the last __zag_posix-family
 ## preamble resident (__zag_process_spawn) retires here. The old
 ## zig-side helper wrapped std.process.spawn(+SpawnOptions literal)/
@@ -284,24 +663,34 @@ pub fun argv() -> []const []const u8 {
 ##   - fork; the child execve's straight away (between fork and
 ##     exec only async-signal-safe work — touching already-copied
 ##     memory — happens) and exit(127)s on execve failure (shell's
-##     command-not-found convention; the old helper's 255 covered
-##     spawn-SETUP failures, which this path has no analog of);
+##     command-not-found convention);
 ##   - waitpid decodes via the WIFEXITED mask `(status & 0x7F) == 0`
-##     — exit code is `(status >> 8)`; signal kills / wait errors map
-##     to 255.
-## Over-limit inputs (arena or pointer-array overflow) return 255.
+##     — exit code is `(status >> 8)`.
+##
+## Returns Result: Ok(exit code) for a child that exited, Err(errno)
+## for a FAILURE TO SPAWN (arena too small, pointer-array overflow,
+## fork/waitpid errno, unreadable environ). The 255 collapse is gone:
+## 255 used to mean either "setup failed" or "the child exited 255",
+## and a caller could not tell which.
+## Two deliberate survivors of shell convention:
+##   - an execve FAILURE inside the child exits 127, so Ok(127) cannot
+##     be distinguished from a program that exited 127 (same ambiguity
+##     the shell has; closing it needs a close-on-exec status pipe).
+##   - a child KILLED BY A SIGNAL has no exit code and reports 255.
+## A zero-length /proc/self/environ is a legitimate empty environment
+## and now spawns a child with an empty envp instead of failing.
 var arg_arena: [16384]u8 = undefined;
 var arg_ptrs: [64:null]?[*:0]const u8 = undefined;
 var env_ptrs: [256:null]?[*:0]const u8 = undefined;
-pub fun spawn(cmd: []const []const u8) -> i32 {
+pub fun spawn(cmd: []const []const u8) -> Result(i32, Errno) {
     let nargs: usize = cmd.len;
-    if (nargs == 0) { return 255; }
-    if (nargs >= arg_ptrs.len) { return 255; }
+    if (nargs == 0) { return Err(Errno.of(EINVAL)); }
+    if (nargs >= arg_ptrs.len) { return Err(Errno.of(EINVAL)); }
     var off: usize = 0;
     var i: usize = 0;
     while (i < nargs) {
         let a: []const u8 = cmd[i];
-        if (off + a.len + 1 > arg_arena.len) { return 255; }
+        if (off + a.len + 1 > arg_arena.len) { return Err(Errno.of(EINVAL)); }
         memcpy(arg_arena[off .. off + a.len], a, a.len);
         arg_arena[off + a.len] = 0;
         let seg: []const u8 = arg_arena[off .. off + a.len];
@@ -310,18 +699,19 @@ pub fun spawn(cmd: []const []const u8) -> i32 {
         i = i + 1;
     }
     arg_ptrs[nargs] = null;
-    let fd_raw: usize = openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
-    let fd_signed: isize = fd_raw as isize;
-    if (fd_signed < 0) { return 255; }
-    let fd: i32 = fd_signed as i32;
-    let en: isize = read(fd, env_buf[0..env_buf.len], env_buf.len);
-    _ = close(fd);
-    if (en <= 0) { return 255; }
-    let env_len: usize = en as usize;
+    let fr: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/proc/self/environ", 0, 0);
+    if let Err(e) = fr { return Err(e); }
+    var fd: i32 = 0;
+    if let Ok(v) = fr { fd = v; }
+    let r: Result(usize, Errno) = read_full(fd, env_buf[0..env_buf.len]);
+    _ = close(fd); # deliberate discard: /proc/self/environ was opened read-only, so close(2) has no buffered write to report.
+    if let Err(e) = r { return Err(e); }
+    var env_len: usize = 0;
+    if let Ok(n) = r { env_len = n; }
     var e: usize = 0;
     var j: usize = 0;
     while (e < env_len) {
-        if (j >= env_ptrs.len) { return 255; }
+        if (j >= env_ptrs.len) { return Err(Errno.of(ENOMEM)); }
         let entry: []const u8 = env_buf[e .. env_len];
         env_ptrs[j] = entry.ptr as [*:0]const u8;
         j = j + 1;
@@ -333,7 +723,7 @@ pub fun spawn(cmd: []const []const u8) -> i32 {
     }
     env_ptrs[j] = null;
     let pid: usize = std.os.linux.fork();
-    if ((pid & 0x8000000000000000) != 0) { return 255; }
+    if is_err(pid) { return Err(errno_of(pid)); }
     if (pid == 0) {
         let head: []const u8 = arg_arena[0..off];
         let path_ptr: [*:0]const u8 = head.ptr as [*:0]const u8;
@@ -342,87 +732,100 @@ pub fun spawn(cmd: []const []const u8) -> i32 {
     }
     var status: u32 = 0;
     let wrc: usize = std.os.linux.waitpid(pid as i32, addr_of(status), 0);
-    if ((wrc & 0x8000000000000000) != 0) { return 255; }
+    if is_err(wrc) { return Err(errno_of(wrc)); }
     if ((status & 0x7F) == 0) {
-        return (status >> 8) as i32;
+        return Ok((status >> 8) as i32);
     }
-    return 255;
+    return Ok(255);
 }
+
+## ── exit ──────────────────────────────────────────────────────────────
 
 ## exit — `_exit(2)`. noreturn.
 pub fun exit(code: i32) -> noreturn {
     std.os.linux.exit(code);
 }
 
-## nanosleep — raw `nanosleep(2)` sleeping `sec` seconds + `nsec`
-## nanoseconds (blocks; no signal handling — EINTR retries are the
-## caller's policy). The __zag_nanosleep_ms preamble helper retired
-## into .zag through this entry + std.time.sleep_us's decomposition:
-## the ms→{sec,nsec} math is plain zag arithmetic, and the syscall
-## needs no anonymous-struct spelling zag can't produce (the timespec
-## is a std.os.linux type annotation, passing through type-text
-## verbatim like the spawn pointers did). Returns the raw usize rc
-## (0 on success, errno-encoded otherwise) — mirrors clock_gettime's
-## discard-the-rc shape internally; callers wanting the errno test it
-## via the sign bit.
-pub fun nanosleep(sec: i64, nsec: i64) -> usize {
+## ── nanosleep ─────────────────────────────────────────────────────────
+
+## raw_nanosleep — `nanosleep(2)` sleeping `sec` seconds + `nsec`
+## nanoseconds. Returns the raw usize rc (0 on success, errno-encoded
+## otherwise); EINTR means the sleep was cut short and the CALLER owns
+## the retry policy (see nanosleep_retry below for the common case).
+## The timespec is a std.os.linux type annotation, passing through
+## type-text verbatim like the spawn pointers.
+pub fun raw_nanosleep(sec: i64, nsec: i64) -> usize {
     var req: std.os.linux.timespec = undefined;
     req.sec = sec as isize;
     req.nsec = nsec as isize;
     return std.os.linux.nanosleep(addr_of(req), null);
 }
 
-## mmap — raw `mmap(2)`. `addr` is normally null (kernel picks the
-## page-aligned slot); prot/flags are the kernel numeric values
-## (PROT_READ|WRITE = 3, MAP_PRIVATE|MAP_ANONYMOUS = 0x22 on Linux).
-## fd = -1 + offset = 0 for anonymous mappings. Returns the raw rc:
-## the mapped address, or an errno-encoded (high-bit) usize.
-pub fun mmap(addr: ?[*]u8, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> usize {
-    let p: std.os.linux.PROT = bitcast(prot);
-    let f: std.os.linux.MAP = bitcast(flags);
-    return std.os.linux.mmap(addr, len, p, f, fd, offset);
+## nanosleep — the canonical entry. EINTR surfaces as
+## `Err(Errno.of(EINTR))` rather than being silently retried, because
+## only the caller knows whether the deadline still stands.
+pub fun nanosleep(sec: i64, nsec: i64) -> Result(void, Errno) {
+    return check_void(raw_nanosleep(sec, nsec));
 }
 
-## munmap — raw `munmap(2)`. Returns the raw rc (0 on success).
-pub fun munmap(addr: [*]u8, len: usize) -> usize {
-    return std.os.linux.munmap(addr, len);
-}
+## ── threads ───────────────────────────────────────────────────────────
 
-## clone — raw `clone(2)` for thread creation (std.concurrent.thread).
-## `payload` (the new thread's sole argument) is the address of the
-## control page; `flags` carries the sharing mask — CLONE_CHILD_CLEARTID
-## makes the kernel clear+wake `*ctid` on child exit (the futex word
-## `join` parks on), CLONE_PARENT_SETTID writes the child tid to
-## `*ptid`. Returns the raw rc: child tid in the caller, 0 in the
-## child (the child continues on the fixed zig-side trampoline,
+## raw_clone — `clone(2)` for thread creation
+## (std.concurrent.thread). `payload` (the new thread's sole argument)
+## is the address of the control page; `flags` carries the sharing mask
+## — CLONE_CHILD_CLEARTID makes the kernel clear+wake `*ctid` on child
+## exit (the futex word `join` parks on), CLONE_PARENT_SETTID writes the
+## child tid to `*ptid`. Returns the raw rc: child tid in the caller, 0
+## in the child (the child continues on the fixed zig-side trampoline,
 ## `__zag_thread_tramp`, which unpacks the control page and calls the
 ## user body — an auto-convention zag fun cannot be the clone entry
 ## directly).
-pub fun clone(payload: usize, flags: u32, stack: usize, ptid: *i32, ctid: *i32) -> usize {
+pub fun raw_clone(payload: usize, flags: u32, stack: usize, ptid: *i32, ctid: *i32) -> usize {
     return __zag_thread_start(payload, flags, stack, ptid, ctid);
 }
 
-## wait4 — raw `wait4(2)` (thread join). `flags` passes __WALL (0x40000000)
-## so a non-CLONE_THREAD child's exit is reaped by a threaded parent too.
-## Returns the raw rc: pid on success, errno-encoded (high-bit) usize.
-pub fun wait4(pid: i32, status: *u32, flags: u32) -> usize {
+## clone — the canonical entry. Ok(0) in the CHILD, Ok(tid) in the
+## parent; Err(errno) on failure. A 0 return is not an errno encoding,
+## so the two are unambiguous.
+pub fun clone(payload: usize, flags: u32, stack: usize, ptid: *i32, ctid: *i32) -> Result(usize, Errno) {
+    let rc: usize = raw_clone(payload, flags, stack, ptid, ctid);
+    if is_err(rc) { return Err(errno_of(rc)); }
+    return Ok(rc);
+}
+
+## raw_wait4 — `wait4(2)` (thread join). `flags` passes __WALL
+## (0x40000000) so a non-CLONE_THREAD child's exit is reaped by a
+## threaded parent too. Returns the raw rc: pid on success,
+## errno-encoded (high-bit) usize.
+pub fun raw_wait4(pid: i32, status: *u32, flags: u32) -> usize {
     return std.os.linux.wait4(pid, status, flags, null);
 }
 
+## wait4 — the canonical entry. Ok(pid) (always > 0 for a specific
+## pid request) or Err(errno).
+pub fun wait4(pid: i32, status: *u32, flags: u32) -> Result(i32, Errno) {
+    let rc: usize = raw_wait4(pid, status, flags);
+    if is_err(rc) { return Err(errno_of(rc)); }
+    return Ok(rc as i32);
+}
+
 ## gettid — thread id of the caller (gettid(2); the kernel-assigned
-## tid of this execution context).
+## tid of this execution context). gettid(2) cannot fail, so there is
+## no Result and no raw twin.
 pub fun gettid() -> i32 {
     return std.os.linux.gettid();
 }
 
-## futex_wait / futex_wake — the parking primitives under Future
-## suspension and thread join, exposed so pure-Zag code can block
-## cross-thread without zig-side preamble helpers. `addr` must point
-## to a naturally-aligned u32. WAIT parks while `*addr == expected`
-## (returns immediately with EWOULDBLOCK otherwise — the caller
-## re-checks state in a loop); WAKE resumes `count` parked waiters.
-## Returns the raw rc (0 on wake, errno-encoded otherwise).
-pub fun futex_wait(addr: *const u32, expected: u32) -> usize {
+## ── futex ─────────────────────────────────────────────────────────────
+
+## raw_futex_wait / raw_futex_wake — the parking primitives under
+## Future suspension and thread join, exposed so pure-Zag code can
+## block cross-thread without zig-side preamble helpers. `addr` must
+## point to a naturally-aligned u32. WAIT parks while `*addr == expected`
+## (returns immediately with EWOULDBLOCK otherwise); WAKE resumes
+## `count` parked waiters. Returns the raw rc (0 on wake,
+## errno-encoded otherwise).
+pub fun raw_futex_wait(addr: *const u32, expected: u32) -> usize {
     ## FUTEX_WAIT_BITSET-less v1 op word: cmd=WAIT(0) | PRIVATE(1<<7)
     ## — bitcast needs a runtime-typed source, so the literal binds
     ## to a u32 first (comptime_int has no bit pattern to cast).
@@ -431,20 +834,40 @@ pub fun futex_wait(addr: *const u32, expected: u32) -> usize {
     return std.os.linux.futex_4arg(addr, op, expected, null);
 }
 
-pub fun futex_wake(addr: *const u32, count: u32) -> usize {
+pub fun raw_futex_wake(addr: *const u32, count: u32) -> usize {
     let opv: u32 = 129;
     let op: std.os.linux.FUTEX_OP = bitcast(opv);
     return std.os.linux.futex_3arg(addr, op, count);
 }
 
-## futex_wait_shared — non-private (process-wide) WAIT. The kernel's
+## raw_futex_wait_shared — non-private (process-wide) WAIT. The kernel's
 ## CLONE_CHILD_CLEARTID wake on thread exit is NOT a private wake, so
 ## parking on a ctid word (thread join) MUST use this variant — a
 ## private wait never matches the kernel's wake and parks forever.
-pub fun futex_wait_shared(addr: *const u32, expected: u32) -> usize {
+pub fun raw_futex_wait_shared(addr: *const u32, expected: u32) -> usize {
     let opv: u32 = 0;
     let op: std.os.linux.FUTEX_OP = bitcast(opv);
     return std.os.linux.futex_4arg(addr, op, expected, null);
+}
+
+## futex_wait / futex_wake / futex_wait_shared — the canonical entries.
+## EAGAIN is a NORMAL outcome, not a fault: it means `*addr` no longer
+## held `expected` when the kernel looked, which is exactly how the
+## lock/join loops detect progress. Callers re-check their word after
+## every wait and therefore discard the Result with `_ =` — the discard
+## is explicit and greppable, and a caller that needs to distinguish
+## "word changed" from a real errno can test
+## `e.is(ErrnoKind.Eagain)`.
+pub fun futex_wait(addr: *const u32, expected: u32) -> Result(void, Errno) {
+    return check_void(raw_futex_wait(addr, expected));
+}
+
+pub fun futex_wake(addr: *const u32, count: u32) -> Result(void, Errno) {
+    return check_void(raw_futex_wake(addr, count));
+}
+
+pub fun futex_wait_shared(addr: *const u32, expected: u32) -> Result(void, Errno) {
+    return check_void(raw_futex_wait_shared(addr, expected));
 }
 
 ## slice_eq — byte-equality over two slices (the std.mem.eql

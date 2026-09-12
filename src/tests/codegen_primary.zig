@@ -138,11 +138,11 @@ test "codegen: array progression emits blk+__pat pattern" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(__blk_0: {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "var __arr: [4]i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "const __pat: [2]i32 = .{ 1, 2 }") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "__pat[__i % 2]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __arr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_0 __arr") != null);
 }
 
 test "codegen: single_tuple_lit emits .{ EXPR }" {
@@ -365,6 +365,6 @@ test "codegen: { ... } with statement keywords stays a block expression" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__blk_0: {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, ".{ 7 }") == null);
 }

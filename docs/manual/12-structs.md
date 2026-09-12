@@ -71,13 +71,15 @@ struct Widget {
 }
 
 struct Button {
-    Widget,              # embedded — promotes x, y fields and Widget methods
+    Widget,              # embedded — promotes Widget's methods
     label: String,
 }
 
-let btn = Button { Widget { x: 0, y: 0 }, label: new String("OK") };
-print("{btn.x} {btn.label}\n");   # access promoted field
+let btn = Button { Widget { x: 0, y: 0 }, label: String.from_str("OK") };
+print("{btn.Widget.x} {btn.label}\n");   # embedded field is accessed by name
 ```
+
+The embedded struct's **methods** are promoted: `btn.area()` calls `Widget.area` when `Button` does not declare its own. Its **fields** are not promoted into the outer namespace — read them through the embedded field, as in `btn.Widget.x` above.
 
 **Memory:** Embedded struct is inline — `Button` contains `Widget`'s fields directly. No pointer indirection.
 

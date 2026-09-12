@@ -2,7 +2,7 @@
 
 The canonical source of truth for primitive-type sizes, ranges, and representation. For literal syntax (how to *write* `42`, `0xFF`, `1_000_000`, `'\n'`, etc.), see [Literals](03-literals.md). For the type system that those literals feed into — type inference, `Copy` vs move, `as` conversions, struct embedding — see [Types](07-types.md).
 
-> All primitive types in Zag are **statically typed**: every `let x = 42` binding has exactly one compile-time-resolved type, every `*T` dereference is type-checked, and every `as` conversion is verified at compile time. There is no implicit numeric promotion in overload resolution (unlike Julia or C++), no auto-boxing, and no runtime type dispatch for primitive operations — the compiler emits native instructions for every primitive type on every target.
+> All primitive types in Zag are **statically typed**: every `let x = 42` binding has exactly one compile-time-resolved type, every `*T` dereference is type-checked, and every `as` conversion is verified at compile time. An integer literal may select a float overload only when no integer overload matches (see [Method Overloading](30-method-overloading.md)), there is no auto-boxing, and no runtime type dispatch for primitive operations — the compiler emits native instructions for every primitive type on every target.
 
 ## Integers
 

@@ -1,0 +1,257 @@
+## memory/leak_check.zag — proving there is no leak, with a number.
+##
+## Zag has no garbage collector: `new`/`alloc` allocate, `free`/`release`
+## deallocate, and nothing is inserted for you. The question "did I leak?"
+## therefore has a mechanical answer — take a snapshot of the live heap
+## before the work, and compare it after the work is freed:
+##
+##     let before: usize = Counters.snapshot().bytes_live;
+##     ... allocate, use, free ...
+##     assert(Counters.snapshot().bytes_live == before);
+##
+## `std.bench.Counters.snapshot()` reads the runtime allocation ledger
+## (docs/manual/20 §"Checking for leaks"). `bytes_live` is charged by
+## every allocation and discharged by every deallocation, so a NON-ZERO
+## difference is a leak, and the amount is the size of it.
+##
+## What the ledger covers, and at which layer:
+##
+##   new T(v)            charged @sizeOf(T)          freed by `free p`
+##   alloc(n)            charged n                  freed by `free buf`
+##   alloc_raw(n)        charged n                  freed by release(p, n)
+##   realloc_raw(p,c,n)  charged the delta (n - c)  freed by release(p, cap)
+##
+## The same three families are what the COMPILE-TIME leak warning tracks
+## (src/codegen/escape.zig): a `new`/`alloc`/`alloc_raw` site that never
+## escapes the enclosing function and is never freed is reported as
+## `warning: ... is never freed (leak)`. The warning is static and
+## conservative (a site handed to any user call counts as escaping); the
+## ledger below is the exact, runtime answer. The last gate row is the one
+## site here that is deliberately never freed, so it is the one warning
+## this file emits.
+##   String / ArrayList / HashMap growth, all via the mem.zag primitives,
+##   reclaimed by the container's own deinit() (String.deinit() included,
+##   so a read_file result is reclaimable — see the last two gate rows)
+##   slice helpers (split/join/to_upper/…) via alloc_raw
+##
+## The two layers agree because the accounting lives in the PRIMITIVES
+## (lib/std/mem.zag) and in the `new`/`free` emit — not at each call
+## site, where it could be forgotten or double-counted.
+##
+## Run from the repository root (the file-backed row reads
+## `examples/basics/hello.zag`):
+##
+##     zag run examples/memory/leak_check.zag
+##     zag test examples/memory/leak_check.zag   # the gate rows below
+##
+## The @[test] blocks below are the gate: each one asserts that its own
+## construct returns the ledger to where it started.
+
+import std.mem.{alloc, alloc_raw, release}
+import std.bench.{Counters}
+import std.types.{String}
+import std.collections.{ArrayList, HashMap}
+import std.strings.{to_upper}
+import std.fs.{read_file}
+
+fun live() -> usize {
+    return Counters.snapshot().bytes_live;
+}
+
+fun main() {
+    let before: usize = live();
+    print("baseline live = {before} bytes\n");
+
+    # ── a value: new + free ─────────────────────────────────────────
+    let p = new i32(42);
+    print("after new i32: live = {live()} (charged 4)\n");
+    free(p);
+    print("after free(p): live = {live()}\n");
+
+    # ── a buffer: alloc + free ──────────────────────────────────────
+    let buf: []u8 = alloc(1024);
+    print("after alloc(1024): live = {live()}\n");
+    free(buf);
+    print("after free(buf): live = {live()}\n");
+
+    # ── the raw tier: alloc_raw + release ───────────────────────────
+    let raw: [*]u8 = alloc_raw(256);
+    print("after alloc_raw(256): live = {live()}\n");
+    release(raw, 256);
+    print("after release: live = {live()}\n");
+
+    # ── a heap String, including a read_file result ─────────────────
+    var sb: String = String.from_str("heap-owned");
+    print("after String.from_str: live = {live()}\n");
+    sb.deinit();
+    print("after sb.deinit(): live = {live()}\n");
+    var f: String = read_file("examples/basics/hello.zag")!;
+    print("after read_file: live = {live()}\n");
+    f.deinit();
+    print("after f.deinit(): live = {live()}\n");
+
+    # ── a growable container, with its deinit ───────────────────────
+    var list: ArrayList(i32) = ArrayList(i32).new();
+    var i: i32 = 0;
+    while (i < 100) { list.push(i); i = i + 1; }
+    print("after ArrayList(100): live = {live()}\n");
+    list.deinit();
+    print("after list.deinit(): live = {live()}\n");
+
+    let after: usize = live();
+    if (after == before) {
+        print("no leak: live returned to baseline ({after} bytes)\n");
+    } else {
+        print("LEAK: {after - before} bytes still live\n");
+    }
+}
+
+# ── The gate ─────────────────────────────────────────────────────────
+# Every row takes its own baseline, so ordering cannot make one row
+# depend on another's leftovers. (`#` not `##` here: a doc comment can
+# not be attached to a test.)
+
+@[test]
+fun test_new_and_free_balance() {
+    let before: usize = live();
+    let p = new i32(42);
+    assert(live() == before + 4);
+    free(p);
+    assert(live() == before);
+}
+
+@[test]
+fun test_defer_free_balances_at_scope_exit() {
+    let before: usize = live();
+    {
+        let p = new i32(42);
+        defer free(p);
+        assert(live() == before + 4);
+    }
+    assert(live() == before);
+}
+
+@[test]
+fun test_alloc_and_free_balance() {
+    let before: usize = live();
+    let buf: []u8 = alloc(4096);
+    assert(live() == before + 4096);
+    free(buf);
+    assert(live() == before);
+}
+
+@[test]
+fun test_raw_tier_alloc_and_release_balance() {
+    let before: usize = live();
+    let raw: [*]u8 = alloc_raw(256);
+    assert(live() == before + 256);
+    release(raw, 256);
+    assert(live() == before);
+}
+
+@[test]
+fun test_array_list_growth_and_deinit_balance() {
+    let before: usize = live();
+    var list: ArrayList(i32) = ArrayList(i32).new();
+    var i: i32 = 0;
+    while (i < 100) { list.push(i); i = i + 1; }
+    # Growth is visible: the ledger tracks the doubling, not the element
+    # count, so a container that silently failed to grow would read low.
+    assert(live() > before);
+    list.deinit();
+    assert(live() == before);
+}
+
+@[test]
+fun test_hash_map_growth_and_deinit_balance() {
+    let before: usize = live();
+    var m: HashMap<i32, i32> = HashMap<i32, i32>.new();
+    var i: i32 = 0;
+    while (i < 200) { m.put(i, i * 2); i = i + 1; }
+    assert(live() > before);
+    m.deinit();
+    assert(live() == before);
+}
+
+@[test]
+fun test_string_growth_is_charged_and_released() {
+    let before: usize = live();
+    var s: String = String.with_capacity(8);
+    var k: usize = 0;
+    while (k < 500) { s.push_str("abcdefghij"); k = k + 1; }
+    # The charge is the CAPACITY the growth settled on, not the bytes
+    # written — realloc_raw charges exactly the delta on each grow, so
+    # the ledger equals the final cap.
+    assert(live() == before + s.cap);
+    s.deinit();
+    assert(live() == before);
+}
+
+@[test]
+fun test_string_deinit_is_idempotent() {
+    # `deinit` zeroes `cap` (mirroring ArrayList.deinit), so a second call
+    # is a no-op rather than an munmap of an already-released range.
+    let before: usize = live();
+    var s: String = String.from_str("released twice");
+    assert(live() > before);
+    s.deinit();
+    s.deinit();
+    assert(live() == before);
+    # A zero-capacity String never mapped, so its deinit must be a no-op
+    # too (the `cap > 0` guard).
+    var z: String = String.with_capacity(0);
+    z.deinit();
+    assert(live() == before);
+}
+
+@[test]
+fun test_read_file_string_is_reclaimable() {
+    # The gap this row closes: `read_file` returns a heap-owned String,
+    # and before `String.deinit` existed that buffer had NO release path —
+    # so the documented leak-check recipe could never return to baseline
+    # after reading a file. Now it can, and this row is the proof.
+    let before: usize = live();
+    var s: String = read_file("examples/basics/hello.zag")!;
+    assert(s.as_str().len > 0);
+    assert(live() > before);
+    s.deinit();
+    assert(live() == before);
+}
+
+@[test]
+fun test_slice_helper_results_are_charged_once() {
+    # The regression this guards: alloc_raw charges, and a second charge
+    # at the slices.zag call site made every helper result read as a
+    # permanent 2x leak. Charged once, freed once, balanced.
+    let before: usize = live();
+    let up: []u8 = to_upper("hello");
+    assert(live() == before + 5);
+    free(up);
+    assert(live() == before);
+}
+
+@[test]
+fun test_a_real_leak_is_visible() {
+    # The counterpart to every row above: an allocation that is NOT freed
+    # must show up. Without this, a broken ledger that always read zero
+    # would pass the whole suite.
+    #
+    # This row is ALSO the fixture for the compile-time leak warning, which
+    # covers `alloc`/`alloc_raw` as well as `new`: building or running this
+    # file prints
+    #
+    #     warning: `alloc` at ... in test_a_real_leak_is_visible is never
+    #     freed (leak) — add an explicit `free` or `defer free`
+    #
+    # for the line below. That warning is expected — do not "fix" it by
+    # freeing `leaked`, which would defeat the row. The two layers agree:
+    # the warning names the site statically, and the ledger below measures
+    # it (docs/manual/20 §"Checking for leaks").
+    let before: usize = live();
+    let leaked: []u8 = alloc(64);
+    assert(leaked.len == 64);
+    assert(live() == before + 64);
+    # `leaked` is intentionally never freed — this is the point of the row.
+    # (Read `leaked.len` above so the binding is USED: zig rejects an unused
+    # local, and a `free` here would defeat the test.)
+}

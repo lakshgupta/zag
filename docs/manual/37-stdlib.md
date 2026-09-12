@@ -28,11 +28,11 @@ surface of the modules below.
 | `std.mem` | `alloc` (keyword `free`), `memcpy` | heap |
 | `std.argv` | `get` | heap |
 | `std.env` | `get_env` (borrowed view) | none |
-| `std.fs` | `read_file`, `write_file`, `mkdir`, `File` (`open`/`create`/`open_append`, `read_at`, `write_at`, `read_block`, `write_block`, `append`, `size`, `block_count`, `truncate`, `sync`, `page_size`) | heap |
+| `std.fs` | `read_file`, `write_file`, `mkdir`, `try_read`, `File` (Result-returning: `open(path, FileMode)` — `Read`/`Rw`/`Append`/`Create` — plus `read_at`, `write_at`, `read_block`, `write_block`, `append`, `size`, `block_count`, `truncate`, `sync`, `datasync`, `fsync_parent`, `close`, `close_durable`), `FileMode`, `PAGE_SIZE`, `PARENT_CAP` | heap |
 | `std.bytes` | endian-explicit `put_u{16,32,64}_{le,be}` / `get_u{16,32,64}_{le,be}`, LEB128 varints (`put_varint`, `read_varint`, `varint_len`), `eq`, `cmp`, `zero`, `fill`, `copy` | none |
 | `std.process` | `exec`, `exit` | heap |
 | `std.io` | `read_line`, `read_all`, `write_all`, `ByteWriter` / `ByteReader` (cursor over a buffer), `FileWriter` / `FileReader` (page-buffered streams over an fd) | none |
-| `std.posix` | `openat`, `read`, `write`, `close`, `pread`, `pwrite`, `lseek`, `ftruncate`, `fsync`, `fdatasync`, `mkdirat`, `getdents64`, `clock_gettime`, `getcwd`, `getenv`, `spawn`, `exit` | none |
+| `std.posix` | `openat`, `read`, `write`, `close`, `pread`, `pwrite`, `lseek`, `ftruncate`, `fsync`, `fdatasync`, `mkdirat`, `getdents64`, `clock_gettime`, `getcwd`, `nanosleep`, `mmap`, `munmap`, `clone`, `wait4`, `futex_wait`, `futex_wake`, `getenv`, `argv`, `spawn`, `exit`, plus the `raw_*` escape hatch | none |
 | `std.debug` | `panic` | none |
 
 ## Storage primitives
@@ -44,21 +44,63 @@ block store with per-page checksums).
 
 **1. Positioned file I/O** — `std.fs.File`, backed by `pread` /
 `pwrite` (offset as an argument, so the fd's file position is never
-shared state and no seek is needed):
+shared state and no seek is needed). Every fallible method returns
+`Result(_, Error)`, so a storage engine can report a full disk instead
+of dying. There is exactly ONE spelling of each operation: the caller
+picks the policy with postfix `!` (panic), `?` (propagate), `catch`
+(fallback), or `match` (branch) — so there is no `*_or_panic` twin to
+keep in step:
 
 ```zag
-import std.fs.{File, page_size}
+import std.fs.{File, FileMode, PAGE_SIZE}
 
-var f: File = File.create("db.pages");
-f.truncate(page_size() * 2);      # pre-extend
-var page: [4096]u8 = undefined;
-f.write_block(0, page[0..]);      # one page at block id 0
-let ok: bool = f.read_block(0, page[0..]);
-f.sync();                         # durability barrier
-f.close();
+var f: File = File.open("db.pages", FileMode.Create)!;
+f.truncate(PAGE_SIZE * 2)!;            # pre-extend
+var page: [PAGE_SIZE]u8 = undefined;
+f.write_block(0, page[0..])!;          # one page at block id 0
+let ok: bool = f.read_block(0, page[0..])!;
+f.sync()!;                             # durability barrier
+f.close()!;
 ```
 
-`open_append` adds `O_APPEND`, which makes seek-to-end + write
+The same calls without `!` are the recoverable spelling:
+
+```zag
+let cr: Result(File, Error) = File.open("db.pages", FileMode.Rw);
+match cr {
+    Ok(h) => { f = h; },
+    Err(e) => { print("cannot open db.pages\n"); return; },
+}
+```
+
+`FileMode` selects the open flags (`Read` = O_RDONLY, `Rw` =
+O_RDWR|O_CREAT, `Append` = O_WRONLY|O_CREAT|O_APPEND, `Create` =
+O_RDWR|O_CREAT|O_TRUNC). The mode is mandatory because `File` is a
+cross-module type, where a one-argument overload could not resolve
+(see [Method Overloading](30-method-overloading.md) §"Across modules").
+
+**The handle remembers how it was opened.** `File` retains the parent
+directory of its path and whether it was opened with `O_CREAT`, which
+is what makes durability a property of the handle instead of a ritual
+every writer has to reproduce:
+
+- `close()` — a plain checked close. Fast; it never silently fsyncs,
+  but it does report a deferred writeback error (ENOSPC/EIO).
+- `close_durable()` — flush the contents, checked close, then flush
+  the parent directory when this handle created the entry, so the new
+  *name* is durable and not just its bytes. `fsync_parent()` for that
+  step on its own. `EINVAL`/`ENOTSUP` from a directory fsync (a
+  filesystem without support) is tolerated; a parent that did not fit
+  in `PARENT_CAP` bytes is an `Err`, because the handle cannot prove
+  the name is durable.
+- `write_file(path, content) -> Result(usize, Error)` — the whole
+  durable create-write-flush sequence, as a value. `write_file(p, c)!`
+  is the fail-fast spelling of the same call.
+
+There is no `try_open`: `open` returns a `Result`, and `is_open()`
+reports whether the handle still owns a descriptor.
+
+`FileMode.Append` adds `O_APPEND`, which makes seek-to-end + write
 atomic — the property a write-ahead log needs for concurrent
 writers. `size` / `block_count` / `truncate` / `sync` / `datasync`
 manage the file extent and durability.
@@ -120,39 +162,83 @@ pass, below). Modules import it with the std-to-std form:
 pub import std.posix.{openat, read, write, close, mkdirat}
 ```
 
-Conventions, mirroring the retired preamble:
+### Two tiers: the canonical `Result` surface and `raw_*`
 
-- `openat(dirfd, path, flags: u32, mode: u32) -> usize` — path is
-  copied into a 4096-byte sentinel buffer (the .zag surface has no
-  `[N:0]u8` literal); callers treat the high bit as the error marker
-  (`(fd & 0x8000000000000000) != 0`), same convention as the
-  preamble. `flags` reaches zig via `bitcast` (the packed `O`
-  bitfield).
-- `read(fd, buf, len) -> isize` / `write(fd, buf, len) -> isize` —
-  the returned raw `usize` is sign-cast back to `isize` so callers
-  can branch on `<= 0` for EOF/error.
-- `getcwd() -> []const u8` / `getenv(name) -> ?str` — return slices
-  into fixed module-level buffers (`var cwd_buf: [4096]u8`,
-  `var env_buf: [32768]u8`); `getenv` scans `/proc/self/environ` so
-  the returned slice is NUL-terminated-free; `getenv` never
-  allocates, so lookups are safe in signal-ish contexts.
-- `clock_gettime(clk_id: i32) -> i64` — nanosecond monotonic time via
-  `enum_from_int` (runtime int → `clockid_t`); `std.time.now`
-  delegates to it.
+Every fallible entry point exists twice. The canonical name returns
+`Result(T, Errno)`; the `raw_` prefix gives the kernel's value verbatim
+(a `usize` with bit 63 set on failure, or a negative `isize`).
+
+```zag
+import std.posix.{openat, close, read, write, lseek, mkdirat}
+import std.errno.{Errno, ErrnoKind}
+
+fun copy_one(src: str, dst: str) -> Result(void, Errno) {
+    let s: Result(i32, Errno) = openat(std.posix.AT.FDCWD, src, 0, 0);
+    if let Err(e) = s { return Err(e); }
+    var sfd: i32 = 0;
+    if let Ok(v) = s { sfd = v; }
+    # ...
+    _ = close(sfd);   # explicit discard: this fd's close cannot matter
+    return Ok(undefined);
+}
+```
+
+Use the canonical tier unless you are writing a loop that owns its own
+EINTR policy (`read_full`/`write_full` below are the only places in
+lib/std that do) or a hot path that must not branch twice.
+
+What the canonical tier guarantees:
+
+- **A failure is always an `Err`, and a success is always an `Ok`.**
+  EOF is `Ok(0)`, a seek to offset 0 is `Ok(0)`, and a futex that
+  reports EAGAIN is a normal `Err(EAGAIN)` that lock loops re-check.
+- **No entry fabricates an errno.** An over-long path is
+  `Err(EINVAL)`; it used to return `0xFFFFFFFFFFFFFFFF`, which decodes
+  as `EPERM`.
+- **The errno is a named value.** `Errno { kind, code }` keeps the exact
+  kernel number even for a code outside `ErrnoKind`, and `Errno.name()`
+  renders it (`"ENOSPC"`, or `"errno 4094"`).
+- **`_ = name(...)` is the only way to ignore a result**, so a site that
+  means to discard a failure says so in the source.
+
+Shapes worth knowing:
+
+- `openat(dirfd, path, flags: u32, mode: u32) -> Result(i32, Errno)` —
+  path is copied into a 4096-byte sentinel buffer (the .zag surface has
+  no `[N:0]u8` literal). `flags` reaches zig via `bitcast` (the packed
+  `O` bitfield).
+- `read` / `write` / `pread` / `pwrite` -> `Result(usize, Errno)`;
+  `lseek -> Result(i64, Errno)` (so a legit `Ok(0)` is not mistaken for
+  the old negative-error marker).
+- `close` / `fsync` / `fdatasync` / `ftruncate` / `mkdirat` / `munmap` /
+  `nanosleep` / `futex_*` -> `Result(void, Errno)`. `mkdirat` returns
+  `Err(Errno.of(EEXIST))` rather than swallowing it — `std.fs.mkdir`
+  coalesces it for `mkdir -p` semantics.
+- `getcwd() -> Result([]const u8, Errno)` and `getenv(name) -> ?str`
+  both return slices into fixed module-level buffers
+  (`var cwd_buf: [4096]u8`, `var env_buf: [32768]u8`). `getcwd` is a
+  `Result` because a failure has no sensible empty-string spelling;
+  `getenv` stays `?str` because "unset" is a normal answer, not a
+  syscall failure. `getenv` scans `/proc/self/environ` and never
+  allocates.
+- `clock_gettime(clk_id: i32) -> Result(i64, Errno)` — nanosecond time
+  via `enum_from_int` (runtime int → `clockid_t`); `std.time.now`
+  delegates to it and panics on failure, because a broken monotonic
+  clock makes every `Timer`/`Duration` in the process meaningless.
 - `exit(code: i32) -> noreturn` — raw `std.os.linux.exit`.
-- `spawn(argv: []const []const u8) -> i32` — fork/execve/waitpid in
-  .zag (the last preamble retirement). argv strings land in a fixed
-  module-level arena, each NUL-terminated; `arg_ptrs`/`env_ptrs` are
-  `[64:null]`/`[256:null]` sentinel pointer arrays (the `.zag`
-  type-text pass-through gets the sentinel array via `[N:S]T`
-  annotations — the parser's sentinel-size carve-out). The child
-  inherits the parent environment (an envp walk over a fresh
+- `spawn(argv: []const []const u8) -> Result(i32, Errno)` —
+  fork/execve/waitpid in .zag (the last preamble retirement). argv
+  strings land in a fixed module-level arena, each NUL-terminated;
+  `arg_ptrs`/`env_ptrs` are `[64:null]`/`[256:null]` sentinel pointer
+  arrays (the `.zag` type-text pass-through gets the sentinel array via
+  `[N:S]T` annotations — the parser's sentinel-size carve-out). The
+  child inherits the parent environment (an envp walk over a fresh
   /proc/self/environ read) and execve's; execve failure exits 127.
-  The parent waitpid-decodes via `(status & 0x7F) == 0` → exit code
-  is `(status >> 8)`; signal kills / errors map to 255. NOTE:
-  callers must pass a SLICED array (`args[0..2]`) — zig 0.16 removed
-  the by-value array→slice coercion, so a bare `exec(args)` fails
-  ("array literal requires address-of operator").
+  `Ok(exit code)` for a child that exited; `Err(errno)` only when the
+  SPAWN failed, so a child's `Ok(255)` is no longer ambiguous with a
+  setup failure. NOTE: callers must pass a SLICED array (`args[0..2]`) —
+  zig 0.16 removed the by-value array→slice coercion, so a bare
+  `exec(args)` fails ("array literal requires address-of operator").
 
 `std.fs`, `std.env`, `std.time`, and `std.process` import from this
 facade; `std.process.exit` re-exports it under the alias

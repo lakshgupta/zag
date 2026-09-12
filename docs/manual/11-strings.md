@@ -11,7 +11,7 @@ Zag has two string types:
 
 ```
 let greeting: []const u8 = "hello";
-let owned = new String("hello");     # String — heap allocated
+var owned: String = String.from_str("hello");   # String — heap allocated
 ```
 
 ## Concatenation with `+`
@@ -57,45 +57,85 @@ legacy `std.string` module was removed, so a stray
 ```
 import std.types.{String}
 
-let s = new String("hello");
-defer free(s);
+# with_capacity(n): allocate n bytes, length 0.
+# from_str(s):     allocate a fresh buffer holding a COPY of s.
+var s: String = String.from_str("hello");
 
-s.push('!');
-s.push_str(" world");
-print("{s}\n");         # "hello world"
+s.push_str(" world");            # append a borrowed slice
+s.push_ch('!');                  # append one byte
+print("{s.as_str()}\n");         # "hello world"
+
+s.deinit();                      # release the buffer
 ```
 
-**Memory:** `new String(...)` heap-allocates via the global allocator. Must be `free`d.
+**Memory:** both constructors heap-allocate through `std.mem`'s raw tier
+(`alloc_raw` over `mmap`). The buffer is owned by the `String` and has **no
+implicit reclamation** — release it with `deinit()`. The binding must be `var`
+for that, because `deinit` takes `*String`; a `let` binding is `*const` and
+the call is a compile error.
+
+Printing a `String` directly (`print("{s}\n")`) does **not** print its
+contents — `String` has no `Display` impl, so a bare `{s}` placeholder shows
+the struct fields. Use `s.as_str()` (or `s.trim()` / `s.slice(a, b)`, which
+also return a borrowed `[]const u8`).
 
 ## String Methods
 
 ```
-let s = new String("hello");
+var s: String = String.from_str("hello");
 
-s.push('!');                     # append character
-s.push_str(" world");            # append string slice
-s.reserve(100);                  # pre-allocate capacity
-s.clear();                       # reset to empty (keeps allocation)
-let view: []const u8 = s.as_str();  # borrow as slice
+s.push_str(" world");                # append a slice
+s.push_ch('!');                      # append one byte
+s.insert_ch(0, '>');                 # insert one byte at an index (bounds-checked)
+let last: ?u8 = s.pop_ch();          # remove + return the last byte, or null
+let view: []const u8 = s.as_str();   # borrow the bytes
+
+# Comparison and search take a borrowed `str`, not a String:
+let same: bool = s.eq("hello world");
+let has:  bool = s.contains("ell");
+let pre:  bool = s.starts_with("he");
+let suf:  bool = s.ends_with("lo");
+let at: ?usize = s.find("ell");       # first index, or null
+let part: []const u8 = s.slice(0, 3);
+let trimmed: []const u8 = s.trim();
+
+s.to_upper();                        # in-place ASCII case conversion
+s.to_lower();
+
+print("view={view} same={same} contains={has} prefix={pre} suffix={suf} part={part} trimmed={trimmed} last={last} at={at}\n");
+
+s.clear();                           # length 0, buffer still allocated
+s.deinit();                          # release the buffer
 ```
 
-**Memory:** `push` and `push_str` may reallocate if capacity is exceeded. `reserve` pre-allocates. `clear` resets length without freeing.
+**Memory:** `push_str` / `push_ch` / `insert_ch` reallocate (via
+`realloc_raw`) when the length would exceed `cap`, doubling until it fits.
+`clear` resets the length **without** freeing — the buffer stays charged
+until `deinit`. `to_upper` / `to_lower` are in place; the search and slice
+methods return borrowed views that must not outlive the `String`.
 
 ## String Builder Pattern
 
 ```
 fun build_greeting(name: str) -> String {
-    var s = String.with_capacity(64);
-    s.with_writer(|w| {
-        Display.write("hello, ", w);
-        Display.write(name, w);
-        Display.write("!\n", w);
-    });
-    return s;
+    var s: String = String.with_capacity(64);   # one allocation
+    s.push_str("hello, ");
+    s.push_str(name);
+    s.push_ch('!');
+    return s;                                    # ownership moves to the caller
+}
+
+fun main() {
+    var g: String = build_greeting("world");
+    print("{g.as_str()}\n");
+    g.deinit();
 }
 ```
 
-**Memory:** `with_capacity` allocates once. `with_writer` formats into the buffer without intermediate allocations.
+**Memory:** `with_capacity(n)` allocates once, so the `push` calls only
+reallocate if the result exceeds `n`. The returned `String` carries ownership
+to the caller, which is why the builder needs no `deinit` of its own — and why
+the caller does.
 
 ## String Interpolation
 
@@ -111,27 +151,39 @@ print("{42:x}\n");              # "2a"
 print("{42:b}\n");              # "101010"
 ```
 
-**Expression content** — the `{...}` placeholder accepts any
-zig expression, not just a single identifier. Dots, spaces,
-operators, parens, and method calls are all valid inside the
-braces because the gate only rejects a NESTED `{` (an embedded
-code block, not an interpolation):
+**Expression content** — a placeholder holds an expression, not
+necessarily a single identifier. The parser understands literals
+(integer, float, and string), names, field access (`self.n`),
+casts (`x as f64`), calls (`obj.f()`), indexing (`a[0]`), and
+top-level `+`/`-` chains:
 
 ```
 let a: i32 = 1;
 let b: i32 = 2;
 print("sum = {a + b}\n");                 # "sum = 3"
 print("dot = {obj.f()}\n");               # method-call expression
+print("quoted = {p.show(\"hi\")}\n");    # a string ARGUMENT, not data
 print("precise = {pi:.5}\n");            # format spec still works
 ```
 
-The placeholder text is emitted verbatim at the format-arg site,
-so any expression that zig accepts as a value-yielding expression
-is a valid interpolation. Format specifiers (`:spec`) are split
-off the first `:` and applied to the placeholder (e.g.
-`{pi:.5}` becomes `{any:.5}` with arg `pi`).
+A string containing `{...}` stays a plain string (an embedded code
+blob or JSON payload, not an interpolation) when a placeholder
+contains a nested `{`, a `;`, or when its first non-whitespace
+character is a quote or backslash — `"{\"a\": [1, 2, 3]}"` is
+data. Quotes later in a placeholder are string arguments, as above.
 
-**Memory:** Interpolation allocates a `String` via `Display.write`. Use `with_writer` for zero-alloc formatting in hot paths.
+Other compound expressions are not part of the placeholder grammar;
+bind them to a local first:
+
+```
+let same: bool = a == b;
+print("eq = {same}\n");                   # not {a == b}
+```
+
+Format specifiers (`:spec`) are split off the first `:` and applied
+to the placeholder (e.g. `{pi:.5}` becomes `{any:.5}` with arg `pi`).
+
+**Memory:** Outside `print`/`eprint` a template is materialized into the destination binding. There is no `String`-producing form and no `with_writer`/`as_writer`; to build an owned buffer, `push_str`/`push_ch` into a `String.with_capacity(n)` and `deinit` it (see the methods section above).
 
 **Byte-slice printing (`{s}` vs `{any}`):** Interpolated byte-slice bindings (`let s: []const u8 = ...` OR `let s: str = ...`) route through zig's `{s}` formatter and display the slice's contents (`hello`) rather than the byte-element list (`{ 104, 101, 108, 108, 111 }`). Optional byte-slice bindings (`let s: ?[]const u8 = ...`) ALSO route through `{s}` but the arg slot is wrapped with `orelse ""` so the non-null value emits and null displays as an empty string. Unannotated bindings and primitive scalar types (`i32`, `bool`, `f64`, ...) preserve the legacy `{any}` default. The widening applies to BOTH `print(arg)` (direct call) and `print("v={arg}\n")` (template interpolation) surfaces.
 
@@ -156,8 +208,8 @@ let bytes: []const u8 = b"hello";
 
 ```
 let borrowed: str = "hello";
-let owned: String = new String(borrowed);   # heap allocate
-let back: str = owned.as_str();             # borrow — no allocation
+var owned: String = String.from_str(borrowed);   # heap allocate + copy
+let back: str = owned.as_str();                  # borrow — no allocation
 ```
 
-**Memory:** `new String(str)` copies the bytes to the heap. `as_str()` borrows — zero cost.
+**Memory:** `String.from_str(str)` copies the bytes to the heap; `as_str()` borrows them back at zero cost. Note the `var`: `String.from_str` returns an owned buffer, and releasing it with `deinit` (which takes `*String`) requires a mutable binding.

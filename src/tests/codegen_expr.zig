@@ -1072,7 +1072,7 @@ test "codegen: catch with error binding emits err variable in handler" {
     try std.testing.expect(std.mem.indexOf(u8, zig, ".Err => |msg|") != null);
 }
 
-test "codegen: block expression emits labeled blk with break :blk" {
+test "codegen: block expression emits labeled block with break" {
     const src =
         \\fun f() -> i32 {
         \\    return { let x: i32 = 5; x };
@@ -1086,9 +1086,31 @@ test "codegen: block expression emits labeled blk with break :blk" {
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
     // Block expression emits labeled block
-    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk: {") != null);
-    // Last expression broken with :blk
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(__blk_0: {") != null);
+    // Last expression broken with the block's label
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_0") != null);
+}
+
+test "codegen: nested block expressions emit distinct labels" {
+    // A block expression inside another block expression must not reuse the
+    // block label — a literal `blk` produced zig's "redefinition of label
+    // 'blk'". Each block now draws a unique `__blk_<N>`.
+    const src =
+        \\fun f() -> i32 {
+        \\    return { let a: i32 = { let x: i32 = 1; x }; a };
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__blk_0: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__blk_1: {") != null);
+    // No literal `blk:` label survives the rename.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "(blk:") == null);
 }
 
 test "codegen: catch with block handler emits break :blk for handler body" {

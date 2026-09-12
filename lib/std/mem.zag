@@ -46,8 +46,33 @@
 ##
 ## OOM panics via __zag_panic — matching the retired helpers'
 ## `catch @panic(...)` behavior.
+##
+## ## Allocation accounting (leak checking)
+## This module is the CHOKEPOINT for the runtime allocation ledger
+## that `std.bench.Counters.snapshot()` reads. The accounting lives in
+## the primitives here — not at each call site — because a charge the
+## caller has to remember is a charge that gets forgotten or applied
+## twice:
+##
+##   alloc_raw(n)             charges n
+##   realloc_raw(p, cap, n)    charges n and discharges cap (net delta)
+##   release(p, cap)           discharges cap
+##
+## The `new` / `free` keyword paths also account (the emitter charges
+## @sizeOf(T) / the slice length; src/codegen/expr.zig), so the two
+## tiers land in one ledger and `Counters.snapshot().bytes_live`
+## returns to its baseline exactly when everything is freed. The
+## discipline for a caller of the RAW tier is therefore: whatever `n`
+## you charged by allocating is the `cap` you must pass to `release`.
+##
+## Because the charge is taken from the same `n`/`cap` the allocator
+## used, a container that grows (String, ArrayList, HashMap) reports
+## its CAPACITY as live bytes rather than its element count — and a
+## container that is never released shows up as a leak of that size.
+## See docs/manual/20-memory.md §"Checking for leaks".
 
 import std.posix.{mmap, munmap}
+import std.errno.{Errno}
 
 ## alloc — `n` usable bytes as a data slice (public tier; the
 ## mapping is page-rounded, so `free buf` via the keyword munmaps
@@ -62,12 +87,14 @@ pub fun alloc_raw(n: usize) -> [*]u8 {
     let page: usize = 4096;
     var mapped: usize = (n + page - 1) & ~(page - 1);
     if (mapped == 0) { mapped = page; }
-    let rc: usize = mmap(null, mapped, 3, 34, -1, 0);
-    if ((rc & 0x8000000000000000) != 0) {
+    let r: Result([*]u8, Errno) = mmap(null, mapped, 3, 34, -1, 0);
+    if let Err(_) = r {
         __zag_panic("std.mem.alloc: mmap failed (OOM)");
     }
+    var p: [*]u8 = undefined;
+    if let Ok(v) = r { p = v; }
     __zag_bench_alloc(n);
-    return rc as [*]u8;
+    return p;
 }
 
 ## realloc_raw — grow/shrink to `n` usable bytes preserving
@@ -81,11 +108,12 @@ pub fun realloc_raw(p: [*]u8, old_cap: usize, n: usize) -> [*]u8 {
     if (old_mapped == 0) { old_mapped = page; }
     var new_mapped: usize = (n + page - 1) & ~(page - 1);
     if (new_mapped == 0) { new_mapped = page; }
-    let rc: usize = mmap(null, new_mapped, 3, 34, -1, 0);
-    if ((rc & 0x8000000000000000) != 0) {
+    let r: Result([*]u8, Errno) = mmap(null, new_mapped, 3, 34, -1, 0);
+    if let Err(_) = r {
         __zag_panic("std.mem.realloc: mmap failed (OOM)");
     }
-    let np: [*]u8 = rc as [*]u8;
+    var np: [*]u8 = undefined;
+    if let Ok(v) = r { np = v; }
     var keep: usize = old_mapped;
     if (new_mapped < keep) { keep = new_mapped; }
     var k: usize = 0;
@@ -93,12 +121,30 @@ pub fun realloc_raw(p: [*]u8, old_cap: usize, n: usize) -> [*]u8 {
         np[k] = p[k];
         k = k + 1;
     }
-    _ = munmap(p, old_mapped);
+    # munmap publishes Result(void, Errno); discarding it would silently
+    # LEAK the old mapping when the unmap is rejected, so surface that as
+    # a panic instead (matching alloc's OOM panic above).
+    let ur: Result(void, Errno) = munmap(p, old_mapped);
+    if let Err(_) = ur {
+        __zag_panic("std.mem.realloc: munmap failed");
+    }
+    # Account for the mapping SWAP at the chokepoint rather than at each
+    # call site: the new mapping is live and the old is gone, so the raw
+    # tier's ledger moves by exactly the delta. String and the
+    # collections grow through this helper, which is why a container that
+    # is never released currently shows up as live bytes — the leak a
+    # `Counters.snapshot()` check is looking for.
+    __zag_bench_alloc(n);
+    __zag_bench_free(old_cap);
     return np;
 }
 
 ## release — release a mapping of `cap` caller-tracked bytes
 ## (page-rounded here; munmap length must match the mapping).
+## `cap` is also the ledger discharge, so it must be the same `n` the
+## mapping was acquired with (`alloc_raw(n)` / the last
+## `realloc_raw(_, _, n)`), otherwise `Counters.snapshot().bytes_live`
+## drifts by the difference.
 ## Named `release` (not `free`) because the `free` KEYWORD hijacks
 ## that identifier at statement level (`free x, cap` rewrites to
 ## zig's page_allocator.destroy — the keyword path stays for
@@ -108,7 +154,20 @@ pub fun release(p: [*]u8, cap: usize) -> void {
     let page: usize = 4096;
     var mapped: usize = (cap + page - 1) & ~(page - 1);
     if (mapped == 0) { mapped = page; }
-    _ = munmap(p, mapped);
+    # Checked, not discarded: a rejected munmap leaks the mapping, and
+    # a silent leak is exactly the failure mode a manual-memory
+    # language must not swallow.
+    let r: Result(void, Errno) = munmap(p, mapped);
+    if let Err(_) = r {
+        __zag_panic("std.mem.release: munmap failed");
+    }
+    # Charge the mapping back. `release` is the raw tier's deallocator
+    # (used by ArrayList/HashMap/thread stacks, which track `cap`
+    # themselves), so WITHOUT this the counter could only ever grow and
+    # every container deinit would read as a leak. The amount charged is
+    # the caller's `cap`, matching the `n` that alloc_raw/realloc_raw
+    # charged for the same mapping.
+    __zag_bench_free(cap);
 }
 
 ## memcpy — byte-for-byte copy `dst[0..len] ← src[0..len]` (callers

@@ -24,7 +24,7 @@
 ## src/codegen/expr.zig emit `__zag_String.with_capacity(N)` as the
 ## migrated call site, so impl-block method names must match).
 
-import std.mem.{memcpy, alloc_raw, realloc_raw}
+import std.mem.{memcpy, alloc_raw, realloc_raw, release}
 ##
 ## Layout { ptr: [*]u8, len: usize, cap: usize }. The `*u8` raw
 ## pointer shape rewrites through zagTypeToZig's `*raw T` rule
@@ -41,6 +41,24 @@ impl String {
     pub fun with_capacity(cap: usize) -> String {
         let p: *raw u8 = alloc_raw(cap);
         return String { ptr: p, len: 0, cap: cap };
+    }
+
+    # Release the backing buffer. `cap` is the exact discharge the ledger
+    # charged (`alloc_raw(cap)` / the last `realloc_raw(_, _, cap)`), the
+    # same contract ArrayList.deinit follows — so a String released this
+    # way returns `Counters.snapshot().bytes_live` to its baseline. The
+    # `cap > 0` guard mirrors ArrayList: a zero-cap String's mapping is
+    # released by nothing and its charge is zero, so there is no residue.
+    #
+    # Setting `cap = 0` (never touching `ptr`) mirrors ArrayList: the
+    # view is empty, so a second `deinit()` is a no-op rather than an
+    # munmap of an already-released range.
+    pub fun deinit(self: *String) {
+        if (self.cap > 0) {
+            release(self.ptr, self.cap);
+            self.len = 0;
+            self.cap = 0;
+        }
     }
 
     pub fun as_str(self: *const String) -> []const u8 {

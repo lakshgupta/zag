@@ -86,7 +86,7 @@ The `fun Trait.method` prefix makes the binding unambiguous.
 
 ## Method Overloading
 
-Multiple methods can share a name with different parameter types:
+Multiple methods can share a name with different parameter types or arity:
 
 ```
 impl Printer {
@@ -100,11 +100,11 @@ printer.print("hello");  # calls print(str)
 printer.print(pos);      # calls print(Vec3)
 ```
 
-Resolution is compile-time with zero runtime cost.
+Resolution is compile-time with zero runtime cost. When the argument types cannot decide the call, the compiler reports the ambiguous candidates and the caller annotates or casts the argument — see [Method Overloading](30-method-overloading.md).
 
 ## Operator Methods
 
-Define operators with dunder methods:
+Define operators with dunder methods, and the operator syntax works on the type:
 
 ```
 impl Vec3 {
@@ -116,7 +116,12 @@ impl Vec3 {
         return a.x == b.x && a.y == b.y && a.z == b.z;
     }
 }
+
+let sum: Vec3 = a + b;
+let same: bool = a == b;
 ```
+
+See [Operator Overloading](31-operator-overloading.md) for the full table and the cases where desugaring does not apply.
 
 ## Constructor Pattern
 

@@ -26,6 +26,7 @@
 
 import std.posix.{clone as sys_clone, futex_wait_shared, futex_wake, gettid}
 import std.mem.{alloc, release}
+import std.errno.{Errno}
 
 ## Thread — a joinable kernel thread handle. Fields are usize-stored
 ## internals, never read directly by user code (join/spawn/tid do).
@@ -65,10 +66,15 @@ pub fun spawn(body: *const fn (usize) void, payload: usize) -> Thread {
 
     let flags: u32 = 0x00000100 | 0x00010000 | 0x00000200 | 0x00000400 | 0x00000800 | 0x00040000 | 0x00200000 | 0x00100000;
     let tid_out: *i32 = (ctl_buf.ptr as usize + 24) as *i32;
-    let rc: usize = sys_clone(ctl_buf.ptr as usize, flags, stack_top, tid_out, ctl_buf.ptr as *i32);
-    if ((rc & 0x8000000000000000) != 0) {
+    # posix.clone returns Result(usize, Errno): the child sees Ok(0),
+    # the parent Ok(tid), and a failure is an `Err` instead of a
+    # hand-tested sign bit.
+    let cr: Result(usize, Errno) = sys_clone(ctl_buf.ptr as usize, flags, stack_top, tid_out, ctl_buf.ptr as *i32);
+    if let Err(_) = cr {
         __zag_panic("std.concurrent.thread.spawn: clone failed");
     }
+    var rc: usize = 0;
+    if let Ok(v) = cr { rc = v; }
     let t: Thread = Thread { ctid_addr: ctl_buf.ptr as usize, stack: stack_buf.ptr as usize, stack_len: 131072, ctl: ctl_buf.ptr as usize, tid: rc as i32 };
     return t;
 }
@@ -89,7 +95,9 @@ pub fun join(t: Thread) -> void {
         if (cur == 0) { break; }
         ## SHARED (non-private) wait: the kernel's CLONE_CHILD_CLEARTID
         ## wake on thread exit is a non-private wake — a private wait
-        ## would never match it and park forever.
+        ## would never match it and park forever. The Result is
+        ## discarded on purpose: EAGAIN just means the ctid word moved
+        ## (the thread exited) and the loop re-reads it.
         _ = futex_wait_shared(waddr, cur);
     }
     _ = futex_wake(waddr, 1);

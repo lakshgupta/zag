@@ -170,9 +170,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // Bare rebinding: `name = expr;` (no leading `let`/`var`).
                 // The name must refer to a previously-declared `var`; Zig's
                 // compile-time type checker surfaces "undeclared identifier"
-                // errors at the generated use site.
+                // errors at the generated use site. `identEmitName` keeps a
+                // shadow-renamed match capture writable (`Err(e) => { e = x; }`
+                // inside an outer `Err(e)`), and is a no-op otherwise.
                 self.write("    ");
-                self.write(a.name);
+                self.write(self.identEmitName(a.name));
                 self.write(" = ");
                 self.genExpr(a.value);
                 self.write(";\n");
@@ -257,9 +259,14 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         self.write("if (");
                         self.write(tmp);
                         self.write(") |");
+                        // Capture-scope entry: the payload binding is a
+                        // synthetic local, so register it (and mangle it on
+                        // an enclosing-name collision) exactly like a match
+                        // arm capture.
+                        const il_mark = self.beginBindScope();
                         if (ev.bindings) |binds| {
                             if (binds.len > 0 and binds[0] != null) {
-                                self.write(binds[0].?);
+                                self.write(self.bindEmitName(binds[0].?));
                             } else {
                                 self.write("_");
                             }
@@ -300,14 +307,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         self.write("    }");
                         self.genElseBranch(ifs.else_kind);
                         self.write(" });\n");
+                        self.endBindScope(il_mark);
                         return;
                     }
                     self.write("    if (");
                     self.genExpr(ifs.cond);
                     self.write(") |");
+                    // Capture-scope entry (mirror of the match-arm / the
+                    // enum-variant if-let branch above): register the
+                    // binding so a same-name enclosing capture does not
+                    // produce a shadowing local.
+                    const il_mark = self.beginBindScope();
                     // Write the capture name from the pattern
                     if (pat == .ident) {
-                        self.write(pat.ident);
+                        self.write(self.bindEmitName(pat.ident));
                     } else {
                         self.write("_");
                     }
@@ -316,6 +329,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     self.write("    }");
                     self.genElseBranch(ifs.else_kind);
                     self.write("\n");
+                    self.endBindScope(il_mark);
                 } else {
                     self.write("    if ");
                     self.writeCond(ifs.cond);
@@ -429,8 +443,14 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     self.genExpr(fs.iter);
                 }
                 self.write(") |");
+                // The loop variable is a fresh synthetic binding: register
+                // it so a `for` var that shares a name with an enclosing
+                // match capture is mangled rather than shadowing it (zig
+                // 0.16 rejects the shadow, and the body's references have
+                // to follow whichever name won).
+                const for_bind_mark = self.beginBindScope();
                 switch (fs.pattern) {
-                    .ident => |name| self.write(name),
+                    .ident => |name| self.write(self.bindEmitName(name)),
                     .discard => self.write("_"),
                     else => {
                         // Range / literal patterns inside `for` are not
@@ -441,10 +461,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("| {\n");
                 for (fs.body) |s| self.genStmt(s, false);
                 self.write("    }\n");
+                self.endBindScope(for_bind_mark);
             },
             .match_stmt => |m| {
                 // CRITICAL: match-as-stmt emit shape. The MATCH form
-                // always emits a labelled `(blk: { ... });` block.
+                // always emits a labelled `(__blk_N: { ... });` block.
                 // Because that block sits on its own indented line in
                 // the generated zig (NOT inline with the function
                 // body's closing `}`), zig's implicit-return detection
@@ -458,7 +479,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // with an explicit `return ` so the matched value gets
                 // returned. Otherwise (mid-fn match, OR last-in-a-void-
                 // fn match) we emit the bare indented
-                // `(blk: { ... });` — zig accepts the discared block
+                // `(__blk_N: { ... });` — zig accepts the discared block
                 // value at statement position.
                 //
                 // The caller (`genFun`/`genMethod`/`genFreeMethod`)
@@ -525,6 +546,42 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
             },
             .index_assign => |ia| {
+                // Operator overloading (docs/manual/31): `a[k] = v` lowers
+                // to `a.__index_set__(k, v)` when the target's type declares
+                // a three-parameter `__index_set__` (receiver + key +
+                // value). Braced and `return`-ed so a user aggregate never
+                // reaches the bracket emit below (zig rejects `a[k] = v` on
+                // a struct), while arrays/slices/tuples keep it verbatim.
+                if (self.receiverTypeNameOf(ia.target.*)) |t| {
+                    if (self.typeDeclaresMethod(t, "__index_set__", 3)) {
+                        self.write("    ");
+                        // Mutating receiver: a value binding is a zig const,
+                        // so `b.__index_set__(...)` on a `let b: Vec2` is a
+                        // const-discard. Mirror the dot-call arm's
+                        // const-receiver fix (which is why `let v: Vec3;
+                        // v.normalize()` compiles today): wrap a value-typed
+                        // ident in `@constCast(&...)`, and pass pointer
+                        // bindings verbatim.
+                        const ann: ?[]const u8 = if (ia.target.payload == .ident)
+                            self.getSourceTypeName(ia.target.payload.ident)
+                        else
+                            null;
+                        const wrap_value_receiver = if (ann) |a| !std.mem.startsWith(u8, a, "*") else false;
+                        if (wrap_value_receiver) {
+                            self.write("@constCast(&");
+                            self.genExpr(ia.target.*);
+                            self.write(")");
+                        } else {
+                            self.genExpr(ia.target.*);
+                        }
+                        self.write(".__index_set__(");
+                        self.genExpr(ia.index.*);
+                        self.write(", ");
+                        self.genExpr(ia.value);
+                        self.write(");\n");
+                        return;
+                    }
+                }
                 // `target[i] = value;` writes a single element of an
                 // indexable container. Zig 0.16 accepts `a[i] = b;` syntax
                 // for both arrays and (where applicable) anonymous-struct
@@ -631,10 +688,10 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         }
         // Compile-time block form (docs/manual/16-generics.md §6): `const
         // NAME: T = const { … return EXPR; };`. We emit the body as a zig
-        // labeled block `blk: { …stmts…; break :blk EXPR; }`, translating
-        // the parser-side `return EXPR;` terminator into `break :blk EXPR;`
+        // labeled block `__blk_N: { …stmts…; break :__blk_N EXPR; }`, translating
+        // the parser-side `return EXPR;` terminator into `break :__blk_N EXPR;`
         // so the result of the block is the binding's RHS value (matching
-        // zig's native `return` (for fns) → `break :blk` (for blocks)
+        // zig's native `return` (for fns) → `break :<lbl>` (for blocks)
         // difference). The block is evaluated at comptime when bound to a
         // `const` so the entire payload collapses to a compile-time constant
         // downstream. Body statements are emitted via the shared `genStmt`
@@ -647,15 +704,23 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(": ");
                 self.writeType(t);
             }
-            self.write(" = blk: {\n");
+            // Unique labeled-block name so nested const-blocks don't
+            // collide on a literal `blk`.
+            var lbl_buf: [16]u8 = undefined;
+            const lbl = self.nextBlkLabel(&lbl_buf);
+            self.write(" = ");
+            self.write(lbl);
+            self.write(": {\n");
             const prev_anchor = self.pushCtorAnchor(if (b.type_name) |t| t else "");
             for (stmts) |s| {
                 if (s.payload == .return_stmt) {
-                    // `return EXPR;` → `break :blk EXPR;` so zig's
+                    // `return EXPR;` → `break :<lbl> EXPR;` so zig's
                     // labeled-block semantics carries the bind's RHS
                     // value out. Bare `return;` (no value) is rejected
                     // at parse time so this arm always has a value.
-                    self.write("        break :blk ");
+                    self.write("        break :");
+                    self.write(lbl);
+                    self.write(" ");
                     if (s.payload.return_stmt.value) |v| {
                         self.genExpr(v);
                     }
@@ -987,12 +1052,58 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         }
     }
 
+    /// True when an arm's body is lowered to `break :<lbl> EXPR` (i.e.
+    /// the arm carries the match's VALUE), false when the arm's tail is
+    /// emitted as the real statement it is — `return` / `break` /
+    /// `continue`, an assignment, or any other non-`expr_stmt` tail.
+    ///
+    /// genMatchExpr uses this only to decide whether the enclosing block
+    /// needs a label at all: zig rejects a labeled block that is never
+    /// broken out of ("unused block label"), so a statement-position
+    /// match whose arms all end in real statements must emit an
+    /// UNLABELED block. Sharing the predicate with the emit loop keeps
+    /// the label decision and the `break :<lbl>` emission in sync.
+    fn armYieldsValue(arm: ast.MatchArm) bool {
+        if (arm.expr.payload == .block_expr) {
+            const body = arm.expr.payload.block_expr;
+            if (body.len == 0) return false;
+            return body[body.len - 1].payload == .expr_stmt;
+        }
+        return true;
+    }
+
     pub     fn genMatchExpr(self: *Codegen, m: ast.Expr.MatchExpr) void {
         const id = self.match_counter;
         self.match_counter += 1;
         var name_buf: [16]u8 = undefined;
         const scrut_name = std.fmt.bufPrint(&name_buf, "__m_{d}", .{id}) catch "__m";
-        self.write("(blk: { const ");
+        // Unique labeled-block name. A literal `blk` collides the moment
+        // one match nests inside another match's arm (zig reports
+        // "redefinition of label 'blk'"). `nextBlkLabel` draws from the
+        // same per-function counter the `?` / `catch` / if-expression
+        // blocks use, so every open block in a function is distinct.
+        var lbl_buf: [16]u8 = undefined;
+        const lbl = self.nextBlkLabel(&lbl_buf);
+        // Emit the label only if at least one arm will break it. A
+        // statement-position match whose arms all end in real statements
+        // (a returning arm next to an assigning arm, say) never emits a
+        // `break :<lbl>`, and zig rejects the leftover label with
+        // "unused block label" — which made an ordinary
+        // `match r { Ok(n) => { total = total + n; }, Err(e) => { return
+        // Err(e); } }` fail to compile.
+        var needs_label = false;
+        for (m.arms) |arm| {
+            if (armYieldsValue(arm)) {
+                needs_label = true;
+                break;
+            }
+        }
+        self.write("(");
+        if (needs_label) {
+            self.write(lbl);
+            self.write(": ");
+        }
+        self.write("{ const ");
         self.write(scrut_name);
         self.write(" = ");
         // `m.scrutinee` is `*Expr` (cycle-breaking pointer) — deref before
@@ -1012,13 +1123,22 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(")");
             }
             self.write(") { ");
+            // Synthetic-binding scope for THIS arm. Every capture the arm
+            // declares (`Err(e)` payloads, an ident-pattern binding) is
+            // registered here, and the matching `endBindScope` below drops
+            // them when the arm closes. `bindEmitName` mangles a name that
+            // is already live in an enclosing arm (zig 0.16 rejects a
+            // shadowing local), so nested same-name matches emit distinct
+            // zig identifiers while the arm body keeps using the source
+            // name.
+            const arm_bind_mark = self.beginBindScope();
             if (arm.pat == .ident) {
                 // Ident-pattern arm: bind scrutinee to `<name>` so the
                 // arm's body can reference it. Always emitted as
                 // `const` because the binding is synthetic and a
                 // shadow never reuses the name within an arm body.
                 self.write("const ");
-                self.write(arm.pat.ident);
+                self.write(self.bindEmitName(arm.pat.ident));
                 self.write(" = ");
                 self.write(scrut_name);
                 self.write("; ");
@@ -1033,51 +1153,38 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             // `.discard` patterns. See `emitPatternBindings` doc
             // for the zig 0.16 unused-const throwaway rationale.
             self.emitPatternBindings(scrut_name, arm.pat);
-            // Block-bodied arms (`Json.Null => { ... }`): emit the
-            // block's statements INLINE with the final statement as
-            // `break :blk EXPR` — the arm's own blk context is
-            // already open, so a nested `(blk: {` would collide on
-            // the `blk` label (redefinition error surfaced by
-            // std.json's stringify).
+            // Block-bodied arms (`Json.Null => { ... }`): the block's
+            // statements are emitted INLINE, with a TAIL VALUE EXPRESSION
+            // lowered to `break :<lbl> EXPR` (the arm's value). A tail
+            // `return` / `break` / `continue` is emitted as the real
+            // statement it is — `return` returns from the FUNCTION and
+            // `break`/`continue` target the enclosing LOOP; neither is
+            // the match's value. (Lowering a tail `return EXPR` to
+            // `break :<lbl> EXPR` made a statement-position match whose
+            // arm returns miscompile against a void-valued sibling arm:
+            // the two arms then disagreed on the blk's value type.)
             if (arm.expr.payload == .block_expr) {
                 const body = arm.expr.payload.block_expr;
                 for (body, 0..) |s, si| {
-                    if (si == body.len - 1 and s.payload == .return_stmt) {
-                        const rs = s.payload.return_stmt;
-                        if (rs.value) |v| {
-                            self.write("break :blk ");
-                            self.genExpr(v);
-                            self.write(";");
-                        } else {
-                            self.genStmt(s, false);
-                        }
-                    } else if (si == body.len - 1 and s.payload == .expr_stmt) {
-                        self.write("break :blk ");
+                    if (si == body.len - 1 and s.payload == .expr_stmt) {
+                        self.write("break :");
+                        self.write(lbl);
+                        self.write(" ");
                         self.genExpr(s.payload.expr_stmt);
                         self.write(";");
-                    } else if (si == body.len - 1 and s.payload == .return_stmt) {
-                        // Tail `return EXPR;` inside a block-bodied match
-                        // arm: lower to `break :blk EXPR;` (a bare return
-                        // stmt would double-emit the callee's arg tuple
-                        // when the arm's expression is also emitted).
-                        const rs = s.payload.return_stmt;
-                        if (rs.value) |v| {
-                            self.write("break :blk ");
-                            self.genExpr(v);
-                            self.write(";");
-                        } else {
-                            self.genStmt(s, false);
-                        }
                     } else {
                         self.genStmt(s, false);
                     }
                 }
             } else {
-                self.write("break :blk ");
+                self.write("break :");
+                self.write(lbl);
+                self.write(" ");
                 self.genExpr(arm.expr.*);
                 self.write(";");
             }
             self.write(" }");
+            self.endBindScope(arm_bind_mark);
             had_any_arm = true;
         }
         const last_is_wildcard = m.arms.len > 0 and m.arms[m.arms.len - 1].pat == .discard;
@@ -1308,10 +1415,10 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         // declared on the pattern (`Variant { x: w, y: h }` for the
         // brace-named form OR `Variant(w, h)` for the paren-pos
         // form) are in lexical scope for the arm-body EXPR that
-        // follows `break :blk`. Emit is called from `genMatchExpr`'s
+        // follows `break :<lbl>`. Emit is called from `genMatchExpr`'s
         // arm loop AFTER the `if (arm.pat == .ident)` block (the
-        // legacy ident-binding path) and BEFORE the
-        // `self.write("break :blk ")` line, so the `const` decls
+        // legacy ident-binding path) and BEFORE the arm's
+        // `break :<lbl> EXPR` emit, so the `const` decls
         // land inside the surrounding `if (cond) { ... }` block
         // — the exact spot zig 0.16 requires for the EXPR's
         // identifier scope to include them.
@@ -1395,6 +1502,15 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                     const letters = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z" };
                     for (bs, 0..) |b, i| {
                         if (b) |name| {
+                            // Register the capture with the arm's binding
+                            // scope and take its emitted spelling ONCE —
+                            // `bindEmitName` pushes on each call, so a
+                            // second call for the same source name would
+                            // see its own entry as a collision and mangle
+                            // it. `name` stays the source spelling for the
+                            // type-seeding below (the arm body's format
+                            // lookups are keyed by source name).
+                            const emit_bind = self.bindEmitName(name);
                             // `var` (not `const`): the generic-instance
                             // dispatch passes `&capture` to orphan free
                             // fns (`ArrayList_get(Json, &items, i)` for
@@ -1406,7 +1522,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             // by-value copy of the union payload, so
                             // mutability is harmless.
                             self.write("var ");
-                            self.write(name);
+                            self.write(emit_bind);
                             self.write(" = ");
                             self.write(scrut_name);
                             self.write(".");
@@ -1435,7 +1551,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             // for the generic-instance dispatch to pass
                             // `&NAME` as a mutable receiver.
                             self.write("_ = &");
-                            self.write(name);
+                            self.write(emit_bind);
                             self.write("; ");
                             // Seed the capture's payload type so
                             // generic-instance dispatch works on it
@@ -1460,6 +1576,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .enum_variant_named => |env| {
                 for (env.fields) |f| {
                     if (f.capture) |name| {
+                        const emit_bind = self.bindEmitName(name);
                         // gap #2 brace-named-field emit preserves
                         // user-written field names on the anonymous-
                         // struct payload (`Drag { x: f64, y: f64 }`
@@ -1480,7 +1597,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         // paren-positional arm — generic-instance
                         // dispatch passes `&capture` to orphan fns.
                         self.write("var ");
-                        self.write(name);
+                        self.write(emit_bind);
                         self.write(" = ");
                         self.write(scrut_name);
                         self.write(".");
@@ -1503,7 +1620,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                         // unused / never-mutated errors on the var
                         // capture.
                         self.write("_ = &");
-                        self.write(name);
+                        self.write(emit_bind);
                         self.write("; ");
                         // Seed the capture's payload type (mirror of
                         // the paren-positional arm above).

@@ -91,10 +91,10 @@ test "codegen: new T(v) emits page_allocator.create heap alloc (bug fix)" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const p = blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const p = __blk_0: {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "try std.heap.page_allocator.create(i32)") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "__p_0.* = 42") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk __p_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_0 __p_0") != null);
     // The page_allocator.destroy(p) — for the matching free(p) below.
     try std.testing.expect(std.mem.indexOf(u8, zig, "std.heap.page_allocator.destroy") != null);
     // Sanity: the OLD stack-pointer emission must NOT appear.
@@ -141,8 +141,8 @@ test "codegen: alloc_counter increments across multiple new exprs" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const a = blk: {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "    const b = blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const a = __blk_0: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "    const b = __blk_1: {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "try std.heap.page_allocator.create(i32)") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "__p_0.* = 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "__p_1.* = 2") != null);
@@ -522,7 +522,7 @@ test "codegen: bench hooks — new inline path charges __zag_bench_alloc(@sizeOf
      const prog = p.parse();
      var cg = codegen_mod.Codegen.init();
      const zig = cg.generate(prog);
-     try std.testing.expect(std.mem.indexOf(u8, zig, "blk: { const __p_0 = try std.heap.page_allocator.create(i32); __zag_bench_alloc(@sizeOf(i32));") != null);
+     try std.testing.expect(std.mem.indexOf(u8, zig, "__blk_0: { const __p_0 = try std.heap.page_allocator.create(i32); __zag_bench_alloc(@sizeOf(i32));") != null);
      // Negative: no hoisted prologue, no inserted charge-back defer.
      try std.testing.expect(std.mem.indexOf(u8, zig, "defer __zag_bench_free(@sizeOf(i32));") == null);
      try std.testing.expect(std.mem.indexOf(u8, zig, "defer std.heap.page_allocator.destroy(__p_0);") == null);

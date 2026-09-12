@@ -64,24 +64,24 @@ zig version
 
 ### Install a pre-built binary
 
-The `zag-lang.org` website is not hosted yet — all install URLs below source directly from this GitHub repo. The installer script itself downloads the release archive from `github.com/zag-lang/zag/releases/latest/download/...` at runtime, so a tagged release must exist on the [Releases page](https://github.com/zag-lang/zag/releases) for the install to succeed.
+The `zag-lang.org` website is not hosted yet — all install URLs below source directly from this GitHub repo. The installer script itself downloads the release archive from `github.com/lakshgupta/zag/releases/latest/download/...` at runtime, so a tagged release must exist on the [Releases page](https://github.com/lakshgupta/zag/releases) for the install to succeed.
 
 Linux or macOS (defaults to the `main` branch — bleeding edge):
 
 ```
-curl -fsSL https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lakshgupta/zag/main/zag-install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```
-powershell -c "irm https://raw.githubusercontent.com/zag-lang/zag/main/scripts/install.ps1 | iex"
+powershell -c "irm https://raw.githubusercontent.com/lakshgupta/zag/main/scripts/install.ps1 | iex"
 ```
 
 The canonical Linux / macOS installer lives at [`zag-install.sh`](zag-install.sh) at this repo's root; the canonical Windows PowerShell installer lives at [`scripts/install.ps1`](scripts/install.ps1). For tagged releases, pin a specific version via the GitHub raw URL (substitute the same `vX.Y.Z` tag for both occurrences below):
 
 ```
-curl -fsSL https://raw.githubusercontent.com/zag-lang/zag/v0.1.0/zag-install.sh | bash -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/lakshgupta/zag/v0.1.0/zag-install.sh | bash -s -- --version v0.1.0
 ```
 
 The two `v0.1.0` strings are intentionally the same: one names the script file on the GitHub raw filesystem at that tag, and one tells the script which release to download. Mismatched tags are rejected because the user-pinned version must exist as a GitHub Release tag for the trailing download URL to resolve.
@@ -89,7 +89,7 @@ The two `v0.1.0` strings are intentionally the same: one names the script file o
 The installer downloads the platform release into `~/.zag/bin/zag`, appends `export PATH="$PATH:$HOME/.zag/bin"` to your shell profile (`.bashrc`, `.zshrc`, `.profile`, or `~/.config/fish/config.fish`), and prints `Zag installed successfully!`. To pin a version, download first and pass `--version`:
 
 ```
-curl -sSO https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh
+curl -sSO https://raw.githubusercontent.com/lakshgupta/zag/main/zag-install.sh
 bash zag-install.sh --version v0.1.0
 ```
 
@@ -104,7 +104,7 @@ ZAG_HOME=$HOME/local bash install.sh
 If no release binary is available for your platform, clone the repository and use the build scripts:
 
 ```
-git clone https://github.com/zag-lang/zag
+git clone https://github.com/lakshgupta/zag
 cd zag
 ./scripts/build.sh --release     # debug build by default; --release sets -Doptimize=ReleaseFast
 ./scripts/install-local.sh       # copy zig-out/bin/zag-<os>-<arch> to ~/.zag/bin and configure PATH

@@ -24,7 +24,25 @@ pub const Lexer = struct {
     pos: u32,
     line: u32,
     col: u32,
-    tokens_buf: [4096]Token,
+    // Token scratch for ONE source file, sized so the whole file fits:
+    // the buffer is not just a chunk, `tokenize()` returns the populated
+    // prefix and the parser indexes it by position for the whole parse,
+    // so an overflow is unrecoverable (not a "read more later" case).
+    //
+    // The previous [4096] limit was reached by real sources — lib/std's
+    // largest module sat at ~85% of it, and any user file past roughly
+    // 600 dense lines hit `index out of bounds: index 4096, len 4096`
+    // as a raw PANIC with no diagnostic. 16384 is 4x that, which covers
+    // every lib/std module with room to grow; `addToken` below turns the
+    // remaining limit into a printed error instead of a panic.
+    //
+    // Cost is stack: Token is ~32 bytes, so this field is ~512 KiB and
+    // the Lexer is built on the stack in transpileEx and in the
+    // whole-module import expansion (which NESTS one Lexer per import
+    // level). That is what caps the size here — an unbounded buffer
+    // would be the better fix, and is the follow-up this comment is
+    // pointing at.
+    tokens_buf: [16384]Token,
     tokens_len: u32,
     // v2 char fix path (docs/features.md §08 v2 4-byte Unicode char
     // row, gap (b)): each bare `\uNNNN` escape is normalized to the
@@ -51,6 +69,18 @@ pub const Lexer = struct {
     }
 
     pub fn addToken(self: *Lexer, tok: Token) void {
+        // Fail with a diagnostic rather than an index-out-of-bounds
+        // panic. `Parser.expect` sets the precedent for a lexer/parser
+        // hard stop: print `error:line:col:` and exit 1, so the user
+        // gets a located message instead of a zig panic trace.
+        if (self.tokens_len >= self.tokens_buf.len) {
+            std.debug.print("error:{d}:{d}: source file has more than {d} tokens (lexer limit)\n", .{
+                tok.loc.line,
+                tok.loc.col,
+                self.tokens_buf.len,
+            });
+            std.process.exit(1);
+        }
         self.tokens_buf[self.tokens_len] = tok;
         self.tokens_len += 1;
     }

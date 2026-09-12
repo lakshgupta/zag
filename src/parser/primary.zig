@@ -12,6 +12,98 @@ const Expr = ast.Expr;
 const Parser = core.Parser;
 
 
+/// Build a leaf Expr from one interpolation fragment. An all-digits run
+/// becomes `.int_lit`; a `\"...\"` run becomes `.string_lit` with the
+/// outer escaped quotes stripped (codegen re-wraps, so the inner escaped
+/// text is preserved byte-for-byte); a dotted identifier (`self.n`) becomes
+/// a real `.member_access` chain; anything else stays an `.ident` that
+/// codegen emits verbatim. Shared by the additive-operand builder and the
+/// call-argument builder so both accept the same leaf shapes — before this
+/// the argument builder's `.ident` fallback put the raw `\"hello\"` into
+/// the generated args tuple, which zig rejected outside a string context.
+///
+/// The `.member_access` node matters for overload resolution: a bare ident
+/// carrying the text `self.n` has no type, so an i32/f64 overload pair left
+/// `{p.scale(self.n)}` ambiguous even though the statement-position form
+/// resolved. As an AST node, `exprTypeNameOf` walks it to the field's
+/// declared type.
+fn templateOperand(arena: *ast.Arena, text: []const u8, loc: ast.Loc) Expr {
+    // Numeric classification runs on the body after an optional sign, so
+    // `{p.scale(-2.5)}` scores as a float instead of falling through to
+    // an opaque ident. Without the rule a float-literal argument made an
+    // i32/f64 overload pair ambiguous even though the same literal in
+    // statement position selected the f64 overload.
+    var body = text;
+    if (body.len > 0 and body[0] == '-') body = body[1..];
+    var digits: usize = 0;
+    var dots: usize = 0;
+    var others: usize = 0;
+    for (body) |ch| {
+        if (ch >= '0' and ch <= '9') {
+            digits += 1;
+        } else if (ch == '.') {
+            dots += 1;
+        } else {
+            others += 1;
+        }
+    }
+    if (others == 0 and digits > 0 and dots == 0) {
+        return Expr{ .payload = .{ .int_lit = text }, .loc = loc };
+    }
+    if (others == 0 and digits > 0 and dots == 1) {
+        return Expr{ .payload = .{ .float_lit = text }, .loc = loc };
+    }
+    if (text.len >= 4 and text[0] == '\\' and text[1] == '"' and text[text.len - 2] == '\\' and text[text.len - 1] == '"') {
+        return Expr{ .payload = .{ .string_lit = text[2 .. text.len - 2] }, .loc = loc };
+    }
+    if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
+        return Expr{ .payload = .{ .string_lit = text[1 .. text.len - 1] }, .loc = loc };
+    }
+    // Dotted identifier → member-access chain. Only plain identifier
+    // segments qualify; anything else (`a.b(c)`, a path) keeps the
+    // verbatim-ident fallback so no text is lost.
+    {
+        var segs: [8][]const u8 = undefined;
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, text, '.');
+        var overflow = false;
+        while (it.next()) |s| {
+            if (n >= segs.len) {
+                overflow = true;
+                break;
+            }
+            segs[n] = s;
+            n += 1;
+        }
+        if (!overflow and n >= 2) {
+            var ok = true;
+            for (segs[0..n]) |s| {
+                if (s.len == 0 or (!std.ascii.isAlphabetic(s[0]) and s[0] != '_')) {
+                    ok = false;
+                    break;
+                }
+                for (s) |ch| {
+                    if (!std.ascii.isAlphanumeric(ch) and ch != '_') {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) break;
+            }
+            if (ok) {
+                var lhs = Expr{ .payload = .{ .ident = segs[0] }, .loc = loc };
+                for (segs[1..n]) |s| {
+                    const boxed = arena.alloc(Expr, 1);
+                    boxed[0] = lhs;
+                    lhs = Expr{ .payload = .{ .member_access = .{ .target = &boxed[0], .name = s } }, .loc = loc };
+                }
+                return lhs;
+            }
+        }
+    }
+    return Expr{ .payload = .{ .ident = text }, .loc = loc };
+}
+
 pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
         var parts_buf: [32]ast.Expr.TemplatePart = undefined;
         var part_count: usize = 0;
@@ -62,7 +154,25 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                 }
 
                 i = end_i + 1; // skip '}'
-                const expr_text = if (has_spec) raw[expr_start .. spec_start - 1] else raw[expr_start..end_i];
+                var expr_text = if (has_spec) raw[expr_start .. spec_start - 1] else raw[expr_start..end_i];
+                // Postfix `!` inside a placeholder (`{f.size()!}`,
+                // `{read_file(p)!}`): strip the trailing `!` and wrap the
+                // built node in `.unwrap_op` after the builders below run.
+                // Without this the text ending in `!` failed the `.call`
+                // builder's trailing-`)` check and fell through to the
+                // verbatim-ident fallback, so zig parsed `f.size()!` as a
+                // type expression and rejected it. `!` only ever trails a
+                // placeholder operand here (there is no `!=` form the
+                // mini-parser accepts), so a single strip is unambiguous.
+                var unwrap_tail = false;
+                {
+                    var tail_end = expr_text.len;
+                    while (tail_end > 0 and (expr_text[tail_end - 1] == ' ' or expr_text[tail_end - 1] == '\t')) tail_end -= 1;
+                    if (tail_end > 0 and expr_text[tail_end - 1] == '!') {
+                        unwrap_tail = true;
+                        expr_text = expr_text[0 .. tail_end - 1];
+                    }
+                }
                 // Closure-call widening for template-literal interpolations
                 // (docs/15 §\"Closures\" + basic.zag section 3). The pre-fix
                 // code unconditionally wrapped the interpolation text as
@@ -162,20 +272,10 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                         }
                         if (seg_count >= 2) {
                             // Operand: int-lit when all digits, else ident.
-                            const mkOperand = struct {
-                                fn go(text: []const u8, loc: ast.Loc) Expr {
-                                    var is_int = text.len > 0;
-                                    for (text) |ch| {
-                                        if (ch < '0' or ch > '9') is_int = false;
-                                    }
-                                    if (is_int) return Expr{ .payload = .{ .int_lit = text }, .loc = loc };
-                                    return Expr{ .payload = .{ .ident = text }, .loc = loc };
-                                }
-                            }.go;
-                            var acc = mkOperand(segs_buf[0], start_loc);
+                            var acc = templateOperand(self.arena, segs_buf[0], start_loc);
                             var oi: usize = 0;
                             while (oi < op_count) : (oi += 1) {
-                                const rhs = mkOperand(segs_buf[oi + 1], start_loc);
+                                const rhs = templateOperand(self.arena, segs_buf[oi + 1], start_loc);
                                 const op: ast.Expr.BinaryOp = if (ops_buf[oi] == '+') .add else .sub;
                                 const lhs_slot = self.arena.alloc(Expr, 1);
                                 lhs_slot[0] = acc;
@@ -188,6 +288,7 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                         }
                     }
                 }
+                var call_handled = false;
                 if (!additive_handled) {
                 // Scan for the first `(` (top-level; the args segment
                 // is tracked separately with depth-aware comma-split
@@ -224,11 +325,29 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                                         for (seg) |c| {
                                             if (c < '0' or c > '9') is_int = false;
                                         }
-                                        if (is_int) {
-                                            args_buf[arg_count] = Expr{ .payload = .{ .int_lit = seg }, .loc = start_loc };
-                                        } else {
-                                            args_buf[arg_count] = Expr{ .payload = .{ .ident = seg }, .loc = start_loc };
+                                        const seg_is_string = std.mem.startsWith(u8, seg, "\\\"") or std.mem.startsWith(u8, seg, "\"");
+                                        // `arg as T` builds a `.cast` Expr so the
+                                        // overload diagnostic's "cast it" remedy
+                                        // works inside a placeholder too. Left as
+                                        // a bare ident, the cast text scored as
+                                        // an unknown type and `{w.go(n as f64)}`
+                                        // stayed ambiguous while the message
+                                        // told the caller to write exactly that.
+                                        if (!is_int and !seg_is_string) {
+                                            if (std.mem.indexOf(u8, seg, " as ")) |as_i| {
+                                                const lhs = std.mem.trim(u8, seg[0..as_i], " \t");
+                                                const ty = std.mem.trim(u8, seg[as_i + 4 ..], " \t");
+                                                if (lhs.len > 0 and ty.len > 0) {
+                                                    const lhs_slot = self.arena.alloc(Expr, 1);
+                                                    lhs_slot[0] = templateOperand(self.arena, lhs, start_loc);
+                                                    args_buf[arg_count] = Expr{ .payload = .{ .cast = .{ .expr = &lhs_slot[0], .type_text = ty } }, .loc = start_loc };
+                                                    arg_count += 1;
+                                                    seg_start = pos + 1;
+                                                    continue;
+                                                }
+                                            }
                                         }
+                                        args_buf[arg_count] = templateOperand(self.arena, seg, start_loc);
                                         arg_count += 1;
                                     }
                                     seg_start = pos + 1;
@@ -290,10 +409,69 @@ pub fn buildTemplate(self: *Parser, raw: []const u8, start_loc: ast.Loc) Expr {
                                 }
                             }
                             build_expr = Expr{ .payload = .{ .call = .{ .name = name_text, .args = args_arena, .type_args = targs } }, .loc = start_loc };
+                            call_handled = true;
                         }
                     }
                 }
                 } // end `if (!additive_handled)` — call-shape builder skipped when the additive scan claimed the placeholder
+                // `base[key]` shape → a real `.index` Expr instead of leaving
+                // the bracketed text on the `.ident` fallback. This matters
+                // because the fallback emits the text verbatim, and zig's
+                // native bracket access only accepts arrays/slices/tuples —
+                // so `{a[0]}` on a user aggregate declaring `__index__`
+                // reached zig as an illegal `Vec2[0]` ("does not support
+                // indexing") even though the statement-position `a[0]`
+                // desugared fine. Building the node routes the placeholder
+                // through codegen's existing `.index` arm, where the
+                // `__index__` desugar (docs/manual/31) fires and every
+                // array/slice case falls through to the identical verbatim
+                // bracket emit as before. Nested brackets are left to the
+                // fallback (`{m[i][j]}` is not claimed) so the split stays
+                // unambiguous.
+                if (!additive_handled and !call_handled) {
+                    const t = std.mem.trim(u8, expr_text, " \t");
+                    if (t.len > 2 and t[t.len - 1] == ']') {
+                        var depth: usize = 0;
+                        var open_idx: ?usize = null;
+                        var k: usize = t.len;
+                        while (k > 0) {
+                            k -= 1;
+                            const ch = t[k];
+                            if (ch == ']') {
+                                depth += 1;
+                            } else if (ch == '[') {
+                                if (depth > 0) depth -= 1;
+                                if (depth == 0) {
+                                    open_idx = k;
+                                    break;
+                                }
+                            }
+                        }
+                        if (open_idx) |ob| {
+                            const base_text = std.mem.trim(u8, t[0..ob], " \t");
+                            const key_text = std.mem.trim(u8, t[ob + 1 .. t.len - 1], " \t");
+                            if (base_text.len > 0 and key_text.len > 0 and std.mem.indexOfAny(u8, key_text, "[]") == null) {
+                                const base_slot = self.arena.alloc(Expr, 1);
+                                base_slot[0] = Expr{ .payload = .{ .ident = base_text }, .loc = start_loc };
+                                const key_slot = self.arena.alloc(Expr, 1);
+                                var key_is_int = key_text.len > 0;
+                                for (key_text) |ch| {
+                                    if (ch < '0' or ch > '9') key_is_int = false;
+                                }
+                                key_slot[0] = if (key_is_int)
+                                    Expr{ .payload = .{ .int_lit = key_text }, .loc = start_loc }
+                                else
+                                    Expr{ .payload = .{ .ident = key_text }, .loc = start_loc };
+                                build_expr = Expr{ .payload = .{ .index = .{ .target = &base_slot[0], .index = &key_slot[0] } }, .loc = start_loc };
+                            }
+                        }
+                    }
+                }
+                if (unwrap_tail) {
+                    const inner_slot = self.arena.alloc(Expr, 1);
+                    inner_slot[0] = build_expr;
+                    build_expr = Expr{ .payload = .{ .unwrap_op = .{ .expr = &inner_slot[0] } }, .loc = start_loc };
+                }
                 parts_buf[part_count] = .{
                     .literal = null,
                     .expr = build_expr,
@@ -706,11 +884,12 @@ pub fn parsePostfix(self: *Parser) Expr {
                 }
             }
         }
-        // The postfix chain interleaves three shapes:
+        // The postfix chain interleaves four shapes:
         //   - `?` (postfix try/unwrap) → `.try_op`
+        //   - `!` (postfix PANICKING unwrap) → `.unwrap_op`
         //   - `[start..end]` (or single-index or no-bound variants) → `.index` / `.slice`
         //   - `.name` (no parens) → `.member_access` | `.name(args...)` → `.method_call`
-        // Both shapes are checked in this single `while` so chains like
+        // All shapes are checked in this single `while` so chains like
         // `arr[i].len`, `(getBox()).field`, `obj.method().chain` interleave
         // naturally — each iteration of the loop consumes one postfix
         // token and re-emits `lhs` with the wrapping applied.
@@ -721,6 +900,17 @@ pub fn parsePostfix(self: *Parser) Expr {
                 const target_buf = self.arena.alloc(Expr, 1);
                 target_buf[0] = lhs;
                 lhs = Expr{ .payload = .{ .try_op = .{ .expr = &target_buf[0] } }, .loc = start_loc };
+                self.advance();
+                continue;
+            }
+            // Postfix `!` — the fail-fast twin of `?`: unwrap the Ok/
+            // Some value, or panic at this source location. `!=` lexes
+            // as a single `.bang_eq` token, so a postfix `!` can never
+            // be a comparison's left half.
+            if (self.peek().tag == .bang) {
+                const target_buf = self.arena.alloc(Expr, 1);
+                target_buf[0] = lhs;
+                lhs = Expr{ .payload = .{ .unwrap_op = .{ .expr = &target_buf[0] } }, .loc = start_loc };
                 self.advance();
                 continue;
             }
@@ -931,6 +1121,14 @@ pub fn parsePostfix(self: *Parser) Expr {
 ///      matching-brace gate needs an explicit `;` check because the
 ///      inner `print(...)` parens are not braces, so the nested-`{`
 ///      path doesn't fire.
+///   3. A QUOTE or BACKSLASH as the placeholder's first non-whitespace
+///      byte — embedded data (`parse("{\"a\": [1, 2, 3]}")`), not an
+///      expression. Only the LEADING byte counts: a quote later in the
+///      placeholder is an ordinary string argument, so
+///      `{p.show("hello")}` is a template. (The rule used to reject a
+///      quote anywhere, which silently demoted that call to a plain
+///      `.string_lit` and made zig report a bogus "too few arguments"
+///      against the literal `{...}`.)
 /// The legacy char-class gate (`isAlphanumeric || _ || :`) caught
 /// BOTH rejections (nested-`{` indirectly via non-alphanumeric
 /// characters; `;` directly) but at the cost of also rejecting
@@ -968,8 +1166,23 @@ fn looksLikeTemplateLiteral(text: []const u8) bool {
             // the .ident verbatim-emit at codegen will produce a
             // valid Zig expression.
             var found_close = false;
+            var content_seen = false;
             while (i < text.len) {
                 const c = text[i];
+                // A placeholder whose FIRST non-whitespace byte is a quote
+                // or a backslash is embedded DATA — a JSON object, a
+                // C-style code blob — not an interpolation, so the whole
+                // string must stay a plain `.string_lit`. This leading-only
+                // test replaces the previous any-quote rejection, which
+                // also refused ordinary string ARGUMENTS: `{p.show("hello")}`
+                // silently demoted the entire format string, and the source
+                // then reached zig as a literal `{...}` placeholder ("too
+                // few arguments"). Quotes later in the placeholder are part
+                // of a valid `{expr}`.
+                if (!content_seen and c != ' ' and c != '\t' and c != '\n' and c != '\r') {
+                    content_seen = true;
+                    if (c == '"' or c == '\'' or c == '\\') return false;
+                }
                 if (c == '{') {
                     // Nested brace — embedded code, not a template
                     // interpolation. The legacy char-class gate
@@ -996,21 +1209,6 @@ fn looksLikeTemplateLiteral(text: []const u8) bool {
                     // because the inner `print(...)` parens are
                     // NOT braces, so the nested-`{` path above
                     // doesn't fire for the boilerplate.
-                    return false;
-                }
-                if (c == '"' or c == '\'') {
-                    // Quoted content inside `{...}` — embedded code
-                    // or a data literal (JSON object/array strings
-                    // carry `\"` escapes; C-style boilerplate has
-                    // `\"...\"`), never a template interpolation.
-                    // The interpolation mini-parser (buildTemplate)
-                    // only builds `.ident` / `.call` shapes, so any
-                    // content containing a quote character could
-                    // never be a valid `{expr}` — rejecting here
-                    // keeps `parse("{\"a\": [1, 2, 3]}")`
-                    // (lib/std/json.zag's documented surface) a
-                    // plain `.string_lit` instead of mangling it
-                    // into a template with a bogus expression.
                     return false;
                 }
                 if (c == '}') {

@@ -215,7 +215,7 @@ pub const Codegen = struct {
     /// passed to `genStmt` as the gate that decides whether a tail-
     /// position `match_stmt` should be prefixed with `return` (so the
     /// matched value is returned to the zig call site) vs emitted as a
-    /// bare indented `(blk: { ... });` statement (the value-discarding
+    /// bare indented `(__blk_N: { ... });` statement (the value-discarding
     /// form zig accepts at any other position).
     fn_returns_value: bool,
     /// Builtin generic-ctor anchor (Option/Result ctor gap): the
@@ -261,6 +261,27 @@ pub const Codegen = struct {
     /// (`new`-heap-local temps) and `destructure_counter` /
     /// `match_counter` / `blk_counter` remain live.
     blk_counter: u32 = 0,
+    /// ── Synthetic-binding rename stack (nested `match` captures) ──────
+    /// A match arm binds its payload to the USER's source name
+    /// (`Err(e) => …`), and zig 0.16 rejects an inner local that shadows
+    /// an outer one. Two matches nested with the SAME capture name would
+    /// therefore emit `var e = __m_0.Err;` inside `var e = __m_1.Err;`
+    /// and fail with a diagnostic pointing into GENERATED code. Each arm
+    /// records a `src -> emit` pair here and `identEmitName` consults the
+    /// stack, so the arm body's references follow the rename. A binding
+    /// whose name is NOT already live in an enclosing scope records
+    /// `src -> src`, so emitted bytes are unchanged for every program
+    /// that does not hit the collision (the property the pinned codegen
+    /// tests rest on). See `beginBindScope` / `bindEmitName`.
+    rename_src: [64][]const u8 = undefined,
+    rename_dst: [64][]const u8 = undefined,
+    rename_len: usize = 0,
+    /// Per-function counter for collision-driven shadow renames
+    /// (`__zag_shadow_<N>`); reset alongside `match_counter` so two
+    /// functions never reuse a name in the same emitted unit. Drawn only
+    /// on an actual collision, so a program with no nested same-name
+    /// capture never advances it and emits no such identifier.
+    shadow_counter: u32 = 0,
     /// Tracked trait-decl names (Phase 3 trait-cast, docs/17 §"Using
     /// Traits"): populated at `generate()` entry from `prog.traits`
     /// so the `.cast` arm in `genExpr` can detect `x as Trait` forms
@@ -462,9 +483,36 @@ pub const MapEntry = struct {
     pub const markUnusedParamDiscards = @import("decl.zig").markUnusedParamDiscards;
     pub const methodTakesMutableSelfanyType = @import("expr.zig").methodTakesMutableSelfanyType;
     pub const bindingIsVar = @import("core.zig").bindingIsVar;
+    // Synthetic-binding rename stack (nested same-name match captures):
+    // the scope helpers live at file scope in this file's CORE_INLINE
+    // bucket, so the `.ident` / `.assign` emitters and the match / if-let
+    // / for arm emitters all reach them as `self.X(...)` only through
+    // these re-exports.
+    pub const beginBindScope = @import("core.zig").beginBindScope;
+    pub const endBindScope = @import("core.zig").endBindScope;
+    pub const bindEmitName = @import("core.zig").bindEmitName;
+    pub const identEmitName = @import("core.zig").identEmitName;
     pub const traitMethodVtableNameFull = @import("core.zig").traitMethodVtableNameFull;
     pub const traitMethodVtableName = @import("core.zig").traitMethodVtableName;
     pub const internedSuffixName = @import("core.zig").internedSuffixName;
+    // Method + operator overloading (docs/manual/30, 31). The bodies
+    // live at file scope in this file's CORE_INLINE bucket, so each one
+    // called as `self.X(...)` has to be re-exported into the struct --
+    // without these the build stops at `no field or member function
+    // named 'methodZigName'`. `stripPointerType` is NOT here: it is
+    // called module-qualified (`core.stripPointerType`) from expr.zig.
+    pub const methodOverloadCount = @import("core.zig").methodOverloadCount;
+    pub const methodZigName = @import("core.zig").methodZigName;
+    pub const typeDeclaresMethod = @import("core.zig").typeDeclaresMethod;
+    pub const outerShadowsPromoted = @import("core.zig").outerShadowsPromoted;
+    pub const receiverTypeNameOf = @import("core.zig").receiverTypeNameOf;
+    pub const staticTypeNameOf = @import("core.zig").staticTypeNameOf;
+    pub const isDeclaredTypeName = @import("core.zig").isDeclaredTypeName;
+    pub const methodReceiverIsMutable = @import("core.zig").methodReceiverIsMutable;
+    pub const resolveOverloadedMethod = @import("core.zig").resolveOverloadedMethod;
+    pub const exprTypeNameOf = @import("core.zig").exprTypeNameOf;
+    pub const printOverloadCandidates = @import("core.zig").printOverloadCandidates;
+    pub const argMatchScore = @import("core.zig").argMatchScore;
     pub const genTypeParamsPreamble = @import("decl.zig").genTypeParamsPreamble;
     pub const genBoundsGuards = @import("decl.zig").genBoundsGuards;
     pub const rewriteReceiverType = @import("decl.zig").rewriteReceiverType;
@@ -742,6 +790,74 @@ pub const MapEntry = struct {
         return std.fmt.bufPrint(buf, "__blk_{d}", .{id}) catch "__blk_0";
     }
 
+    /// Open a synthetic-binding scope (a `match` arm, an `if let` body, a
+    /// `for` body). Returns the current stack depth; hand it to
+    /// `endBindScope` when the scope closes to drop exactly the entries
+    /// pushed inside it.
+    pub fn beginBindScope(self: *Codegen) usize {
+        return self.rename_len;
+    }
+
+    /// Close a scope opened by `beginBindScope`, dropping every binding
+    /// recorded inside it.
+    pub fn endBindScope(self: *Codegen, mark: usize) void {
+        if (self.rename_len > mark) self.rename_len = mark;
+    }
+
+    /// The emitted zig spelling of a synthetic binding whose SOURCE name
+    /// is `src`. Returns `src` unchanged unless that name is already live
+    /// in an enclosing binding scope, in which case a unique
+    /// `__zag_shadow_<N>` name is allocated (and recorded so the body's
+    /// references resolve to it). Either way the pair is pushed on the
+    /// rename stack, so a caller must pair it with `endBindScope`.
+    pub fn bindEmitName(self: *Codegen, src: []const u8) []const u8 {
+        var collides = false;
+        for (self.rename_src[0..self.rename_len]) |n| {
+            if (std.mem.eql(u8, n, src)) {
+                collides = true;
+                break;
+            }
+        }
+        if (!collides) {
+            if (self.rename_len < self.rename_src.len) {
+                self.rename_src[self.rename_len] = src;
+                self.rename_dst[self.rename_len] = src;
+                self.rename_len += 1;
+            }
+            return src;
+        }
+        var buf: [48]u8 = undefined;
+        const dst_src = std.fmt.bufPrint(&buf, "__zag_shadow_{d}", .{self.shadow_counter}) catch "__zag_shadow";
+        self.shadow_counter += 1;
+        // `internedSuffixName` returns its ARGUMENT unchanged when the name
+        // pool is exhausted, and the argument here is a stack-local buffer
+        // — returning it would leave a dangling slice in the emitted text.
+        // Degrade to "no rename" instead (a shadow error at worst, never
+        // freed memory in the output).
+        if (self.name_pool_len + dst_src.len > self.name_pool_buf.len) return src;
+        const dst = self.internedSuffixName(dst_src);
+        if (self.rename_len < self.rename_src.len) {
+            self.rename_src[self.rename_len] = src;
+            self.rename_dst[self.rename_len] = dst;
+            self.rename_len += 1;
+        }
+        return dst;
+    }
+
+    /// The emitted spelling of an identifier: its shadow-renamed name when
+    /// it names a synthetic binding currently in scope, else the source
+    /// name unchanged. Consulted by the `.ident` / `.assign` emitters and
+    /// the synthetic-binding declarations, so a rename is consistent
+    /// between the declaration and every reference in the arm body.
+    pub fn identEmitName(self: *Codegen, name: []const u8) []const u8 {
+        var i: usize = self.rename_len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.rename_src[i], name)) return self.rename_dst[i];
+        }
+        return name;
+    }
+
     /// Write a u32 integer into a caller-provided buffer. Returns the number
     /// of bytes written.
     fn writeIntToBuf(buf: []u8, val: u32) usize {
@@ -847,19 +963,27 @@ pub const MapEntry = struct {
             \\// `prior primitive`'s own surface so the format-string
             \\// interpolation rules (`{any}`, `:.N`, `:x`, etc.) are
             \\// preserved byte-identical — only the destination
-            \\// fd changes. `catch return` is intentional: v1's
-            \\// `print(...)` is documented to silently drop I/O
-            \\// errors (no exception/panic propagation expected
-            \\// from a print statement). The `__zag_` prefix
-            \\// reserves the name against user identifiers.
+            \\// fd changes. I/O errors are dropped (`catch return`, and a
+            \\// real write errno returns) — v1's `print(...)` is
+            \\// documented best-effort with no exception/panic
+            \\// propagation. EINTR is the exception: a signal before any
+            \\// bytes moved is retried, and a short write keeps looping
+            \\// until the whole slice is out. (The old loop added the
+            \\// errno-encoded `usize` straight back into `written`, so a
+            \\// failed write overflowed the cursor instead of stopping.)
+            \\// The `__zag_` prefix reserves the name against user
+            \\// identifiers.
             \\fn __zag_print(comptime fmt: []const u8, args: anytype) void {
             \\    var buf: [65536]u8 = undefined;
             \\    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
             \\    var written: usize = 0;
             \\    while (written < slice.len) {
             \\        const rc = std.os.linux.write(std.posix.STDOUT_FILENO, slice.ptr + written, slice.len - written);
+            \\        const signed: isize = @bitCast(rc);
+            \\        if (signed == -4) continue;
+            \\        if (signed < 0) return;
             \\        if (rc == 0) return;
-            \\        written += @intCast(rc);
+            \\        written += rc;
             \\    }
             \\}
             \\
@@ -990,7 +1114,7 @@ pub const MapEntry = struct {
             \\    __zag_bench_allocations += 1;
             \\}
             \\pub fn __zag_bench_dec(n: usize) void {
-            \\    __zag_bench_bytes_live -= n;
+            \\    if (n > __zag_bench_bytes_live) { __zag_bench_bytes_live = 0; } else { __zag_bench_bytes_live -= n; }
             \\}
             \\fn __zag_bench_alloc(n: usize) void {
             \\    @import("root").__zag_bench_inc(n);
@@ -3308,6 +3432,335 @@ pub const MapEntry = struct {
         return self.name_pool_buf[start .. start + name.len];
     }
 
+    // ── method + operator overloading (docs/manual/30, 31) ────────────
+    //
+    // Zig has no overloading, so an OVERLOADED impl method is emitted
+    // under a mangled name; a method whose name is unique on its type
+    // keeps the bare spelling, so every non-overloaded program emits
+    // byte-identical output (the property the whole test suite rests on).
+    //
+    // The suffix encodes the full parameter signature (receiver included)
+    // rather than a declaration index, so the emitter (decl.zig) and the
+    // call-site resolver (expr.zig) each derive the same spelling from
+    // the MethodDecl alone -- there is no shared counter that two
+    // separate walks have to keep in sync.
+
+    /// True when `name` is a module-local declared type (struct, enum,
+    /// or trait). Used to tell a STATIC call (`File.open(path)`, where
+    /// `File` is the type itself) apart from an instance call on a
+    /// binding that happens to share the name. Only consulted after
+    /// `receiverTypeNameOf` has already failed, so a typed binding always
+    /// wins over a same-named type.
+    pub fn isDeclaredTypeName(self: *Codegen, name: []const u8) bool {
+        for (self.prog.structs) |sd| {
+            if (std.mem.eql(u8, sd.name, name)) return true;
+        }
+        for (self.prog.enums) |ed| {
+            if (std.mem.eql(u8, ed.name, name)) return true;
+        }
+        for (self.prog.traits) |td| {
+            if (std.mem.eql(u8, td.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// The declared type an expression names as a STATIC receiver, or null.
+    /// Sibling of `receiverTypeNameOf` for the `Type.method(...)` form:
+    /// `Type` is not a `let` binding, so the binding-based lookup cannot
+    /// see it, and an overloaded method declared on the type emitted under
+    /// its mangled spelling while the call site stayed verbatim
+    /// (`File.open(...)` against an emitted `open__str`).
+    pub fn staticTypeNameOf(self: *Codegen, e: ast.Expr) ?[]const u8 {
+        return switch (e.payload) {
+            .ident => |n| if (self.isDeclaredTypeName(n)) n else null,
+            else => null,
+        };
+    }
+
+    /// Non-trait impl methods named `method_name` on `target_type`,
+    /// across every `impl` block for that type. Trait-bound methods are
+    /// excluded because they emit as `<Type>_<Trait>_<name>` free fns
+    /// (see `resolveTraitBinding`), never nested inside the struct --
+    /// counting one would mangle the name of a method that is not in the
+    /// same namespace.
+    pub fn methodOverloadCount(self: *Codegen, target_type: []const u8, method_name: []const u8) usize {
+        var count: usize = 0;
+        for (self.prog.impls) |*impl| {
+            if (!std.mem.eql(u8, impl.target_type, target_type)) continue;
+            for (impl.methods) |m| {
+                if (!std.mem.eql(u8, m.name, method_name)) continue;
+                if (self.resolveTraitBinding(impl, m) != null) continue;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Zig spelling of `m` as declared on `target_type`: the bare name
+    /// when it is unique, `<name>_<rectype>_<argtype>...` when the type
+    /// overloads it. Both bytes of the suffix come from the signature, so
+    /// `show(self: *const P)` and `show(self: *const P, x: i32)` become
+    /// `show__const_P` and `show__const_P_i32`.
+    pub fn methodZigName(self: *Codegen, target_type: []const u8, m: ast.MethodDecl) []const u8 {
+        if (self.methodOverloadCount(target_type, m.name) <= 1) return m.name;
+        var buf: [512]u8 = undefined;
+        var n: usize = 0;
+        appendMangledType(&buf, &n, m.name);
+        for (m.params) |p| {
+            appendMangledType(&buf, &n, "_");
+            appendMangledType(&buf, &n, p.type_text);
+        }
+        return self.internedSuffixName(buf[0..n]);
+    }
+
+    /// True when `outer_type` declares a non-trait method `name` with
+    /// `param_count` parameters (receiver included) -- i.e. its own method
+    /// overrides a promoted one with the same name and arity, so the
+    /// embedding forwarder must not be emitted. See the call site in
+    /// genStructDecl's embedding block.
+    pub fn outerShadowsPromoted(self: *Codegen, outer_type: []const u8, name: []const u8, param_count: usize) bool {
+        for (self.prog.impls) |*impl| {
+            if (!std.mem.eql(u8, impl.target_type, outer_type)) continue;
+            for (impl.methods) |m| {
+                if (!std.mem.eql(u8, m.name, name)) continue;
+                if (m.params.len != param_count) continue;
+                if (self.resolveTraitBinding(impl, m) != null) continue;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// True when `target_type` declares a non-trait method `name` taking
+    /// exactly `param_count` parameters (receiver included). Operator
+    /// desugaring uses it to decide whether `a + b` may lower to
+    /// `a.__add__(b)`.
+    pub fn typeDeclaresMethod(self: *Codegen, target_type: []const u8, name: []const u8, param_count: usize) bool {
+        for (self.prog.impls) |*impl| {
+            if (!std.mem.eql(u8, impl.target_type, target_type)) continue;
+            for (impl.methods) |m| {
+                if (!std.mem.eql(u8, m.name, name)) continue;
+                if (m.params.len != param_count) continue;
+                if (self.resolveTraitBinding(impl, m) != null) continue;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The user-type name an expression's *receiver* is known to have, or
+    /// null when codegen cannot tell. Handles a typed binding
+    /// (`let v: Vec3`), `self` inside an impl method
+    /// (`current_receiver_struct_name`), and pointer annotations
+    /// (`*Vec3` / `*const Vec3` -> `Vec3`). Returning the name only means
+    /// "this identifier is annotated with T"; whether T declares the
+    /// method is a separate lookup, so a primitive annotation simply
+    /// never matches an impl.
+    pub fn receiverTypeNameOf(self: *Codegen, e: ast.Expr) ?[]const u8 {
+        const raw: []const u8 = switch (e.payload) {
+            .ident => |n| blk: {
+                if (self.getSourceTypeName(n)) |t| break :blk t;
+                if (std.mem.eql(u8, n, "self")) {
+                    if (self.current_receiver_struct_name) |rs| break :blk rs;
+                }
+                return null;
+            },
+            else => return null,
+        };
+        return stripPointerType(raw);
+    }
+
+    /// True when a method's first parameter is a MUTABLE `*T` receiver.
+    /// The overload-aware replacement for `methodTakesMutableSelfanyType`
+    /// at a call site that already resolved which overload it is calling
+    /// -- the type-agnostic version can consult a same-name method on
+    /// some other type and decide the receiver's mutability by accident.
+    pub fn methodReceiverIsMutable(self: *Codegen, m: ast.MethodDecl) bool {
+        _ = self;
+        if (m.params.len == 0) return false;
+        if (std.mem.startsWith(u8, m.params[0].type_text, "*const")) return false;
+        return std.mem.startsWith(u8, m.params[0].type_text, "*");
+    }
+
+    /// Resolve `receiver.name(args...)` against the overloads of `name`
+    /// on `receiver_type` (docs/manual/30 "Resolution Order").
+    ///
+    /// Returns null when the name is NOT overloaded on that type -- the
+    /// caller then emits the bare name exactly as before. Otherwise the
+    /// winning MethodDecl, or a zag-level diagnostic + exit 1 when the
+    /// call cannot be decided. A call the compiler cannot resolve is a
+    /// source error, not a zig error pointing into generated code -- but
+    /// note that such a call is only reachable at all because overloads
+    /// exist, so there is no pre-existing program to break.
+    /// `has_receiver` says whether the call supplies a receiver instance:
+    /// true for `v.name(args)` / `v.name(args)` on a typed binding, false
+    /// for the static `Type.name(args)` form. The caller knows which it is
+    /// (it resolved the receiver), so it is passed in rather than guessed
+    /// from the first parameter — a static method's first parameter is an
+    /// ordinary argument, and an overload pair like `open(path)` /
+    /// `open(path, mode)` has one more parameter than the static arity.
+    pub fn resolveOverloadedMethod(
+        self: *Codegen,
+        receiver_type: []const u8,
+        name: []const u8,
+        args: []const ast.Expr,
+        loc: ast.Loc,
+        has_receiver: bool,
+    ) ?ast.MethodDecl {
+        if (self.methodOverloadCount(receiver_type, name) <= 1) return null;
+
+        var best: ?ast.MethodDecl = null;
+        var best_score: i32 = 0;
+        var best_ties: usize = 0;
+        var arity_seen: usize = 0;
+        const recv_off: usize = if (has_receiver) 1 else 0;
+
+        for (self.prog.impls) |*impl| {
+            if (!std.mem.eql(u8, impl.target_type, receiver_type)) continue;
+            for (impl.methods) |m| {
+                if (!std.mem.eql(u8, m.name, name)) continue;
+                if (self.resolveTraitBinding(impl, m) != null) continue;
+                // With a receiver the call site supplies param 0, so the
+                // user-visible arity is params.len - 1. Without one (a
+                // static call) every parameter is a real argument.
+                if (m.params.len < recv_off) continue;
+                if (m.params.len - recv_off != args.len) continue;
+                arity_seen += 1;
+                var score: i32 = 0;
+                for (m.params[recv_off..], args) |p, a| score += self.argMatchScore(a, p.type_text);
+                if (best == null or score > best_score) {
+                    best = m;
+                    best_score = score;
+                    best_ties = 1;
+                } else if (score == best_score) {
+                    best_ties += 1;
+                }
+            }
+        }
+
+        if (arity_seen == 0) {
+            std.debug.print(
+                "error:{d}:{d}: no overload of '{s}.{s}' takes {d} argument(s)\n",
+                .{ loc.line, loc.col, receiver_type, name, args.len },
+            );
+            self.printOverloadCandidates(receiver_type, name, has_receiver);
+            std.process.exit(1);
+        }
+        if (best_ties > 1) {
+            std.debug.print(
+                "error:{d}:{d}: call to overloaded method '{s}.{s}' is ambiguous for these argument(s)\n",
+                .{ loc.line, loc.col, receiver_type, name },
+            );
+            self.printOverloadCandidates(receiver_type, name, has_receiver);
+            std.debug.print(
+                "  hint: annotate the argument (e.g. `let x: i32 = ...`) or cast it (`x as i32`) so the type selects one overload.\n",
+                .{},
+            );
+            std.process.exit(1);
+        }
+        return best;
+    }
+
+    /// Print the overload set for a name, one line per candidate, so an
+    /// ambiguity diagnostic names the call the user has to choose.
+    fn printOverloadCandidates(self: *Codegen, target_type: []const u8, name: []const u8, has_receiver: bool) void {
+        const recv_off: usize = if (has_receiver) 1 else 0;
+        for (self.prog.impls) |*impl| {
+            if (!std.mem.eql(u8, impl.target_type, target_type)) continue;
+            for (impl.methods) |m| {
+                if (!std.mem.eql(u8, m.name, name)) continue;
+                if (self.resolveTraitBinding(impl, m) != null) continue;
+                std.debug.print("  candidate: {s}.{s}(", .{ target_type, name });
+                if (m.params.len < recv_off) continue;
+                for (m.params[recv_off..], 0..) |p, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s}: {s}", .{ p.name, p.type_text });
+                }
+                std.debug.print(")\n", .{});
+            }
+        }
+    }
+
+    /// Match score for one argument against one parameter's type text:
+    /// +2 exact, +1 implicit (an integer literal into a float parameter),
+    /// -1 impossible, 0 unknown. A higher total wins; an equal top score
+    /// is reported as ambiguous. Only *knowable* argument types are
+    /// scored negatively -- an argument whose type codegen cannot see
+    /// scores 0 so it never disqualifies an otherwise matching
+    /// candidate.
+    pub fn argMatchScore(self: *Codegen, arg: ast.Expr, param_type: []const u8) i32 {
+        const pt = normalizeTypeText(param_type);
+        return switch (arg.payload) {
+            // `isIntTypeName` / `isFloatTypeName` / `isStringishTypeText`
+            // are the file-scope type-text predicates this file already
+            // uses for the integer-division, float-literal, and string-
+            // concat shims, reused so the overload matcher and those
+            // shims agree on what `u64`, `f16`, or `[]const u8` means.
+            .int_lit => blk: {
+                if (isIntTypeName(pt)) break :blk 2;
+                if (isFloatTypeName(pt)) break :blk 1;
+                break :blk -1;
+            },
+            .float_lit => if (isFloatTypeName(pt)) 2 else -1,
+            .bool_lit => if (std.mem.eql(u8, pt, "bool")) 2 else -1,
+            .char_lit => if (std.mem.eql(u8, pt, "u8") or std.mem.eql(u8, pt, "char")) 2 else -1,
+            .string_lit, .byte_string_lit => if (isStringishTypeText(pt)) 2 else -1,
+            // Idents and field accesses both go through the same type
+            // resolver, so `p.show(self.n)` (a struct field) is scored
+            // exactly like `p.show(n)` on a typed binding. Without this
+            // the very common field-argument call fell through to the
+            // ambiguous branch, which made overloads unusable from
+            // inside a method body.
+            .ident, .member_access => blk: {
+                const at = self.exprTypeNameOf(arg) orelse break :blk 0;
+                if (std.mem.eql(u8, normalizeTypeText(at), pt)) break :blk 2;
+                break :blk 0;
+            },
+            // `x as T` — the diagnostic's own remedy has to actually
+            // work, or the hint sends the user in a circle: with the
+            // cast unscored, both the T overload and the original-typed
+            // one scored 0, so `w.go(n as f64)` stayed ambiguous while
+            // the message told the caller to do exactly that. Scoring
+            // the cast's target text (+2 on an exact match) makes the
+            // remedy real. A cast to a non-matching type scores 0, not
+            // -1: zig may still widen it, and refusing to decide an
+            // unfamiliar cast is the safe read.
+            .cast => |c| blk: {
+                if (std.mem.eql(u8, normalizeTypeText(c.type_text), pt)) break :blk 2;
+                break :blk 0;
+            },
+            else => 0,
+        };
+    }
+
+    /// Static type text of an expression, for overload scoring and
+    /// operator-receiver detection: a typed binding, `self` inside an
+    /// impl method (via `current_receiver_struct_name`), or a field of
+    /// either (`self.n`, `p.x`). Anything else -- a call result, a
+    /// literal, an index -- returns null, which callers treat as
+    /// "unknown" rather than as a mismatch.
+    ///
+    /// Sibling of `getSourceTypeNameOfExpr`, which resolves the same
+    /// shapes but has no `self` case: that one serves cast sites, which
+    /// never appear on an untyped `self`.
+    pub fn exprTypeNameOf(self: *Codegen, e: ast.Expr) ?[]const u8 {
+        return switch (e.payload) {
+            .ident => |n| blk: {
+                if (self.getSourceTypeName(n)) |t| break :blk t;
+                if (std.mem.eql(u8, n, "self")) break :blk self.current_receiver_struct_name;
+                break :blk null;
+            },
+            .member_access => |ma| blk: {
+                const base = self.exprTypeNameOf(ma.target.*) orelse break :blk null;
+                break :blk self.structFieldType(stripPointerType(base), ma.name);
+            },
+            // `x as T` is statically T by construction — the same
+            // reading `getSourceTypeNameOfExpr` takes for cast sites.
+            .cast => |c| c.type_text,
+            else => null,
+        };
+    }
+
     pub     fn traitMethodVtableName(self: *Codegen, trait_decl: ast.TraitDecl, method_index: usize) []const u8 {
         if (method_index >= trait_decl.methods.len) return "";
         const method_name = trait_decl.methods[method_index].name;
@@ -3622,6 +4075,76 @@ fn stdlibPreambleName(name: []const u8) []const u8 {
 /// Strip a trailing `_N` overload suffix (`render_1` → `render`).
 /// File-scope twin of decl.zig's baseMethodName (core.zig cannot
 /// import decl.zig at file scope without a cycle — decl imports
+/// core's types). Used by the vtable-registration field-name walk
+/// where bucket entries carry suffixed names but the trait decl's
+/// method list carries bare spellings.
+/// Append `text` to `buf` with every non-alphanumeric byte replaced by
+/// `_`, so a Zig type text (`*const Vec3`, `[]const u8`) becomes a legal
+/// identifier fragment (`_const_Vec3`, `__const_u8`). Deterministic, which
+/// is the whole point: the emitter and the call-site resolver each mangle
+/// the same MethodDecl independently and must agree byte for byte. A
+/// signature so long that it overflows the buffer truncates rather than
+/// failing -- the result can then collide with another overload's name,
+/// which zig reports as a duplicate struct member (a compile error, never
+/// a silently wrong call).
+fn appendMangledType(buf: []u8, n: *usize, text: []const u8) void {
+    for (text) |c| {
+        if (n.* == buf.len) return;
+        buf[n.*] = if (std.ascii.isAlphanumeric(c)) c else '_';
+        n.* += 1;
+    }
+}
+
+/// Canonical form of a type text for overload matching: surrounding space
+/// trimmed, one level of `*const `/`*` stripped (a receiver annotation is
+/// `*Vec3` while the parameter it binds to may be `Vec3`), and the `str`
+/// alias expanded to the `[]const u8` it stands for (docs/manual/07
+/// "Type Aliases"), so `let s: str` matches a `s: []const u8` parameter.
+fn normalizeTypeText(text: []const u8) []const u8 {
+    var t = std.mem.trim(u8, text, " \t");
+    if (std.mem.startsWith(u8, t, "*const ")) t = t["*const ".len..];
+    if (std.mem.startsWith(u8, t, "*")) t = t[1..];
+    t = std.mem.trim(u8, t, " \t");
+    if (std.mem.eql(u8, t, "str")) return "[]const u8";
+    return t;
+}
+
+/// One level of pointer annotation stripped (`*Vec3` -> `Vec3`), used to
+/// look an impl up from a receiver whose binding is a pointer. `pub`
+/// because expr.zig's method-call arms need the same strip before asking
+/// for an overload's emitted name.
+pub fn stripPointerType(text: []const u8) []const u8 {
+    var t = std.mem.trim(u8, text, " \t");
+    if (std.mem.startsWith(u8, t, "*const ")) t = t["*const ".len..];
+    if (std.mem.startsWith(u8, t, "*")) t = t[1..];
+    return std.mem.trim(u8, t, " \t");
+}
+
+/// Operator method name for a binary operator (docs/manual/31), or null
+/// when the operator has no dunder form. Wrapping arithmetic and the
+/// logical/bitwise operators deliberately have none: `+%` has no
+/// conventional spelling, and `&&`/`||`/shifts are not part of the
+/// documented table.
+pub fn operatorMethodName(op: ast.Expr.BinaryOp) ?[]const u8 {
+    return switch (op) {
+        .add => "__add__",
+        .sub => "__sub__",
+        .mul => "__mul__",
+        .div => "__div__",
+        .mod => "__mod__",
+        .eq => "__eq__",
+        .ne => "__ne__",
+        .lt => "__lt__",
+        .gt => "__gt__",
+        .le => "__le__",
+        .ge => "__ge__",
+        else => null,
+    };
+}
+
+/// Strip a trailing `_N` overload suffix (`render_1` -> `render`).
+/// File-scope twin of decl.zig's baseMethodName (core.zig cannot
+/// import decl.zig at file scope without a cycle -- decl imports
 /// core's types). Used by the vtable-registration field-name walk
 /// where bucket entries carry suffixed names but the trait decl's
 /// method list carries bare spellings.

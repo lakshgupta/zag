@@ -31,6 +31,14 @@ pub import std.bench.{Counters}
 # v0.1 Tier-1 migration; the call site resolves via the @import+alias
 # fallthrough.
 # Phase 1 entries:
+#   SUPERSEDED (the `!` collapse): every `std.fs.{read_file}`/
+#   `{write_file}` reference below describes the pre-P2 surface. The
+#   barrel now publishes `read_file` / `write_file` / `try_read` /
+#   `mkdir` (one Result-returning spelling per operation, named for the
+#   OPERATION rather than the failure policy — `!` at the call site
+#   spells the fail-fast form) and the `File` surface
+#   (`File`, `FileMode`, `PAGE_SIZE`); the panicking `read_file` /
+#   `write_file` pair and the `*_or_panic` twins are GONE.
 #   `pub import std.env.{get_env}`     → REAL impl in lib/std/env.zag backed by
 #                                         __zag_getenv (Tier-1 migration;
 #                                         renamed from `getEnv`).
@@ -60,13 +68,24 @@ pub import std.bench.{Counters}
 #                                         fs_mkdir router row retired.
 #   `pub import std.process.{exec}`   → REAL impl in lib/std/process.zag
 #                                         (__zag_process_spawn: std.process.spawn+
-#                                         wait, .exited→exit code, else→255);
+#                                         wait, .exited→exit code). Under the P1
+#                                         posix tier split this returns
+#                                         Result(i32, Errno) — a spawn SETUP
+#                                         failure is an Err, so 255 no longer
+#                                         means two different things;
 #                                         process_exec router row retired.
 pub import std.argv.{get}
 pub import std.env.{get_env}
-pub import std.fs.{read_file}
-pub import std.fs.{write_file}
-pub import std.fs.{mkdir}
+# IO is Result-shaped throughout (P2 + the `!` collapse): every fallible
+# entry point returns Result(_, Error) and there is exactly one spelling
+# of each operation. The failure policy lives at the CALL SITE —
+# `read_file("x")!` panics, `?` propagates, `catch` falls back, and
+# `match` branches. mkdir keeps `mkdir -p` semantics with EEXIST as Ok.
+# The four fs constructor names collapsed into `File.open(path, mode)`
+# with a mandatory `FileMode` (cross-module types cannot resolve a
+# same-name overload — docs/manual/30).
+pub import std.fs.{read_file, write_file, try_read, mkdir}
+pub import std.fs.{File, FileMode, PAGE_SIZE}
 pub import std.process.{exec}
 pub import std.process.{exit}
 pub import std.mem.{alloc}
@@ -82,3 +101,14 @@ pub import std.hash.{fnv1a32, fnv1a64, crc32, sha256}
 pub import std.random.{XorShift64Star}
 pub import std.debug.{panic}
 pub import std.json.{Json, JsonPair, parse, stringify}
+# The error vocabulary the Result tier speaks — a std.posix caller
+# needs the type to name what it is handling.
+#
+# KNOWN BUG (pre-existing, NOT caused by this line): the whole-module
+# barrel form `import std.{X}` does not resolve at all today, for ANY X
+# (`import std.{read_file}` fails identically). The barrel's mirror is
+# never written — `materializeWalk` deliberately skips `mod.zag` — so
+# codegen's `@import("std/mod.zig")` hits FileNotFound. The working
+# spelling is the direct module path: `import std.errno.{Errno}`.
+# Recorded in docs/architecture.md §Known Coverage Gap.
+pub import std.errno.{Errno, ErrnoKind}

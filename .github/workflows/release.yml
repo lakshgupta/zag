@@ -8,24 +8,45 @@ name: release
 #     archives from)
 #   - scripts/install.sh's detect_platform `PLATFORM_FILE`
 #   - zag-install.sh at the repo root (the user-facing curl-pipe installer)
-#   - docs/manual/31-building.md § Distribution
+#   - docs/manual/32-building.md § Distribution
 # Keep all four lists in lockstep — adding a target here without
 # updating the others would silently "vaporize" that platform's
 # install path on a fresh `bash zag-install.sh --version v0.1.0`.
 #
+# Every archive ALSO carries the installers (`zag-install.sh` +
+# `install.ps1`) so it is self-contained — running `./zag-install.sh`
+# inside the extracted archive installs the bundled binary. The same two
+# scripts are uploaded as standalone release assets (see the publish job's
+# `files:` list). This must mirror scripts/package.sh's staging set.
+#
+# Archive NAMES embed the bare version (`zag-0.2.0-linux-x86_64.tar.gz`),
+# constructed identically in scripts/package.sh, scripts/install.sh
+# (PLATFORM_FILE), scripts/install.ps1 ($FileName), zag-install.sh
+# ($ARCHIVE), and here (the `archive=` line below). The installers
+# resolve `latest` via the GitHub API because the filename's version
+# segment isn't knowable statically.
+#
 # Triggers:
 #   - `v*` tags (e.g. `v0.1.0`)            → build + publish release
-# No `workflow_dispatch` here on purpose: tag-triggered releases give
-# a single canonical point of truth (the tag itself); pre-tag
-# validation happens via `gh workflow run release.yml --ref <branch>`,
-# which uploads artifacts as workflow artifacts (visible for 90 days)
-# without minting a noise release.
+#   - workflow_dispatch (any branch)       → build only, artifacts only
+# Tag-triggered releases give a single canonical point of truth (the tag
+# itself). workflow_dispatch exists for pre-tag validation:
+# `gh workflow run release.yml --ref <branch>` runs test + build + package
+# and uploads the archives as workflow artifacts (visible for 90 days)
+# WITHOUT minting a release — the publish job is gated on tag context
+# (`if: startsWith(github.ref, 'refs/tags/')`) because on a branch
+# dispatch `github.ref_name` is the branch name, and action-gh-release
+# would otherwise try to create a tag/release named after the branch.
 # ──────────────────────────────────────────────────────────────────────────
 
 on:
   push:
     tags:
       - 'v*'
+  # Pre-tag validation: dispatching on a branch runs test + build + package
+  # and uploads workflow artifacts, but never publishes (publish job is
+  # gated on tag context below).
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -42,9 +63,10 @@ env:
 
 jobs:
   # ── Quick smoke gate ─────────────────────────────────────────────────
-  # ~1 minute on ubuntu-latest. Catches obvious build breakage before
-  # burning 6 cross-compile targets (which run sequentially to a single
-  # runner + take ~5-8 minutes total).
+  # A couple of minutes on ubuntu-latest (the unit suite is ~1 min; the
+  # example suite adds ~1 min of parallel `zag test` subprocesses).
+  # Catches obvious build breakage before burning 6 cross-compile targets
+  # (which run sequentially to a single runner + take ~5-8 minutes total).
   test:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -53,8 +75,21 @@ jobs:
       - uses: mlugg/setup-zig@v1
         with:
           version: ${{ env.ZIG_VERSION }}
+      # Also runs the discarded-result audit (`zig build audit`, wired into
+      # the test step): a lib/std close/sync/read/write result discarded
+      # without a `deliberate discard` marker fails here rather than
+      # shipping as a silent failure path.
       - name: zig build test
         run: zig build test
+      # Runs `zag test` over every test-bearing example fixture -- the rows
+      # `zig build test` (in-process Zig graph, never reads a .zag file) and
+      # examples/run_all.sh (runs `main`, skips */tests/*) both miss. The
+      # fixtures are discovered from examples/ at config time and run in
+      # file or project mode as their layout requires; the step pins
+      # ZAG_ZIG_PATH to the zig on $PATH itself, which is what setup-zig
+      # provides -- see detectZigOnPath in build.zig.
+      - name: zig build example_tests
+        run: zig build example_tests
 
   # ── Cross-compile all 6 (OS, arch) targets ───────────────────────────
   # Single ubuntu-latest runner + zig 0.16's bundled LLVM / MinGW /
@@ -186,15 +221,35 @@ jobs:
               chmod +x "$staging/zag"
             fi
             echo "$VERSION" > "$staging/VERSION"
-            archive="$out_dir/$bare.$archive_ext"
+            # Ship the installers in every archive (mirrors
+            # scripts/package.sh): the archive is self-contained — running
+            # ./zag-install.sh inside it installs the bundled binary.
+            cp "$GITHUB_WORKSPACE/zag-install.sh" "$staging/zag-install.sh"
+            chmod +x "$staging/zag-install.sh"
+            cp "$GITHUB_WORKSPACE/scripts/install.ps1" "$staging/install.ps1"
+            # Versioned archive name (`zag-0.2.0-<os>-<arch>.<ext>` — the
+            # bare version, matching package.sh + the installers' filename
+            # construction).
+            archive="$out_dir/zag-$VERSION-${bare#zag-}.$archive_ext"
             if [ "$archive_ext" = "tar.gz" ]; then
-              tar -czf "$archive" -C "$staging" zag VERSION
+              tar -czf "$archive" -C "$staging" zag VERSION zag-install.sh install.ps1
             else
-              ( cd "$staging" && zip -q "$OLDPWD/$archive" zag.exe VERSION )
+              ( cd "$staging" && zip -q "$OLDPWD/$archive" zag.exe VERSION zag-install.sh install.ps1 )
             fi
             echo "  packaged: $archive ($(du -h "$archive" | cut -f1))"
             rm -rf "$staging"
           done
+      - name: Include standalone install scripts in dist/
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          out_dir="dist/$VERSION"
+          cp zag-install.sh "$out_dir/zag-install.sh"
+          chmod +x "$out_dir/zag-install.sh"
+          cp scripts/install.ps1 "$out_dir/install.ps1"
+          echo "--- dist contents:"
+          ls -l "$out_dir"
       - name: Generate SHA256 checksums
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -218,6 +273,9 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: package
+    # Only on a real tag push. On a workflow_dispatch (branch ref) run this
+    # job is skipped, so dispatch runs are build+package validation only.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -241,3 +299,5 @@ jobs:
             dist/${{ steps.version.outputs.version }}/*.tar.gz
             dist/${{ steps.version.outputs.version }}/*.zip
             dist/${{ steps.version.outputs.version }}/checksums.txt
+            dist/${{ steps.version.outputs.version }}/zag-install.sh
+            dist/${{ steps.version.outputs.version }}/install.ps1

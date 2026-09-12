@@ -6,7 +6,7 @@
 ## directly from this repo on GitHub raw (defaults to the `main` branch
 ## — bleeding edge):
 ##
-##   curl -fsSL https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh | bash
+##   curl -fsSL https://raw.githubusercontent.com/lakshgupta/zag/main/zag-install.sh | bash
 ##
 ## Downloads the prebuilt zag binary for your platform from the latest
 ## GitHub Release, extracts it to `$ZAG_HOME/bin/zag` (default
@@ -15,14 +15,14 @@
 ##
 ## Supported release artifacts (publish matrix in
 ## `.github/workflows/release.yml` matches this list — keep the two in
-## lockstep):
+## lockstep). Names embed the BARE version (`v0.2.0` tag → `0.2.0`):
 ##
-##   zag-linux-x86_64.tar.gz
-##   zag-linux-arm64.tar.gz
-##   zag-darwin-x86_64.tar.gz
-##   zag-darwin-arm64.tar.gz
-##   zag-windows-x86_64.zip
-##   zag-windows-arm64.zip
+##   zag-0.2.0-linux-x86_64.tar.gz
+##   zag-0.2.0-linux-arm64.tar.gz
+##   zag-0.2.0-darwin-x86_64.tar.gz
+##   zag-0.2.0-darwin-arm64.tar.gz
+##   zag-0.2.0-windows-x86_64.zip
+##   zag-0.2.0-windows-arm64.zip
 ##
 ## Usage:
 ##   bash zag-install.sh                 # interactive, defaults
@@ -30,6 +30,13 @@
 ##   bash zag-install.sh --version v0.1.0          # pin a release tag
 ##   bash zag-install.sh --dest /usr/local/bin/zag # install to system path
 ##   bash zag-install.sh --no-path-modify           # skip shell rc edits
+##
+## Release-archive form: every release archive ships this script next to
+## the `zag` binary (see scripts/package.sh). Running it from inside the
+## extracted archive with no `--version` installs the bundled binary
+## directly — no download; the sibling `VERSION` file supplies the
+## default version. Standalone fetches (`curl ... | bash`) always
+## download the requested release.
 ##
 ## PowerShell / native-Windows users: this script is bash. The PowerShell
 ## mirror at `scripts/install.ps1` in the source repo handles native
@@ -39,7 +46,7 @@ set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-ZAG_REPO="zag-lang/zag"
+ZAG_REPO="${ZAG_REPO:-lakshgupta/zag}"
 GITHUB_DOWNLOAD="https://github.com/${ZAG_REPO}/releases"
 
 ZAG_HOME="${ZAG_HOME:-$HOME/.zag}"
@@ -74,13 +81,19 @@ usage() {
 Usage: zag-install.sh [OPTIONS]
 
 Options:
-  --version <tag>      Release tag to install (e.g. v0.1.0; default: latest)
+  --version <tag>      Release tag to download+install (e.g. v0.1.0; default: latest)
   --dest <path>        Override the binary destination (default: \$ZAG_HOME/bin/zag)
   --check              Check if zag is installed; exit 0 if yes
   --uninstall          Remove zag from the system
   --force              Reinstall even if already installed
   --no-path-modify     Skip appending PATH to shell rc files
   --help               Show this message
+
+Release-archive form:
+  When run from inside an extracted release archive (a \`zag\` binary sits
+  next to this script) with no --version, the bundled binary is installed
+  directly — no download needed. An explicit --version <tag> always
+  downloads that release from GitHub.
 
 Environment:
   ZAG_HOME             Install root (default: ~/.zag)
@@ -92,9 +105,15 @@ EOF
 
 # ── Parse args ───────────────────────────────────────────────────────────────
 
+# VERSION_EXPLICIT distinguishes `--version <tag>` from the default
+# `latest`: an explicit tag always downloads that release from GitHub,
+# while the default may short-circuit to a bundled binary (see
+# release-archive self-install below).
+VERSION_EXPLICIT=0
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version)        ZAG_VERSION="$2"; shift ;;
+        --version)        ZAG_VERSION="$2"; VERSION_EXPLICIT=1; shift ;;
         --dest)           DEST_OVERRIDE="$2"; shift ;;
         --check)          CHECK_ONLY=1 ;;
         --uninstall)      UNINSTALL=1 ;;
@@ -130,7 +149,7 @@ detect_platform() {
             error "Cannot detect platform (empty \$OSTYPE)."
             echo ""
             echo "  If you're on native Windows, use the PowerShell installer:"
-            echo "    irm https://raw.githubusercontent.com/zag-lang/zag/main/scripts/install.ps1 | iex"
+            echo "    irm https://raw.githubusercontent.com/lakshgupta/zag/main/scripts/install.ps1 | iex"
             echo "  (the source mirror is scripts/install.ps1)."
             exit 1
             ;;
@@ -159,13 +178,37 @@ detect_platform() {
     else
         EXT="tar.gz"; BIN_SUFFIX=""
     fi
-
-    ARCHIVE="zag-${OS}-${ARCH}.${EXT}"
 }
 
 detect_platform
 DEST_DEFAULT="${ZAG_BIN_DIR}/zag${BIN_SUFFIX}"
 DEST="${DEST_OVERRIDE:-$DEST_DEFAULT}"
+
+# ── Release-archive self-install ─────────────────────────────────────────────
+# When this script ships INSIDE a release archive (it is bundled there by
+# scripts/package.sh and the release workflow), a `zag` binary sits next to
+# it in the same directory. In that case, with no explicit `--version`, the
+# script installs that bundled binary directly — no network round-trip, and
+# the archive is fully self-contained. The sibling `VERSION` file (also
+# bundled) becomes the default install version. An explicit `--version <tag>`
+# still downloads that release from GitHub, which is the primary purpose of
+# this script when fetched standalone via `curl ... | bash`.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOCAL_INSTALL=0
+LOCAL_BIN=""
+if [ -x "$SCRIPT_DIR/zag${BIN_SUFFIX}" ]; then
+    LOCAL_BIN="$SCRIPT_DIR/zag${BIN_SUFFIX}"
+fi
+
+if [ "$LOCAL_INSTALL" -eq 0 ] && [ -n "$LOCAL_BIN" ] && [ "$VERSION_EXPLICIT" -eq 0 ]; then
+    LOCAL_INSTALL=1
+    # Default the reported version to the archive's own VERSION file when
+    # present; stays "latest" for standalone fetches.
+    if [ -f "$SCRIPT_DIR/VERSION" ]; then
+        read -r ZAG_VERSION < "$SCRIPT_DIR/VERSION" 2>/dev/null || true
+        [ -n "$ZAG_VERSION" ] || ZAG_VERSION="latest"
+    fi
+fi
 
 # ── Download helper ──────────────────────────────────────────────────────────
 # Works with curl OR wget; both are present in the typical
@@ -273,6 +316,9 @@ header "Zag Installer"
 info "Platform:      ${OS}-${ARCH}"
 info "Version:       ${ZAG_VERSION}"
 info "Destination:   ${DEST}"
+if [ "$LOCAL_INSTALL" -eq 1 ]; then
+    info "Source:        bundled binary (${LOCAL_BIN}) — no download"
+fi
 
 if [ -n "${DEST_OVERRIDE:-}" ]; then
     INSTALL_DIR="$(dirname "$DEST")"
@@ -282,93 +328,118 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 
-if [ "$ZAG_VERSION" = "latest" ]; then
-    DOWNLOAD_URL="${GITHUB_DOWNLOAD}/latest/download/${ARCHIVE}"
+if [ "$LOCAL_INSTALL" -eq 1 ]; then
+    # ── Self-contained path: the archive already carries the binary ──
+    echo ""
+    info "Installing bundled zag ${ZAG_VERSION}..."
+    cp "$LOCAL_BIN" "$INSTALL_DIR/zag${BIN_SUFFIX}"
+    chmod +x "$INSTALL_DIR/zag${BIN_SUFFIX}" 2>/dev/null || true
 else
-    DOWNLOAD_URL="${GITHUB_DOWNLOAD}/download/${ZAG_VERSION}/${ARCHIVE}"
-fi
+    # ── Download path: fetch a specific release from GitHub ──────────
+    # Archive filenames embed the BARE version (`zag-0.2.0-<os>-<arch>.<ext>`),
+    # so the exact release tag must be resolved before the name is built.
+    # `latest` → GitHub API; an explicit `--version` tag is used verbatim.
+    # (Only reached here, so local self-installs never touch the network.)
+    if [ "$VERSION_EXPLICIT" -eq 1 ]; then
+        RELEASE_TAG="$ZAG_VERSION"
+    else
+        RELEASE_TAG="$(curl -fsSL --retry 3 "https://api.github.com/repos/${ZAG_REPO}/releases/latest" 2>/dev/null | grep -oE '"tag_name": *"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+        if [ -z "$RELEASE_TAG" ]; then
+            error "Could not resolve the latest Zag release from GitHub."
+            echo "  Check your network, or pin a tag with --version v0.X.Y."
+            exit 1
+        fi
+    fi
+    RELEASE_BARE="${RELEASE_TAG#v}"
+    ARCHIVE="zag-${RELEASE_BARE}-${OS}-${ARCH}.${EXT}"
 
-echo ""
-info "Downloading ${ARCHIVE}..."
-info "  ${DOWNLOAD_URL}"
-
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-if ! download "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE"; then
-    echo ""
-    error "Failed to download Zag binary."
-    echo ""
     if [ "$ZAG_VERSION" = "latest" ]; then
-        echo "  No release binaries are available yet at:"
-        echo "    ${GITHUB_DOWNLOAD}"
-        echo "  Build from source: https://github.com/${ZAG_REPO}"
+        DOWNLOAD_URL="${GITHUB_DOWNLOAD}/latest/download/${ARCHIVE}"
     else
-        echo "  Version '${ZAG_VERSION}' may not exist. Check available releases:"
-        echo "    ${GITHUB_DOWNLOAD}/tags"
+        DOWNLOAD_URL="${GITHUB_DOWNLOAD}/download/${RELEASE_TAG}/${ARCHIVE}"
     fi
-    exit 1
-fi
 
-info "Extracting..."
-if [ "$EXT" = "zip" ]; then
-    if ! (cd "$TMP_DIR" && unzip -qo "$ARCHIVE"); then
-        warn "unzip not found or failed. Falling back to PowerShell Expand-Archive..."
-        if command -v powershell >/dev/null 2>&1; then
-            (cd "$TMP_DIR" && powershell -NoProfile -Command "Expand-Archive -Path '$ARCHIVE' -DestinationPath '.'")
+    echo ""
+    info "Downloading ${ARCHIVE}..."
+    info "  ${DOWNLOAD_URL}"
+
+    TMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TMP_DIR"' EXIT
+
+    if ! download "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE"; then
+        echo ""
+        error "Failed to download Zag binary."
+        echo ""
+        if [ "$ZAG_VERSION" = "latest" ]; then
+            echo "  No release binaries are available yet at:"
+            echo "    ${GITHUB_DOWNLOAD}"
+            echo "  Build from source: https://github.com/${ZAG_REPO}"
         else
-            error "Cannot extract .zip (no unzip, no PowerShell). Install one of them and retry."
-            exit 1
+            echo "  Version '${ZAG_VERSION}' may not exist. Check available releases:"
+            echo "    ${GITHUB_DOWNLOAD}/tags"
         fi
+        exit 1
     fi
-else
-    tar -xzf "$TMP_DIR/$ARCHIVE" -C "$INSTALL_DIR"
-    # Defensive net for non-CI archive sources: some publishers wrap
-    # the binary in a versioned sub-directory
-    # (`zag-linux-x86_64-0.1.0/zag`). The CI-built archives in this
-    # repo place `zag` + `VERSION` at top-level so the freshly-
-    # extracted `$INSTALL_DIR/zag${BIN_SUFFIX}` exists after `tar`
-    # and the depth-2 promoter must NOT run -- it would otherwise
-    # promote a stale nested binary from a prior install and
-    # overwrite the just-downloaded fresh copy.
-    # Only activate the depth-2 promoter if the fresh `tar` did
-    # NOT produce `$INSTALL_DIR/zag${BIN_SUFFIX}` (i.e. we're
-    # genuinely staring at a nested-archive shape). `2>/dev/null ||
-    # true` swallows find's "no match" exit under `set -euo
-    # pipefail`.
-    if [ ! -f "$INSTALL_DIR/zag${BIN_SUFFIX}" ]; then
-        inner="$(find "$INSTALL_DIR" -mindepth 2 -maxdepth 2 -name "zag${BIN_SUFFIX}" -print -quit 2>/dev/null || true)"
-        if [ -n "$inner" ]; then
-            mv "$inner" "$INSTALL_DIR/zag${BIN_SUFFIX}"
-        fi
-    fi
-fi
 
-# Handle zips uniformly: stage from the temp dir into $INSTALL_DIR.
-if [ "$EXT" = "zip" ]; then
-    if [ -f "$TMP_DIR/zag.exe" ]; then
-        cp "$TMP_DIR/zag.exe" "$INSTALL_DIR/zag.exe"
-    elif [ -f "$TMP_DIR/zag" ]; then
-        cp "$TMP_DIR/zag" "$INSTALL_DIR/zag.exe"
+    info "Extracting..."
+    if [ "$EXT" = "zip" ]; then
+        if ! (cd "$TMP_DIR" && unzip -qo "$ARCHIVE"); then
+            warn "unzip not found or failed. Falling back to PowerShell Expand-Archive..."
+            if command -v powershell >/dev/null 2>&1; then
+                (cd "$TMP_DIR" && powershell -NoProfile -Command "Expand-Archive -Path '$ARCHIVE' -DestinationPath '.'")
+            else
+                error "Cannot extract .zip (no unzip, no PowerShell). Install one of them and retry."
+                exit 1
+            fi
+        fi
     else
-        # Walk any versioned subdir the zip created.
-        inner="$(find "$TMP_DIR" -name 'zag.exe' -print -quit || true)"
-        if [ -n "$inner" ]; then
-            cp "$inner" "$INSTALL_DIR/zag.exe"
-        else
-            error "Extracted .zip did not contain zag.exe"
-            exit 1
+        tar -xzf "$TMP_DIR/$ARCHIVE" -C "$INSTALL_DIR"
+        # Defensive net for non-CI archive sources: some publishers wrap
+        # the binary in a versioned sub-directory
+        # (`zag-linux-x86_64-0.1.0/zag`). The CI-built archives in this
+        # repo place `zag` + `VERSION` at top-level so the freshly-
+        # extracted `$INSTALL_DIR/zag${BIN_SUFFIX}` exists after `tar`
+        # and the depth-2 promoter must NOT run -- it would otherwise
+        # promote a stale nested binary from a prior install and
+        # overwrite the just-downloaded fresh copy.
+        # Only activate the depth-2 promoter if the fresh `tar` did
+        # NOT produce `$INSTALL_DIR/zag${BIN_SUFFIX}` (i.e. we're
+        # genuinely staring at a nested-archive shape). `2>/dev/null ||
+        # true` swallows find's "no match" exit under `set -euo
+        # pipefail`.
+        if [ ! -f "$INSTALL_DIR/zag${BIN_SUFFIX}" ]; then
+            inner="$(find "$INSTALL_DIR" -mindepth 2 -maxdepth 2 -name "zag${BIN_SUFFIX}" -print -quit 2>/dev/null || true)"
+            if [ -n "$inner" ]; then
+                mv "$inner" "$INSTALL_DIR/zag${BIN_SUFFIX}"
+            fi
         fi
     fi
+
+    # Handle zips uniformly: stage from the temp dir into $INSTALL_DIR.
+    if [ "$EXT" = "zip" ]; then
+        if [ -f "$TMP_DIR/zag.exe" ]; then
+            cp "$TMP_DIR/zag.exe" "$INSTALL_DIR/zag.exe"
+        elif [ -f "$TMP_DIR/zag" ]; then
+            cp "$TMP_DIR/zag" "$INSTALL_DIR/zag.exe"
+        else
+            # Walk any versioned subdir the zip created.
+            inner="$(find "$TMP_DIR" -name 'zag.exe' -print -quit || true)"
+            if [ -n "$inner" ]; then
+                cp "$inner" "$INSTALL_DIR/zag.exe"
+            else
+                error "Extracted .zip did not contain zag.exe"
+                exit 1
+            fi
+        fi
+    fi
+
+    chmod +x "$INSTALL_DIR/zag${BIN_SUFFIX}" 2>/dev/null || true
 fi
 
 if [ ! -f "$INSTALL_DIR/zag${BIN_SUFFIX}" ]; then
-    error "Extracted archive did not contain a zag binary at $INSTALL_DIR/zag${BIN_SUFFIX}"
-    error "Inspect $TMP_DIR before re-running."
+    error "No zag binary at $INSTALL_DIR/zag${BIN_SUFFIX} (bundled install or download both failed)."
     exit 1
 fi
-
-chmod +x "$INSTALL_DIR/zag${BIN_SUFFIX}" 2>/dev/null || true
 
 # Verify the produced binary runs.
 if ! "$INSTALL_DIR/zag${BIN_SUFFIX}" version >/dev/null 2>&1; then

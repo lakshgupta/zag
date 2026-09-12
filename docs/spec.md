@@ -50,7 +50,9 @@ type      undefined union     unsafe    var       void      while
 | Null | `null` — value of any nullable pointer type (`?*T`, `?*const T`, `?*raw T`) |
 | Undefined | `undefined` — explicitly uninitialized memory; reading is UB |
 
-**String interpolation:** String literals support `{expr}` interpolation. The expression is converted to a string using the `to_string()` method. Format specifiers follow the syntax `{expr:spec}` where `spec` is a Python/Rust-style format mini-language: `:.N` for N decimal places, `:>N` for right-align in N chars, `:<N` for left-align, `:b`/`:x`/`:o` for binary/hex/octal integer formatting, and `:?` for debug representation. Use `{{` and `}}` for literal braces:
+**String interpolation:** String literals support `{expr}` interpolation. The value is formatted with its `Display` impl (there is no `to_string()` method — the earlier draft's claim of one was wrong). Use `{{` and `}}` for literal braces.
+
+**Format specifiers are limited to what the underlying zig formatter accepts.** The only specifier that works through the placeholder is zig's float precision form, `{expr:.N}`; integer base/width/alignment/debug forms (`:x`, `:b`, `:o`, `:>N`, `:<N`, `:N`, `:?`) are passed through verbatim and rejected at compile time (`expected . or }, found 'x'`). Do not document or rely on a Python/Rust mini-language here — format the value yourself (`std.fmt`-free helpers, or a manual conversion) before interpolating it.
 
 ```
 "error: {err}"
@@ -63,19 +65,20 @@ type      undefined union     unsafe    var       void      while
 - Inside `print` / `eprint`: interpolation writes directly to the `fmt.Writer` — **zero-alloc**. The expression is formatted via `Display` into the writer buffer.
 - As a standalone expression: produces a heap-allocated `String`. `"error: {err}"` is a `String`.
 
-**Important:** String interpolation always produces `[]const u8` when the result is assigned to a `[]const u8` binding, but the intermediate representation depends on context. Inside `print`/`eprint`, no intermediate `String` is created. As a standalone expression, a `String` is heap-allocated. If you need zero-alloc formatting outside `print`, use `Display` directly with a pre-allocated buffer or `String.with_writer`.
+**Important:** the representation depends on context. Inside `print`/`eprint`, interpolation writes into the output writer with no intermediate allocation. Assigned to a slice binding, the bytes are materialized there (`let msg: []u8 = "error: {err}";`). There is no `String`-producing interpolation form and no `String.with_writer` — to build an owned `String` from formatted pieces, `push_str` / `push_ch` them (see the `String` section below).
 
 ```
 print("error: {err}\n");           # zero-alloc — writes to stdout
 let msg: []u8 = "error: {err}";
 let greeting: []u8 = "hello {name}";
 
-# Zero-alloc alternative outside print:
-var buf = String.with_capacity(64);
-buf.write("error: {err}");         # format into pre-allocated buffer
+# Building an owned String from formatted pieces:
+var buf: String = String.with_capacity(64);
+buf.push_str("error: ");
+buf.push_str(err);                 # then buf.deinit() when done
 ```
 
-**Zero-alloc formatting:** For hot paths (game loops, AI kernels, HTTP response serialization) where `to_string()` would allocate, types can implement the `Display` trait for stack-based output (see §4.5). `Display` is the canonical formatting interface; it is zero-alloc by design. The compiler's string interpolation and `print`/`eprint` use `Display` directly, and the compiler synthesizes a `Display` implementation for primitive types.
+**Zero-alloc formatting:** For hot paths (game loops, AI kernels, HTTP response serialization) where building a `String` would allocate, types can implement the `Display` trait for stack-based output (see §4.5). `Display` is the canonical formatting interface. The compiler's string interpolation and `print`/`eprint` use `Display` directly, and the compiler synthesizes a `Display` implementation for primitive types.
 
 ### 2.3 Operators
 
@@ -300,68 +303,35 @@ print(point.0);     # positional access (same value)
 
 A `(min: i32, max: i32)` and an `(i32, i32)` are identical in memory and interchangeable.
 
-**String** — a mutable, growable, heap-allocated UTF-8 string provided by `std.types` (not a compiler-builtin type). Layout `{ ptr: *u8, len: usize, cap: usize }` — the compiler knows the layout for interop, but `String` is a library type.
+**String** — a mutable, growable, heap-allocated UTF-8 string provided by `std.types` (not a compiler-builtin type). Layout `{ ptr: *raw u8, len: usize, cap: usize }` — the compiler knows the layout for interop, but `String` is a library type.
 
 ```
-import std.types
+import std.types.{String}
 
-let s: String = new String("hello");
-let view: []const u8 = s.as_str();   # borrow as []const u8
+var s: String = String.from_str("hello");   # heap copy of the bytes
+let view: []const u8 = s.as_str();          # borrow as []const u8
+s.deinit();                                 # release the buffer
 ```
 
-String literals produce `[]const u8`. Use `new String(literal)` to heap-allocate an owned copy:
+String literals produce `[]const u8`. There is **no** `new String(literal)` form — `new T(v)` runs the allocator's `create` path with a single initializer, and `String` is built by its own constructors:
 
 ```
-let greeting: []const u8 = "hello";
-let owned = new String("hello");          # String (heap-allocated)
+let greeting: []const u8 = "hello";            # borrowed literal — nothing to free
+var owned: String = String.from_str("hello");  # owned heap buffer holding a copy
+var empty: String = String.with_capacity(64);  # owned buffer, len 0
 ```
+
+**Ownership.** A `String` owns a heap buffer allocated through `std.mem`'s raw tier (`alloc_raw` / `realloc_raw` over `mmap`). Nothing reclaims it implicitly: release it with `String.deinit()`, which discharges exactly `cap` bytes from the runtime allocation ledger. `deinit` takes `*String`, so the binding must be `var` — calling it on a `let` binding is a compile error. Because the buffer is charged to that ledger, a `String` that is never `deinit`ed shows up as live bytes in `Counters.snapshot()`; the manual's memory chapter has the check and the `defer` pattern.
 
 Indexing a string literal yields `u8` (byte), not a Unicode codepoint; use `std.unicode` for codepoint iteration.
 
-`String` exposes `len` and `cap` as read-only fields and provides these stdlib methods: `push(self, c: char)`, `push_str(self, s: []const u8)`, `with_capacity(self, cap: usize) -> String` (creates an empty `String` with reserved capacity — the canonical way to build a `String` whose final length is roughly known up front), `reserve(self, extra: usize)`, `clear(self)`, `as_str(self) -> []const u8` (borrows as `[]const u8`), `as_writer(self) -> *fmt.Writer` (returns a pointer to a `fmt.Writer` view that appends bytes to the `String`; the writer is valid until the next non-`const` method call on the `String` and is the standard way to format into a `String` via `Display` without an intermediate buffer), `with_writer(self, f: fun(*fmt.Writer) -> void)` (scoped writer — calls `f` with a writer bound to the closure scope; the writer cannot escape the closure, enforced by `-Dref-check`).
+`String` exposes `len` and `cap` as read-only fields and provides these methods: `with_capacity(cap: usize) -> String` (owned buffer, `len` 0 — the canonical constructor when the final length is roughly known up front), `from_str(s: []const u8) -> String` (owned copy of a borrowed `str`), `push_str(s: []const u8)`, `push_ch(ch: u8)`, `pop_ch() -> ?u8`, `insert_ch(pos: usize, ch: u8)`, `clear()` (resets `len`, **keeps** the buffer), `as_str() -> []const u8`, `eq(other: []const u8) -> bool`, `contains(needle: []const u8) -> bool`, `starts_with(prefix: []const u8) -> bool`, `ends_with(suffix: []const u8) -> bool`, `find(needle: []const u8) -> ?usize`, `slice(start: usize, end: usize) -> []const u8`, `trim() -> []const u8`, `to_upper()`, `to_lower()` (in-place ASCII), and `deinit()`.
 
-**`as_writer` lifetime contract.** The returned `*fmt.Writer` is invalidated by any non-`const` method call on the source `String` (`push`, `push_str`, `reserve`, `clear`, a reentrant `as_writer`, or any `Display` call that re-formats into the same `String`) — the writer holds an internal pointer into the `String`'s buffer, and a reallocation or mutation leaves the pointer dangling. Using a writer after it has been invalidated is **undefined behavior** (read of freed memory, or a write to a freed `cap` region). The compiler does not enforce this in the type system — Zag has no borrow checker (§5.3.1) — so the discipline is on the caller. **Preferred alternative:** use `with_writer` which enforces the lifetime via closure scope and `-Dref-check`:
+`push_str` / `push_ch` / `insert_ch` reallocate (`realloc_raw`) when `len` would exceed `cap`, doubling until it fits; `clear` does not free. `to_upper` / `to_lower` mutate in place. Every method returning `[]const u8` (`as_str`, `slice`, `trim`) returns a **borrowed** view into the buffer: it must not outlive the `String` or survive a reallocating call — Zag has no borrow checker (§5.3.1), so the discipline is the caller's.
 
-```zag
-# SAFE — with_writer enforces lifetime via closure
-s.with_writer(|w| {
-    w.write("value: ");
-    w.write(x);
-});
+`String` has no `Display` impl, so a bare `{s}` placeholder interpolates the struct fields, not the contents. Write `{s.as_str()}` (or any other borrowed view) to format the text.
 
-# UNSAFE — as_writer requires manual lifetime discipline
-let w = s.as_writer();
-w.write("value: ");
-w.write(x);
-# s.push('!');  — would invalidate w, causing UB
-```
-
-```
-fun build_greeting(name: str) -> String {
-    var s: String = String.with_capacity(64);
-    let w: *fmt.Writer = s.as_writer();
-    Display.write("hello, ", w);
-    Display.write(name, w);
-    Display.write("!\n", w);
-    return s;          # w is out of scope here; safe to return s
-}
-```
-
-**`with_writer` — scoped, checked alternative.** `with_writer` takes a closure and passes a writer that is guaranteed not to escape the closure scope. The `-Dref-check` compile-time check (enabled by default in `zag check`) verifies the writer does not escape:
-
-```
-fun build_greeting(name: str) -> String {
-    var s: String = String.with_capacity(64);
-    s.with_writer(|w| {
-        Display.write("hello, ", w);
-        Display.write(name, w);
-        Display.write("!\n", w);
-    });
-    return s;          # writer cannot escape; checked at compile time
-}
-```
-
-Use `with_writer` for all new code; `as_writer` remains for interop and unusual patterns where the closure-based API doesn't fit.
+**Not implemented — writer API.** An earlier draft of this spec described a `fmt.Writer`-based `String` surface: `as_writer() -> *fmt.Writer`, `with_writer(f: fun(*fmt.Writer) -> void)`, the writer-invalidation contract, and a `-Dref-check` compile-time check that the writer cannot escape its closure. **None of that exists in the implementation** — there is no `fmt` module, no `ref-check` build step, and no writer method on `String` (`grep`ing `as_writer`, `with_writer`, `ref-check` over `src/`, `lib/`, and `tests/` returns nothing). Formatting into a `String` today means `push_str` / `push_ch` of already-formatted pieces, or `Display.write` against an explicit buffer. Building the writer API — or deleting the remaining prose about it — is tracked as a follow-up in `docs/architecture.md`.
 
 **Structs** — value types with optional struct embedding (data + method reuse)
 ```
@@ -377,7 +347,7 @@ struct Button {
 }
 ```
 
-A struct may embed at most one other struct by naming it as a field. The embedded struct's fields are promoted to the parent — they can be accessed directly without qualification. The embedded struct's methods are also promoted and participate in overload resolution. Struct embedding replaces inheritance: there are no virtual methods, no subtyping, and no upcasting. Polymorphism is provided by traits (§4.7).
+A struct may embed at most one other struct by naming it as a field. The embedded struct's methods are promoted to the parent and participate in overload resolution. Its fields are not promoted — reach them through the embedded field name (`btn.Widget.x`) — so field lookup stays unambiguous when the outer and embedded structs both declare a same-named field. Struct embedding replaces inheritance: there are no virtual methods, no subtyping, and no upcasting. Polymorphism is provided by traits (§4.7).
 
 **Copy semantics:** An aggregate type (struct, array, tuple, or enum) is `Copy` iff all its fields/elements/variants are `Copy`. Copy types duplicate on assignment; non-Copy types transfer ownership (move). `*T` and `String` are **not** `Copy` — they are moved on assignment. `*const T`, `*raw T`, `[]T`, `[]const T`, `?*T`, `?*const T`, `?*raw T`, `char`, and `void` are `Copy`.
 
@@ -428,6 +398,8 @@ union Shape {
 ```
 
 **Error type** — the canonical error type is an `enum` defined in the stdlib (§11.1). Its variants are all bare, so it is written with `enum`, not `union`. `Error` has variants `NotFound`, `Permission`, `Io`, `Parse`, `InvalidInput`, `Unavailable`, and `Other`. The compiler enforces exhaustiveness in `catch |err|` blocks that match on `err` directly. `Error` is **zero-alloc** — no heap-allocated message field. For custom error types that carry data, use `union MyError { NotFound, Timeout, Custom(str) }` — see below.
+
+**IO errno mapping** — the IO layer collapses the kernel's errno into these variants rather than inventing a second error namespace: `ENOENT` → `NotFound`, `EPERM` / `EACCES` → `Permission`, everything else → `Io`. When that distinction is too coarse, `std.posix` hands back the errno itself as a `std.errno.Errno` (§11.3), which preserves the kernel's exact code.
 
 **Backed enum vs union**: a type whose variants all share the same value type `T` is `enum(T)`, not `union`. `union` is for variants whose payload types may differ (`Shape { Circle(f64), Rect(f64, f64) }`). The keywords are deliberately separated so the "category of similar values" form (enums) doesn't pay for a per-variant tag when all variants share `T`.
 
@@ -704,11 +676,12 @@ impl Printer {
 ```
 
 **Resolution order (inspired by Julia):**
-1. Check the type's own methods for an exact signature match
-2. Check promoted (embedded) methods for an exact signature match
-3. If still ambiguous (multiple overloads match at the same distance), **compile error** — the caller must disambiguate with an explicit cast
+1. Keep the candidates whose arity matches the call
+2. Score each candidate over the argument list: exact type match **+2**, an integer literal into a float parameter **+1**, an argument whose type cannot be determined **0**
+3. Highest total wins
+4. If the top score ties — or no candidate survives the arity filter — **compile error**, reported at the call site with the candidate list. The caller annotates the argument or casts it: `move(1.0 as i32, 2.0 as i32)`
 
-**No implicit conversions in overload resolution.** Unlike Julia, Zag does not try implicit widening or narrowing in step 3. If `move(i32, i32)` and `move(f32, f32)` both exist, calling `move(1, 2)` unambiguously selects `move(i32, i32)`. Calling `move(1.0, 2.0)` unambiguously selects `move(f32, f32)`. If neither matches exactly, it is a compile error — the caller must cast explicitly: `move(1.0 as i32, 2.0 as i32)`.
+Only *statically visible* argument types score: literals, annotated bindings, `self`, struct fields, and explicit casts. A nested call result has no inferred type and therefore scores 0 — it never disqualifies a candidate, but it also cannot break a tie.
 
 ```
 impl Widget {
@@ -727,7 +700,7 @@ button.move(1, 2, 3);     # Button.move — exact match on (i32, i32, i32)
 
 Overload resolution does not cross trait boundaries. A trait method and an overload with the same name on the same type are distinct — the trait method is only dispatched through the trait object.
 
-**Overload scope:** All overloads of a type method live in the same `impl Type { ... }` block — `impl Printer { fun print(i32); fun print(String); ... }` is one namespace. Trait methods have a fixed signature per trait and cannot be overloaded: an `impl Type` block can have at most one `fun Trait.method(...)` declaration per trait method.
+**Overload scope:** All overloads of a type method share one overload set, whether they are declared in one `impl Type { ... }` block — `impl Printer { fun print(i32); fun print(String); ... }` — or spread across several `impl Type` blocks. Trait methods have a fixed signature per trait and cannot be overloaded: an `impl Type` block can have at most one `fun Trait.method(...)` declaration per trait method.
 
 ### 4.5 Operator Overloading
 
@@ -1162,18 +1135,43 @@ The runtime allocator maintains counters for benchmarking and diagnostics: total
 
 ### 5.2 Ownership
 
-A pointer returned by `new` has a single owner. Assignment moves ownership for non-`Copy` types. The source becomes uninitialized.
+A pointer returned by `new` has a single owner conceptually. **Assignment does not move it.**
 
 ```
-let s = new String("hello");
-let t = s;          # ownership moved
-# print(*s);        # error: s is moved
-free(t);
+let s: String = String.from_str("hello");
+var t: String = s;      # copies the { ptr, len, cap } descriptor: t.ptr == s.ptr
+t.deinit();             # releases the buffer BOTH bindings point at
+print("{s.as_str()}\n");  # use-after-free — segfault, no diagnostic
 ```
 
-`Copy` types duplicate on assignment. See §3.3 for the structural Copy rules.
+Every Zag type is a fixed-size value; assignment copies those bytes. The
+intended ownership classification is:
 
-A pointer returned by `new` or `alloc` is considered **owning**. Pointers and slices created with `&` or slicing are **non-owning views** and are `Copy`. Ownership analysis tools (§5.7) use this distinction: `free` of a non-owning view is a compile error under `-Downership-check`, and failing to `free` an owning pointer is a leak under `-Dleak-check`.
+- **Owning:** `*T` returned by `new`, `[]T` returned by `alloc`, `String`.
+- **Non-owning views (`Copy`):** `*const T`, `*raw T`, `[]const T`, `?*T`,
+  and anything made with `&` or slicing.
+
+**The owning category is not enforced.** `let q: *i32 = p;` and
+`var t: String = s;` both compile and both alias the resource; no move is
+inserted and no aliasing is diagnosed. The only related check that exists is
+receiver mutability — mutating methods and `deinit` take `*String`, so a `let`
+binding cannot be released through (it fails with
+`expected type '*T', found '*const T'`), which forces `var` but does not
+prevent two bindings from sharing one buffer.
+
+Consequences for callers, given no enforcement:
+
+- Exactly one binding owns each buffer; hand callees a `*T` or a borrowed view,
+  never the value.
+- Passing a `String` by value to a function is accepted and aliases — a callee
+  that calls `deinit` frees the caller's buffer.
+- Release once, through the owner.
+
+An ownership checker that rejects `free` of a non-owning view
+(`-Downership-check`) and a leak checker (`-Dleak-check`) are described in §5.7
+as tooling; neither is implemented. What exists today is the runtime allocation
+ledger (`std.bench.Counters`) for leak *detection* on demand — see the manual's
+memory chapter.
 
 **Inter-procedural ownership:** `-Downership-check` is intraprocedural (§5.3.1). At a call site, a function returning `*T` is treated as returning a **potentially owning** pointer — the analysis conservatively allows `free` on it. This is correct for factory functions (`new_X`) but may suppress false positives for accessor functions (`get_X`). For full inter-procedural reasoning, use `-fsanitize=memory` at runtime.
 
@@ -2390,7 +2388,10 @@ Packages the bootstrap stdlib must provide:
 - `std.default` — `Default` trait and `Zero` trait:
   - `trait Default { fun default() -> Self; }` — produces a type-appropriate "zero" value (`0`, `false`, `{}`, `'\0'`, `Option.None`, the first enum variant). `Default` is implemented for all primitive types and for any `struct` annotated with `@[derive(Default)]` (§2.5). Use it to give a struct a canonical empty value without writing a constructor. `Default` is the right choice when the type may contain non-`Copy` fields (e.g. `String`) that need a non-zero empty state. Because Zag has no trait bounds on generics (§4.1), `Default` is invoked through method call syntax (`T.default()`) — there is no top-level generic `default<T>()` function
   - `trait Zero { fun zero() -> Self; }` — marker for "all-zero bytes is a valid value." `Zero` is implemented for all primitive types, `[N]T` where the element is `Zero`, and any `@[derive(Zero)]` struct where every field is `Zero` (no embedded slices, `String`, `Option<T>` where `T` is not `Zero`, or other non-`Zero` types). **Use `Zero` in hot loops** (game frames, AI kernels, page-table zeroing) where the compiler can emit a single `memset`; use `Default` when the struct is heterogeneous or contains `String` / `Option` / `Result`. `Zero` is a stronger precondition than `Default` — not every `Default` type is `Zero`, but every `Zero` type is `Default` (a `zero` value is a valid `default` value). Same caveat as `Default`: invoke via `T.zero()` method syntax, not generic helpers
-- `std.net`, `std.fs`, `std.io`, `std.json`, `std.bytes`, `std.math`
+- `std.errno` — the errno vocabulary for the `std.posix` tier. `ErrnoKind` names the codes callers branch on (`Noent`, `Eacces`, `Eisdir`, `Enospc`, `Eexist`, `Eagain`, `Enotdir`, …); `Errno { kind: ErrnoKind, code: isize }` pairs the named kind with the kernel's exact number and exposes `of(code) -> Errno`, `is(kind) -> bool`, and `name() -> str`. `name()` renders a faithful `errno <n>` for a code `ErrnoKind` does not cover, so the exact code is never lost to a fallback label
+- `std.posix` — the raw syscall facade, in two deliberate tiers. The canonical entries (`openat`, `read`, `write`, `pread`, `pwrite`, `lseek`, `ftruncate`, `fsync`, `fdatasync`, `close`, `mkdirat`, `getdents64`, `mmap`, `munmap`, `nanosleep`, `clone`, `wait4`, `futex_*`) return `Result(T, Errno)` and are the only place the high-bit-set-`usize` / negative-`isize` convention is decoded. A `raw_<name>` twin returns the kernel's value verbatim for IO hot loops that own their own errno policy. The shared transfer helpers `read_some`, `read_full`, `write_full`, `pread_some`, and `pwrite_full` retry `EINTR` internally, so it never surfaces as a caller-visible failure. There is no `raw_` twin where one would be meaningless: `clock_gettime` and `getcwd` need a success-side out-parameter, `spawn` is a composition (arena + `environ` + fork + `execve` + `waitpid`) rather than a single syscall, and `gettid` cannot fail
+- `std.fs` — file IO on the same `Result` shape. `read_file` / `write_file` / `try_read` are the whole-file reader, the whole-file writer, and the fd-level read; each returns `Result(_, Error)` and there is exactly one spelling per operation, the FAILURE POLICY being chosen at the call site with postfix `!` (panic), `?` (propagate), `catch` (fallback), or `match` (branch) — so neither `*_or_panic` twins nor an `_or` policy suffix exist; each name denotes the operation, not its failure mode. `File` returns `Result(_, Error)` from every fallible member and has ONE constructor, `File.open(path, mode)` with a mandatory `FileMode` (`Read` / `Rw` / `Append` / `Create`); the mode is explicit because a cross-module type cannot resolve a same-name overload (`§4.1` adjacent, `docs/manual/30` §Across modules). `write_file` / `close_durable` flush the contents **and** the directory entry, so a reported success is durable
+- `std.net`, `std.io`, `std.json`, `std.bytes`, `std.math`
 
 **Deferred stdlib packages (planned, not in v1):** `std.crypto` (cryptographic primitives), `std.regex` (regular expressions), `std.ui` (GUI toolkit). See §19 for the full deferral list.
 

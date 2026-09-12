@@ -9,6 +9,29 @@
 ## allocator itself (no logging-allocator swap, no per-site call
 ## overhead beyond two integer adds).
 ##
+## ── The leak check ────────────────────────────────────────────────
+## `bytes_live` is a LEDGER, so "did I leak?" is a comparison rather
+## than a judgement call:
+##
+##     let before: usize = Counters.snapshot().bytes_live;
+##     ... allocate, use, free ...
+##     assert(Counters.snapshot().bytes_live == before);
+##
+## That only works if every allocation path is accounted, so the
+## charges live in the PRIMITIVES rather than at call sites: the raw
+## tier is charged inside std.mem (alloc_raw charges n, realloc_raw
+## charges the delta, release discharges cap — see lib/std/mem.zag
+## §"Allocation accounting"), and the `new` / `free` keyword paths
+## charge and discharge at the emit. A container that is never
+## released therefore shows its CAPACITY as live bytes; a container
+## released with the wrong `cap` leaves a residue equal to the
+## difference.
+##
+## Worked example + the gated assertions: examples/memory/leak_check.zag.
+## The compile-time leak warning is the other half of the story: the
+## escape analysis flags a `new` / `alloc` / `alloc_raw` site that
+## never escapes its function and is never freed (docs/manual/20).
+##
 ## Pre-migration state: the stub returned zeros. Per-line benchmark
 ## scaffolding (timing + per-source-line counters) is a follow-up.
 

@@ -17,11 +17,21 @@
 ## delegation; the posix family is completely out of the preamble.
 
 pub import std.posix.{exit as sys_exit, spawn as sys_spawn}
+import std.errno.{Errno}
 
 pub fun exit(code: i32) {
     sys_exit(code);
 }
 
-pub fun exec(argv: []const []const u8) -> i32 {
+## exec — run `argv` to completion and return the child's exit code.
+## Under the P1 posix tier split this is a `Result`, which removes the
+## old 255 ambiguity: 255 used to mean EITHER "spawn setup failed"
+## (empty argv, arena overflow, fork/waitpid errno) OR "the child
+## exited with 255", and no caller could tell which. Now a setup
+## failure is `Err(errno)` and `Ok(255)` is unambiguously a child code.
+## Two shell conventions survive inside `spawn` and are documented
+## there: a failed execve in the child exits 127, and a child killed by
+## a signal reports 255.
+pub fun exec(argv: []const []const u8) -> Result(i32, Errno) {
     return sys_spawn(argv);
 }

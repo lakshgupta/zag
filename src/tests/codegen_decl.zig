@@ -1773,7 +1773,7 @@ test "codegen: block-form const `const x: str = const { ... }` expands `: str` t
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const x: []const u8 = blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const x: []const u8 = __blk_0: {") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "const x: str =") == null);
 }
 
@@ -3597,7 +3597,7 @@ test "codegen: assert(false, msg) emits expect with message" {
     try std.testing.expect(std.mem.indexOf(u8, zig, "should be true") != null);
 }
 
-test "codegen: const block emits comptime blk with break :blk" {
+test "codegen: const block emits comptime labeled block with break" {
     const src =
         \\const TABLE: [3]i32 = const {
         \\    var t: [3]i32 = undefined;
@@ -3615,11 +3615,11 @@ test "codegen: const block emits comptime blk with break :blk" {
     // the redundant `comptime` keyword (zig 0.16 rejects "redundant
     // comptime keyword in already comptime scope" — the const binding
     // RHS IS already comptime scope), and the `return t;` terminator
-    // becomes `break :blk t`.
-    try std.testing.expect(std.mem.indexOf(u8, zig, "blk: {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime blk: {") == null);
-    // Return statement becomes break :blk
-    try std.testing.expect(std.mem.indexOf(u8, zig, "break :blk t") != null);
+    // becomes `break :<lbl> t`.
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__blk_0: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "comptime __blk") == null);
+    // Return statement becomes break :<lbl>
+    try std.testing.expect(std.mem.indexOf(u8, zig, "break :__blk_0 t") != null);
 }
 
 test "codegen: type_name(T) emits @typeName(T)" {
@@ -3939,8 +3939,8 @@ test "codegen: await lowers to the inline-drive form" {
     const prog = p.parse();
     var cg = codegen_mod.Codegen.init();
     const zig = cg.generate(prog);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "__fut_0.drive(); break :blk __fut_0.take();") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zig, "const x: i32 = (blk: { var __fut_1 = h(); __fut_1.drive(); break :blk __fut_1.take(); });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "__fut_0.drive(); break :__blk_0 __fut_0.take();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "const x: i32 = (__blk_1: { var __fut_1 = h(); __fut_1.drive(); break :__blk_1 __fut_1.take(); });") != null);
     // Retired free-fn helpers must not reappear.
     try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_future_drive(") == null);
     try std.testing.expect(std.mem.indexOf(u8, zig, "__zag_future_ready_void(") == null);

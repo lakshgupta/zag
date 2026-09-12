@@ -23,23 +23,41 @@ const ast = @import("../ast.zig");
 // allocates on the heap and the USER must pair it with
 // `defer free(p)` — zag's memory model is MANUALLY MANAGED, zig-
 // style (no compiler-inserted frees). This pass classifies every
-// `new` site in a function body and reports the LEAK set — sites
-// that never escape the function, are never explicitly freed, and
-// use the default page allocator — as compile-time warnings
-// ("new ... is never freed"). The verdicts deliberately do NOT
-// change the emitted code: freeing is always the user's explicit
-// `free` / `defer free`.
+// ALLOCATION site in a function body and reports the LEAK set —
+// sites that never escape the function, are never explicitly
+// freed, and use the default page allocator — as compile-time
+// warnings ("... is never freed"). The verdicts deliberately do
+// NOT change the emitted code: freeing is always the user's
+// explicit `free` / `release` / `defer`.
+//
+// TWO construct families produce a site, because both hand back
+// owned memory under the manual model:
+//
+//   `new T(v)`        discharged by `free p`
+//   `alloc(n)`        `[]u8`,  discharged by `free buf`
+//   `alloc_raw(n)`    `[*]u8`, discharged by `release(p, n)`
+//
+// `alloc`/`alloc_raw` are ordinary `std.mem` functions rather than
+// syntax, so their site is created at the `.call` node (the
+// callee's own body is a separate function and is analyzed when it
+// is compiled). Tracking only `new` — the pre-widening behavior —
+// left every slice allocation silent: `let buf = alloc(n);` with
+// no `free buf` produced no warning at all, and only the runtime
+// ledger in std.bench could see it.
 //
 // June's data model is used directly: the pass produces a SIDE-
 // VECTOR of per-site info keyed by a stable site index (the Nth
-// `new_expr` in AST depth-first walk order) — nothing is stuffed
-// into the AST node structs. The site index IS the codegen
-// `alloc_counter` value at the corresponding `.new_expr` arm in
-// src/codegen/expr.zig, so the two passes agree by construction
-// as long as both walk the AST in the same left-to-right order.
-// The one intentional divergence — the `.add` / `.offset`
-// method-call arms re-emit subexpressions — is mirrored here (see
-// the `.method_call` arm below).
+// allocation site in AST depth-first walk order) — nothing is
+// stuffed into the AST node structs. The index is INTERNAL to this
+// diagnostic: it keys `sites` / `site_locs` / the `leaks` mask.
+// (It used to mirror codegen's `alloc_counter`, which numbers
+// `.new_expr` for the unique `__p_<N>` temp names; the auto-free
+// prologue that needed that correspondence was retired with the
+// manual memory model, and `alloc` sites have no codegen counter,
+// so the two numberings are now independent.) The one intentional
+// divergence kept from that era — the `.add` / `.offset`
+// method-call arms in codegen re-emit subexpressions — is mirrored
+// here (see the `.method_call` arm below).
 //
 // Soundness contract: the analysis errs CONSERVATIVELY toward
 // "escapes" — any site that might escape (returned, passed to a
@@ -54,8 +72,9 @@ const ast = @import("../ast.zig");
 // — no emitted code changes, so a mis-verdict can never corrupt
 // runtime behavior.
 
-/// Max tracked `new` sites per function body. Sites beyond this are
-/// treated as escaping (no leak warning) via the `overflow` flag.
+/// Max tracked allocation sites (`new` / `alloc` / `alloc_raw`) per
+/// function body. Sites beyond this are treated as escaping (no leak
+/// warning) via the `overflow` flag.
 pub const MAX_SITES = 128;
 /// Max tracked variable slots (per-scope name slots are reused
 /// across fixpoint iterations by construction — see `defineVar`).
@@ -69,11 +88,28 @@ const MAX_SCOPE_VARS = 32;
 /// is defensive — on a hit everything conservatively escapes.
 const MAX_FIXPOINT_ITERS = 32;
 
-/// One tracked allocation site: the info codegen needs to emit the
-/// hoisted `const __p_N = try ...create(T);` prologue.
+/// Which construct produced a tracked allocation site. Both kinds
+/// hand back owned memory that only an explicit deallocation
+/// discharges — they differ only in how the leak warning names them
+/// and in which deallocator is the natural pairing.
+pub const SiteKind = enum {
+    /// `new T(v)` — discharged by `free p` (and `defer free(p)`).
+    new_expr,
+    /// `alloc(n)` / `alloc_raw(n)` from `std.mem` — `alloc` returns a
+    /// `[]u8` (discharged by `free buf`), `alloc_raw` a `[*]u8`
+    /// (discharged by `release(p, n)`; the `free` keyword would route
+    /// a many-pointer through its pointer overload).
+    alloc_fn,
+};
+
+/// One tracked allocation site.
 pub const SiteInfo = struct {
-    type_name: []const u8,
-    allocator: ?[]const u8,
+    /// `.new_expr`: the `T` in `new T(v)`. Empty for `.alloc_fn`.
+    type_name: []const u8 = "",
+    allocator: ?[]const u8 = null,
+    /// `.alloc_fn`: the callee name that handed back the mapping.
+    fn_name: []const u8 = "",
+    kind: SiteKind = .new_expr,
 };
 
 /// Per-function verdict table (the June-style side-vector).
@@ -83,7 +119,7 @@ pub const Result = struct {
     /// function, is not explicitly freed, and uses the default page
     /// allocator — under zag's MANUAL memory model (zig-style,
     /// docs/manual/20-memory.md) nothing deallocates it. Codegen
-    /// surfaces these as compile-time warnings ("new ... is never
+    /// surfaces these as compile-time warnings ("... is never
     /// freed"); no free is auto-inserted.
     leaks: u128 = 0,
     /// Site info by index; valid up to `site_count`.
@@ -136,13 +172,12 @@ const Analyzer = struct {
     /// true, a tail-position match statement's arm flows are returned
     /// by the emitted zig (genStmt prefixes `return`).
     tail_match_returns: bool = false,
-    /// Position of the current `.new_expr` visit in THIS iteration's
-    /// walk. Resets to 0 every fixpoint iteration; because the walk
-    /// is deterministic (AST-driven), the same node lands on the
-    /// same position every iteration — which IS the site id. Site
-    /// recording happens only on the first pass so a re-walked
-    /// `.new_expr` node keeps its id (codegen's alloc_counter
-    /// visits each node exactly once).
+    /// Position of the current allocation-site visit (`new_expr` OR
+    /// `alloc`/`alloc_raw` call) in THIS iteration's walk. Resets to
+    /// 0 every fixpoint iteration; because the walk is deterministic
+    /// (AST-driven), the same node lands on the same position every
+    /// iteration — which IS the site id. Site recording happens only
+    /// on the first pass so a re-walked node keeps its id.
     visit_count: u32 = 0,
     /// True while the first fixpoint iteration is running. Only the
     /// first pass appends to `result.sites` / `result.site_count`.
@@ -303,6 +338,50 @@ fn addArena(a: *Analyzer, idx: u32) void {
     if (idx < 128) a.arena_sites |= @as(u128, 1) << @intCast(idx);
 }
 
+/// `std.mem`'s owning-allocation family. A call to one of these
+/// hands back a fresh mapping, so the CALL is the allocation site
+/// (the callee's own body is a different function and is analyzed
+/// when it is compiled). Matched by bare callee name — the plain
+/// `alloc(n)` form, which is what an `import std.mem.{alloc}` call
+/// site looks like. A dotted (`std.mem.alloc(n)`) or aliased
+/// (`import std.mem.{alloc as a}`) call is NOT matched: the result
+/// stays untracked, which only ever misses a warning (the safe
+/// direction — see the soundness contract in the header).
+fn allocCalleeName(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "alloc")) return "alloc";
+    if (std.mem.eql(u8, name, "alloc_raw")) return "alloc_raw";
+    return null;
+}
+
+/// `std.mem`'s discharging call: `release(p, cap)` unmaps the mapping
+/// argument 0 names. Without this the raw tier's documented pairing
+/// (`alloc_raw(n)` + `release(p, n)`) would read as a leak, because
+/// every call argument otherwise escapes conservatively.
+fn isFreeCallee(name: []const u8) bool {
+    return std.mem.eql(u8, name, "release");
+}
+
+/// Compiler builtins that READ their arguments and retain nothing.
+/// Passing an owning value to one of these is not an escape: `print`
+/// formats the value straight into the output writer (`__zag_print`),
+/// and `assert` only tests it. Without this the conservative
+/// call-arg rule below would hide the most common leak shape there
+/// is — allocate a buffer, report something about it, never free it:
+///
+///     let buf: []u8 = alloc(1024);
+///     print("buf.len = {buf.len}\n");   # no escape → still a leak
+///
+/// The list is deliberately tiny and limited to compiler-owned names
+/// (a user function cannot shadow `print`/`assert` — both are
+/// dispatched by the builtin router before name resolution). Note
+/// the direction of the residual error: if a user fn of one of these
+/// names did retain its argument, the result is one MISSED warning,
+/// never a false one — the site must still be unfreed and
+/// non-escaping to be reported.
+fn isNonRetainingCallee(name: []const u8) bool {
+    return std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "assert");
+}
+
 /// Register a `.new_expr` visit. Returns the site id = the visit's
 /// position in the current (deterministic) walk. Site records are
 /// appended only on the first fixpoint pass so re-walked nodes keep
@@ -317,6 +396,24 @@ fn newSite(a: *Analyzer, n: ast.Expr.NewExpr, loc: ast.Loc) u32 {
     }
     if (a.first_pass) {
         a.result.sites[id] = .{ .type_name = n.type_name, .allocator = n.allocator };
+        a.result.site_locs[id] = loc;
+        a.result.site_count = id + 1;
+    }
+    return id;
+}
+
+/// Register an `alloc(n)` / `alloc_raw(n)` visit — same id and
+/// first-pass bookkeeping as `newSite`, with the callee recorded so
+/// the warning can name the construct.
+fn allocSite(a: *Analyzer, fn_name: []const u8, loc: ast.Loc) u32 {
+    const id = a.visit_count;
+    a.visit_count += 1;
+    if (id >= MAX_SITES) {
+        a.overflow = true;
+        return id;
+    }
+    if (a.first_pass) {
+        a.result.sites[id] = .{ .kind = .alloc_fn, .fn_name = fn_name };
         a.result.site_locs[id] = loc;
         a.result.site_count = id + 1;
     }
@@ -481,7 +578,7 @@ fn walkStmt(a: *Analyzer, s: ast.Stmt, is_tail: bool, value_out: ?*u128) void {
         },
         .match_stmt => |m| {
             // June's "Return" via tail-position match: genStmt emits
-            // `return (blk: {...});` when the match is the LAST
+            // `return (__blk_N: {...});` when the match is the LAST
             // statement of a value-returning method — its arm flows
             // then leave the function.
             var scr: u128 = 0;
@@ -599,6 +696,51 @@ fn walkExpr(a: *Analyzer, e: ast.Expr, out: *u128) void {
             if (resolveVar(a, name)) |slot| out.* |= a.var_flow[slot];
         },
         .call => |c| {
+            // Allocation-family call: the RESULT is the tracked site
+            // (this is what closes the `alloc(n)`-without-`free` gap —
+            // previously only `.new_expr` produced a site, so a slice
+            // allocation was invisible to the leak warning). The
+            // arguments are size expressions: they own nothing, but any
+            // site hiding inside one is consumed as a length, so it
+            // escapes rather than flowing into the result.
+            if (allocCalleeName(c.name)) |alloc_name| {
+                for (c.args) |arg| {
+                    var scratch: u128 = 0;
+                    walkExpr(a, arg, &scratch);
+                    addEscapes(a, scratch);
+                }
+                const id = allocSite(a, alloc_name, e.loc);
+                if (id < 128) out.* |= @as(u128, 1) << @intCast(id);
+                return;
+            }
+            // Discharging call: `release(p, cap)` unmaps argument 0, so
+            // that value is freed, not escaped. Remaining arguments are
+            // size expressions (walked for numbering, escaping like any
+            // other call argument).
+            if (isFreeCallee(c.name)) {
+                if (c.args.len > 0) {
+                    var flow: u128 = 0;
+                    walkExpr(a, c.args[0], &flow);
+                    addFreed(a, flow);
+                }
+                var i: usize = 1;
+                while (i < c.args.len) : (i += 1) {
+                    var scratch: u128 = 0;
+                    walkExpr(a, c.args[i], &scratch);
+                    addEscapes(a, scratch);
+                }
+                return;
+            }
+            // Non-retaining builtin: the argument is read (formatted,
+            // tested) and dropped, so it does not escape. Walked for
+            // numbering parity only.
+            if (isNonRetainingCallee(c.name)) {
+                for (c.args) |arg| {
+                    var scratch: u128 = 0;
+                    walkExpr(a, arg, &scratch);
+                }
+                return;
+            }
             // Unknown callee: every argument can be stored or
             // returned by the callee, so every arg site escapes.
             for (c.args) |arg| {
@@ -722,6 +864,9 @@ fn walkExpr(a: *Analyzer, e: ast.Expr, out: *u128) void {
         },
         .try_op => |t| {
             walkExpr(a, t.expr.*, out);
+        },
+        .unwrap_op => |u| {
+            walkExpr(a, u.expr.*, out);
         },
         .catch_expr => |c| {
             walkExpr(a, c.expr.*, out);

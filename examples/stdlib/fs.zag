@@ -1,25 +1,26 @@
-## stdlib/fs.zag — v0.1 read_file usage example.
+## stdlib/fs.zag — whole-file read usage example.
 ##
 ## Reads a small known file and prints its byte count. The exact
 ## file is `examples/basics/hello.zag` — a tiny source file with
 ## predictable content (assert its size is stable across zag
 ## revisions so the smoke run's expected-output pin holds).
 ##
-## v0.1 contract (this migration):
-## - `read_file(path) -> String` (heap `String`, not `[]u8`).
-##   Panics on open/read error today (see lib/std/fs.zag docblock).
+## One-spelling contract (the `!` collapse):
+## - `read_file(path) -> Result(String, Error)` is the ONLY whole-file
+##   reader; it never panics on IO failure. The caller chooses the
+##   failure policy at the CALL SITE:
+##   - `read_file(path)!`   → panic on failure (the fail-fast form)
+##   - `read_file(path)?`   → propagate the Err to the caller
+##   - `match read_file(p)` → branch on NotFound vs Permission vs Io
+##   docs/manual/19 documents `!` as the panicking mirror of `?`. There
+##   is no separate panicking spelling: `read_file(p)!` IS that spelling.
 ## - `String.as_str(self: *String) -> []const u8` returns a slice
 ##   over the heap-owned buffer; `.len` on it is the byte count.
-## - Heap ownership: the returned `String`'s buffer is __zag_page_alloc
-##   backed; lifecycle is process-exit-reclaim today (Phase 2+ may
-##   add `data.free_expr()` once the docs/19 error-propagation
-##   zig-side codegen is wired).
-## - Migration from pre-v0.1 `[]u8` contract: drop any `defer free
-##   data` (the slice was codegen-router-owned, nu longer applies);
-##   replace with bare `let data: String = read_file(...)`.
+## - Heap ownership: the returned `String`'s buffer is page-allocator
+##   backed; lifecycle is process-exit-reclaim today.
 ##
-## Imports contract: BOTH std.fs.{read_file} (the migrated impl)
-## AND std.string.{String} (the return type) must be visible at the
+## Imports contract: BOTH std.fs.{read_file} (the impl) AND
+## std.types.{String} (the return type) must be visible at the
 ## fixture's top — the imports-loop in src/codegen/core.zig bridges
 ## @import("lib/std/...") + per-selector aliases only on explicit
 ## `import` lines in user source. The `lib/std` namespace is NOT
@@ -31,6 +32,7 @@ import std.types.{String};
 fun main() {
     # Harness contract (examples/run_all.sh): every fixture runs with
     # CWD = repo root, so the anchor path is repo-root-relative.
-    let data: String = read_file("examples/basics/hello.zag");
+    # `!` unwraps the Ok and panics on Err — the fail-fast spelling.
+    let data: String = read_file("examples/basics/hello.zag")!;
     print("read {data.as_str().len} bytes\n");
 }

@@ -1,9 +1,10 @@
 ## std.encoding — base64, hex, and UTF-8 helpers over byte slices.
 ##
 ## All encode/decode functions return HEAP-allocated slices (backed
-## by std.mem.alloc_raw) — the caller owns them and must `free` (the
-## escape analysis warns on unpaired `new`/`alloc`-style returns, and
-## these count as escaping by design).
+## by std.mem.alloc_raw) — the caller owns them and must `free`. The
+## internal allocation sites are `return`ed, so the escape analysis
+## counts them as escaping by design and no leak warning is emitted
+## for them; ownership is the caller's.
 ##
 ##   import std.encoding.{base64_encode, base64_decode, hex_encode,
 ##                        hex_decode, utf8_validate}

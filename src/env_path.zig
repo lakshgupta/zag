@@ -131,7 +131,7 @@ pub var environ_count: usize = 0;
 pub fn readEnviron() void {
     const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
     const n = std.os.linux.read(fd, &environ_buf, environ_buf.len);
-    _ = std.os.linux.close(fd);
+    _ = std.os.linux.close(fd); // deliberate discard: read-only /proc/self/environ fd
     if (n < environ_buf.len) environ_buf[n] = 0;
 
     environ_count = 0;

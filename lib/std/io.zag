@@ -8,11 +8,28 @@
 ##
 ## read_line reads from the fd into `buf` until a `\n` (inclusive)
 ## or EOF; returns null on EOF-with-no-bytes. read_all reads until
-## the buffer is full or EOF. Both return the byte count read —
-## panics on read errors, matching std.fs's errno model.
+## the buffer is full or EOF. Both return the byte count read.
+## Error model (matching std.fs): EOF (0 bytes) is NOT an error — the
+## stream-based fns return null/false for it — while a real read errno
+## panics. EINTR is a signal before any bytes moved, so it is retried
+## internally and never surfaces. (Older revisions collapsed every
+## `n <= 0` into EOF, which silently truncated a read that failed
+## mid-stream.)
 
-import std.posix.{read as fd_read, write as fd_write}
+import std.posix.{read_some as fd_read_some, write_full as fd_write_full}
+import std.errno.{Errno}
 import std.bytes.{put_u16_le, put_u32_le, put_u64_le, put_u32_be, put_u64_be, put_varint, get_u16_le, get_u32_le, get_u64_le, get_u32_be, get_u64_be, read_varint as bytes_read_varint}
+
+## ── Transfer helpers ───────────────────────────────────────────────────
+##
+## The EINTR retry and the errno decode live in ONE place — std.posix's
+## read_some / read_full / write_full — not here, not in fs.zag, and
+## not in random.zag. This module deliberately uses the *single*
+## transfer read (read_some) rather than read_full: a line reader hands
+## back whatever one read(2) produced, so draining the buffer would
+## block until EOF instead of returning the line.
+##
+## `fd_read_some` / `fd_write_full` are the aliases this file binds.
 
 ## ── Writer: a cursor over a caller-owned buffer ────────────────────────
 ##
@@ -253,14 +270,11 @@ impl FileWriter {
         }
     }
 
-    ## Push the buffer to the fd (loops: write(2) may be partial).
+    ## Push the buffer to the fd. write_full loops until the whole
+    ## slice lands (write(2) may be partial) and retries EINTR.
     pub fun flush(self: *FileWriter) {
-        var pos: usize = 0;
-        while (pos < self.len) {
-            let n: isize = fd_write(self.fd, self.buf[pos..self.len], self.len - pos);
-            if (n <= 0) { __zag_panic("std.io.FileWriter.flush: write error"); }
-            pos = pos + (n as usize);
-        }
+        let r: Result(usize, Errno) = fd_write_full(self.fd, self.buf[0..self.len]);
+        if let Err(_) = r { __zag_panic("std.io.FileWriter.flush: write error"); }
         self.flushed = self.flushed + self.len;
         self.len = 0;
     }
@@ -316,13 +330,18 @@ impl FileReader {
         return done;
     }
 
-    ## Refill the buffer from the fd. Returns false at EOF.
+    ## Refill the buffer from the fd. Returns false at EOF (0 bytes);
+    ## a real read errno panics instead of being mistaken for EOF.
     pub fun fill(self: *FileReader) -> bool {
-        let n: isize = fd_read(self.fd, self.buf, self.buf.len);
-        if (n <= 0) { return false; }
-        self.len = n as usize;
-        self.pos = 0;
-        return true;
+        let r: Result(usize, Errno) = fd_read_some(self.fd, self.buf);
+        if let Err(_) = r { __zag_panic("std.io.FileReader.fill: read error"); }
+        if let Ok(n) = r {
+            if (n == 0) { return false; }
+            self.len = n;
+            self.pos = 0;
+            return true;
+        }
+        return false;
     }
 }
 
@@ -330,30 +349,34 @@ impl FileReader {
 ## line length, or null at EOF. A line longer than the buffer is
 ## truncated (the remainder stays in the fd for the next read).
 pub fun read_line(fd: i32, buf: []u8) -> ?usize {
-    let n: isize = fd_read(fd, buf, buf.len);
-    if (n <= 0) { return null; }
-    var i: usize = 0;
-    while (i < n as usize) {
-        if (buf[i] == '\n') { return i + 1; }
-        i = i + 1;
+    let r: Result(usize, Errno) = fd_read_some(fd, buf);
+    if let Err(_) = r { __zag_panic("std.io.read_line: read error"); }
+    if let Ok(n) = r {
+        if (n == 0) { return null; }
+        var i: usize = 0;
+        while (i < n) {
+            if (buf[i] == '\n') { return i + 1; }
+            i = i + 1;
+        }
+        return n;
     }
-    return n as usize;
+    return null;
 }
 
 ## Read until the buffer is full or EOF. Returns the byte count
 ## (null on EOF-with-no-bytes — a short read returns Some(short)).
 pub fun read_all(fd: i32, buf: []u8) -> ?usize {
-    let n: isize = fd_read(fd, buf, buf.len);
-    if (n <= 0) { return null; }
-    return n as usize;
+    let r: Result(usize, Errno) = fd_read_some(fd, buf);
+    if let Err(_) = r { __zag_panic("std.io.read_all: read error"); }
+    if let Ok(n) = r {
+        if (n == 0) { return null; }
+        return n;
+    }
+    return null;
 }
 
 ## Write all bytes to the fd (loops until the whole slice is out).
 pub fun write_all(fd: i32, bytes: []const u8) -> void {
-    var pos: usize = 0;
-    while (pos < bytes.len) {
-        let n: isize = fd_write(fd, bytes[pos..], bytes.len - pos);
-        if (n <= 0) { __zag_panic("std.io.write_all: write error"); }
-        pos = pos + (n as usize);
-    }
+    let r: Result(usize, Errno) = fd_write_full(fd, bytes);
+    if let Err(_) = r { __zag_panic("std.io.write_all: write error"); }
 }

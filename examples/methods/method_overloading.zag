@@ -1,29 +1,22 @@
-## Method overloading — same name, different parameter types (docs/29)
+## Method overloading — same name, different parameter types (docs/30)
 ##
-## Multiple methods can share a name if their parameter types differ.
-## Resolution is compile-time, zero runtime cost. zig handles it natively.
+## Multiple methods can share a name if their parameter types or arity
+## differ. Resolution is compile-time, zero runtime cost: the compiler
+## picks one exact method and emits a plain (non-virtual) call.
 ##
 ## Run: zag run method_overloading.zag
 
 struct Point {
-    x: f64,
-    y: f64,
+    x: i32,
+    y: i32,
 }
 
 impl Point {
-    pub fun init(x: f64, y: f64) -> Point {
+    pub fun init(x: i32, y: i32) -> Point {
         return Point { x: x, y: y };
     }
 }
 
-# Overloaded methods — same name, different signatures
-impl Point {
-    pub fun distance(self: *const Point) -> f64 {
-        return self.x + self.y;
-    }
-}
-
-# Printer with overloaded print method
 struct Printer {
     prefix: str,
 }
@@ -33,34 +26,82 @@ impl Printer {
         return Printer { prefix: p };
     }
 
-    pub fun print_i32(self: *const Printer, x: i32) -> str {
+    # Three overloads of `show`, selected by the argument's type.
+    pub fun show(self: *const Printer, x: i32) -> str {
         _ = x;
-        return self.prefix;
+        return self.prefix + "i32";
     }
 
-    pub fun print_str(self: *const Printer, s: str) -> str {
+    pub fun show(self: *const Printer, s: str) -> str {
         _ = s;
-        return self.prefix;
+        return self.prefix + "str";
+    }
+
+    pub fun show(self: *const Printer, p: Point) -> str {
+        _ = p;
+        return self.prefix + "Point";
+    }
+
+    # A same-name pair distinguished by arity instead of by type.
+    pub fun bump(self: *Printer, x: i32) -> i32 {
+        return x + 1;
+    }
+
+    pub fun bump(self: *Printer, a: i32, b: i32) -> i32 {
+        return a + b;
+    }
+
+    # A numeric pair: an integer literal still prefers `i32`, while a
+    # float literal (or a cast) selects `f64`.
+    pub fun scale(self: *const Printer, x: i32) -> i32 {
+        return x * 2;
+    }
+
+    pub fun scale(self: *const Printer, x: f64) -> f64 {
+        return x * 2.0;
     }
 }
 
 fun main() {
-    let p: Printer = Printer.init("LOG: ");
-    let a: str = p.print_i32(42);
-    let b: str = p.print_str("hello");
-    print("loaded: {a} {b}\n");
+    let p: Printer = Printer.init("-> ");
+    print("show: {p.show(42)}\n");
+    # A string-literal argument inside a placeholder is a template
+    # expression, not embedded data (docs/manual/30).
+    print("show: {p.show(\"hello\")}\n");
+    # Annotate the argument so the compiler can score the overload: a
+    # bare `Point.init(1, 2)` argument has no inferred type, which is
+    # the ambiguous case the diagnostic spells out.
+    let pt: Point = Point.init(1, 2);
+    print("show: {p.show(pt)}\n");
+    print("bump(5)    = {p.bump(5)}\n");
+    print("bump(3, 4) = {p.bump(3, 4)}\n");
+    print("scale(3)   = {p.scale(3)}\n");
+    print("scale(2.5) = {p.scale(2.5)}\n");
 }
 
 @[test]
-fun test_overload_i32() {
+fun test_overload_by_type() {
     let p: Printer = Printer.init("OK: ");
-    let result: str = p.print_i32(42);
-    assert(result == "OK: ");
+    assert(p.show(42) == "OK: i32");
+    assert(p.show("hello") == "OK: str");
 }
 
 @[test]
-fun test_overload_str() {
+fun test_overload_by_arity() {
     let p: Printer = Printer.init("OK: ");
-    let result: str = p.print_str("hello");
-    assert(result == "OK: ");
+    assert(p.bump(5) == 6);
+    assert(p.bump(3, 4) == 7);
+}
+
+@[test]
+fun test_cast_selects_overload() {
+    let p: Printer = Printer.init("OK: ");
+    # An annotated binding scores by its declared type...
+    let n: i32 = 5;
+    assert(p.scale(n) == 10);
+    let f: f64 = 1.5;
+    assert(p.scale(f) == 3.0);
+    # ...and so does an explicit cast, which is the remedy the
+    # ambiguity diagnostic prints.
+    assert(p.scale(n as f64) == 10.0);
 }

@@ -1,9 +1,10 @@
-## Operator methods — dunder pattern (docs/30)
+## Operator overloading — dunder pattern (docs/31)
 ##
-## Define methods like __add__, __sub__, __eq__ on custom types.
-## The methods work as regular calls: v.__add__(u), a.__eq__(b).
-## Automatic operator desugaring (a + b → a.__add__(b)) requires
-## a type resolver not yet available — use direct method calls.
+## Operators desugar to specially named methods declared in an `impl`
+## block: `a + b` calls `__add__`, `a[i]` calls `__index__`, and so on.
+## The compiler picks the method that matches the operands' types, so a
+## user type participates in normal operator syntax with zero runtime
+## indirection.
 ##
 ## Run: zag run operator_overloading.zag
 
@@ -29,8 +30,20 @@ impl Vec2 {
         return Vec2 { x: a.x * s, y: a.y * s };
     }
 
+    pub fun __div__(a: Vec2, s: f64) -> Vec2 {
+        return Vec2 { x: a.x / s, y: a.y / s };
+    }
+
+    pub fun __neg__(a: Vec2) -> Vec2 {
+        return Vec2 { x: -a.x, y: -a.y };
+    }
+
     pub fun __eq__(a: Vec2, b: Vec2) -> bool {
         return a.x == b.x && a.y == b.y;
+    }
+
+    pub fun __lt__(a: Vec2, b: Vec2) -> bool {
+        return a.x < b.x;
     }
 
     pub fun __index__(self: *const Vec2, i: usize) -> f64 {
@@ -42,44 +55,82 @@ impl Vec2 {
     }
 }
 
+# A mutable aggregate: `__index__` reads, `__index_set__` backs `s[i] = v`.
+struct Store {
+    slots: [2]i32,
+}
+
+impl Store {
+    pub fun init() -> Store {
+        return Store { slots: { 0, 0 } };
+    }
+
+    pub fun __index__(self: *const Store, i: usize) -> i32 {
+        return self.slots[i];
+    }
+
+    pub fun __index_set__(self: *Store, i: usize, v: i32) {
+        self.slots[i] = v;
+    }
+}
+
 fun main() {
-    let a: Vec2 = Vec2.init(1.0, 2.0);
-    let b: Vec2 = Vec2.init(3.0, 4.0);
-
-    let c: Vec2 = a.__add__(b);
-    let d: Vec2 = a.__sub__(b);
-    let e: Vec2 = a.__mul__(2.0);
-    let same: bool = a.__eq__(b);
-    let val: f64 = a.__index__(0);
-
-    print("add: ({c.x}, {c.y})\n");
-    print("sub: ({d.x}, {d.y})\n");
-    print("mul: ({e.x}, {e.y})\n");
-    print("eq: {same}\n");
-    print("index(0): {val}\n");
-}
-
-@[test]
-fun test_vec2_add() {
-    let a: Vec2 = Vec2.init(1.0, 2.0);
-    let b: Vec2 = Vec2.init(3.0, 4.0);
-    let c: Vec2 = a.__add__(b);
-    assert(c.x == 4.0);
-    assert(c.y == 6.0);
-}
-
-@[test]
-fun test_vec2_eq() {
-    let a: Vec2 = Vec2.init(1.0, 2.0);
+    let a: Vec2 = Vec2.init(4.0, 6.0);
     let b: Vec2 = Vec2.init(1.0, 2.0);
-    let c: Vec2 = Vec2.init(3.0, 4.0);
-    assert(a.__eq__(b));
-    assert(!a.__eq__(c));
+
+    let sum: Vec2 = a + b;
+    let diff: Vec2 = a - b;
+    let scaled: Vec2 = a * 2.0;
+    let halved: Vec2 = b / 2.0;
+    let negated: Vec2 = -a;
+    print("a + b = ({sum.x}, {sum.y})\n");
+    print("a - b = ({diff.x}, {diff.y})\n");
+    print("a * 2 = ({scaled.x}, {scaled.y})\n");
+    print("b / 2 = ({halved.x}, {halved.y})\n");
+    print("-a    = ({negated.x}, {negated.y})\n");
+    let same: bool = a == b;
+    let less: bool = b < a;
+    print("a == b: {same}\n");
+    print("b < a:  {less}\n");
+    print("a[0] = {a[0]}, a[1] = {a[1]}\n");
+
+    var s: Store = Store.init();
+    s[0] = 7;
+    s[1] = 9;
+    print("s[0] = {s[0]}, s[1] = {s[1]}\n");
 }
 
 @[test]
-fun test_vec2_index() {
-    let a: Vec2 = Vec2.init(5.0, 7.0);
-    assert(a.__index__(0) == 5.0);
-    assert(a.__index__(1) == 7.0);
+fun test_arithmetic_desugars() {
+    let a: Vec2 = Vec2.init(4.0, 6.0);
+    let b: Vec2 = Vec2.init(1.0, 2.0);
+    let sum: Vec2 = a + b;
+    assert(sum.x == 5.0 && sum.y == 8.0);
+    let diff: Vec2 = a - b;
+    assert(diff.x == 3.0 && diff.y == 4.0);
+    let scaled: Vec2 = b * 3.0;
+    assert(scaled.x == 3.0 && scaled.y == 6.0);
+    let negated: Vec2 = -b;
+    assert(negated.x == -1.0 && negated.y == -2.0);
+}
+
+@[test]
+fun test_comparison_and_index() {
+    let a: Vec2 = Vec2.init(4.0, 6.0);
+    let same: Vec2 = Vec2.init(4.0, 6.0);
+    let other: Vec2 = Vec2.init(1.0, 2.0);
+    assert(a == same);
+    assert(!(a == other));
+    assert(other < a);
+    assert(a[0] == 4.0);
+    assert(a[1] == 6.0);
+}
+
+@[test]
+fun test_index_set() {
+    var s: Store = Store.init();
+    s[0] = 7;
+    s[1] = 9;
+    assert(s[0] == 7);
+    assert(s[1] == 9);
 }

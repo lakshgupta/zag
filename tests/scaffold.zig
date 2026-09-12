@@ -51,7 +51,7 @@ const std = @import("std");
 const parser_mod = @import("parser");
 const ast = parser_mod.ast;
 const lexer_mod = parser_mod;
-// Build-time-embedded stub contents. The 9 `lib/std/*.zag` files
+// Build-time-embedded stub contents. The 10 `lib/std/*.zag` files
 // can't be `@embedFile`d from `tests/scaffold.zig` for the same
 // path-scope reason (path scope is `tests/`, the .zag files live
 // in `lib/std/`). build.zig reads each stub at config time via
@@ -74,12 +74,19 @@ fn parseStub(_name: []const u8, src: []const u8) !ast.Program {
 
 // ---------------------------------------------------------------
 // std.mod — top-level re-export barrel.
-// Expected: 16 `pub import` decls (one per line), NO struct/enum/
+// Expected: 28 `pub import` decls (one per line), NO struct/enum/
 // trait/fun decls. The barrel imports track the canonical surface
 // listed in docs/manual/22-modules.md "Adding a new std module".
 // ---------------------------------------------------------------
 test "scaffold: std.mod parses with 28 selective-import decls" {
     const prog = try parseStub("std.mod", build_options.stub_mod);
+    // 28 = the long-standing re-exports + std.errno, added by the P1
+    // posix tier split so `import std.{Errno, ErrnoKind}` resolves next
+    // to `import std.{Error}`, MINUS the two fs lines the `!` collapse
+    // removed: `read_file`/`write_file` (the panicking spellings) are
+    // gone, and `open`/`create`/`open_rw`/`open_append` collapsed into
+    // one `File.open(path, FileMode)` — so the four fs barrel lines
+    // became two (the Result tier + the File surface).
     try std.testing.expectEqual(@as(usize, 28), prog.imports.len);
     // Each line is `pub import std.X.{A, B, …}` so is_pub=true on
     // every entry and selectors.len >= 2.
@@ -94,7 +101,6 @@ test "scaffold: std.mod parses with 28 selective-import decls" {
         "std.bench",
         "std.argv",
         "std.env",
-        "std.fs",
         "std.fs",
         "std.fs",
         "std.process",
@@ -112,7 +118,20 @@ test "scaffold: std.mod parses with 28 selective-import decls" {
         "std.random",
         "std.debug",
         "std.json",
+        "std.errno",
     };
+    // The fs free-function line is the ONLY one, and its names are the
+    // OPERATIONS: the `_or` suffix is gone together with the panicking
+    // twins it disambiguated from, because `!` now spells the fail-fast
+    // form of the very same call. So `read_file` / `write_file` /
+    // `try_read` / `mkdir` are the whole Result tier reachable from the
+    // barrel.
+    const recoverable_io_line = prog.imports[10];
+    try std.testing.expectEqual(@as(usize, 4), recoverable_io_line.selectors.len);
+    try std.testing.expectEqualStrings("read_file", recoverable_io_line.selectors[0].name);
+    try std.testing.expectEqualStrings("write_file", recoverable_io_line.selectors[1].name);
+    try std.testing.expectEqualStrings("try_read", recoverable_io_line.selectors[2].name);
+    try std.testing.expectEqualStrings("mkdir", recoverable_io_line.selectors[3].name);
     var i: usize = 0;
     while (i < prog.imports.len) : (i += 1) {
         const imp = prog.imports[i];
@@ -170,14 +189,18 @@ test "scaffold: std.types parses with String struct + impl methods" {
 
     try std.testing.expectEqual(@as(usize, 1), prog.impls.len);
     try std.testing.expectEqualStrings("String", prog.impls[0].target_type);
-    // with_capacity, as_str, push_str, push_ch, pop_ch, clear,
+    // with_capacity, deinit, as_str, push_str, push_ch, pop_ch, clear,
     // insert_ch, from_str, eq, contains, starts_with, ends_with,
     // find, slice, trim, to_upper, to_lower
-    try std.testing.expectEqual(@as(usize, 17), prog.impls[0].methods.len);
+    try std.testing.expectEqual(@as(usize, 18), prog.impls[0].methods.len);
     try std.testing.expectEqualStrings("with_capacity", prog.impls[0].methods[0].name);
-    try std.testing.expectEqualStrings("as_str", prog.impls[0].methods[1].name);
-    try std.testing.expectEqualStrings("push_str", prog.impls[0].methods[2].name);
-    try std.testing.expectEqualStrings("push_ch", prog.impls[0].methods[3].name);
+    // The release path for the String buffer: without it a read_file
+    // result is unreclaimable, so the runtime leak ledger can never
+    // return to baseline in a file-reading program (manual 20).
+    try std.testing.expectEqualStrings("deinit", prog.impls[0].methods[1].name);
+    try std.testing.expectEqualStrings("as_str", prog.impls[0].methods[2].name);
+    try std.testing.expectEqualStrings("push_str", prog.impls[0].methods[3].name);
+    try std.testing.expectEqualStrings("push_ch", prog.impls[0].methods[4].name);
 }
 
 // ---------------------------------------------------------------
@@ -319,6 +342,109 @@ test "scaffold: std.arch.x86.avx2 parses as comment-only (no decls)" {
     try std.testing.expectEqual(@as(usize, 0), prog.functions.len);
     try std.testing.expectEqual(@as(usize, 0), prog.impls.len);
     try std.testing.expectEqual(@as(usize, 0), prog.imports.len);
+}
+
+// ---------------------------------------------------------------
+// std.fs — the P2 File contract.
+//
+// fs.zag is the one lib/std module with a stateful handle whose
+// methods are called from real programs, and project mode never
+// materializes it (it is transpiled inline), so a rename or a dropped
+// constant would otherwise only surface as a zig codegen error deep
+// inside a user's build. This pin exists so the rename fails here.
+// ---------------------------------------------------------------
+fn implHasMethod(impl: ast.ImplBlock, name: []const u8) bool {
+    var i: usize = 0;
+    while (i < impl.methods.len) : (i += 1) {
+        if (std.mem.eql(u8, impl.methods[i].name, name)) return true;
+    }
+    return false;
+}
+
+fn hasFreeFn(prog: ast.Program, name: []const u8) bool {
+    var i: usize = 0;
+    while (i < prog.functions.len) : (i += 1) {
+        if (std.mem.eql(u8, prog.functions[i].name, name)) return true;
+    }
+    return false;
+}
+
+fn hasConst(prog: ast.Program, name: []const u8) bool {
+    var i: usize = 0;
+    while (i < prog.consts.len) : (i += 1) {
+        if (std.mem.eql(u8, prog.consts[i].name, name)) return true;
+    }
+    return false;
+}
+
+test "scaffold: std.fs parses with the P2 File surface" {
+    const prog = try parseStub("std.fs", build_options.stub_fs);
+
+    // Exactly one struct — File — with the four fields the durable
+    // close is built on: the descriptor, the retained parent directory
+    // (buffer + length), and the `created` flag that decides whether the
+    // directory entry needs flushing.
+    try std.testing.expectEqual(@as(usize, 1), prog.structs.len);
+    try std.testing.expectEqualStrings("File", prog.structs[0].name);
+    try std.testing.expectEqual(@as(usize, 4), prog.structs[0].fields.len);
+
+    // One impl block, ONE spelling per operation: every fallible method
+    // returns Result and the failure policy is chosen at the CALL SITE
+    // with postfix `!` / `?` / `catch` / `match` (docs/manual/19), so
+    // there is no `*_or_panic` twin left to keep in step.
+    try std.testing.expectEqual(@as(usize, 1), prog.impls.len);
+    const file_impl = prog.impls[0];
+    try std.testing.expectEqualStrings("File", file_impl.target_type);
+    const canonical = [_][]const u8{
+        "open",       "is_open", "read_at", "write_at",
+        "read_block", "write_block", "append", "size",
+        "block_count", "truncate", "sync", "datasync",
+        "fsync_parent", "close", "close_durable",
+    };
+    var i: usize = 0;
+    while (i < canonical.len) : (i += 1) {
+        try std.testing.expect(implHasMethod(file_impl, canonical[i]));
+    }
+    // The `!` collapse retired every panicking twin, and the four
+    // constructor names collapsed into `open(path, mode)`.
+    const retired = [_][]const u8{
+        "create", "create_or_panic", "open_rw", "open_append",
+        "open_or_panic", "open_rw_or_panic", "open_append_or_panic",
+        "try_open",
+    };
+    i = 0;
+    while (i < retired.len) : (i += 1) {
+        try std.testing.expect(!implHasMethod(file_impl, retired[i]));
+    }
+
+    // The free-function tier: the whole-file reader/writer, the fd-level
+    // read, the directory helper, and mkdir. Each name is the OPERATION;
+    // the `_or` suffix was retired with the panicking twins, because
+    // `read_file(p)!` / `write_file(p, c)!` are the fail-fast forms of
+    // these same functions.
+    const free_fns = [_][]const u8{ "read_file", "write_file", "try_read", "mkdir", "dir_of" };
+    i = 0;
+    while (i < free_fns.len) : (i += 1) {
+        try std.testing.expect(hasFreeFn(prog, free_fns[i]));
+    }
+    // The policy-suffixed spellings are what the rename removed — their
+    // reappearance would mean a twin crept back in.
+    try std.testing.expect(!hasFreeFn(prog, "read_file_or"));
+    try std.testing.expect(!hasFreeFn(prog, "write_file_or"));
+
+    // FileMode is the mode enum `open(path, mode)` selects from; the
+    // four variants are the four retired constructor names.
+    var found_mode = false;
+    for (prog.enums) |ed| {
+        if (std.mem.eql(u8, ed.name, "FileMode")) found_mode = true;
+    }
+    try std.testing.expect(found_mode);
+
+    // PAGE_SIZE is the transfer unit the block methods require;
+    // PARENT_CAP is the retained-parent bound whose overflow makes
+    // `fsync_parent` report Err instead of promising durability.
+    try std.testing.expect(hasConst(prog, "PAGE_SIZE"));
+    try std.testing.expect(hasConst(prog, "PARENT_CAP"));
 }
 
 // ---------------------------------------------------------------

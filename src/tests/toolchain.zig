@@ -116,7 +116,7 @@ test "toolchain: materializeZigToCache writes zig_payload to disk under tmpdir" 
         .{ .ACCMODE = .RDONLY },
         0,
     );
-    defer _ = std.os.linux.close(fd);
+    defer _ = std.os.linux.close(fd); // deliberate discard: read-only test artifact fd
 
     // Readback loop, mirroring `src/main.zig`'s `readFile`. The
     // cap is `min(buffer, expected payload size)` so a payload

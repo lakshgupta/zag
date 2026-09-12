@@ -1,0 +1,94 @@
+## Nested control flow — labeled-block codegen regression coverage.
+##
+## Every construct below emits a zig labeled block (`__blk_<N>: { … }`).
+## Before the label fix, a nested match / block / if-expression reused
+## the literal label `blk`, and zig rejected the program with
+## "redefinition of label 'blk'". Match arms that contained `break` /
+## `return` were also folded into the match's value, which miscompiled a
+## statement-position match whose arms disagreed on type.
+##
+## This fixture keeps those paths covered at RUNTIME — if the fix
+## regresses, it stops compiling (or asserting) rather than silently
+## misbehaving. See examples/error-handling/recoverable_io.zag for the
+## recoverable-IO consumer of the same lowering.
+##
+## Run: zag run nested_blocks.zag
+
+## Nested match: the inner match is an arm VALUE of the outer match, so
+## both labeled blocks are open at the same time.
+fun classify(a: i32, b: i32) -> []const u8 {
+    let r: []const u8 = match a {
+        1 => match b {
+            2 => "one-two",
+            _ => "one-other",
+        },
+        _ => "other",
+    };
+    return r;
+}
+
+## Nested block expressions: the outer block yields its last expression,
+## which is itself a block expression.
+fun nested_blocks() -> i32 {
+    let v: i32 = { let inner: i32 = { let x: i32 = 1; x }; inner + 10 };
+    return v;
+}
+
+## Nested if-expressions — also labeled blocks.
+fun nested_if(a: i32, b: i32) -> i32 {
+    let z: i32 = if a > 0 { if b > 0 { 1 } else { 2 } } else { 0 };
+    return z;
+}
+
+## Return-in-arm: a `return` in a match arm returns from the FUNCTION,
+## not from the match's block. The `0` arm returns early; the wildcard
+## arm falls through to the trailing return.
+fun pick(n: i32) -> i32 {
+    match n {
+        0 => { return -1; },
+        _ => { print("pick: falling through for {n}\n"); },
+    }
+    return n * 10;
+}
+
+## Tail-position match whose arm returns (`return match { … }` shape).
+fun tail_pick(n: i32) -> i32 {
+    return match n {
+        7 => { return 700; },
+        _ => n,
+    };
+}
+
+fun main() {
+    print("classify: {classify(1, 2)} {classify(1, 9)} {classify(9, 2)}\n");
+    print("nested_blocks: {nested_blocks()}\n");
+    print("nested_if: {nested_if(1, 1)} {nested_if(1, 0)} {nested_if(0, 0)}\n");
+    print("pick(0): {pick(0)}\n");
+    print("pick(3): {pick(3)}\n");
+    print("tail_pick(7): {tail_pick(7)}\n");
+    print("tail_pick(5): {tail_pick(5)}\n");
+}
+
+@[test]
+fun test_nested_match() {
+    let a: []const u8 = classify(1, 2);
+    assert(a[0] == 'o');
+    let b: []const u8 = classify(9, 2);
+    assert(b[0] == 'o');
+}
+
+@[test]
+fun test_nested_blocks_and_if() {
+    assert(nested_blocks() == 11);
+    assert(nested_if(1, 1) == 1);
+    assert(nested_if(1, 0) == 2);
+    assert(nested_if(0, 0) == 0);
+}
+
+@[test]
+fun test_return_in_arm() {
+    assert(pick(0) == -1);
+    assert(pick(3) == 30);
+    assert(tail_pick(7) == 700);
+    assert(tail_pick(5) == 5);
+}

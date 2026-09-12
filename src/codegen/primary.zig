@@ -673,7 +673,13 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
 
         if (a.progression) {
             const k = a.elements.len;
-            self.write("(blk: { var __arr: [");
+            // Unique labeled-block name so nested progression literals
+            // don't collide on a literal `blk`.
+            var lbl_buf: [16]u8 = undefined;
+            const lbl = self.nextBlkLabel(&lbl_buf);
+            self.write("(");
+            self.write(lbl);
+            self.write(": { var __arr: [");
             self.write(size_str);
             self.write("]");
             self.writeType(a.type_name);
@@ -697,7 +703,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(k_str);
                 self.write("]; ");
             }
-            self.write("break :blk __arr; })");
+            self.write("break :");
+            self.write(lbl);
+            self.write(" __arr; })");
             return;
         }
 
@@ -772,6 +780,18 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
         args_cg.generic_struct_count = self.generic_struct_count;
         args_cg.tracked_trait_names = self.tracked_trait_names;
         args_cg.tracked_trait_count = self.tracked_trait_count;
+        // Operator/method-overload transfer: the desugaring arms in
+        // expr.zig (`{a[0]}` -> `a.__index__(0)`, `{a + b}` ->
+        // `a.__add__(b)`, unary `__neg__`) consult `prog.impls` via
+        // `typeDeclaresMethod`. A fresh `Codegen.init()` points `prog`
+        // at the comptime-empty Program, so every such placeholder
+        // fell through to the verbatim emit and zig rejected the
+        // bracket/`+` on a user aggregate. `current_receiver_struct_name`
+        // rides along for the same reason: interpolating an indexed
+        // `self[...]` inside an impl method needs the receiver type
+        // that the fresh instance would otherwise not know.
+        args_cg.prog = self.prog;
+        args_cg.current_receiver_struct_name = self.current_receiver_struct_name;
         var first_arg = true;
 
         for (t.parts) |part| {
@@ -1041,13 +1061,21 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // local `var`. Multiple independent template_lit expressions
                 // would race on this buffer, so standalone template_lit is
                 // appropriate only when each value is consumed before the next
-                // assignment (e.g. `print((blk: { ... })  .*)` is wrong; use
+                // assignment (e.g. `print((__blk_N: { ... })  .*)` is wrong; use
                 // single-arg `print("...{x}...")` instead).
-                self.write("(blk: { const __tmp = std.fmt.bufPrint(__zag_interp_buf[0..], \"");
+                // Unique labeled-block name so nested interpolations don't
+                // collide on a literal `blk`.
+                var lbl_buf: [16]u8 = undefined;
+                const lbl = self.nextBlkLabel(&lbl_buf);
+                self.write("(");
+                self.write(lbl);
+                self.write(": { const __tmp = std.fmt.bufPrint(__zag_interp_buf[0..], \"");
                 self.write(fmt_buf[0..fmt_len]);
                 self.write("\", .{");
                 self.write(args_cg.out_buf[0..args_cg.out_len]);
-                self.write("}) catch __zag_interp_buf[0..0]; break :blk __tmp; })");
+                self.write("}) catch __zag_interp_buf[0..0]; break :");
+                self.write(lbl);
+                self.write(" __tmp; })");
             },
         }
     }

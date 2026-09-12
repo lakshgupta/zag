@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const sys = @import("sys.zig");
 
 /// Parsed view of `zag.toml` for project-mode commands (`zag run`,
 /// `zag build`, `zag check`, `zag test`). Today the runtime only
@@ -110,7 +111,7 @@ pub fn discoverModules() []const ModuleEntry {
     module_names_pos = 0;
 
     const src_fd = posix.openat(posix.AT.FDCWD, "src", .{ .ACCMODE = .RDONLY }, 0) catch return &[_]ModuleEntry{};
-    defer _ = std.os.linux.close(src_fd);
+    defer _ = std.os.linux.close(src_fd); // deliberate discard: read-only src/ directory fd
 
     walkSrcTree(src_fd, "");
     sortByPath();
@@ -189,7 +190,7 @@ fn walkSrcTree(dir_fd: i32, rel_to_src: []const u8) void {
                 const child_path = std.fmt.bufPrint(&child_path_buf, "src/{s}", .{new_rel}) catch continue;
                 const child_fd = posix.openat(posix.AT.FDCWD, child_path, .{ .ACCMODE = .RDONLY }, 0) catch continue;
                 walkSrcTree(child_fd, new_rel);
-                _ = std.os.linux.close(child_fd);
+                _ = std.os.linux.close(child_fd); // deliberate discard: read-only subdirectory fd, walk complete
             } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
                 // Build abs path "src/<rel>/<name>" (only `name`
                 // for top-level entries).
@@ -302,7 +303,7 @@ pub fn discoverTests() []const TestEntry {
     test_names_pos = 0;
 
     const tests_fd = posix.openat(posix.AT.FDCWD, "tests", .{ .ACCMODE = .RDONLY }, 0) catch return &[_]TestEntry{};
-    defer _ = std.os.linux.close(tests_fd);
+    defer _ = std.os.linux.close(tests_fd); // deliberate discard: read-only tests/ directory fd
 
     walkTestsTree(tests_fd, "");
     sortTestsByPath();
@@ -344,7 +345,7 @@ fn walkTestsTree(dir_fd: i32, rel_to_tests: []const u8) void {
                 const child_path = std.fmt.bufPrint(&child_path_buf, "tests/{s}", .{new_rel}) catch continue;
                 const child_fd = posix.openat(posix.AT.FDCWD, child_path, .{ .ACCMODE = .RDONLY }, 0) catch continue;
                 walkTestsTree(child_fd, new_rel);
-                _ = std.os.linux.close(child_fd);
+                _ = std.os.linux.close(child_fd); // deliberate discard: read-only subdirectory fd, walk complete
             } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
                 var path_buf: [1024]u8 = undefined;
                 const abs_path: []const u8 = if (rel_to_tests.len == 0)
@@ -468,7 +469,7 @@ fn cleanDepName(name: []const u8, buf: []u8) []const u8 {
 /// (skip-on-missing: a dep without a manifest uses defaults).
 fn readDepManifest(path: []const u8, buf: []u8) ?[]const u8 {
     const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
-    defer _ = std.os.linux.close(fd);
+    defer _ = std.os.linux.close(fd); // deliberate discard: read-only dep manifest fd
     var total: usize = 0;
     while (total < buf.len) {
         const n = std.os.linux.read(fd, buf[total..].ptr, buf.len - total);
@@ -635,7 +636,7 @@ fn discoverOneDep(dep: DepEntry, owner_dir: []const u8, queue: []DepRoot, q_len:
     const lib_path = std.fmt.bufPrint(&lib_path_buf, "{s}/{s}", .{ root_dir, lib_rel }) catch return;
     {
         const fd = posix.openat(posix.AT.FDCWD, lib_path, .{ .ACCMODE = .RDONLY }, 0) catch return;
-        _ = std.os.linux.close(fd);
+        _ = std.os.linux.close(fd); // deliberate discard: read-only lib-root existence probe
     }
 
     // Walk <root>/src/** for the full module set (lib root +
@@ -643,7 +644,7 @@ fn discoverOneDep(dep: DepEntry, owner_dir: []const u8, queue: []DepRoot, q_len:
     var src_dir_buf: [1024]u8 = undefined;
     const src_dir = std.fmt.bufPrint(&src_dir_buf, "{s}/src", .{root_dir}) catch return;
     const src_fd = posix.openat(posix.AT.FDCWD, src_dir, .{ .ACCMODE = .RDONLY }, 0) catch return;
-    defer _ = std.os.linux.close(src_fd);
+    defer _ = std.os.linux.close(src_fd); // deliberate discard: read-only dep src/ directory fd
 
     walkDepTree(src_fd, src_dir, "", clean, lib_rel);
 }
@@ -684,7 +685,7 @@ fn walkDepTree(dir_fd: i32, fs_prefix: []const u8, rel: []const u8, clean: []con
                 const child_fs = std.fmt.bufPrint(&child_fs_buf, "{s}/{s}", .{ fs_prefix, new_rel }) catch continue;
                 const child_fd = posix.openat(posix.AT.FDCWD, child_fs, .{ .ACCMODE = .RDONLY }, 0) catch continue;
                 walkDepTree(child_fd, fs_prefix, new_rel, clean, lib_rel);
-                _ = std.os.linux.close(child_fd);
+                _ = std.os.linux.close(child_fd); // deliberate discard: read-only subdirectory fd, walk complete
             } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
                 // fs path + rel stem for this file.
                 var fs_buf: [1024]u8 = undefined;
@@ -893,7 +894,7 @@ pub fn detectProject(root_dir: []const u8) !?ProjectConfig {
     };
 
     const fd = posix.openat(posix.AT.FDCWD, config_path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
-    defer _ = std.os.linux.close(fd);
+    defer _ = std.os.linux.close(fd); // deliberate discard: read-only zag.toml fd
 
     var buf: [4096]u8 = undefined;
     const n = std.os.linux.read(fd, &buf, buf.len);
@@ -1451,12 +1452,17 @@ fn writeLockEntry(dep: LockEntry, buf: []u8) !usize {
 /// still parses via `parseToml`'s default-section default — but the
 /// explicit header is the form users see in the docs.
 pub fn createProject(dir: []const u8) !void {
-    var d: [256]u8 = undefined;
-    if (dir.len > 0) {
-        @memcpy(d[0..dir.len], dir);
-        d[dir.len] = 0;
-        _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&d), 0o755);
-    }
+    // The scaffold paths below are assembled in fixed 256/512-byte stack
+    // buffers with unchecked copies (src_buf is the tightest: dir +
+    // "/src/"). Reject an over-long dir up front rather than overrun one.
+    if (dir.len > 250) return sys.pathTooLong();
+
+    // Project directory. EEXIST is success; every other errno (EACCES on
+    // an unwritable parent, ENOTDIR, ...) must reach the caller. This
+    // used to discard the result, so `zag init` printed "created project
+    // at ..." and exited 0 while creating nothing — the same
+    // failure-reported-as-success shape as the writeFile bug.
+    if (dir.len > 0) try sys.mkdirPath(dir);
 
     var pn_buf: [256]u8 = undefined;
     const project_name = if (dir.len > 0) dir else blk: {
@@ -1484,10 +1490,8 @@ pub fn createProject(dir: []const u8) !void {
     @memcpy(src_buf[sl..][0..4], "src/");
     sl += 4;
     const src_sub = src_buf[0 .. sl - 1]; // "src" (no trailing slash for mkdir)
-    var src_null: [256]u8 = undefined;
-    @memcpy(src_null[0..src_sub.len], src_sub);
-    src_null[src_sub.len] = 0;
-    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&src_null), 0o755);
+    // Same fail-closed rule as the project directory above.
+    try sys.mkdirPath(src_sub);
 
     // src/main.zag
     var main_zag: [512]u8 = undefined;
@@ -1532,7 +1536,11 @@ pub fn createProject(dir: []const u8) !void {
     bi += 1;
     body_buf[bi] = '\n';
     bi += 1;
-    writeFile(main_zag_path, body_buf[0..bi]) catch {};
+    // Propagated, not swallowed. `catch {}` here meant a failed scaffold
+    // still reached the "created project at ..." banner below — the
+    // caller reported success for a project directory that was never
+    // written. The errno survives for the caller's diagnostic.
+    try writeFile(main_zag_path, body_buf[0..bi]);
 
     // zag.toml — v2.1 surfaces the `[package]` header explicitly so
     // the scaffolded file matches the doc form (manual/35 §Top-Level
@@ -1565,7 +1573,7 @@ pub fn createProject(dir: []const u8) !void {
     tbi += 1;
     toml_body[tbi] = '\n';
     tbi += 1;
-    writeFile(toml_path, toml_body[0..tbi]) catch {};
+    try writeFile(toml_path, toml_body[0..tbi]);
 
     const display_path = if (dir.len > 0) dir else ".";
     std.debug.print("created project at {s}/\n", .{display_path});
@@ -1573,20 +1581,13 @@ pub fn createProject(dir: []const u8) !void {
     std.debug.print("  {s}/src/main.zag\n", .{display_path});
 }
 
+/// Thin delegation into src/sys.zig (same rationale as main.zig's
+/// wrapper). This used to be a second copy of the raw write loop whose
+/// `if (n == 0) return error.WriteFailed` test could never fire — a
+/// failed write comes back as an errno-encoded usize, which is nonzero —
+/// so the counter overran and the function returned success.
 fn writeFile(path: []const u8, content: []const u8) !void {
-    const fd = try posix.openat(
-        posix.AT.FDCWD,
-        path,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
-    );
-    defer _ = std.os.linux.close(fd);
-    var written: usize = 0;
-    while (written < content.len) {
-        const n = std.os.linux.write(fd, content[written..].ptr, content.len - written);
-        if (n == 0) return error.WriteFailed;
-        written += n;
-    }
+    return sys.writeFile(path, content, .report_only);
 }
 
 // =====================================================================

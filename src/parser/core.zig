@@ -834,6 +834,14 @@ pub const Parser = struct {
         .{ .name = "std.types", .path = "lib/std/types/mod.zag" },
         .{ .name = "std.types.string", .path = "lib/std/types/string.zag" },
         .{ .name = "std.error", .path = "lib/std/error.zag" },
+        // std.errno — the shared errno vocabulary (ErrnoKind / Errno /
+        // is_err / errno_of). NOTE for anyone adding a lib/std module:
+        // this table is the ONLY thing that makes `import std.<name>`
+        // resolvable from user code, and a miss here is skipped
+        // SILENTLY — the import line simply vanishes from the emitted
+        // zig and the failure surfaces much later as a zig "use of
+        // undeclared identifier". Register the module here.
+        .{ .name = "std.errno", .path = "lib/std/errno.zag" },
         .{ .name = "std.env", .path = "lib/std/env.zag" },
         .{ .name = "std.posix", .path = "lib/std/posix.zag" },
         .{ .name = "std.argv", .path = "lib/std/argv.zag" },

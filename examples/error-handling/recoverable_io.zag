@@ -1,0 +1,66 @@
+## error-handling/recoverable_io.zag — recoverable IO (Result-returning).
+##
+## `read_file` and `try_read` (lib/std/fs.zag) return
+## `Result(_, Error)` and never panic on IO failure, so a caller can
+## tell a missing file from a permission or I/O error and keep going.
+## There is exactly one spelling of each operation, named for the
+## OPERATION rather than the failure policy: `read_file(p)` is the value
+## form and `read_file(p)!` is the fail-fast form, the same call with
+## one character appended — so no pair of names can drift apart.
+##
+## errno collapses to the canonical std.error.Error variants:
+##   ENOENT(2)           -> Error.NotFound
+##   EPERM(1)/EACCES(13) -> Error.Permission
+##   everything else     -> Error.Io
+##
+## Run: zag run recoverable_io.zag
+
+import std.fs.{read_file, try_read, File, FileMode}
+import std.types.{String}
+import std.error.{Error}
+
+## Classify an Error with a value-returning match. A match arm may also
+## `break`/`return` directly (the arm is emitted as real control flow,
+## not folded into the match's value) — see
+## examples/control-flow/nested_blocks.zag.
+fun is_not_found(e: Error) -> bool {
+    let r: bool = match e {
+        Error.NotFound => true,
+        _ => false,
+    };
+    return r;
+}
+
+fun main() {
+    # Ok path: the file exists and is readable.
+    let ok: Result(String, Error) = read_file("examples/basics/hello.zag");
+    match ok {
+        Ok(data) => print("read_file ok: {data.as_str().len} bytes\n"),
+        Err(e) => print("read_file failed unexpectedly\n"),
+    }
+
+    # Err path: a missing file is an Error.NotFound VALUE, not a panic.
+    let missing: Result(String, Error) = read_file("examples/basics/nope.zag");
+    match missing {
+        Ok(data) => print("unexpected success\n"),
+        Err(e) => {
+            if (is_not_found(e)) {
+                print("read_file missing -> Error.NotFound\n");
+            }
+            if (!is_not_found(e)) {
+                print("read_file missing -> some other error\n");
+            }
+        },
+    }
+
+    # try_read: the fd-level primitive. Ok(n) with 0 at EOF, Err on a
+    # real errno (EINTR is retried internally, never surfaced).
+    var f: File = File.open("examples/basics/hello.zag", FileMode.Read)!;
+    var buf: [16]u8 = undefined;
+    let chunk: Result(usize, Error) = try_read(f.fd, buf[0..]);
+    match chunk {
+        Ok(n) => print("try_read: {n} bytes\n"),
+        Err(e) => print("try_read failed\n"),
+    }
+    f.close()!;
+}

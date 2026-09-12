@@ -16,24 +16,24 @@ zig version
 
 ### Install a pre-built binary
 
-All install URLs below source directly from this GitHub repo (the project domain isn't currently hosted — fetch the canonical installer from GitHub raw). The installer script itself downloads the release archive from `github.com/zag-lang/zag/releases/latest/download/...` at runtime, so a tagged release must exist on the [Releases page](https://github.com/zag-lang/zag/releases) for the install to succeed.
+All install URLs below source directly from this GitHub repo (the project domain isn't currently hosted — fetch the canonical installer from GitHub raw). The installer script itself downloads the release archive from `github.com/lakshgupta/zag/releases/latest/download/...` at runtime, so a tagged release must exist on the [Releases page](https://github.com/lakshgupta/zag/releases) for the install to succeed.
 
 Linux or macOS (defaults to the `main` branch — bleeding edge):
 
 ```
-curl -fsSL https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lakshgupta/zag/main/zag-install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```
-powershell -c "irm https://raw.githubusercontent.com/zag-lang/zag/main/scripts/install.ps1 | iex"
+powershell -c "irm https://raw.githubusercontent.com/lakshgupta/zag/main/scripts/install.ps1 | iex"
 ```
 
 The installer downloads the platform release into `~/.zag/bin/zag`, appends `export PATH="$PATH:$HOME/.zag/bin"` to your shell profile (`.bashrc`, `.zshrc`, `.profile`, or `~/.config/fish/config.fish`), and prints `Zag installed successfully!`. To pin a version, download first and pass `--version`:
 
 ```
-curl -sSO https://raw.githubusercontent.com/zag-lang/zag/main/zag-install.sh
+curl -sSO https://raw.githubusercontent.com/lakshgupta/zag/main/zag-install.sh
 bash zag-install.sh --version v0.1.0
 ```
 
@@ -48,7 +48,7 @@ ZAG_HOME=$HOME/local bash install.sh
 If no release binary is available for your platform, clone the repository and use the build scripts:
 
 ```
-git clone https://github.com/zag-lang/zag
+git clone https://github.com/lakshgupta/zag
 cd zag
 ./scripts/build.sh --release     # debug build by default; --release sets -Doptimize=ReleaseFast
 ./scripts/install-local.sh       # copy zig-out/bin/zag-<os>-<arch> to ~/.zag/bin and configure PATH

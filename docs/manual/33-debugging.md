@@ -234,12 +234,21 @@ internals) fall back to their raw zig locations.
 
 #### Leak check at compile time
 
-The escape analysis warns before you even run gdb:
+The escape analysis warns before you even run gdb. It tracks all three
+allocation families, so a never-freed slice is caught too:
 
 ```
 $ zag build
 warning: `new i32` at src/main.zag:12:9 in main is never freed (leak) — add an explicit `free` or `defer free`
+warning: `alloc` at src/main.zag:14:24 in main is never freed (leak) — add an explicit `free` or `defer free`
+warning: `alloc_raw` at src/main.zag:16:26 in main is never freed (leak) — add an explicit `release(p, n)` or `defer release(p, n)`
 ```
+
+Each warning names the construct and points at the allocation site; the
+analysis is conservative (anything passed to a user call counts as
+escaping) and changes no emitted code — the fix is always your explicit
+`free` / `release`. See the memory chapter for the escape rules and the
+runtime ledger that measures the same thing exactly.
 
 #### Commands reference
 

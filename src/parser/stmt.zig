@@ -590,7 +590,14 @@ pub fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
             break :blk self.parseExpr();
         };
         self.expect(.lbrace);
-        var arms_buf: [16]ast.MatchArm = undefined;
+        // Cap matches the size the parser uses for the other list-shaped
+        // constructs (stmts_buf in parseBlock/parseStmtList is [256]). The
+        // previous [16] was the outlier and overran silently: a match with
+        // 17+ arms -- an ordinary thing to write, e.g. one arm per variant
+        // of an enum -- indexed past the end of this buffer and aborted the
+        // COMPILER with `index out of bounds` and no diagnostic. The guard
+        // below turns any future overrun into a real parse error.
+        var arms_buf: [256]ast.MatchArm = undefined;
         var arm_count: usize = 0;
         while (self.peek().tag != .rbrace and !self.eof()) {
             const tag = self.peek().tag;
@@ -629,6 +636,11 @@ pub fn parseMatchExpr(self: *Parser) ast.Expr.MatchExpr {
             // is optional -- if rbrace is the immediate next token after the
             // rbrace of the body, we accept it without error.
             if (self.peek().tag == .comma) self.advance();
+            if (arm_count >= arms_buf.len) {
+                const over = self.peek();
+                std.debug.print("error:{d}:{d}: too many match arms (limit {d})\n", .{ over.loc.line, over.loc.col, arms_buf.len });
+                std.process.exit(1);
+            }
             arms_buf[arm_count] = .{ .pat = pat, .guard = guard, .expr = &body_buf[0] };
             arm_count += 1;
         }

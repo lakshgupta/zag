@@ -1,0 +1,413 @@
+## error-handling/posix_tier.zag — the std.posix Result tier.
+##
+## lib/std/posix.zag exposes every syscall twice:
+##
+##   name(...)     -> Result(T, Errno)   the canonical entry
+##   raw_name(...) -> usize / isize      the kernel's value verbatim
+##
+## Before the split every call site in lib/std hand-rolled the failure
+## test, and got it wrong in four different places. This fixture pins
+## the contract at RUNTIME, so a regression in the decode shows up as a
+## wrong branch here rather than as a mysterious downstream failure:
+##
+##   * A FAILED syscall is an `Err` with a named kind — the caller can
+##     branch on it, and the errno's exact code is preserved even for a
+##     number the named set (ErrnoKind) does not cover.
+##   * A SUCCESS is an `Ok`, and the shapes that are not failures stay
+##     successes: a 0-byte read is `Ok(0)` (EOF), a `lseek` to offset 0
+##     is `Ok(0)`, and `futex_wait` returning EAGAIN is a normal outcome.
+##   * NO entry fabricates an errno. An over-long path is `Err(Einval)`;
+##     it used to return 0xFFFFFFFFFFFFFFFF, which decodes as EPERM and
+##     made a too-long path look like a permission error.
+##   * `_ = name(...)` is the explicit way to discard a result, so a
+##     site that means to ignore a failure says so in the source.
+##   * An injected errno arrives as the RIGHT kind: reading a directory
+##     fd is EISDIR (not a 0-byte success), opening one O_WRONLY is
+##     EISDIR too (not EACCES), writing to /dev/full is ENOSPC, and an
+##     O_WRONLY open of a 0o444 file is EACCES (not EPERM). All four are
+##     injectable with no signal handler and no chmod binding — the file
+##     mode is passed at creation time. Each row skips itself on a host
+##     that cannot inject it (root bypasses the permission bits; a
+##     non-Linux host has no /dev/full).
+##
+## This fixture must never panic: every failure below is a value.
+##
+## Run:        zag run posix_tier.zag
+## Test only:  zag test posix_tier.zag
+
+import std.posix.{openat, close, read, write, write_full, lseek, mkdirat, getdents64, munmap, nanosleep, clock_gettime, getcwd, spawn, futex_wait_shared, futex_wake}
+import std.errno.{Errno, ErrnoKind}
+
+fun main() {
+    # ── openat: a missing path is Err(Noent) ─────────────────────────
+    let missing: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/tmp/zag_posix_absent_xyz", 0, 0);
+    match missing {
+        Ok(fd) => { _ = close(fd); print("missing path opened?!\n"); },
+        Err(e) => print("missing path -> {e.name()}\n"),
+    }
+
+    # ── an over-long path is Err(Einval), NOT a fabricated EPERM ─────
+    var long_path: [8192]u8 = undefined;
+    var i: usize = 0;
+    while (i < long_path.len) {
+        long_path[i] = 'a';
+        i = i + 1;
+    }
+    let too_long: Result(i32, Errno) = openat(std.posix.AT.FDCWD, long_path[0..], 0, 0);
+    match too_long {
+        Ok(fd) => { _ = close(fd); print("long path opened?!\n"); },
+        Err(e) => {
+            print("long path -> {e.name()}\n");
+            # The whole point of the fix: Einval, not Eperm.
+            assert(e.is(ErrnoKind.Einval));
+        },
+    }
+
+    # ── a real file: write, rewind, read, EOF is Ok(0) ───────────────
+    let path: str = "/tmp/zag_posix_tier.txt";
+    let w: Result(i32, Errno) = openat(std.posix.AT.FDCWD, path, 0x242, 0o644);
+    match w {
+        Ok(fd) => {
+            _ = write(fd, "tier", 4);
+            var buf: [16]u8 = undefined;
+            _ = lseek(fd, 0, 0);
+            let r1: Result(usize, Errno) = read(fd, buf[0..], 16);
+            match r1 {
+                Ok(n) => print("read {n} bytes\n"),
+                Err(e) => print("read failed {e.name()}\n"),
+            }
+            # At EOF read(2) returns 0 — which is Ok(0), never an Err.
+            let r2: Result(usize, Errno) = read(fd, buf[0..], 16);
+            match r2 {
+                Ok(n) => { assert(n == 0); print("eof is Ok(0)\n"); },
+                Err(e) => print("eof reported as {e.name()}?!\n"),
+            }
+            # close is checked; the second close is a REAL Err(Ebadf).
+            let c1: Result(void, Errno) = close(fd);
+            match c1 {
+                Ok(_) => print("close ok\n"),
+                Err(e) => print("close failed {e.name()}\n"),
+            }
+        },
+        Err(e) => print("open failed {e.name()}\n"),
+    }
+
+    # ── EEXIST is a typed value the caller decides about ────────────
+    _ = mkdirat(std.posix.AT.FDCWD, "/tmp/zag_posix_tier_dir", 0o755);
+    let d2: Result(void, Errno) = mkdirat(std.posix.AT.FDCWD, "/tmp/zag_posix_tier_dir", 0o755);
+    match d2 {
+        Ok(_) => print("mkdir twice: both ok\n"),
+        Err(e) => {
+            assert(e.is(ErrnoKind.Eexist));
+            print("mkdir twice -> {e.name()} (coalescable)\n");
+        },
+    }
+
+    # ── a failed listing is an Err, never an empty directory ────────
+    let file_fd: Result(i32, Errno) = openat(std.posix.AT.FDCWD, path, 0, 0);
+    match file_fd {
+        Ok(fd) => {
+            var dbuf: [256]u8 = undefined;
+            let dir: Result(usize, Errno) = getdents64(fd, dbuf[0..], 256);
+            match dir {
+                Ok(n) => print("getdents64 on a file returned {n}?!\n"),
+                Err(e) => {
+                    assert(e.is(ErrnoKind.Enotdir));
+                    print("getdents64 on a file -> {e.name()}\n");
+                },
+            }
+            _ = close(fd);
+        },
+        Err(e) => print("reopen failed {e.name()}\n"),
+    }
+
+    # ── EISDIR: a directory is not readable/writable as a file ──────
+    let dir_fd: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/tmp", 0, 0);
+    match dir_fd {
+        Ok(fd) => {
+            var dbuf2: [16]u8 = undefined;
+            let dr: Result(usize, Errno) = read(fd, dbuf2[0..], 16);
+            match dr {
+                Ok(n) => print("read on a directory returned {n}?!\n"),
+                Err(e) => {
+                    # The contract: EISDIR, never Ok(0) — a 0-byte "success"
+                    # would make a directory look like an empty file.
+                    assert(e.is(ErrnoKind.Eisdir));
+                    print("read on a directory -> {e.name()}\n");
+                },
+            }
+            _ = close(fd);
+        },
+        Err(e) => print("open /tmp failed {e.name()}\n"),
+    }
+    # Opening a directory for writing is EISDIR, NOT EACCES.
+    let dir_w: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/tmp", 1, 0);
+    match dir_w {
+        Ok(fd) => { _ = close(fd); print("dir opened O_WRONLY?!\n"); },
+        Err(e) => {
+            assert(e.is(ErrnoKind.Eisdir));
+            print("dir O_WRONLY -> {e.name()}\n");
+        },
+    }
+
+    # ── ENOSPC: /dev/full hands back an fd and fails the write ──────
+    let full: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/dev/full", 1, 0);
+    match full {
+        Ok(fd) => {
+            let fw2: Result(usize, Errno) = write_full(fd, "no room");
+            match fw2 {
+                Ok(n) => print("/dev/full accepted {n} bytes?!\n"),
+                Err(e) => {
+                    assert(e.is(ErrnoKind.Enospc));
+                    print("/dev/full -> {e.name()}\n");
+                },
+            }
+            _ = close(fd);
+        },
+        Err(e) => print("/dev/full absent ({e.name()}) — skipped\n"),
+    }
+
+    # ── a rejected munmap leaks, so it is an Err, not a discarded rc ─
+    var scratch: [16]u8 = undefined;
+    let bad_unmap: Result(void, Errno) = munmap(scratch[0..].ptr, 4096);
+    match bad_unmap {
+        Ok(_) => print("bogus munmap ok?!\n"),
+        Err(e) => print("bogus munmap -> {e.name()}\n"),
+    }
+
+    # ── clock / cwd / sleep: success shapes, not sentinels ──────────
+    let t: Result(i64, Errno) = clock_gettime(1);
+    match t {
+        Ok(ns) => { assert(ns > 0); print("monotonic clock ok\n"); },
+        Err(e) => print("clock failed {e.name()}\n"),
+    }
+    let cwd: Result([]const u8, Errno) = getcwd();
+    match cwd {
+        Ok(p) => print("cwd is {p.len} bytes\n"),
+        Err(e) => print("getcwd failed {e.name()}\n"),
+    }
+    let slept: Result(void, Errno) = nanosleep(0, 1000000);
+    match slept {
+        Ok(_) => print("nanosleep ok\n"),
+        Err(e) => print("nanosleep failed {e.name()}\n"),
+    }
+
+    # ── futex: EAGAIN is a NORMAL outcome, not a fault ──────────────
+    var word: u32 = 0;
+    let fw: Result(void, Errno) = futex_wait_shared(addr_of(word) as *const u32, 99);
+    match fw {
+        Ok(_) => print("futex parked unexpectedly\n"),
+        Err(e) => {
+            # The word didn't hold `expected`, so the kernel said so.
+            assert(e.is(ErrnoKind.Eagain));
+            print("futex mismatch -> {e.name()} (expected)\n");
+        },
+    }
+    _ = futex_wake(addr_of(word) as *const u32, 1);
+
+    # ── spawn: a SETUP failure is Err, so Ok(255) is unambiguous ────
+    var no_args: [0][]const u8 = undefined;
+    let bad_spawn: Result(i32, Errno) = spawn(no_args[0..]);
+    match bad_spawn {
+        Ok(c) => print("empty argv exited {c}?!\n"),
+        Err(e) => {
+            assert(e.is(ErrnoKind.Einval));
+            print("empty argv -> {e.name()} (not 255)\n");
+        },
+    }
+}
+
+@[test]
+fun test_failed_syscall_is_an_err_value() {
+    let r: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/tmp/zag_posix_absent_xyz", 0, 0);
+    match r {
+        Ok(fd) => { _ = close(fd); assert(false); },
+        Err(e) => assert(e.is(ErrnoKind.Noent)),
+    }
+}
+
+@[test]
+fun test_over_long_path_is_einval_not_eperm() {
+    # The pre-split shape fabricated 0xFFFFFFFFFFFFFFFF, which decoded
+    # as EPERM — an over-long path reported itself as a permissions bug.
+    var long_path: [8192]u8 = undefined;
+    var i: usize = 0;
+    while (i < long_path.len) {
+        long_path[i] = 'a';
+        i = i + 1;
+    }
+    let r: Result(i32, Errno) = openat(std.posix.AT.FDCWD, long_path[0..], 0, 0);
+    match r {
+        Ok(fd) => { _ = close(fd); assert(false); },
+        Err(e) => {
+            assert(e.is(ErrnoKind.Einval));
+            assert(e.is(ErrnoKind.Eperm) == false);
+        },
+    }
+}
+
+@[test]
+fun test_eof_is_ok_zero_not_an_error() {
+    let p: str = "/tmp/zag_posix_tier_t.txt";
+    let o: Result(i32, Errno) = openat(std.posix.AT.FDCWD, p, 0x242, 0o644);
+    match o {
+        Ok(fd) => {
+            let w: Result(usize, Errno) = write(fd, "xy", 2);
+            match w {
+                Ok(n) => assert(n == 2),
+                Err(e) => assert(false),
+            }
+            _ = lseek(fd, 0, 0);
+            var b: [8]u8 = undefined;
+            let r1: Result(usize, Errno) = read(fd, b[0..], 8);
+            match r1 {
+                Ok(n) => assert(n == 2),
+                Err(e) => assert(false),
+            }
+            # Drained: Ok(0), which is EOF rather than a failure.
+            let r2: Result(usize, Errno) = read(fd, b[0..], 8);
+            match r2 {
+                Ok(n) => assert(n == 0),
+                Err(e) => assert(false),
+            }
+            _ = close(fd);
+        },
+        Err(e) => assert(false),
+    }
+}
+
+@[test]
+fun test_double_close_surfaces_ebadf() {
+    let p: str = "/tmp/zag_posix_tier_t2.txt";
+    let o: Result(i32, Errno) = openat(std.posix.AT.FDCWD, p, 0x242, 0o644);
+    match o {
+        Ok(fd) => {
+            let c1: Result(void, Errno) = close(fd);
+            match c1 {
+                Ok(_) => assert(true),
+                Err(e) => assert(false),
+            }
+            # Closing again is a real failure, and it is reported.
+            let c2: Result(void, Errno) = close(fd);
+            match c2 {
+                Ok(_) => assert(false),
+                Err(e) => assert(e.is(ErrnoKind.Ebadf)),
+            }
+        },
+        Err(e) => assert(false),
+    }
+}
+
+@[test]
+fun test_eexist_is_a_typed_value() {
+    _ = mkdirat(std.posix.AT.FDCWD, "/tmp/zag_posix_tier_t3", 0o755);
+    let second: Result(void, Errno) = mkdirat(std.posix.AT.FDCWD, "/tmp/zag_posix_tier_t3", 0o755);
+    match second {
+        Ok(_) => assert(true),
+        Err(e) => assert(e.is(ErrnoKind.Eexist)),
+    }
+}
+
+@[test]
+fun test_clock_and_cwd_are_ok_values() {
+    let t: Result(i64, Errno) = clock_gettime(1);
+    match t {
+        Ok(ns) => assert(ns > 0),
+        Err(e) => assert(false),
+    }
+    let c: Result([]const u8, Errno) = getcwd();
+    match c {
+        Ok(p) => assert(p.len > 0),
+        Err(e) => assert(false),
+    }
+}
+
+@[test]
+fun test_futex_eagain_is_a_normal_outcome() {
+    var word: u32 = 0;
+    let r: Result(void, Errno) = futex_wait_shared(addr_of(word) as *const u32, 99);
+    match r {
+        Ok(_) => assert(false),
+        Err(e) => assert(e.is(ErrnoKind.Eagain)),
+    }
+    _ = futex_wake(addr_of(word) as *const u32, 1);
+}
+
+@[test]
+fun test_read_on_directory_is_eisdir() {
+    # read(2) on a directory fd is EISDIR. The pre-split shape could
+    # have read the errno as a byte count; the point of the tier is that
+    # this can only ever be an Err.
+    let d: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/tmp", 0, 0);
+    match d {
+        Ok(fd) => {
+            var b: [16]u8 = undefined;
+            let r: Result(usize, Errno) = read(fd, b[0..], 16);
+            match r {
+                Ok(n) => assert(false),
+                Err(e) => assert(e.is(ErrnoKind.Eisdir)),
+            }
+            _ = close(fd);
+        },
+        Err(e) => assert(false),
+    }
+    # A directory opened for writing is EISDIR, not EACCES.
+    let w: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/tmp", 1, 0);
+    match w {
+        Ok(fd) => { _ = close(fd); assert(false); },
+        Err(e) => assert(e.is(ErrnoKind.Eisdir)),
+    }
+}
+
+@[test]
+fun test_write_to_full_device_is_enospc() {
+    # `/dev/full` is a Linux device node whose write(2) always fails
+    # with ENOSPC. On a host without it this row is a no-op
+    # (skip-on-missing-fixture), matching the harness convention.
+    let f: Result(i32, Errno) = openat(std.posix.AT.FDCWD, "/dev/full", 1, 0);
+    match f {
+        Ok(fd) => {
+            let w: Result(usize, Errno) = write_full(fd, "capacity");
+            match w {
+                Ok(n) => assert(false),
+                Err(e) => assert(e.is(ErrnoKind.Enospc)),
+            }
+            _ = close(fd);
+        },
+        Err(e) => assert(true),
+    }
+}
+
+@[test]
+fun test_open_readonly_file_for_write_is_eacces() {
+    # There is no chmod binding in std.posix — but openat takes the mode
+    # at creation time, so a 0o444 file IS the injection (umask 022
+    # leaves 0444). Writing it must be EACCES, and the read bit still
+    # being set proves the denial is the write permission and not a
+    # missing path. Root bypasses the mode bits (CAP_DAC_OVERRIDE), so
+    # the row degrades to a skip there.
+    #
+    # 0xC1 is O_WRONLY|O_CREAT|O_EXCL, which makes the row IDEMPOTENT: a
+    # re-run finds the file already there (EEXIST) instead of re-opening
+    # an existing 0o444 file for writing — that open is itself EACCES, so
+    # a plain O_TRUNC create would look like a creation failure on the
+    # second run of this fixture.
+    let p: str = "/tmp/zag_posix_tier_ro.txt";
+    let c: Result(i32, Errno) = openat(std.posix.AT.FDCWD, p, 0xC1, 0o444);
+    match c {
+        Ok(fd) => { _ = close(fd); },
+        Err(e) => assert(e.is(ErrnoKind.Eexist)),
+    }
+    # Readable first: that is what makes the write denial below a
+    # permission decision rather than a missing-path artifact.
+    let r: Result(i32, Errno) = openat(std.posix.AT.FDCWD, p, 0, 0);
+    match r {
+        Ok(fd) => { _ = close(fd); },
+        Err(e) => assert(false),
+    }
+    let w: Result(i32, Errno) = openat(std.posix.AT.FDCWD, p, 1, 0);
+    match w {
+        Ok(fd) => { _ = close(fd); assert(true); },
+        Err(e) => assert(e.is(ErrnoKind.Eacces)),
+    }
+}

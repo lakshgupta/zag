@@ -13,10 +13,26 @@
 ## inline as a blk-expression; retired in the Tier-1 migration —
 ## this .zag body chain is the single source of truth.
 
-pub import std.posix.{clock_gettime, nanosleep}
+## Under the P1 posix tier split these are `Result`-returning; this
+## module is the Zag-friendly wrapper that decides what a clock failure
+## MEANS, so it does not re-export them (a bare re-export would push
+## `Result` handling onto every `std.time` caller).
+import std.posix.{clock_gettime, nanosleep_retry}
+import std.errno.{Errno}
 
+## now — nanoseconds on CLOCK_MONOTONIC. Panics if the clock read
+## fails: a broken monotonic clock makes every Timer/Duration value in
+## the process meaningless, so there is no honest fallback value to
+## return (the previous shape discarded the syscall result and handed
+## back whatever the uninitialised timespec happened to hold).
 pub fun now() -> i64 {
-    return clock_gettime(1);
+    let r: Result(i64, Errno) = clock_gettime(1);
+    if let Err(_) = r {
+        __zag_panic("std.time.now: clock_gettime failed");
+    }
+    var n: i64 = 0;
+    if let Ok(v) = r { n = v; }
+    return n;
 }
 
 pub struct Duration {
@@ -34,16 +50,20 @@ impl Duration {
 }
 
 ## sleep_us — block the calling thread for `us` microseconds via the
-## posix.nanosleep facade (raw `nanosleep(2)`). The __zag_nanosleep_ms
-## preamble helper retired here: the µs→{sec,nsec} decomposition is
-## plain zag arithmetic and the syscall itself needs no zig-side
-## spelling (see posix.zag's nanosleep docblock). Sub-microsecond
-## requests (us <= 0) return immediately.
+## posix.nanosleep_retry facade (raw `nanosleep(2)` plus the EINTR
+## resume). The __zag_nanosleep_ms preamble helper retired here: the
+## µs→{sec,nsec} decomposition is plain zag arithmetic and the syscall
+## itself needs no zig-side spelling (see posix.zag's docblocks).
+## Sub-microsecond requests (us <= 0) return immediately.
+## nanosleep_retry resumes with the kernel's remainder after a signal,
+## so an interrupted sleep no longer silently returns early; a real
+## errno (EINVAL for a malformed duration, which cannot happen here)
+## is the only thing discarded, and sleep_us has no way to report it.
 pub fun sleep_us(us: i64) {
     if (us <= 0) { return; }
     let sec: i64 = us / 1_000_000;
     let nsec: i64 = (us % 1_000_000) * 1_000;
-    _ = nanosleep(sec, nsec);
+    _ = nanosleep_retry(sec, nsec);
 }
 
 ## sleep_ms — millisecond convenience over sleep_us.

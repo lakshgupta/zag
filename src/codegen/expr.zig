@@ -262,7 +262,12 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write("    } }){}");
             },
             .ident => |name| {
-                self.write(name);
+                // `.ident` is the hot path for every variable reference; the
+                // rename lookup returns the source name unchanged unless a
+                // nested same-name `match` capture is in scope (see
+                // `bindEmitName`), so non-colliding programs emit the exact
+                // same bytes as before this hook existed.
+                self.write(self.identEmitName(name));
             },
             .call => |c| {
                 if (std.mem.eql(u8, c.name, "print")) {
@@ -356,6 +361,60 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                                     self.write(")");
                                     dispatched = true;
                                 }
+                            }
+                        }
+                    }
+                    if (!dispatched) {
+                        // Method-overloading mirror for the placeholder
+                        // parser's dotted-callee shape (docs/manual/30):
+                        // `{p.show(42)}` arrives as `.call` with name
+                        // "p.show", so the `.method_call` arm's overload
+                        // resolution never runs and the verbatim emit
+                        // asks zig for a member named `show` on a struct
+                        // whose overloads were emitted as `show_1`/
+                        // `show_2`. Resolve against the receiver's
+                        // tracked type and emit the mangled spelling;
+                        // null (the common non-overloaded case) keeps
+                        // the byte-identical verbatim fallback below.
+                        // A mutable-self overload on a value binding needs
+                        // the same `@constCast(&recv)` widening the
+                        // method_call arm applies, but only when the
+                        // annotation is a value (a `*T` receiver already
+                        // has the right pointer).
+                        // Receiver type: a typed binding first, then the
+                        // static/associated form (`{File.open(path)}`, where
+                        // `File` is the declared type and has no binding
+                        // entry) — the same two-step lookup the
+                        // `.method_call` arm uses.
+                        var overload_rtn_raw: []const u8 = "";
+                        var overload_has_receiver = true;
+                        if (self.getSourceTypeName(recv)) |rtn0| {
+                            overload_rtn_raw = rtn0;
+                        } else if (self.isDeclaredTypeName(recv)) {
+                            overload_rtn_raw = recv;
+                            overload_has_receiver = false;
+                        }
+                        if (overload_rtn_raw.len > 0) {
+                            const rtn = core.stripPointerType(overload_rtn_raw);
+                            if (self.resolveOverloadedMethod(rtn, meth, c.args, expr.loc, overload_has_receiver)) |rm| {
+                                const recv_mutable_self = self.methodReceiverIsMutable(rm);
+                                const recv_is_ptr = std.mem.startsWith(u8, std.mem.trim(u8, overload_rtn_raw, " \t"), "*");
+                                if (recv_mutable_self and !recv_is_ptr) {
+                                    self.write("@constCast(&");
+                                    self.write(recv);
+                                    self.write(")");
+                                } else {
+                                    self.write(recv);
+                                }
+                                self.write(".");
+                                self.write(self.methodZigName(rtn, rm));
+                                self.write("(");
+                                for (c.args, 0..) |arg, i| {
+                                    if (i > 0) self.write(", ");
+                                    self.genExpr(arg);
+                                }
+                                self.write(")");
+                                dispatched = true;
                             }
                         }
                     }
@@ -492,11 +551,16 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // HTTP-request lifecycles that `defer arena.free_all()`);
                 // arena-backed sites are never auto-freed by the escape
                 // pass (the arena owns the lifecycle).
+                // Unique labeled-block name (a literal `blk` collides when
+                // two of these nest — same rationale as genMatchExpr).
+                var lbl_buf: [16]u8 = undefined;
+                const lbl = self.nextBlkLabel(&lbl_buf);
                 const id = self.alloc_counter;
                 self.alloc_counter += 1;
                 var name_buf: [16]u8 = undefined;
                 const name = std.fmt.bufPrint(&name_buf, "__p_{d}", .{id}) catch "__p";
-                self.write("blk: { const ");
+                self.write(lbl);
+                self.write(": { const ");
                 self.write(name);
                 // OOM propagation is return-type-aware: the `try` shape
                 // only works when the enclosing fn can carry the error
@@ -536,7 +600,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(name);
                 self.write(".* = ");
                 self.genExpr(n.value.*);
-                self.write("; break :blk ");
+                self.write("; break :");
+                self.write(lbl);
+                self.write(" ");
                 self.write(name);
                 self.write("; }");
             },
@@ -1040,6 +1106,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 //           `*T` for mutable bindings, `*const T` for
                 //           immutable bindings — the source-of-address binding
                 //           kind is preserved through zig's type inference)
+                // Unary operator overloading (docs/manual/31): `-a` lowers
+                // to `a.__neg__()` when the operand's type declares it.
+                // The method takes the single operand, so the check is for
+                // a one-parameter `__neg__`.
+                if (u.op == .neg) {
+                    if (self.receiverTypeNameOf(u.operand.*)) |t| {
+                        if (self.typeDeclaresMethod(t, "__neg__", 1)) {
+                            self.write("(");
+                            self.genExpr(u.operand.*);
+                            self.write(".__neg__())");
+                            return;
+                        }
+                    }
+                }
                 switch (u.op) {
                     .neg => self.write("-"),
                     .bnot => self.write("~"),
@@ -1051,6 +1131,21 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 if (u.op == .deref) self.write(".*");
             },
             .index => |i| {
+                // Operator overloading (docs/manual/31): `a[k]` lowers to
+                // `a.__index__(k)` when the target's type declares a
+                // two-parameter `__index__` (receiver + key). Only user
+                // aggregates declared with the dunder are affected -- for
+                // every array/slice/tuple target the verbatim bracket emit
+                // below is what zig needs.
+                if (self.receiverTypeNameOf(i.target.*)) |t| {
+                    if (self.typeDeclaresMethod(t, "__index__", 2)) {
+                        self.genExpr(i.target.*);
+                        self.write(".__index__(");
+                        self.genExpr(i.index.*);
+                        self.write(")");
+                        return;
+                    }
+                }
                 // `target[index]` in zigzag source. Zig accepts bracket
                 // access on both arrays and anonymous-struct tuples in
                 // 0.16, so no method-call shimming is needed. Multi-dim
@@ -1123,7 +1218,7 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             },
             .if_expr => |ife| {
                 // `if cond { … } else { … }` expression form. Emitted as a
-                // labeled block + two `break :blk` arms so the whole
+                // labeled block + two `break :<lbl>` arms so the whole
                 // construct yields a value without forcing zig's `if` to
                 // be the only shape. The outer parens make this a
                 // parenthesised expression so the caller can use it in any
@@ -1134,13 +1229,23 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 //
                 // Same outer-paren caveat as `.if_stmt`: genExpr already
                 // wraps `.binary`, so do NOT emit literal `(` / `)` around
-                // the cond here either. The shared outer `(blk: { … })`
+                // the cond here either. The shared outer `(<lbl>: { … })`
                 // parenthesisation is sufficient.
-                self.write("(blk: { if ");
+                // Unique labeled-block name so nested if-expressions don't
+                // collide on a literal `blk`.
+                var lbl_buf: [16]u8 = undefined;
+                const lbl = self.nextBlkLabel(&lbl_buf);
+                self.write("(");
+                self.write(lbl);
+                self.write(": { if ");
                 self.genExpr(ife.cond.*);
-                self.write(" break :blk ");
+                self.write(" break :");
+                self.write(lbl);
+                self.write(" ");
                 self.genExpr(ife.then_expr.*);
-                self.write(" else break :blk ");
+                self.write(" else break :");
+                self.write(lbl);
+                self.write(" ");
                 self.genExpr(ife.else_expr.*);
                 self.write("; })");
             },
@@ -1964,15 +2069,52 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // ability errors. `obj.Trait.method()` and generic-
                 // dispatch sites above carry their own copies of this
                 // logic (the receiver kind differs per path).
+                // Method overloading (docs/manual/30 "Resolution Order").
+                // When the receiver's tracked type overloads this name,
+                // pick the overload now and emit its mangled spelling;
+                // `resolved` stays null for every non-overloaded call, so
+                // the emit below is byte-identical to the pre-overloading
+                // baseline. Turbofish call sites (mc.type_args) are trait
+                // dispatch and skip this.
+                var resolved: ?ast.MethodDecl = null;
+                // `resolved_type` is the type the overload was resolved
+                // against, kept so the mangled spelling is derived from the
+                // SAME name resolution used to pick it. Without it the emit
+                // below re-derived the type through `receiverTypeNameOf`,
+                // which is null for the static form — `File.open(path)`
+                // would resolve to `open__str` and then print the bare
+                // `open`, so zig reported the member missing.
+                var resolved_type: []const u8 = "";
+                if (mc.target.payload == .ident and mc.type_args.len == 0) {
+                    if (self.receiverTypeNameOf(mc.target.*)) |rtn| {
+                        resolved_type = rtn;
+                        resolved = self.resolveOverloadedMethod(rtn, mc.name, mc.args, expr.loc, true);
+                    } else if (self.staticTypeNameOf(mc.target.*)) |rtn| {
+                        // Static/associated call `Type.method(args...)` —
+                        // the receiver is the declared type, not a value,
+                        // so the call supplies no receiver parameter.
+                        resolved_type = rtn;
+                        resolved = self.resolveOverloadedMethod(rtn, mc.name, mc.args, expr.loc, false);
+                    }
+                }
                 if (mc.target.payload == .ident) {
                     if (self.getSourceTypeName(mc.target.payload.ident)) |rtn| {
                         if (!std.mem.startsWith(u8, rtn, "*")) {
-                            if (self.methodTakesMutableSelfanyType(mc.name)) {
+                            // Overload-aware receiver mutability: with a
+                            // resolved overload, read the mutability off
+                            // THAT method rather than off whichever
+                            // same-name method the type-agnostic walk
+                            // happens to hit first.
+                            const receiver_is_mutable = if (resolved) |rm|
+                                self.methodReceiverIsMutable(rm)
+                            else
+                                self.methodTakesMutableSelfanyType(mc.name);
+                            if (receiver_is_mutable) {
                                 self.write("@constCast(&");
                                 self.genExpr(mc.target.*);
                                 self.write(")");
                                 self.write(".");
-                                self.write(mc.name);
+                                self.write(if (resolved) |rm| self.methodZigName(core.stripPointerType(rtn), rm) else mc.name);
                                 self.write("(");
                                 for (mc.type_args, 0..) |ta, i| {
                                     if (i > 0) self.write(", ");
@@ -1991,7 +2133,11 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 }
                 self.genExpr(mc.target.*);
                 self.write(".");
-                self.write(mc.name);
+                if (resolved) |rm| {
+                    self.write(self.methodZigName(resolved_type, rm));
+                } else {
+                    self.write(mc.name);
+                }
                 self.write("(");
                 for (mc.type_args, 0..) |ta, i| {
                     if (i > 0) self.write(", ");
@@ -2007,20 +2153,30 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
             .block_expr => |body| {
                 // `{ stmts... }` — block expression. Emit a labeled
                 // zig block that executes all statements and yields
-                // the value of the final expression via `break :blk`.
-                self.write("(blk: {\n");
+                // the value of the final expression via `break :<lbl>`.
+                // Unique labeled-block name so nested block expressions
+                // don't collide on a literal `blk`.
+                var lbl_buf: [16]u8 = undefined;
+                const lbl = self.nextBlkLabel(&lbl_buf);
+                self.write("(");
+                self.write(lbl);
+                self.write(": {\n");
                 for (body, 0..) |s, i| {
                     if (i == body.len - 1 and s.payload == .return_stmt) {
                         const rs = s.payload.return_stmt;
                         if (rs.value) |v| {
-                            self.write("        break :blk ");
+                            self.write("        break :");
+                            self.write(lbl);
+                            self.write(" ");
                             self.genExpr(v);
                             self.write(";\n");
                         } else {
                             self.genStmt(s, false);
                         }
                     } else if (i == body.len - 1 and s.payload == .expr_stmt) {
-                        self.write("        break :blk ");
+                        self.write("        break :");
+                        self.write(lbl);
+                        self.write(" ");
                         self.genExpr(s.payload.expr_stmt);
                         self.write(";\n");
                     } else {
@@ -2039,13 +2195,20 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // keyword in already comptime scope" there; in runtime
                 // scope (`let x = const { … }`) the keyword stays so the
                 // block still evaluates at compile time.
+                // Unique labeled-block name so nested comptime blocks
+                // don't collide on a literal `blk`.
+                var lbl_buf: [16]u8 = undefined;
+                const lbl = self.nextBlkLabel(&lbl_buf);
                 if (!self.comptime_scope) self.write("(comptime ");
-                self.write("blk: {\n");
+                self.write(lbl);
+                self.write(": {\n");
                 for (body, 0..) |s, i| {
                     if (i == body.len - 1 and s.payload == .return_stmt) {
                         const rs = s.payload.return_stmt;
                         if (rs.value) |v| {
-                            self.write("        break :blk ");
+                            self.write("        break :");
+                            self.write(lbl);
+                            self.write(" ");
                             self.genExpr(v);
                             self.write(";\n");
                         } else {
@@ -2068,9 +2231,9 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // eager same-thread path — state is already 1 — and a
                 // kernel futex wait for cross-thread producers) and
                 // take() unwraps the payload:
-                //   (blk: { var __fut_<N> = <expr>;
+                //   (__blk_<N>: { var __fut_<N> = <expr>;
                 //          __fut_<N>.drive();
-                //          break :blk __fut_<N>.take(); })
+                //          break :__blk_<N> __fut_<N>.take(); })
                 // The methods live on the Future type itself (the
                 // __zag_future_drive free fn is retired) so the lowering
                 // is module-agnostic — a user-module await on a std
@@ -2079,17 +2242,25 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 // signature. take() panics only on a pending non-void
                 // future the caller take()s without driving; drive()
                 // always precedes take() in this lowering.
+                // Unique labeled-block name so nested awaits don't collide
+                // on a literal `blk`. The label and the `__fut_<N>` temp
+                // share one counter id so the numbering stays coherent.
                 const id = self.blk_counter;
-                self.blk_counter += 1;
+                var lbl_buf: [16]u8 = undefined;
+                const lbl = self.nextBlkLabel(&lbl_buf);
                 var name_buf: [16]u8 = undefined;
                 const name = std.fmt.bufPrint(&name_buf, "__fut_{d}", .{id}) catch "__fut";
-                self.write("(blk: { var ");
+                self.write("(");
+                self.write(lbl);
+                self.write(": { var ");
                 self.write(name);
                 self.write(" = ");
                 self.genExpr(ae.expr.*);
                 self.write("; ");
                 self.write(name);
-                self.write(".drive(); break :blk ");
+                self.write(".drive(); break :");
+                self.write(lbl);
+                self.write(" ");
                 self.write(name);
                 self.write(".take(); })");
             },
@@ -2183,6 +2354,39 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(tl);
                 self.write(" __v, .None => return @as(@TypeOf(__try), .{ .None = {} }), } } })");
             },
+            .unwrap_op => |u| {
+                // `expr!` — the PANICKING mirror of `expr?`. Same
+                // compile-time `@hasField` discriminator so one lowering
+                // covers `Result<T,E>` and `Option<T>`; the Err/None arm
+                // calls `__zag_panic_at` with this source location instead
+                // of returning the failure. That single operator is what
+                // retires the `*_or_panic` name family: a library publishes
+                // one fallible method and the caller chooses the failure
+                // policy at the call site (`?` / `!` / `catch` / match).
+                var uw_lbl_buf: [16]u8 = undefined;
+                const uw = self.nextBlkLabel(&uw_lbl_buf);
+                self.write("(");
+                self.write(uw);
+                self.write(": { const __unw = ");
+                self.genExpr(u.expr.*);
+                self.write("; if (@hasField(@TypeOf(__unw), \"Ok\")) { switch (__unw) { .Ok => |__v| break :");
+                self.write(uw);
+                self.write(" __v, .Err => __zag_panic_at(\"unwrapped Err\", \"");
+                self.write(self.source_path);
+                self.write("\", ");
+                self.writeInt(expr.loc.line);
+                self.write(", ");
+                self.writeInt(expr.loc.col);
+                self.write("), } } else { switch (__unw) { .Some => |__v| break :");
+                self.write(uw);
+                self.write(" __v, .None => __zag_panic_at(\"unwrapped None\", \"");
+                self.write(self.source_path);
+                self.write("\", ");
+                self.writeInt(expr.loc.line);
+                self.write(", ");
+                self.writeInt(expr.loc.col);
+                self.write("), } } })");
+            },
             .catch_expr => |c| {
                 // `expr catch HANDLER` or `expr catch |err| HANDLER` —
                 // emits a label-block with compile-time type discriminator
@@ -2239,6 +2443,40 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                 self.write(", } } })");
             },
             .binary => |b| {
+                // Operator overloading (docs/manual/31): `a + b` lowers to
+                // `a.__add__(b)` when the left operand's declared type has
+                // the matching dunder method. The emit deliberately reuses
+                // zig's own method sugar instead of a free-fn call: the
+                // manual's operator methods take the two operands as
+                // parameters with no `self`, so `a.__add__(b)` binds `a` to
+                // the first parameter exactly the way the direct call
+                // `a.__add__(b)` in the docs does. Nothing is emitted
+                // unless the type declares the method, so every existing
+                // program keeps its verbatim operator emit -- including
+                // the two shims below, whose string operands are never
+                // user aggregates.
+                if (core.operatorMethodName(b.op)) |op_method| {
+                    if (self.receiverTypeNameOf(b.lhs.*)) |lhs_type| {
+                        if (self.typeDeclaresMethod(lhs_type, op_method, 2)) {
+                            // An overloaded dunder (`__mul__(a, s: f64)`
+                            // beside `__mul__(a, b: Vec2)`) is spelled by
+                            // the same resolver the dot-call arm uses.
+                            var rhs_args = [_]ast.Expr{b.rhs.*};
+                            const op_zig = if (self.resolveOverloadedMethod(lhs_type, op_method, rhs_args[0..], expr.loc, true)) |rm|
+                                self.methodZigName(lhs_type, rm)
+                            else
+                                op_method;
+                            self.write("(");
+                            self.genExpr(b.lhs.*);
+                            self.write(".");
+                            self.write(op_zig);
+                            self.write("(");
+                            self.genExpr(b.rhs.*);
+                            self.write("))");
+                            return;
+                        }
+                    }
+                }
                 // zig 0.16 string-comparison shim. The bare `(lhs == rhs)`
                 // form is rejected by zig 0.16 when both operands are
                 // `[]const u8` (slices don't implement `==` by default

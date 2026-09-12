@@ -9,8 +9,10 @@ zig build                              # production binary → zig-out/bin/zag-<
 zig build -Doptimize=ReleaseFast       # release build
 zig build -Dzig_payload=<path>         # embed a zig binary (default: auto-detect vendor/zig/zig)
 
-zig build test                         # unit tests (336/337 pass; 1 pre-existing failure)
+zig build test                         # unit tests (514/514, plus the audit step below)
+zig build audit                        # fail when a close/sync/read/write (or waitpid/lseek/dup2/ftruncate) result is discarded in lib/std or src without a `deliberate discard` comment
 zig build scaffold_tests               # parse-only regression on lib/std stubs
+zig build example_tests                # `zag test` over the whole example catalog (discovers @[test] + fun test_* fixtures; auto-detects project mode)
 zig build e2e                          # end-to-end integration (fork+execve; opt-in)
 zig build runtime_smoke                # runtime vtable correctness (opt-in)
 zig build smoke                        # materialize-path integration (needs vendor/zig/zig.test fixture)
@@ -20,7 +22,7 @@ zig build smoke                        # materialize-path integration (needs ven
 ./examples/run_all.sh [--check] [cat/] # run/check all .zag examples
 ```
 
-`zig build test` is the fast (~1s) in-process test. `zig build e2e`, `runtime_smoke`, `smoke` are separate executables that fork child processes — always verify at least `test` + `scaffold_tests` before committing.
+`zig build test` is the fast (~1s) in-process test; it also runs `zig build audit`, which fails the build when a discard of a close/sync/read/write (`waitpid`/`dup2`/`lseek`/`ftruncate` too) is not named as `deliberate discard` in an inline comment. Scope is `lib/std` **and** `src`, and the gate needs to stay green: a new `_ = f.close();` without the marker will fail your build, not just a review. `zig build e2e`, `runtime_smoke`, `smoke` are separate executables that fork child processes, and `example_tests` shells out to the `zag` binary it just built — always verify at least `test` + `scaffold_tests` before committing, and add `example_tests` when you touch `lib/std/**` or anything under `examples/`.
 
 ## Architecture
 

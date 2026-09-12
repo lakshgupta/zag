@@ -208,8 +208,9 @@ import std.types                   # whole namespace
 import std.types.{String}          # selective import
 import std.types as t              # alias the namespace
 
-let greeting: String = new String("hello");
-s.push_str(greeting, ", world");
+var greeting: String = String.from_str("hello");
+greeting.push_str(", world");
+greeting.deinit();
 let line: str = "hello" + ", " + name;
 ```
 
@@ -297,8 +298,9 @@ import math.vec3
 import net.http.server
 
 fun main() {
-    let s = new String("hello");
+    var s: String = String.from_str("hello");
     let v = vec3.Vec3 { x: 1.0, y: 2.0, z: 3.0 };
     server.serve("0.0.0.0:8080");
+    s.deinit();
 }
 ```

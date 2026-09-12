@@ -405,3 +405,38 @@ test "lexer: wrapping ops do not shadow compound-assign or plain ops" {
     try std.testing.expectEqual(@as(usize, 1), n_plain_minus);
     try std.testing.expectEqual(@as(usize, 1), n_plain_star);
 }
+
+test "lexer: a source file larger than the old 4096-token cap tokenizes" {
+    // REGRESSION: `tokens_buf` was [4096] and `addToken` wrote without a
+    // bounds check, so any file past ~600 dense lines died on
+    // `index out of bounds: index 4096, len 4096` — a raw panic, with no
+    // diagnostic and no hint which file. lib/std/posix.zag sat at ~85% of
+    // the old cap, so the limit was already binding for real sources.
+    //
+    // This drives the lexer past the OLD limit and past the new
+    // [16384] one's guard-free region, asserting the buffer simply holds
+    // the file. Overflow past 16384 now prints an error and exits
+    // (`addToken`), which is not assertable in-process — this test covers
+    // the capacity half of the fix.
+    var src_buf: [64 * 1024]u8 = undefined;
+    var len: usize = 0;
+    const head = "fun main() {\n";
+    @memcpy(src_buf[0..head.len], head);
+    len += head.len;
+    var i: usize = 0;
+    // ~9 tokens per line (let, ident, colon, type, eq, int, semi, newline),
+    // so 1200 lines lands above the OLD 4096 cap and below the new 16384
+    // one — the point is that a file this size simply lexes.
+    while (i < 1200) : (i += 1) {
+        const line = std.fmt.bufPrint(src_buf[len..], "    let v{d}: i32 = {d};\n", .{ i, i }) catch break;
+        len += line.len;
+    }
+    src_buf[len] = '}';
+    src_buf[len + 1] = '\n';
+    len += 2;
+
+    var l = lexer_mod.Lexer.init(src_buf[0..len]);
+    const tokens = l.tokenize();
+    try std.testing.expect(tokens.len > 4096);
+    try std.testing.expectEqual(lexer_mod.TokenTag.eof, tokens[tokens.len - 1].tag);
+}

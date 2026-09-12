@@ -108,6 +108,11 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_payload", zig_payload_bytes);
     options.addOption([]const u8, "z_install", z_install_path);
+    // The version string `zag version` prints -- read from build.zig.zon at
+    // config time (see zonVersion above). Rides the SAME shared `options`
+    // instance as zig_payload/z_install so every consumer module (zag main,
+    // the tests module, smoke-runner, scaffold) sees one consistent value.
+    options.addOption([]const u8, "zag_version", zonVersion(b));
     mod.addOptions("build_options", options);
 
     // -------------------------------------------------------------------
@@ -137,6 +142,10 @@ pub fn build(b: *std.Build) void {
     // env_path_mod.addOptions removed -- see comment block above (env_path.zig uses comptime_fallback parameter instead)
     mod.addImport("env_path", env_path_mod);
 
+    const exe_name = b.fmt("zag-{s}-{s}", .{
+        targetOsString(target.result.os.tag),
+        targetArchString(target.result.cpu.arch),
+    });
     const exe = b.addExecutable(.{
         // v0.1 install-script alignment: produce a platform-suffixed
         // executable name so scripts/install-local.sh's
@@ -153,10 +162,7 @@ pub fn build(b: *std.Build) void {
         // `zag-windows-x86_64.exe.exe`. See `targetOsString` +
         // `targetArchString` (bottom of this file) for the mapping
         // logic.
-        .name = b.fmt("zag-{s}-{s}", .{
-            targetOsString(target.result.os.tag),
-            targetArchString(target.result.cpu.arch),
-        }),
+        .name = exe_name,
         .root_module = mod,
     });
 
@@ -236,6 +242,58 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     // -------------------------------------------------------------------
+    // `zig build audit` -- the discarded-result regression check.
+    //
+    // The compiler's unused-value rule cannot catch this class of bug:
+    // `_ = f.close();` is exactly how a hole gets (re-)opened silently,
+    // and it is also a legitimate spelling when the close genuinely
+    // cannot lose data. So the rule is not "never discard" but "name
+    // the decision": every discard of an audited callee (close/sync +
+    // the transfer family; see `isAuditedDiscardCallee`) must carry the
+    // phrase `deliberate discard` in a comment on the same line.
+    //
+    // This is the P2 lesson made machine-checkable. P2 established that
+    // write_file must not report success before the durability barrier,
+    // and that a deferred write-back error surfaces only at close/fsync
+    // time -- so a bare `_ = close(fd)` after a write is a silent
+    // data-loss path. The audit cannot know which sites those are; it
+    // can force a human (or a future agent) to say so per site, and it
+    // fails the build when a new one appears unannounced.
+    //
+    // Scope: `lib/std/**/*.zag` AND `src/**/*.zig`. Both trees are
+    // compliant as of P4's completion, which is what lets the step gate
+    // them: `lib/std`'s eight sites are marked, and `src`'s discards are
+    // either marked (read-only/probe fds) or gone (waitpid now goes
+    // through `sys.waitPid`, the ELF patch rewrite through
+    // `sys.writeFile`, the child-side dup2/close through
+    // `childSetupOrExit`, the error-path closes through
+    // `sys.closeOnErrorPath`).
+    //
+    // What the walk skips, so the gate is not read as broader than it is:
+    //   - comment lines, and Zig multiline-string bodies (`\\    _ =
+    //     std.os.linux.close(fd);` in `src/codegen/*.zig` is emitted Zag,
+    //     not compiler code);
+    //   - callees outside the set: `futex_*`/`nanosleep_retry`/
+    //     `fetch_add`/`release`, `execve`, `mkdirat`/`mkdir`/`unlink`
+    //     (see `isAuditedDiscardCallee` for each reason).
+    //
+    // `test` depends on it, so `zig build test` -- the project's fast
+    // primary gate, the one AGENTS.md tells every contributor to run --
+    // already covers it; the separate `audit` step is for running the
+    // check alone.
+    // -------------------------------------------------------------------
+    const discard_audit_step = b.allocator.create(std.Build.Step) catch @panic("OOM allocating audit step");
+    discard_audit_step.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "audit",
+        .owner = b,
+        .makeFn = makeDiscardAuditStep,
+    });
+    const audit_step = b.step("audit", "Fail when a close/sync/read/write (or waitpid/lseek/dup2/ftruncate) result is discarded in lib/std or src without a `deliberate discard` marker");
+    audit_step.dependOn(discard_audit_step);
+    test_step.dependOn(discard_audit_step);
+
+    // -------------------------------------------------------------------
     // End-to-end integration smoke (opt-in via `zig build smoke`).
     //
     // Stage `vendor/zig/zig.test` (a real zig binary) to enable the
@@ -294,7 +352,7 @@ pub fn build(b: *std.Build) void {
 
     // -------------------------------------------------------------------
     // `zig build scaffold_tests` — parse-only regression check that the
-    // 9 staged `lib/std/*.zag` stubs lex+parse cleanly through the
+    // 10 staged `lib/std/*.zag` stubs lex+parse cleanly through the
     // parser. Stubs are embedded at compile time via
     // `@embedFile("../lib/std/X.zag")` inside `tests/scaffold.zig` —
     // no runtime I/O, runs purely in-process, takes <1s. Each test
@@ -412,6 +470,12 @@ pub fn build(b: *std.Build) void {
     // and the file being embedded are in different path scopes.
     const scaffold_options = b.addOptions();
     scaffold_options.addOption([]const u8, "stub_mod", readStubFile(b, "lib/std/mod.zag"));
+    // std.fs joined the stub set with the P2 File rebuild: the module's
+    // File surface (retained parent, Result-returning methods, the
+    // *_or_panic twins, PAGE_SIZE/PARENT_CAP) is only reachable from
+    // real code, and project mode never materializes fs.zag — so this
+    // parse-only pin is where a rename gets caught.
+    scaffold_options.addOption([]const u8, "stub_fs", readStubFile(b, "lib/std/fs.zag"));
     scaffold_options.addOption([]const u8, "stub_types", readStubFile(b, "lib/std/types/string.zag"));
     scaffold_options.addOption([]const u8, "stub_error", readStubFile(b, "lib/std/error.zag"));
     scaffold_options.addOption([]const u8, "stub_fmt", readStubFile(b, "lib/std/fmt.zag"));
@@ -567,6 +631,122 @@ pub fn build(b: *std.Build) void {
     const run_runtime_smoke = b.addRunArtifact(runtime_smoke_exe);
     const runtime_smoke_step = b.step("runtime_smoke", "Runtime smoke for trait vtable dispatch -- spawns `./zig-out/bin/zag run <example>` per trait example and asserts stdout matches the pre-captured runtime output (opt-in like e2e)");
     runtime_smoke_step.dependOn(&run_runtime_smoke.step);
+
+    // -------------------------------------------------------------------
+    // `zig build example_tests` -- run the `@[test]` blocks in the
+    // example catalog.
+    //
+    // Neither existing gate covered them: `zig build test` is the
+    // in-process Zig unit graph and never reads a `.zag` file, and
+    // `examples/run_all.sh` executes each fixture's `main` while
+    // deliberately filtering out `*/tests/*`. So the injected
+    // EACCES/EISDIR/ENOSPC rows, the `File` contract, and the posix
+    // `Result`-tier assertions were green only when a developer ran
+    // `zag test <file>` by hand. This step makes that automatic.
+    //
+    // Discovery, not a hand-maintained list: `walkExampleDir` scans
+    // `examples/` at config time and keeps every `.zag` file that opens
+    // a line with `@[test]` -- the file-mode signal -- plus every file
+    // that declares a `fun test_*`, the project-mode convention
+    // (docs/manual/34-project-layout.md), so a new fixture is covered
+    // the moment it lands. A `##` doc comment mention (`##   zag test
+    // run tests (@[test] functions)`) is not a test block; see
+    // `hasTestBlocks`.
+    //
+    // Each fixture is then classified FILE MODE or PROJECT MODE by
+    // whether an ancestor directory holds a `zag.toml`. A file in a
+    // project has to run in project mode, because its imports resolve
+    // against the project root: `examples/project_layout/tests/parse.zag`
+    // imports the project's `src/lib.zag`, which file mode cannot
+    // resolve (`zag test <that file>` fails to compile). Project-mode
+    // fixtures collapse to ONE step per project -- `zag test` from the
+    // project root compiles the whole module graph and runs every test
+    // in it -- so the dedupe keeps the step count at projects, not files.
+    //
+    // One `Run` step per fixture, spawned via `addSystemCommand` against
+    // the installed binary rather than `addRunArtifact(exe)`. The why is
+    // project mode: `zag` locates its stdlib mirror through
+    // `resolveStdlibRoot`, whose exe-relative candidate is
+    // `<exe_dir>/../../lib/std`, and that expression only lands on the
+    // repository's `lib/std` when the binary sits in `zig-out/bin/`. A
+    // cache artifact under `.zig-cache/o/<hash>/` has no `lib/std` two
+    // levels up, so `addRunArtifact` worked for file mode (cwd = build
+    // root, `./lib/std` hits first) but failed every project-mode 
+    // fixture with `error: cannot locate lib/std`. The resolved path is
+    // ABSOLUTE because the project-mode step changes the child's cwd, and
+    // a relative program path is resolved against that new cwd.
+    //
+    // No output capture or platform-suffix duplication is needed either
+    // way: `zag test` exits non-zero when a row fails, and the exit code
+    // propagates and fails the build. There is consequently no SKIP path
+    // here: unlike e2e/runtime_smoke, whose fixtures (a staged vendor/zig,
+    // a pre-captured stdout) can legitimately be absent, this step's only
+    // precondition is the compiler artifact it was just built from, which
+    // `dependOn(b.getInstallStep())` guarantees. zig's build runner
+    // schedules the steps against the machine's parallelism, so this does
+    // not fork ~75 compilers at once.
+    //
+    // Caveat: a non-default `--prefix` moves the binary off
+    // `zig-out/bin`, and `<exe>/../../lib/std` then points outside the
+    // repository. File mode still resolves `./lib/std` from the build
+    // root; project mode needs `ZAG_HOME=<repo>` (or the default prefix).
+    //
+    // `ZAG_ZIG_PATH` is pinned to the zig found on `$PATH` -- i.e. the
+    // compiler running this very build. It is required, not defensive:
+    // `zag test` resolves its toolchain as zag.toml -> $ZAG_ZIG_PATH ->
+    // {/usr/bin/zig, /usr/local/bin/zig, $HOME/.local/zig/zig} -> the
+    // embedded payload, and it does NOT search `$PATH`. A CI zig that
+    // arrives only via `$PATH` (mlugg/setup-zig) matches none of those
+    // tiers, so an unpinned `zig build example_tests` would fail with
+    // `error: zig compiler not found` and exit 1. Setting it also keeps
+    // this step on the same toolchain that produced the artifact.
+    // `setCwd` pins the working directory -- the build root for file
+    // mode, the project root for project mode -- so relative fixture
+    // paths and `zag`'s `./lib/std` resolution tier agree no matter
+    // where `zig build` was invoked from.
+    // -------------------------------------------------------------------
+    var example_fixtures = ExampleFixtures{};
+    walkExampleDir(b, "examples", &example_fixtures);
+    std.mem.sortUnstable(ExampleFixture, example_fixtures.items(), {}, exampleFixtureLessThan);
+
+    const installed_zag = b.pathResolve(&.{b.getInstallPath(.bin, exe_name)});
+    const example_tests_step = b.step("example_tests", "Run `zag test` over every example fixture with @[test] blocks (file mode; project mode for fixtures inside a zag.toml project)");
+    // Resolved once, not per fixture, so the probe and its diagnostic
+    // line appear a single time in the build log.
+    const host_zig: ?[]const u8 = detectZigOnPath(b.allocator);
+    var file_mode_count: usize = 0;
+    var project_mode_count: usize = 0;
+    var last_project: ?[]const u8 = null;
+    for (example_fixtures.items()) |fixture| {
+        if (fixture.project_root) |project_root| {
+            // Iteration is sorted by path, and every file of a project
+            // shares that project's prefix, so a project's fixtures are
+            // contiguous and the previous root is enough to dedupe -- no
+            // set needed.
+            if (last_project != null and std.mem.eql(u8, last_project.?, project_root)) continue;
+            last_project = project_root;
+        }
+        const run_example_test = b.addSystemCommand(&.{installed_zag});
+        run_example_test.step.dependOn(b.getInstallStep());
+        if (host_zig) |zig_path| {
+            run_example_test.setEnvironmentVariable("ZAG_ZIG_PATH", zig_path);
+        }
+        if (fixture.project_root) |project_root| {
+            run_example_test.setCwd(b.path(project_root));
+            run_example_test.addArg("test");
+            project_mode_count += 1;
+        } else {
+            run_example_test.setCwd(b.path("."));
+            run_example_test.addArg("test");
+            run_example_test.addArg(fixture.path);
+            file_mode_count += 1;
+        }
+        example_tests_step.dependOn(&run_example_test.step);
+    }
+    std.debug.print(
+        "example_tests: {d} file-mode fixture(s) + {d} project(s)\n",
+        .{ file_mode_count, project_mode_count },
+    );
 }
 
 /// Compute the default `-Dz_install` value at build-config time by
@@ -724,6 +904,511 @@ fn targetArchString(arch: std.Target.Cpu.Arch) []const u8 {
         .aarch64 => "arm64",
         else => @tagName(arch),
     };
+}
+
+/// One example fixture found by `walkExampleDir`: a `.zag` file whose
+/// source opens a line with `@[test]`.
+const ExampleFixture = struct {
+    /// Path relative to the repository root, e.g.
+    /// `examples/error-handling/posix_tier.zag`.
+    path: []const u8,
+    /// Non-null when an ancestor directory holds a `zag.toml`: the project
+    /// root, relative to the repository root. Such a fixture runs in
+    /// project mode (one step per project), not file mode, because its
+    /// imports resolve against the project root.
+    project_root: ?[]const u8,
+};
+
+/// Path-ordered comparison, so the emitted step list -- and therefore the
+/// build log -- is stable across runs; `getdents64` order is not.
+fn exampleFixtureLessThan(_: void, lhs: ExampleFixture, rhs: ExampleFixture) bool {
+    return std.mem.lessThan(u8, lhs.path, rhs.path);
+}
+
+/// Fixed-capacity list of repository-relative `.zag` paths, filled by
+/// `collectZagPaths`. Same bounded-buffer rationale as `ExampleFixtures`:
+/// a bound rather than a growable list keeps the scan free of the
+/// deprecated `std.array_list.Managed` and of an allocation-failure path.
+/// Sized for the larger of the two callers: `examples/` holds ~90 `.zag`
+/// files and `lib/std/` ~50.
+const MAX_ZAG_PATHS: usize = 512;
+
+const PathList = struct {
+    buf: [MAX_ZAG_PATHS][]const u8 = undefined,
+    len: usize = 0,
+
+    fn items(self: *PathList) [][]const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn add(self: *PathList, path: []const u8) void {
+        if (self.len == self.buf.len) {
+            std.debug.print(
+                "zag build: .zag path limit ({d}) reached; {s} was not scanned\n",
+                .{ MAX_ZAG_PATHS, path },
+            );
+            return;
+        }
+        self.buf[self.len] = path;
+        self.len += 1;
+    }
+};
+
+/// Fixed-capacity fixture list. A bound rather than a growable list keeps
+/// the discovery free of the deprecated `std.array_list.Managed` and of an
+/// allocation-failure path; `add` reports overflow instead of dropping a
+/// fixture silently, which is the point of this step existing at all.
+const MAX_EXAMPLE_FIXTURES: usize = 512;
+
+const ExampleFixtures = struct {
+    buf: [MAX_EXAMPLE_FIXTURES]ExampleFixture = undefined,
+    len: usize = 0,
+
+    fn items(self: *ExampleFixtures) []ExampleFixture {
+        return self.buf[0..self.len];
+    }
+
+    fn add(self: *ExampleFixtures, fixture: ExampleFixture) void {
+        if (self.len == self.buf.len) {
+            std.debug.print(
+                "example_tests: fixture limit ({d}) reached; {s} will not be tested\n",
+                .{ MAX_EXAMPLE_FIXTURES, fixture.path },
+            );
+            return;
+        }
+        self.buf[self.len] = fixture;
+        self.len += 1;
+    }
+};
+
+/// True when `bytes` opens a line with `@[test]` (leading whitespace
+/// allowed). A plain substring search is not enough: several fixtures
+/// *document* the attribute inside a `##` comment (`##   zag test  run
+/// tests (@[test] functions)`), and a file that only mentions it has no
+/// tests to run. Requiring the attribute to open the line excludes those
+/// comment mentions without needing Zag's lexer at build-config time.
+///
+/// This is the ONLY signal that counts in file mode: `zag test <file>`
+/// collects `@[test]` functions and nothing else, so a lone `fun test_*`
+/// in a standalone file runs zero cases.
+fn hasTestBlocks(bytes: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "@[test]")) return true;
+    }
+    return false;
+}
+
+/// True when `bytes` declares a `fun test_*`. That is the PROJECT-mode
+/// convention (docs/manual/34-project-layout.md): `zag test` from a
+/// project root walks `tests/` and treats every top-level `fun test_*` as
+/// a case with no `@[test]` annotation needed. It is checked in addition
+/// to `hasTestBlocks` when deciding whether a *project* has tests, so a
+/// suite that uses only the naming convention still pulls its project
+/// into the step.
+fn hasTestFunctions(bytes: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "fun test_")) return true;
+    }
+    return false;
+}
+
+/// Read `path` (repository-root-relative) into a build-arena slice, or
+/// null when it cannot be read. Unlike `readStubFile`, a miss is not
+/// fatal: the discovery walk probes every `.zag` under `examples/`, and
+/// one unreadable file should not fail the whole build step.
+fn readFileBytes(b: *std.Build, path: []const u8) ?[]const u8 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.os.linux.close(fd);
+
+    var buf: [262144]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.os.linux.read(fd, buf[total..].ptr, buf.len - total);
+        if (n > std.math.maxInt(isize)) return null;
+        if (n == 0) break;
+        total += n;
+    }
+
+    const result = b.allocator.alloc(u8, total) catch return null;
+    @memcpy(result, buf[0..total]);
+    return result;
+}
+
+/// Extract `.version = "..."` from `build.zig.zon` and surface it as the
+/// `zag_version` build option so `zag version` (src/main.zig) prints the
+/// same version string the package metadata carries.
+///
+/// HISTORY: the version was hardcoded in main.zig ("zag 0.1.0-dev\n") and
+/// had to be bumped in lockstep with build.zig.zon by hand -- a
+/// two-sources-of-truth drift where a tag on a half-bumped tree shipped
+/// binaries reporting the old number. The bump is now a one-line
+/// `build.zig.zon` edit; main.zig reads it via `build_options.zag_version`.
+///
+/// Single-pass scan, no regex: look for the `.version` key, skip the
+/// `=` and whitespace, then take the bytes between the next pair of
+/// double quotes. Tolerates a trailing comma after the closing quote
+/// (the canonical build.zig.zon formatting) and any key ordering.
+/// A miss is a HARD build error (unlike readFileBytes' soft null): the
+/// version string is a release invariant, and silently printing "dev"
+/// in published binaries is worse than failing the build that would
+/// have shipped them.
+fn zonVersion(b: *std.Build) []const u8 {
+    const bytes = readFileBytes(b, "build.zig.zon") orelse
+        @panic("build.zig.zon unreadable: cannot extract .version");
+    const key = ".version";
+    const idx = std.mem.indexOf(u8, bytes, key) orelse
+        @panic("build.zig.zon has no .version key");
+    var pos = idx + key.len;
+    while (pos < bytes.len and (bytes[pos] == ' ' or bytes[pos] == '\t' or bytes[pos] == '=')) pos += 1;
+    if (pos >= bytes.len or bytes[pos] != '"')
+        @panic("build.zig.zon .version is not a quoted string");
+    pos += 1;
+    const end = std.mem.indexOfScalarPos(u8, bytes, pos, '"') orelse
+        @panic("build.zig.zon .version string is unterminated");
+    return b.allocator.dupe(u8, bytes[pos..end]) catch
+        @panic("OOM extracting build.zig.zon .version");
+}
+
+/// The nearest ancestor directory of `file_path` holding a `zag.toml`, or
+/// null for a standalone fixture. That directory is the one `zag test`
+/// must run from -- a file inside a project cannot be tested in file mode
+/// because its imports resolve against the project root (e.g.
+/// `examples/project_layout/tests/parse.zag` imports the project's
+/// `src/lib.zag`).
+fn projectRootOf(b: *std.Build, file_path: []const u8) ?[]const u8 {
+    var dir = file_path[0..(std.mem.lastIndexOfScalar(u8, file_path, '/') orelse return null)];
+    while (true) {
+        const toml = std.fmt.allocPrint(b.allocator, "{s}/zag.toml", .{dir}) catch return null;
+        if (readFileBytes(b, toml) != null) return dir;
+        const slash = std.mem.lastIndexOfScalar(u8, dir, '/') orelse return null;
+        dir = dir[0..slash];
+    }
+}
+
+/// Depth-first scan of `rel_dir`, collecting every file whose name ends
+/// with `suffix` (`.zag` for the example catalog, `.zig` for the
+/// discarded-result audit's `src/` pass).
+///
+/// Generated output is skipped: `build/` (and any dot-directory, which
+/// covers `.zig-cache`) holds a large transpiled tree neither caller has
+/// any business reading, and the project-mode step recreates it anyway.
+///
+/// Shared by the `example_tests` discovery and the discarded-result
+/// audit, so one traversal discipline covers both.
+///
+/// Uses the same `getdents64` + `d_reclen` discipline as `src/main.zig`'s
+/// `materializeWalk`, including the `align(8)` on the batch buffer: the
+/// dirent stream is 8-byte-aligned, so an unaligned base makes the
+/// `@alignCast` below trip in Debug mode.
+fn collectZagPaths(b: *std.Build, rel_dir: []const u8, suffix: []const u8, out: *PathList) void {
+    const dir_fd = std.posix.openat(std.posix.AT.FDCWD, rel_dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
+    defer _ = std.os.linux.close(dir_fd);
+
+    var buf: [8192]u8 align(8) = undefined;
+    while (true) {
+        const n = std.os.linux.getdents64(dir_fd, buf[0..].ptr, buf.len);
+        if (n > std.math.maxInt(isize)) return;
+        if (n == 0) break;
+
+        var pos: usize = 0;
+        while (pos < n) {
+            const entry: *const std.os.linux.dirent64 = @ptrCast(@alignCast(&buf[pos]));
+            pos += entry.reclen;
+
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.name)));
+            const name = name_z[0..name_z.len];
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (name[0] == '.') continue;
+            if (std.mem.eql(u8, name, "build")) continue;
+
+            const child = std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ rel_dir, name }) catch return;
+            if (entry.type == std.os.linux.DT.DIR) {
+                collectZagPaths(b, child, suffix, out);
+            } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, suffix)) {
+                out.add(child);
+            }
+        }
+    }
+}
+
+/// Fill `out` with every test-bearing `.zag` file under `rel_dir`
+/// (`examples/`), tagged with the project root it belongs to (or null for
+/// a standalone fixture).
+///
+/// Two signals count, matching Zag's two documented test conventions:
+///   - `@[test]` opening a line -- the file-mode signal, and the ONLY one
+///     `zag test <file>` collects;
+///   - a top-level `fun test_*` -- the project-mode convention
+///     (docs/manual/34-project-layout.md), where `zag test` from the
+///     project root picks up every `fun test_*` with no annotation.
+///
+/// A standalone file is selected on `@[test]` alone: a lone `fun test_*`
+/// at file scope runs zero cases, because file mode does not use the
+/// naming convention. A file inside a project is selected on either
+/// signal -- the project's step runs the whole module graph, so one
+/// `fun test_*` anywhere in it is enough to make the project worth
+/// testing, and files with no tests at all are skipped.
+fn walkExampleDir(b: *std.Build, rel_dir: []const u8, out: *ExampleFixtures) void {
+    var paths = PathList{};
+    collectZagPaths(b, rel_dir, ".zag", &paths);
+    for (paths.items()) |path| {
+        const bytes = readFileBytes(b, path) orelse continue;
+        const has_block = hasTestBlocks(bytes);
+        const project_root = projectRootOf(b, path);
+        const selected = if (project_root == null)
+            has_block
+        else
+            has_block or hasTestFunctions(bytes);
+        if (!selected) continue;
+        out.add(.{ .path = path, .project_root = project_root });
+    }
+}
+
+/// Marker phrase that turns a discarded result into a *named* decision.
+/// A site is compliant only when the same line carries this phrase in a
+/// comment, e.g. `_ = close(fd); # deliberate discard: read-only fd, no
+/// buffered write to report`. Matching is case-insensitive so the
+/// sentence-cased form already used in several lib/std comments
+/// ("Deliberate discard.") counts without a rewrite.
+const discard_marker = "deliberate discard";
+
+/// Callee names whose discarded result the audit treats as a potential
+/// silent-failure hole: the close/sync + transfer family. These are the
+/// calls whose error a caller cannot see any other way -- a deferred
+/// write-back error (ENOSPC/EIO) reported only by close(2)/fsync(2), or
+/// a short transfer that a bare `_ =` would report as success.
+///
+/// Deliberately NOT in the set:
+///   - `futex_wait`/`futex_wake`: `futex_wait` legitimately returns
+///     EAGAIN on a spurious wakeup, so every call site must discard or
+///     re-check -- a per-site marker would be noise, not judgement.
+///   - `nanosleep_retry`, `fetch_add`, `release`: not the transfer
+///     family this audit exists for.
+///   - `execve`: returns only on failure and is immediately followed by
+///     `exit(127)`; the discard IS the control flow.
+///   - `mkdirat`/`mkdir`/`unlink`: EEXIST/ENOENT are the expected results.
+///
+/// The second group is what the `src/` pass needed: `waitpid` (a
+/// discarded result left `status` at 0, which `W.IFEXITED` reads as
+/// "exited 0", so a failed wait reported success), `dup2` (a failed
+/// redirect silently sends captured output to the terminal), and
+/// `lseek`/`ftruncate` (an unchecked seek/cursor in the DWARF patch path
+/// wrote at the wrong offset).
+fn isAuditedDiscardCallee(callee: []const u8) bool {
+    const names = [_][]const u8{
+        "close",     "sync",       "fsync",      "fdatasync", "datasync",
+        "write",     "write_full", "write_at",   "write_block", "append",
+        "pwrite",    "pwrite_full", "read",      "read_full", "read_some",
+        "read_at",   "read_block", "pread",      "pread_full",
+        "waitpid",   "wait4",      "lseek",      "ftruncate", "truncate",
+        "dup2",
+    };
+    for (names) |name| {
+        if (std.mem.eql(u8, callee, name)) return true;
+    }
+    return false;
+}
+
+/// Case-insensitive search for the deliberate-discard marker.
+fn namesDeliberateDiscard(line: []const u8) bool {
+    if (line.len < discard_marker.len) return false;
+    var i: usize = 0;
+    while (i + discard_marker.len <= line.len) : (i += 1) {
+        var k: usize = 0;
+        while (k < discard_marker.len and std.ascii.toLower(line[i + k]) == discard_marker[k]) k += 1;
+        if (k == discard_marker.len) return true;
+    }
+    return false;
+}
+
+/// The callee of the first *audited* result discard on `line`, or null.
+///
+/// Recognises the project's discard spelling `_ = <path>(...)` wherever
+/// it starts (so `defer _ = close(fd);` matches too). The callee's last
+/// `.`-segment is what the audit compares, which is what makes
+/// `f.close()`, `std.posix.close(fd)`, and `close(fd)` the same call.
+///
+/// Non-call discards are skipped rather than treated as a match, so a
+/// line like `_ = futex_wait(w);` does not hide a later audited discard
+/// on the same line (there is no such line today; the loop is here so
+/// the scanner cannot be fooled by one).
+fn auditedDiscardedCallee(line: []const u8) ?[]const u8 {
+    const needle = "_ = ";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, needle)) |idx| {
+        const rest = line[idx + needle.len ..];
+        var end: usize = 0;
+        while (end < rest.len and
+            (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_' or rest[end] == '.')) end += 1;
+        if (end < rest.len and rest[end] == '(') {
+            const full = rest[0..end];
+            const callee = if (std.mem.lastIndexOfScalar(u8, full, '.')) |dot|
+                full[dot + 1 ..]
+            else
+                full;
+            if (isAuditedDiscardCallee(callee)) return callee;
+        }
+        from = idx + needle.len;
+    }
+    return null;
+}
+
+/// True when `line` is a comment or a multiline-string continuation, and
+/// therefore cannot be code. `#` and `//` cover Zag and Zig comments;
+/// `\\` covers a Zig multiline string literal's body line, which is how
+/// the codegen's emitted-Zag templates appear (`src/codegen/*.zig` holds
+/// literal `_ = std.os.linux.close(fd);` text that is generated code,
+/// not compiler code, and must not be judged as a discard).
+fn isCommentOrStringLine(trimmed: []const u8) bool {
+    if (trimmed.len == 0) return true;
+    if (trimmed[0] == '#') return true;
+    if (std.mem.startsWith(u8, trimmed, "//")) return true;
+    if (std.mem.startsWith(u8, trimmed, "\\\\")) return true;
+    return false;
+}
+
+/// Scan every source file under `rel_root` (`.zag` under `lib/std`,
+/// `.zig` under `src`) for an audited discard with no marker, print each
+/// violation with its path and line, and return the count.
+///
+/// A file that cannot be read is itself a finding, not a skip: the walk
+/// just listed it, so a read failure means the audit's own coverage is
+/// incomplete, and a silently-skipped file is exactly the kind of hole
+/// this step exists to prevent. (In practice the only failure is the
+/// 256 KB `readFileBytes` ceiling; lib/std's largest file is ~40 KB.)
+fn auditDiscardedResults(b: *std.Build, rel_root: []const u8, suffix: []const u8) usize {
+    var paths = PathList{};
+    collectZagPaths(b, rel_root, suffix, &paths);
+
+    var violations: usize = 0;
+    var sites: usize = 0;
+    // A walk that found nothing is a broken gate, not a pass. This is not
+    // hypothetical: the first version of this function hardcoded `.zag`
+    // for both roots, so the `src` pass silently scanned zero files and
+    // reported "0 violation(s)" -- identical to a clean tree.
+    if (paths.len == 0) {
+        std.debug.print("audit: no {s} file found under {s}; the scan did not run\n", .{ suffix, rel_root });
+        return 1;
+    }
+    for (paths.items()) |path| {
+        const bytes = readFileBytes(b, path) orelse {
+            std.debug.print("audit: could not read {s}; its discards were NOT scanned\n", .{path});
+            violations += 1;
+            continue;
+        };
+        var line_no: usize = 0;
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            line_no += 1;
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (isCommentOrStringLine(trimmed)) continue;
+            const callee = auditedDiscardedCallee(line) orelse continue;
+            sites += 1;
+            if (namesDeliberateDiscard(line)) continue;
+            std.debug.print(
+                "audit: {s}:{d}: discarded `{s}` result is not a named decision\n  {s}\n",
+                .{ path, line_no, callee, trimmed },
+            );
+            violations += 1;
+        }
+    }
+    std.debug.print(
+        "audit: {d} file(s), {d} audited discard(s) in {s}, {d} violation(s)\n",
+        .{ paths.len, sites, rel_root, violations },
+    );
+    return violations;
+}
+
+/// `make` body of the `audit` step: run the discarded-result scan and
+/// fail the build when it finds anything. A step rather than a call in
+/// `build()` so the scan runs only when `audit` (or `test`, which depends
+/// on it) is scheduled -- config-time failure would fail `zig build
+/// --help` too.
+fn makeDiscardAuditStep(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options; // Nothing to report to the progress bar.
+    const b = step.owner;
+    // Both trees: `lib/std` is Zag source, `src` is the compiler's own
+    // Zig. The `src` pass is what turned the P4 "remaining" list into
+    // work -- see `auditDiscardedResults` for what the walk skips.
+    const roots = [_]struct { root: []const u8, suffix: []const u8 }{
+        .{ .root = "lib/std", .suffix = ".zag" },
+        .{ .root = "src", .suffix = ".zig" },
+    };
+    var violations: usize = 0;
+    for (roots) |r| violations += auditDiscardedResults(b, r.root, r.suffix);
+    if (violations == 0) return;
+    try step.result_error_msgs.append(
+        b.allocator,
+        b.fmt(
+            "{d} discarded result(s) in lib/std or src lack a `deliberate discard` marker; " ++
+                "either check the result or name the decision in a comment",
+            .{violations},
+        ),
+    );
+    return error.MakeFailed;
+}
+
+/// Locate the `zig` compiler on `$PATH` at build-config time. Used by
+/// the `example_tests` step to pin `ZAG_ZIG_PATH` for each spawned
+/// `zag test`: the resolution chain documented by `zag` on a miss
+/// (zag.toml -> `$ZAG_ZIG_PATH` -> a three-path auto-detect -> the
+/// embedded payload) contains no `$PATH` tier, so a `zig` that is
+/// reachable only via `$PATH` -- which is exactly what a CI
+/// `mlugg/setup-zig` install produces -- would otherwise be invisible
+/// to the spawned compiler.
+///
+/// Returns null (leaving `ZAG_ZIG_PATH` unset, so `zag`'s own tiers
+/// decide) when `$PATH` is empty/absent or no directory on it holds a
+/// readable `zig`. The probe mirrors `detectVendorZig`'s
+/// `posix.openat(RDONLY)` shape because zig 0.16's `std.fs.*` surface
+/// is too sparse for a `stat`-style existence check (AGENTS.md
+/// "Build-system quirks"); readability is the same proxy both this
+/// file and `tests/*.zig` use. Diagnostics are printed so a miss is
+/// visible in the build log rather than silent.
+fn detectZigOnPath(allocator: std.mem.Allocator) ?[]const u8 {
+    // The /proc/self/environ route `defaultZInstall` + `readEnvVar`
+    // already use. It is the codebase's verified build-time env read:
+    // zig 0.16 exposes no `std.process.getEnvMap`/`getEnvVarOwned` and
+    // the build runner does not link libc, so `std.c.getenv` is not an
+    // option (error: dependency on libc must be explicitly specified).
+    // Non-Linux hosts have no /proc, so the probe returns null there and
+    // the step falls back to `zag`'s own tiers; the diagnostic below
+    // names the remedy.
+    var buf: [131072]u8 = undefined;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch {
+        std.debug.print("detectZigOnPath: no /proc/self/environ; set ZAG_ZIG_PATH=$(which zig) if `zig build example_tests` cannot find a toolchain\n", .{});
+        return null;
+    };
+    defer _ = std.os.linux.close(fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.os.linux.read(fd, buf[total..].ptr, buf.len - total);
+        if (n > std.math.maxInt(isize)) return null;
+        if (n == 0) break;
+        total += n;
+    }
+
+    const path_env = readEnvVar(buf[0..total], "PATH", allocator) orelse {
+        std.debug.print("detectZigOnPath: no $PATH in environ; leaving ZAG_ZIG_PATH unset\n", .{});
+        return null;
+    };
+    // tokenizeScalar already skips the empty entries a `::` in $PATH
+    // produces, so no `dir.len == 0` guard is needed here.
+    var dirs = std.mem.tokenizeScalar(u8, path_env, ':');
+    while (dirs.next()) |dir| {
+        for ([_][]const u8{ "zig", "zig.exe" }) |exe| {
+            const candidate = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, exe }) catch return null;
+            const zig_fd = std.posix.openat(std.posix.AT.FDCWD, candidate, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+            _ = std.os.linux.close(zig_fd);
+            std.debug.print("detectZigOnPath: found {s}\n", .{candidate});
+            return candidate;
+        }
+    }
+    std.debug.print("detectZigOnPath: no zig on $PATH; leaving ZAG_ZIG_PATH unset (set it explicitly if `zig build example_tests` cannot find a toolchain)\n", .{});
+    return null;
 }
 
 /// openat(2) probe to detect `vendor/zig/zig` (or

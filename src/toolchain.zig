@@ -20,6 +20,7 @@
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
+const sys = @import("sys.zig");
 
 /// Vendor zig payload, supplied at build time via the `-Dzig_payload`
 /// build option (default: `src/_zig_payload.empty` 0-byte sentinel).
@@ -87,19 +88,21 @@ pub fn materializeZigToCache(dest_path: []const u8) !void {
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
         0o755,
     );
-    defer _ = std.os.linux.close(fd);
-
-    // Loop-write the embedded bytes; partial writes return short-
-    // count and we resume. Mirrors main.zig's writeFile so the
-    // codebase has one consistent write pattern. n == 0 means
-    // EOF-error (regular files don't return 0 unless the file is
-    // truncated under us; we surface error.WriteFailed in that case).
-    var written: usize = 0;
-    while (written < zig_payload.len) {
-        const n = std.os.linux.write(fd, zig_payload[written..].ptr, zig_payload.len - written);
-        if (n == 0) return error.WriteFailed;
-        written += n;
-    }
+    // No `defer` close: the handle is closed exactly once below, and it
+    // is a *checked* close. A deferred write-back error (ENOSPC/EIO on a
+    // large payload) is reported only by close(2); discarding it would
+    // report a truncated zig binary as a successful materialize, which
+    // then fails much later as an opaque execve error.
+    //
+    // The write itself goes through sys.writeFull, which retries EINTR
+    // and decodes the raw `usize` errno. The previous hand-rolled loop
+    // tested `n == 0` on a `usize` (dead — a failure is nonzero) and
+    // then added the errno-encoded value to the counter, so a failed
+    // write overflowed the cursor instead of surfacing.
+    sys.writeFull(fd, zig_payload) catch |e| {
+        sys.closeOnErrorPath(fd);
+        return e;
+    };
 
     // chmod 0o755 via the open fd, propagating EPERM/EROFS so the
     // failure surfaces at the materialize step rather than as a
@@ -110,7 +113,12 @@ pub fn materializeZigToCache(dest_path: []const u8) !void {
     // tests/toolchain.zig) and surface `error.ChmodFailed` on any
     // non-zero rc.
     const rc_fchmod = std.os.linux.fchmod(fd, 0o755);
-    if (rc_fchmod != 0) return error.ChmodFailed;
+    if (rc_fchmod != 0) {
+        sys.closeOnErrorPath(fd);
+        return error.ChmodFailed;
+    }
+
+    try sys.closeChecked(fd);
 }
 
 /// Convenience wrapper around `materializeZigToCache` that gates on

@@ -1,0 +1,303 @@
+## std.errno — the kernel's error vocabulary.
+##
+## One module defines what a syscall failure *is*, so no call site in
+## lib/std has to re-derive the test by hand. std.posix exposes the
+## kernel's two raw conventions:
+##
+##   isize  — read / write / pread / pwrite / lseek. The return value
+##            IS the byte count, or a negative -errno.
+##   usize  — openat / close / fsync / mkdirat / ... . The high bit
+##            (bit 63) is the sign: set means the value is -errno.
+##
+## Both spellings are decoded here by `is_err`, `errno_of`, and
+## `errno_of_signed`. `Errno` pairs the named branch target (`kind`)
+## with the exact kernel code (`code`), so a diagnostic can always
+## print the real number even for an errno the named set omits.
+##
+## Design notes:
+##   * `Errno.of` deliberately uses an explicit `match` over integer
+##     patterns. The `enum_from_int` builtin does NOT map a user enum
+##     by discriminant (it returns the wrong variant for an enum with
+##     explicit values), so it must not be used here.
+##   * A user enum whose variants carry payloads is not supported, so
+##     `Errno` is a struct rather than an enum — that is what lets an
+##     unmapped errno keep its numeric code.
+##   * Do not name a user enum `E`; the Result prelude declares a
+##     global `E` and the collision is a compile error.
+
+## Named errno values, Linux x86-64 numbering. These are exported so
+## the raw tier and any call site that needs the number can compare
+## against a name instead of a literal.
+pub const EPERM: isize = 1;
+pub const ENOENT: isize = 2;
+pub const ESRCH: isize = 3;
+pub const EINTR: isize = 4;
+pub const EIO: isize = 5;
+pub const ENXIO: isize = 6;
+pub const E2BIG: isize = 7;
+pub const ENOEXEC: isize = 8;
+pub const EBADF: isize = 9;
+pub const ECHILD: isize = 10;
+pub const EAGAIN: isize = 11;
+pub const ENOMEM: isize = 12;
+pub const EACCES: isize = 13;
+pub const EFAULT: isize = 14;
+pub const EBUSY: isize = 16;
+pub const EEXIST: isize = 17;
+pub const EXDEV: isize = 18;
+pub const ENODEV: isize = 19;
+pub const ENOTDIR: isize = 20;
+pub const EISDIR: isize = 21;
+pub const EINVAL: isize = 22;
+pub const ENFILE: isize = 23;
+pub const EMFILE: isize = 24;
+pub const ENOTTY: isize = 25;
+pub const EFBIG: isize = 27;
+pub const ENOSPC: isize = 28;
+pub const ESPIPE: isize = 29;
+pub const EROFS: isize = 30;
+pub const EMLINK: isize = 31;
+pub const EPIPE: isize = 32;
+pub const ERANGE: isize = 34;
+pub const ENAMETOOLONG: isize = 36;
+pub const ENOSYS: isize = 38;
+pub const ENOTEMPTY: isize = 39;
+pub const ELOOP: isize = 40;
+pub const EOVERFLOW: isize = 75;
+pub const ENOTSUP: isize = 95;
+pub const ETIMEDOUT: isize = 110;
+pub const ECONNREFUSED: isize = 111;
+pub const ESTALE: isize = 116;
+
+## ErrnoKind — the branch target for a failure. `Unknown` exists
+## because the kernel has errnos this list does not name; those keep
+## their numeric code in `Errno.code` and render via `Errno.name`.
+## The named set covers every code `Errno.of` maps. It is deliberately
+## the full set declared as constants above, so `e.is(ErrnoKind.X)` is
+## always available for an errno this module names — the earlier subset
+## left Enotdir/Eisdir/Exdev/... unnameable, so a caller that needed to
+## branch on (say) "read(2) on a directory fd" had nothing to compare
+## against and a diagnostic rendered the bare number.
+pub enum ErrnoKind {
+    Eperm,
+    Noent,
+    Esrch,
+    Eintr,
+    Eio,
+    Enxio,
+    E2big,
+    Enoexec,
+    Ebadf,
+    Echild,
+    Eagain,
+    Enomem,
+    Eacces,
+    Efault,
+    Ebusy,
+    Eexist,
+    Exdev,
+    Enodev,
+    Enotdir,
+    Eisdir,
+    Einval,
+    Enfile,
+    Emfile,
+    Enotty,
+    Efbig,
+    Enospc,
+    Espipe,
+    Erofs,
+    Emlink,
+    Epipe,
+    Erange,
+    Enametoolong,
+    Enosys,
+    Enotempty,
+    Eloop,
+    Eoverflow,
+    Enotsup,
+    Etimedout,
+    Econnrefused,
+    Estale,
+    Unknown,
+}
+
+## Errno — a syscall failure. `kind` says which branch to take;
+## `code` is the kernel's number, preserved exactly.
+pub struct Errno {
+    kind: ErrnoKind,
+    code: isize,
+}
+
+## mk — the single construction point (struct literals cannot appear
+## directly as a call argument in this compiler, so every path funnels
+## through here).
+fun mk(k: ErrnoKind, code: isize) -> Errno {
+    return Errno { kind: k, code: code };
+}
+
+impl Errno {
+    ## of — decode a positive errno number into an Errno, preserving
+    ## the exact code even when the number is not in the named set.
+    pub fun of(code: isize) -> Errno {
+        let k: ErrnoKind = match code {
+            1 => ErrnoKind.Eperm,
+            2 => ErrnoKind.Noent,
+            3 => ErrnoKind.Esrch,
+            4 => ErrnoKind.Eintr,
+            5 => ErrnoKind.Eio,
+            6 => ErrnoKind.Enxio,
+            7 => ErrnoKind.E2big,
+            8 => ErrnoKind.Enoexec,
+            9 => ErrnoKind.Ebadf,
+            10 => ErrnoKind.Echild,
+            11 => ErrnoKind.Eagain,
+            12 => ErrnoKind.Enomem,
+            13 => ErrnoKind.Eacces,
+            14 => ErrnoKind.Efault,
+            16 => ErrnoKind.Ebusy,
+            17 => ErrnoKind.Eexist,
+            18 => ErrnoKind.Exdev,
+            19 => ErrnoKind.Enodev,
+            20 => ErrnoKind.Enotdir,
+            21 => ErrnoKind.Eisdir,
+            22 => ErrnoKind.Einval,
+            23 => ErrnoKind.Enfile,
+            24 => ErrnoKind.Emfile,
+            25 => ErrnoKind.Enotty,
+            27 => ErrnoKind.Efbig,
+            28 => ErrnoKind.Enospc,
+            29 => ErrnoKind.Espipe,
+            30 => ErrnoKind.Erofs,
+            31 => ErrnoKind.Emlink,
+            32 => ErrnoKind.Epipe,
+            34 => ErrnoKind.Erange,
+            36 => ErrnoKind.Enametoolong,
+            38 => ErrnoKind.Enosys,
+            39 => ErrnoKind.Enotempty,
+            40 => ErrnoKind.Eloop,
+            75 => ErrnoKind.Eoverflow,
+            95 => ErrnoKind.Enotsup,
+            110 => ErrnoKind.Etimedout,
+            111 => ErrnoKind.Econnrefused,
+            116 => ErrnoKind.Estale,
+            _ => ErrnoKind.Unknown,
+        };
+        return mk(k, code);
+    }
+
+    ## is — does this failure have `k` as its kind?
+    pub fun is(self: Errno, k: ErrnoKind) -> bool {
+        return self.kind == k;
+    }
+
+    ## name — the kernel's short name for the errno ("ENOSPC"), or
+    ## "errno <n>" when the number is outside the named set. The
+    ## returned slice is borrowed from a module buffer: the next
+    ## `name()` call overwrites it (same contract as getcwd/getenv).
+    pub fun name(self: Errno) -> str {
+        if (self.kind == ErrnoKind.Unknown) { return unknown_name(self.code); }
+        let s: str = match self.code {
+            1 => "EPERM",
+            2 => "ENOENT",
+            3 => "ESRCH",
+            4 => "EINTR",
+            5 => "EIO",
+            6 => "ENXIO",
+            7 => "E2BIG",
+            8 => "ENOEXEC",
+            9 => "EBADF",
+            10 => "ECHILD",
+            11 => "EAGAIN",
+            12 => "ENOMEM",
+            13 => "EACCES",
+            14 => "EFAULT",
+            16 => "EBUSY",
+            17 => "EEXIST",
+            18 => "EXDEV",
+            19 => "ENODEV",
+            20 => "ENOTDIR",
+            21 => "EISDIR",
+            22 => "EINVAL",
+            23 => "ENFILE",
+            24 => "EMFILE",
+            25 => "ENOTTY",
+            27 => "EFBIG",
+            28 => "ENOSPC",
+            29 => "ESPIPE",
+            30 => "EROFS",
+            31 => "EMLINK",
+            32 => "EPIPE",
+            34 => "ERANGE",
+            36 => "ENAMETOOLONG",
+            38 => "ENOSYS",
+            39 => "ENOTEMPTY",
+            40 => "ELOOP",
+            75 => "EOVERFLOW",
+            95 => "ENOTSUP",
+            110 => "ETIMEDOUT",
+            111 => "ECONNREFUSED",
+            116 => "ESTALE",
+            _ => "UNKNOWN",
+        };
+        return s;
+    }
+}
+
+## Module buffer for the "errno <n>" fallback rendering.
+var name_buf: [32]u8 = undefined;
+
+## unknown_name — render "errno <code>" into the module buffer. Any
+## unmapped errno keeps its real number this way, so a diagnostic
+## never degrades to a bare "UNKNOWN".
+fun unknown_name(code: isize) -> str {
+    if (code <= 0) { return "UNKNOWN"; }
+    let prefix: str = "errno ";
+    var len: usize = 0;
+    while (len < prefix.len) {
+        name_buf[len] = prefix[len];
+        len = len + 1;
+    }
+    # Digits least-significant first, then copied back in reverse.
+    var digits: [16]u8 = undefined;
+    var nd: usize = 0;
+    var x: usize = code as usize;
+    while (x > 0) {
+        let d: u8 = (x % 10) as u8;
+        digits[nd] = d + '0';
+        nd = nd + 1;
+        x = x / 10;
+    }
+    var i: usize = 0;
+    while (i < nd) {
+        name_buf[len + i] = digits[nd - 1 - i];
+        i = i + 1;
+    }
+    return name_buf[0..len + nd];
+}
+
+## ── Raw result decoding ────────────────────────────────────────────────
+
+## is_err — the `usize` convention's test: bit 63 set means the value
+## is a negative errno.
+pub fun is_err(rc: usize) -> bool {
+    return (rc & 0x8000000000000000) != 0;
+}
+
+## errno_of — decode a `usize`-convention result into an Errno.
+## `bitcast` (not `as`) because the high bit is set: a checked
+## @intCast would trap on exactly the value we are trying to read.
+pub fun errno_of(rc: usize) -> Errno {
+    let s: isize = bitcast(rc);
+    return Errno.of(0 -% s);
+}
+
+## errno_of_signed — decode an `isize`-convention result (already a
+## negative -errno) into an Errno. A zero value carries no errno; it
+## means the syscall transferred nothing for a non-zero request, which
+## no errno describes, so it is reported as EIO rather than inventing
+## a code.
+pub fun errno_of_signed(rc: isize) -> Errno {
+    if (rc == 0) { return Errno.of(EIO); }
+    return Errno.of(0 -% rc);
+}

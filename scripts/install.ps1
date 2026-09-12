@@ -3,10 +3,10 @@
 ##
 ## One-command install: fetch the installer from this repo on GitHub raw:
 ##
-##   powershell -c "irm https://raw.githubusercontent.com/zag-lang/zag/main/scripts/install.ps1 | iex"
+##   powershell -c "irm https://raw.githubusercontent.com/lakshgupta/zag/main/scripts/install.ps1 | iex"
 ##
 ## Or download and run:
-##   Invoke-WebRequest -Uri https://raw.githubusercontent.com/zag-lang/zag/main/scripts/install.ps1 -OutFile install.ps1
+##   Invoke-WebRequest -Uri https://raw.githubusercontent.com/lakshgupta/zag/main/scripts/install.ps1 -OutFile install.ps1
 ##   .\install.ps1
 ##
 ## Environment variables:
@@ -27,7 +27,9 @@ $ErrorActionPreference = "Stop"
 
 $ZagHome = if ($env:ZAG_HOME) { $env:ZAG_HOME } else { Join-Path $HOME ".zag" }
 $ZagBinDir = Join-Path $ZagHome "bin"
-$Repo = "zag-lang/zag"
+# GitHub repo slug (`owner/repo`) whose Releases host the archives.
+# Overridable via $env:ZAG_REPO for forks / mirrors.
+$Repo = if ($env:ZAG_REPO) { $env:ZAG_REPO } else { "lakshgupta/zag" }
 $BaseUrl = "https://github.com/$Repo/releases"
 
 if (-not $Version) { $Version = "latest" }
@@ -67,12 +69,31 @@ $Arch = switch ($procArch) {
 }
 
 $Ext = "zip"
-$FileName = "zag-${OS}-${Arch}.${Ext}"
+
+# Archive filenames embed the BARE version (`zag-0.2.0-windows-x86_64.zip`),
+# so the exact release must be resolved before the filename is built.
+# `latest` → GitHub API (the version isn't knowable statically); an explicit
+# `-Version` tag is used verbatim. Mirrors scripts/install.sh's
+# resolve_release_version.
+$Tag = $Version
+if ($Tag -eq "latest") {
+    try {
+        $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
+        $Tag = $latest.tag_name
+    } catch {
+        # Helpers are defined below this block; use inline Write-Host.
+        Write-Host "  ✗ Could not resolve the latest Zag release from GitHub." -ForegroundColor Red
+        Write-Host "  Check your network, or pin a tag with -Version v0.X.Y." -ForegroundColor Yellow
+        exit 1
+    }
+}
+$BareVersion = $Tag.TrimStart('v')
+$FileName = "zag-${BareVersion}-${OS}-${Arch}.${Ext}"
 
 if ($Version -eq "latest") {
     $DownloadUrl = "${BaseUrl}/latest/download/${FileName}"
 } else {
-    $DownloadUrl = "${BaseUrl}/download/${Version}/${FileName}"
+    $DownloadUrl = "${BaseUrl}/download/${Tag}/${FileName}"
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

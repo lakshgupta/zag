@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const sys = @import("sys.zig");
 const lexer_mod = @import("lexer.zig");
 const parser_mod = @import("parser.zig");
 const codegen_mod = @import("codegen.zig");
@@ -124,9 +125,9 @@ pub fn main() !void {
         toolchain.materializeZigToCache(dest_buf[0..dl]) catch {};
         const fd = posix.openat(posix.AT.FDCWD, dest_buf[0..dl], .{ .ACCMODE = .RDONLY }, 0) catch null;
         if (fd) |f| {
-            defer _ = std.os.linux.close(f);
+            defer _ = std.os.linux.close(f); // deliberate discard: read-only ELF-magic probe on the materialised payload
             var magic: [4]u8 = undefined;
-            const n = std.os.linux.read(f, &magic, magic.len);
+            const n = sys.readFull(f, magic[0..]) catch 0;
             if (n == 4 and magic[0] == 0x7f and magic[1] == 'E' and magic[2] == 'L' and magic[3] == 'F') {
                 embedded_zig_path = dest_buf[0..dl];
             }
@@ -159,15 +160,26 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-V")) {
-        std.debug.print("zag 0.1.0-dev\n", .{});
+        // Version lives in build.zig.zon and is baked in at build time
+        // (build.zig's zonVersion -> build_options.zag_version). One bump
+        // site, one source of truth -- see docs/release.md Step 2.
+        std.debug.print("zag {s}\n", .{build_options.zag_version});
         return;
     }
     if (std.mem.eql(u8, cmd, "init")) {
-        if (args.len > 2) {
-            try project_mod.createProject(args[2]);
-        } else {
-            try project_mod.createProject("");
-        }
+        const init_dir: []const u8 = if (args.len > 2) args[2] else "";
+        // Fail closed with a diagnostic that names the directory and the
+        // errno. createProject's writes used to be `catch {}`, so a
+        // failed scaffold still printed "created project at ..." — the
+        // same failure-reported-as-success shape as the writeFile bug.
+        project_mod.createProject(init_dir) catch |e| {
+            std.debug.print("zag: init failed in {s}: {s} ({s})\n", .{
+                if (init_dir.len == 0) "." else init_dir,
+                @errorName(e),
+                sys.lastErrnoName(),
+            });
+            std.process.exit(1);
+        };
         return;
     }
     if (std.mem.eql(u8, cmd, "generate")) {
@@ -568,7 +580,7 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
     // generated zig's `@import("std/<n>.zig")` lines (emitted by
     // Codegen's hybrid preamble when `use_hybrid_stdlib = true`)
     // resolve at compile time.
-    materializeStdlib("build/gen");
+    materializeStdlib("build/gen") catch |e| reportMaterializeFailure(e);
 
     // Discover modules and transpile each
     const modules = project_mod.discoverModules();
@@ -853,7 +865,7 @@ fn generateProjectFiles() !void {
     // v0.1 stdlib migration hybrid: same as projectCmd — materialise
     // lib/std/*.zag to build/gen/std/*.zig so the `zag generate`
     // output directory is consistent with `zag build`.
-    materializeStdlib("build/gen");
+    materializeStdlib("build/gen") catch |e| reportMaterializeFailure(e);
 
     const modules = project_mod.discoverModules();
     const has_main = for (modules) |m| {
@@ -930,7 +942,7 @@ fn resolveZigPath(cfg: ?project_mod.ProjectConfig) void {
     const search_paths = [_][]const u8{ "/usr/bin/zig", "/usr/local/bin/zig", "/usr/local/zig/zig" };
     for (search_paths) |p| {
         if (posix.openat(posix.AT.FDCWD, p, .{ .ACCMODE = .RDONLY }, 0)) |fd| {
-            _ = std.os.linux.close(fd);
+            _ = std.os.linux.close(fd); // deliberate discard: read-only probe for /usr/bin/zig
             zig_path_len = @min(p.len, zig_path_buf.len); @memcpy(zig_path_buf[0..zig_path_len], p); updateZigPathAlias(); return;
         } else |_| {}
     }
@@ -938,7 +950,7 @@ fn resolveZigPath(cfg: ?project_mod.ProjectConfig) void {
         var home_buf: [512]u8 = undefined;
         const home_zig = std.fmt.bufPrint(&home_buf, "{s}/.local/zig/zig", .{home}) catch "";
         if (posix.openat(posix.AT.FDCWD, home_zig, .{ .ACCMODE = .RDONLY }, 0)) |fd| {
-            _ = std.os.linux.close(fd);
+            _ = std.os.linux.close(fd); // deliberate discard: read-only probe for $HOME/.local/zig/zig
             zig_path_len = @min(home_zig.len, zig_path_buf.len); @memcpy(zig_path_buf[0..zig_path_len], home_zig); updateZigPathAlias(); return;
         } else |_| {}
     }
@@ -1066,7 +1078,7 @@ const zag_test_runner_src: []const u8 =
     \\    __zag_bench_allocations += 1;
     \\}
     \\pub fn __zag_bench_dec(n: usize) void {
-    \\    __zag_bench_bytes_live -= n;
+    \\    if (n > __zag_bench_bytes_live) { __zag_bench_bytes_live = 0; } else { __zag_bench_bytes_live -= n; }
     \\}
     \\
     \\pub fn main() void {
@@ -1122,7 +1134,7 @@ fn leafProcess(flag: []const u8, src: []const u8, output_path: ?[]const u8, extr
     // SAME zig type — with the legacy inline aliases they'd be two
     // distinct types and every cross-module String call would
     // compile-error.
-    materializeStdlib(leaf_dir);
+    materializeStdlib(leaf_dir) catch |e| reportMaterializeFailure(e);
 
     const source = try readFile(src);
     const result = try transpile(src, source, true);
@@ -1247,7 +1259,7 @@ fn resolveExePath(name: []const u8) ?[]const u8 {
         // non-executable hit still fails at execve with EACCES → 127,
         // identical to today's behavior.)
         const fd = posix.openat(posix.AT.FDCWD, candidate, .{ .ACCMODE = .RDONLY }, 0) catch continue;
-        _ = std.os.linux.close(fd);
+        _ = std.os.linux.close(fd); // deliberate discard: read-only probe for a $PATH candidate
         return candidate;
     }
     return null;
@@ -1300,8 +1312,14 @@ fn runCommandWithArgs(executable: []const u8, extra_args: []const []const u8) !u
         std.os.linux.exit(127);
     }
 
-    var status: u32 = 0;
-    _ = std.os.linux.waitpid(pid_fork, &status, 0);
+    // sys.waitPid retries EINTR and decodes the errno. The previous
+    // shape discarded the result and read `status` straight after, so a
+    // failed wait left `status` at 0 -- and `W.IFEXITED(0)` is true, so
+    // the caller was told the child exited with code 0.
+    const status = sys.waitPid(pid_fork) catch {
+        std.debug.print("error: waitpid failed: {s}\n", .{sys.lastErrnoName()});
+        return error.WaitFailed;
+    };
     if (std.os.linux.W.IFEXITED(status)) {
         return std.os.linux.W.EXITSTATUS(status);
     }
@@ -1364,12 +1382,32 @@ fn runCommand(executable: ?[]const u8, argv: []const []const u8) !u8 {
         std.os.linux.exit(127);
     }
 
-    var status: u32 = 0;
-    _ = std.os.linux.waitpid(pid_fork, &status, 0);
+    // Same bogus-exit-code hole as runCommandWithArgs: an unreaped
+    // child must not read as "exited 0".
+    const status = sys.waitPid(pid_fork) catch {
+        std.debug.print("error: waitpid failed: {s}\n", .{sys.lastErrnoName()});
+        return error.WaitFailed;
+    };
     if (std.os.linux.W.IFEXITED(status)) {
         return std.os.linux.W.EXITSTATUS(status);
     }
     return 255;
+}
+
+/// Fail closed on a child-side fd-setup call (dup2/close, before
+/// execve). `label` names the step in the diagnostic.
+///
+/// These used to be discarded, and each discard breaks the capture in a
+/// different way: a failed `dup2` leaves fd 2 on the terminal, so the
+/// compiler's diagnostics bypass the pipe and the caller remaps an empty
+/// capture; a failed close of the pipe's *write* end leaves it open in
+/// the child, so the parent's drain-to-EOF never terminates. Exit 125 is
+/// distinct from 127 ("exec failed") and from any exit the compiler
+/// itself produces, so the parent's code is unambiguous.
+fn childSetupOrExit(rc: usize, label: []const u8) void {
+    if (!sys.isErr(rc)) return;
+    std.debug.print("error: child setup failed: {s}: {s}\n", .{ label, sys.lastErrnoName() });
+    std.os.linux.exit(125);
 }
 
 const CapturedRun = struct {
@@ -1378,8 +1416,9 @@ const CapturedRun = struct {
 };
 
 /// 1 MB static capture buffer for zig build-exe / zig build stderr.
-/// Separate from `file_buf` — the remap pass calls readFile (which
-/// owns file_buf) to show the .zag source line for a mapped error.
+/// Separate from the read buffer — the remap pass calls readFile (whose
+/// buffer lives in src/sys.zig) to show the .zag source line for a
+/// mapped error, and the two must not alias.
 var capture_buf: [1024 * 1024]u8 = undefined;
 
 /// runCommand variant that captures the child's fd-2 output through
@@ -1422,10 +1461,13 @@ fn runCommandCaptured(executable: ?[]const u8, argv: []const []const u8) Capture
 
     const pid_fork = std.math.cast(i32, std.os.linux.fork()) orelse return .{ .code = 255, .stderr_len = 0 };
     if (pid_fork == 0) {
-        // Child: stderr → pipe write end.
-        _ = std.os.linux.dup2(fds[1], 2);
-        _ = std.os.linux.close(fds[0]);
-        _ = std.os.linux.close(fds[1]);
+        // Child: stderr → pipe write end. Every step is checked — see
+        // childSetupOrExit for what each discard used to break. When the
+        // dup2 itself fails, fd 2 is still the terminal, so the
+        // diagnostic is visible where it matters.
+        childSetupOrExit(std.os.linux.dup2(fds[1], 2), "stderr redirect (dup2)");
+        childSetupOrExit(std.os.linux.close(fds[0]), "close of the capture read end");
+        childSetupOrExit(std.os.linux.close(fds[1]), "close of the capture write end");
         const exec_path: [*:0]const u8 = blk: {
             if (executable) |ex| {
                 const e_buf = std.heap.page_allocator.allocSentinel(u8, ex.len, 0) catch std.os.linux.exit(127);
@@ -1440,53 +1482,62 @@ fn runCommandCaptured(executable: ?[]const u8, argv: []const []const u8) Capture
         std.os.linux.exit(127);
     }
 
-    _ = std.os.linux.close(fds[1]);
+    // The parent never writes to this pipe, so close(2) has no buffered
+    // write-back to report. Holding the end open past this point would
+    // stop the drain below from ever seeing EOF.
+    _ = std.os.linux.close(fds[1]); // deliberate discard: never written
     var total: usize = 0;
     while (total < capture_buf.len) {
-        const n = std.os.linux.read(fds[0], capture_buf[total..].ptr, capture_buf.len - total);
-        if (n <= 0) break;
-        const n_usize: usize = @intCast(n);
-        if (n_usize > capture_buf.len - total) break;
-        total += n_usize;
+        // sys.readSome retries EINTR and decodes the errno. The previous
+        // raw loop tested `n <= 0` on a `usize` — so a failed read
+        // (errno-encoded, nonzero) fell through to the `> remaining`
+        // guard and broke out looking exactly like EOF, silently
+        // discarding the stderr that carries the zig error.
+        const n = sys.readSome(fds[0], capture_buf[total..]) catch |e| {
+            std.debug.print("warning: could not read compiler stderr: {s} ({s})\n", .{ @errorName(e), sys.lastErrnoName() });
+            break;
+        };
+        if (n == 0) break;
+        total += n;
     }
-    _ = std.os.linux.close(fds[0]);
+    _ = std.os.linux.close(fds[0]); // deliberate discard: read end, already drained
 
-    var status: u32 = 0;
-    _ = std.os.linux.waitpid(pid_fork, &status, 0);
+    // Same bogus-exit-code hole as runCommandWithArgs: a discarded wait
+    // left `status` at 0, which reads as "exited 0". The captured stderr
+    // is re-emitted only after this returns, so reporting a compile
+    // success here would hide the very error the capture exists for.
+    const status = sys.waitPid(pid_fork) catch {
+        std.debug.print("error: waitpid failed after capture: {s}\n", .{sys.lastErrnoName()});
+        return .{ .code = 255, .stderr_len = total };
+    };
     if (std.os.linux.W.IFEXITED(status)) {
         return .{ .code = std.os.linux.W.EXITSTATUS(status), .stderr_len = total };
     }
     return .{ .code = 255, .stderr_len = total };
 }
 
-var file_buf: [1024 * 1024]u8 = undefined;
-
+/// Thin delegations into src/sys.zig so the ~20 existing call sites keep
+/// their names. The implementations (and the only errno decoding in the
+/// compiler) live there.
+///
+/// History worth keeping: these two used to contain their own raw
+/// `std.os.linux.read`/`write` loops. `writeFile` compared the raw
+/// `usize` return against 0 to detect failure, but a failed write comes
+/// back as an errno-encoded usize — nonzero — so `written += n` ran the
+/// counter past `content.len`, the loop exited, and the function RETURNED
+/// SUCCESS. `readFile` had the same shape and could hand back a slice
+/// past the end of its buffer. sys.writeFull/readFull decode the errno
+/// and retry EINTR, so neither can happen here now.
 fn readFile(path: []const u8) ![]const u8 {
-    const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
-    defer _ = std.os.linux.close(fd);
-    var total: usize = 0;
-    while (total < file_buf.len) {
-        const n = std.os.linux.read(fd, file_buf[total..].ptr, file_buf.len - total);
-        if (n == 0) break;
-        total += n;
-    }
-    return file_buf[0..total];
+    return sys.readFile(path);
 }
 
+/// `report_only`: the bytes must reach the kernel, but these are
+/// regenerable build artifacts (generated zig, .zag.map, gdbinit), so no
+/// fsync. A durability failure is not a write failure — see
+/// docs/architecture.md §Resolved Decisions.
 fn writeFile(path: []const u8, content: []const u8) !void {
-    const fd = try posix.openat(
-        posix.AT.FDCWD,
-        path,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
-    );
-    defer _ = std.os.linux.close(fd);
-    var written: usize = 0;
-    while (written < content.len) {
-        const n = std.os.linux.write(fd, content[written..].ptr, content.len - written);
-        if (n == 0) return error.WriteFailed;
-        written += n;
-    }
+    return sys.writeFile(path, content, .report_only);
 }
 
 /// Materialize lib/std/*.zag → <out_dir>/std/*.zig so the generated
@@ -1519,30 +1570,71 @@ fn writeFile(path: []const u8, content: []const u8) !void {
 /// (`@import("string.zig")` from fs.zig), which resolve against the
 /// mirror's own layout.
 ///
-/// Silently no-ops if lib/std cannot be located or a module fails to
-/// parse/transpile (skips-on-missing-fixture convention used
-/// elsewhere in the test runners — callers keep going without
-/// stderr complaints).
-fn materializeStdlib(out_dir: []const u8) void {
+/// Fails closed. This used to return `void` and `continue` past every
+/// read/transpile/write failure, so a half-written mirror surfaced much
+/// later as a confusing zig `@import("std/...")` error with nothing
+/// pointing at the real cause. Every failure now records the offending
+/// path (see `materializeFail`) and propagates; the callers report
+/// `cannot materialize stdlib: <path>: <errno name>` and exit 1.
+///
+/// One thing this cannot catch: a *parse* failure inside a lib/std
+/// module. `Parser.parse` returns an `ast.Program` unconditionally — the
+/// failure path is `Parser.expect`, which prints `error:line:col:` and
+/// calls `std.process.exit(1)` directly — so there is no error to
+/// propagate. It is already loud and fatal, which is what "silently
+/// skipping" was not.
+
+/// Path the last materialize failure was about — lets the caller's
+/// diagnostic name the file. Mirrors sys.zig's `last_errno` slot: the
+/// compiler's IO is single-threaded, so one slot is enough.
+var materialize_path_buf: [1024]u8 = undefined;
+var materialize_path_len: usize = 0;
+
+/// Record `path` as the subject of a materialize failure and hand `e`
+/// back, so `catch |e| return materializeFail(p, e)` reads the same as
+/// sys.zig's own failure helpers.
+fn materializeFail(path: []const u8, e: sys.Error) sys.Error {
+    materialize_path_len = @min(path.len, materialize_path_buf.len);
+    @memcpy(materialize_path_buf[0..materialize_path_len], path[0..materialize_path_len]);
+    return e;
+}
+
+/// The deepest recorded materialize failure path ("" when none).
+fn materializePath() []const u8 {
+    return materialize_path_buf[0..materialize_path_len];
+}
+
+/// Report a `materializeStdlib` failure and stop. Steers the user at
+/// the file (and the errno) that actually broke, instead of letting a
+/// broken mirror surface later as a zig `@import` error.
+fn reportMaterializeFailure(e: anyerror) noreturn {
+    if (e == error.StdlibNotFound) {
+        std.debug.print(
+            "error: cannot locate lib/std (tried ./lib/std, <exe>/../../lib/std, <exe>/../lib/std, $ZAG_HOME/lib/std, $HOME/.local/share/zag/lib/std) — cannot materialize the stdlib mirror\n",
+            .{},
+        );
+    } else {
+        std.debug.print("error: cannot materialize stdlib: {s}: {s} ({s})\n", .{
+            materializePath(),
+            @errorName(e),
+            sys.lastErrnoName(),
+        });
+    }
+    std.process.exit(1);
+}
+
+fn materializeStdlib(out_dir: []const u8) !void {
     var root_buf: [512]u8 = undefined;
-    const root_path = resolveStdlibRoot(&root_buf) orelse return;
+    const root_path = resolveStdlibRoot(&root_buf) orelse return error.StdlibNotFound;
 
     var out_std_buf: [520]u8 = undefined;
-    const out_std = std.fmt.bufPrint(&out_std_buf, "{s}/std", .{out_dir}) catch return;
-    var out_std_z: [520:0]u8 = undefined;
-    if (out_std.len >= out_std_z.len) return;
-    @memcpy(out_std_z[0..out_std.len], out_std);
-    out_std_z[out_std.len] = 0;
-    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, &out_std_z, 0o755);
+    const out_std = std.fmt.bufPrint(&out_std_buf, "{s}/std", .{out_dir}) catch return sys.pathTooLong();
+    sys.mkdirPath(out_std) catch |e| return materializeFail(out_std, e);
 
-    var root_fd_z: [512:0]u8 = undefined;
-    if (root_path.len >= root_fd_z.len) return;
-    @memcpy(root_fd_z[0..root_path.len], root_path);
-    root_fd_z[root_path.len] = 0;
-    const root_fd = posix.openatZ(posix.AT.FDCWD, &root_fd_z, .{ .ACCMODE = .RDONLY }, 0) catch return;
-    defer _ = std.os.linux.close(root_fd);
+    const root_fd = sys.openReadOnly(root_path) catch |e| return materializeFail(root_path, e);
+    defer _ = std.os.linux.close(root_fd); // deliberate discard: read-only stdlib root directory fd for the mirror walk
 
-    materializeWalk(root_fd, root_path, "", out_dir);
+    try materializeWalk(root_fd, root_path, "", out_dir);
 }
 
 /// Recursive stdlib walker — one getdents64 batch per syscall, then
@@ -1551,8 +1643,11 @@ fn materializeStdlib(out_dir: []const u8) void {
 /// `mod.zag` barrel at the top level) transpiles it into
 /// `<out_dir>/std/<rel>.zig` with a self-contained inline preamble
 /// (use_hybrid = false) and same-dir sibling imports
-/// (import_std_base = "").
-fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8, out_dir: []const u8) void {
+/// (import_std_base = ""). Any failure names the file it was about via
+/// `materializeFail` and unwinds; the deepest recorded path survives,
+/// so the caller's diagnostic points at the actual culprit rather
+/// than at the directory the walk started in.
+fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8, out_dir: []const u8) sys.Error!void {
     // `align(8)` on the batch buffer: the getdents64 dirent stream is
     // 8-byte-aligned, so every `d_reclen` offset stays aligned only if
     // the BASE is. Without it, the @alignCast(&buf[pos]) below trips
@@ -1560,9 +1655,8 @@ fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8,
     // out a misaligned buffer.
     var buf: [4096]u8 align(8) = undefined;
     while (true) {
-        const n = std.os.linux.getdents64(root_fd, &buf, buf.len);
+        const n = sys.dirEntries(root_fd, buf[0..]) catch |e| return materializeFail(root_path, e);
         if (n == 0) break;
-        if (n > std.math.maxInt(isize)) break;
 
         var pos: usize = 0;
         while (pos < n) {
@@ -1578,24 +1672,30 @@ fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8,
             if (entry.type == std.os.linux.DT.DIR) {
                 var child_rel_buf: [512]u8 = undefined;
                 const child_rel: []const u8 = if (rel_to_root.len == 0)
-                    std.fmt.bufPrint(&child_rel_buf, "{s}", .{name}) catch continue
+                    std.fmt.bufPrint(&child_rel_buf, "{s}", .{name}) catch return materializeFail(name, sys.pathTooLong())
                 else
-                    std.fmt.bufPrint(&child_rel_buf, "{s}/{s}", .{ rel_to_root, name }) catch continue;
+                    std.fmt.bufPrint(&child_rel_buf, "{s}/{s}", .{ rel_to_root, name }) catch return materializeFail(name, sys.pathTooLong());
 
                 var child_path_buf: [1024]u8 = undefined;
-                const child_path = std.fmt.bufPrint(&child_path_buf, "{s}/{s}", .{ root_path, child_rel }) catch continue;
-                const child_fd = posix.openat(posix.AT.FDCWD, child_path, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+                const child_path = std.fmt.bufPrint(&child_path_buf, "{s}/{s}", .{ root_path, child_rel }) catch return materializeFail(child_rel, sys.pathTooLong());
+                const child_fd = sys.openReadOnly(child_path) catch |e| return materializeFail(child_path, e);
                 // Mirror the subdirectory into <out_dir>/std/<child_rel>.
                 var mir_rel_buf: [1024]u8 = undefined;
-                const mir_rel = std.fmt.bufPrint(&mir_rel_buf, "{s}/std/{s}", .{ out_dir, child_rel }) catch continue;
-                var mir_z: [1024:0]u8 = undefined;
-                if (mir_rel.len < mir_z.len) {
-                    @memcpy(mir_z[0..mir_rel.len], mir_rel);
-                    mir_z[mir_rel.len] = 0;
-                    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, &mir_z, 0o755);
-                }
-                materializeWalk(child_fd, root_path, child_rel, out_dir);
-                _ = std.os.linux.close(child_fd);
+                const mir_rel = std.fmt.bufPrint(&mir_rel_buf, "{s}/std/{s}", .{ out_dir, child_rel }) catch {
+                    _ = std.os.linux.close(child_fd); // deliberate discard: read-only subdirectory fd (path too long)
+                    return materializeFail(child_rel, sys.pathTooLong());
+                };
+                sys.mkdirPath(mir_rel) catch |e| {
+                    _ = std.os.linux.close(child_fd); // deliberate discard: read-only subdirectory fd (mkdir failed)
+                    return materializeFail(mir_rel, e);
+                };
+                // On failure the recursion has already recorded the
+                // deeper path — unwind without overwriting it.
+                materializeWalk(child_fd, root_path, child_rel, out_dir) catch |e| {
+                    _ = std.os.linux.close(child_fd); // deliberate discard: read-only subdirectory fd (recursion failed)
+                    return e;
+                };
+                _ = std.os.linux.close(child_fd); // deliberate discard: read-only subdirectory fd, walk complete
             } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
                 // The barrel (mod.zag) is user-facing only — it would
                 // drag every std module into a single self-importing
@@ -1604,10 +1704,10 @@ fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8,
 
                 var src_path_buf: [1024]u8 = undefined;
                 const src_path = if (rel_to_root.len == 0)
-                    std.fmt.bufPrint(&src_path_buf, "{s}/{s}", .{ root_path, name }) catch continue
+                    std.fmt.bufPrint(&src_path_buf, "{s}/{s}", .{ root_path, name }) catch return materializeFail(name, sys.pathTooLong())
                 else
-                    std.fmt.bufPrint(&src_path_buf, "{s}/{s}/{s}", .{ root_path, rel_to_root, name }) catch continue;
-                const source = readFile(src_path) catch continue;
+                    std.fmt.bufPrint(&src_path_buf, "{s}/{s}/{s}", .{ root_path, rel_to_root, name }) catch return materializeFail(name, sys.pathTooLong());
+                const source = readFile(src_path) catch |e| return materializeFail(src_path, e);
 
                 var l = lexer_mod.Lexer.init(source);
                 const tokens = l.tokenize();
@@ -1629,14 +1729,14 @@ fn materializeWalk(root_fd: i32, root_path: []const u8, rel_to_root: []const u8,
                     if (rel_to_root.len == 0) "" else rel_to_root,
                     if (rel_to_root.len == 0) "" else "/",
                     name[0 .. name.len - ".zag".len],
-                }) catch continue;
-                writeFile(dst_path, zig) catch continue;
+                }) catch return materializeFail(src_path, sys.pathTooLong());
+                writeFile(dst_path, zig) catch |e| return materializeFail(dst_path, e);
                 // Side-file map (same contract as build/gen maps):
                 // the file-mode remap pass translates zig build-exe
                 // errors inside stdlib mirrors back to lib/std/*.zag.
                 cg.buildMapText();
                 const map_text = cg.getMapText();
-                if (map_text.len > 0) writeMapFile(dst_path, map_text) catch continue;
+                if (map_text.len > 0) writeMapFile(dst_path, map_text) catch |e| return materializeFail(dst_path, e);
             }
         }
     }
@@ -1714,7 +1814,7 @@ fn dirExists(path: []const u8) bool {
     @memcpy(z[0..path.len], path);
     z[path.len] = 0;
     const fd = posix.openatZ(posix.AT.FDCWD, &z, .{ .ACCMODE = .RDONLY }, 0) catch return false;
-    _ = std.os.linux.close(fd);
+    _ = std.os.linux.close(fd); // deliberate discard: read-only existence probe
     return true;
 }
 
@@ -1764,7 +1864,7 @@ const RemapMappings = struct {
 fn collectRemapMappings(map_dir: []const u8) RemapMappings {
     var result: RemapMappings = .{ .zig = undefined, .zag = undefined, .count = 0 };
     const map_dir_fd = posix.openat(posix.AT.FDCWD, map_dir, .{ .ACCMODE = .RDONLY }, 0) catch return result;
-    defer _ = std.os.linux.close(map_dir_fd);
+    defer _ = std.os.linux.close(map_dir_fd); // deliberate discard: read-only directory fd for the .zag.map walk
 
     // `align(8)` on the batch buffer: the getdents64 dirent stream is
     // 8-byte-aligned, so every `d_reclen` offset stays aligned only if
@@ -1823,22 +1923,34 @@ fn remapDwarfElf(binary_path: []const u8) void {
     const mappings = collectRemapMappings("build/gen");
     if (mappings.count == 0) return;
 
-    // Read binary
-    const bin_fd = posix.openat(posix.AT.FDCWD, binary_path, .{ .ACCMODE = .RDWR }, 0) catch return;
-    defer _ = std.os.linux.close(bin_fd);
+    // Read binary. Opened READ-ONLY: the patch is written back through
+    // sys.writeFile below, which owns a fresh handle and checks its
+    // write, fsync, and close. The old shape opened O_RDWR, patched the
+    // buffer, then ran lseek + write + ftruncate on this fd with every
+    // result discarded — a truncated patch was indistinguishable from a
+    // successful one.
+    const bin_fd = posix.openat(posix.AT.FDCWD, binary_path, .{ .ACCMODE = .RDONLY }, 0) catch return;
+    defer _ = std.os.linux.close(bin_fd); // deliberate discard: read-only fd
 
-    // Get file size via lseek
+    // Get file size via lseek. `std.os.linux.lseek` returns the raw
+    // `usize` syscall result, so the old `end_pos < 0` test was dead
+    // code and the `@intCast` after it would have trapped on an errno.
     const end_pos = std.os.linux.lseek(bin_fd, 0, std.os.linux.SEEK.END);
-    if (end_pos < 0) return;
-    const file_size: usize = @intCast(end_pos);
-    _ = std.os.linux.lseek(bin_fd, 0, std.os.linux.SEEK.SET);
+    if (sys.isErr(end_pos)) return;
+    const file_size: usize = end_pos;
     if (file_size > 64 * 1024 * 1024) return;
+    // Reads start at the beginning again; an unchecked seek failure here
+    // would leave the cursor at EOF and report a zero-length read.
+    if (sys.isErr(std.os.linux.lseek(bin_fd, 0, std.os.linux.SEEK.SET))) return;
 
     const data = std.heap.page_allocator.alloc(u8, file_size) catch return;
     defer std.heap.page_allocator.free(data);
-    const bytes_read = std.os.linux.read(bin_fd, data.ptr, file_size);
-    if (bytes_read < 0) return;
-    if (@as(usize, @intCast(bytes_read)) != file_size) return;
+    // sys.readFull retries EINTR and loops over short transfers. The old
+    // shape tested `bytes_read < 0` on a `usize` — dead code — and was
+    // only saved from misreading an errno-encoded return by the
+    // following `!= file_size` comparison.
+    const bytes_read = sys.readFull(bin_fd, data) catch return;
+    if (bytes_read != file_size) return;
 
     if (data.len < 4 or !std.mem.eql(u8, data[0..4], "\x7fELF")) return;
 
@@ -1858,9 +1970,19 @@ fn remapDwarfElf(binary_path: []const u8) void {
     }
 
     if (patched > 0) {
-        _ = std.os.linux.lseek(bin_fd, 0, std.os.linux.SEEK.SET);
-        _ = std.os.linux.write(bin_fd, data.ptr, data.len);
-        _ = std.os.linux.ftruncate(bin_fd, @intCast(data.len));
+        // sys.writeFile owns the whole durable rewrite: writeFull loops
+        // over short transfers and retries EINTR, and close(2) is checked
+        // so a deferred write-back error cannot be reported as success.
+        // `.report_only` matches the documented policy for build
+        // artifacts (no fsync — a mid-build crash is repaired by the next
+        // build), which still leaves the checked close. The file already
+        // exists, so O_CREAT applies no mode and the +x bit survives.
+        sys.writeFile(binary_path, data, .report_only) catch |e| {
+            std.debug.print(
+                "warning: could not write the DWARF source-remap patch back to {s}: {s} ({s})\n",
+                .{ binary_path, @errorName(e), sys.lastErrnoName() },
+            );
+        };
     }
 }
 
@@ -1870,12 +1992,15 @@ fn readFirstMapEntry(map_dir: []const u8, entry_name: []const u8) ![]const u8 {
     var path_buf: [512]u8 = undefined;
     const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ map_dir, entry_name }) catch return error.InvalidPath;
     const fd = posix.openat(posix.AT.FDCWD, full_path, .{ .ACCMODE = .RDONLY }, 0) catch return error.OpenFailed;
-    defer _ = std.os.linux.close(fd);
+    defer _ = std.os.linux.close(fd); // deliberate discard: read-only .zag.map fd
 
     var buf: [4096]u8 = undefined;
-    const n = std.os.linux.read(fd, &buf, buf.len);
-    if (n <= 0) return "";
-    const content = buf[0..@intCast(n)];
+    // A failed read is an error, not an empty map entry. The old
+    // `if (n <= 0) return ""` let an errno-encoded `usize` through, and
+    // `buf[0..@intCast(n)]` then sliced ~2^64 bytes past the buffer.
+    const n = sys.readSome(fd, &buf) catch return error.ReadFailed;
+    if (n == 0) return "";
+    const content = buf[0..n];
     // Find first newline
     const line_end = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
     const line = content[0..line_end];
@@ -1920,7 +2045,7 @@ var remap_table_count: usize = 0;
 fn loadRemapTables(map_dir: []const u8) void {
     if (remap_table_count >= remap_tables.len) return;
     const map_dir_fd = posix.openat(posix.AT.FDCWD, map_dir, .{ .ACCMODE = .RDONLY }, 0) catch return;
-    defer _ = std.os.linux.close(map_dir_fd);
+    defer _ = std.os.linux.close(map_dir_fd); // deliberate discard: read-only directory fd for the remap-table walk
 
     var buf: [4096]u8 align(8) = undefined;
     while (true) {
@@ -2137,7 +2262,11 @@ if (zl > 0 and zc > 0) {
         out_pos += n.len;
     }
 
-    _ = std.os.linux.write(2, &remap_out_buf, out_pos);
+    // writeFull loops over partial writes, so a diagnostic written to a
+    // pipe cannot be cut short mid-caret-line. A failure is not
+    // actionable — fd 2 is the stream that just failed, and there is
+    // nowhere left to report it — so it is deliberately swallowed here.
+    sys.writeFull(2, remap_out_buf[0..out_pos]) catch {};
 }
 
 var cmdline_buf: [4096]u8 = undefined;
@@ -2145,8 +2274,14 @@ var cmdline_args: [64][]const u8 = undefined;
 
 fn parseArgs() ![][]const u8 {
     const fd = try posix.openat(posix.AT.FDCWD, "/proc/self/cmdline", .{ .ACCMODE = .RDONLY }, 0);
-    defer _ = std.os.linux.close(fd);
-    const n = std.os.linux.read(fd, &cmdline_buf, cmdline_buf.len);
+    defer _ = std.os.linux.close(fd); // deliberate discard: read-only /proc/self/cmdline fd
+    // A failed read must not become a huge `n`: the scan below walks
+    // `cmdline_buf[0..n]`, so an errno-encoded return ran it off the end
+    // of the buffer (silently "succeeding" with a bogus argv).
+    const n = sys.readFull(fd, &cmdline_buf) catch |e| {
+        std.debug.print("error: cannot read /proc/self/cmdline: {s} ({s})\n", .{ @errorName(e), sys.lastErrnoName() });
+        std.process.exit(1);
+    };
 
     var count: usize = 0;
     var i: usize = 0;
@@ -2220,7 +2355,7 @@ fn readSourceForExpansion(path: []const u8) ?[]const u8 {
     var full_buf: [1024]u8 = undefined;
     const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ root_path, rel }) catch return null;
     const fd = posix.openat(posix.AT.FDCWD, full, .{ .ACCMODE = .RDONLY }, 0) catch return null;
-    defer _ = std.os.linux.close(fd);
+    defer _ = std.os.linux.close(fd); // deliberate discard: read-only stdlib source fd
 
     // Claim a slot (round-robin; 16 covers any real program's
     // distinct stdlib imports).
@@ -2231,15 +2366,13 @@ fn readSourceForExpansion(path: []const u8) ?[]const u8 {
     @memcpy(slot.path[0..path.len], path);
     slot.path_len = path.len;
 
-    var total: usize = 0;
-    while (total < slot.buf.len) {
-        const n = std.os.linux.read(fd, slot.buf[total..].ptr, slot.buf.len - total);
-        if (n == 0) break;
-        // High bit set on raw-syscall failure (errno encoding) — a
-        // read error mid-file degrades to "no expansion".
-        if (n & 0x8000000000000000 != 0) return null;
-        total += n;
-    }
+    // A read error degrades to "no expansion" (this is the optional
+    // whole-module import expansion, not a required artifact), but the
+    // decode now lives in sys.zig. This call site already checked the
+    // errno sign bit by hand; routing it through readFull adds the
+    // EINTR retry it was missing and deletes the last hand-written
+    // decode in `src/`.
+    const total = sys.readFull(fd, slot.buf[0..]) catch return null;
     if (total == slot.buf.len) return null; // truncated: oversized file
     slot.len = total;
     return slot.buf[0..total];
@@ -2636,7 +2769,7 @@ fn installOneDep(dep: project_mod.DepEntry) InstallOutcome {
     // If deps/<name> exists AND points at the pinned SHA, skip.
     const dir_exists = posix.openat(posix.AT.FDCWD, target, .{ .ACCMODE = .RDONLY }, 0) catch null;
     if (dir_exists) |fd| {
-        _ = std.os.linux.close(fd);
+        _ = std.os.linux.close(fd); // deliberate discard: read-only existence probe for deps/<name>
         var sha_cmt_buf: [128]u8 = undefined;
         const sha_cmt = std.fmt.bufPrint(&sha_cmt_buf, "{s}^{{commit}}", .{sha}) catch sha;
         const rev_argv = [_][]const u8{
@@ -2820,15 +2953,17 @@ fn captureCommand(executable: ?[]const u8, argv: []const []const u8) ![]u8 {
     var pipefd: [2]i32 = .{ -1, -1 };
     if (std.os.linux.pipe2(&pipefd, .{}) != 0) return error.PipeFailed;
     errdefer {
-        _ = std.os.linux.close(pipefd[0]);
-        _ = std.os.linux.close(pipefd[1]);
+        // Deliberate discards: neither fd was written by this process,
+        // and the error being returned is the primary failure.
+        _ = std.os.linux.close(pipefd[0]); // deliberate discard: never written
+        _ = std.os.linux.close(pipefd[1]); // deliberate discard: never written
     }
 
     const pid_fork = std.math.cast(i32, std.os.linux.fork()) orelse return error.ForkFailed;
     if (pid_fork == 0) {
-        _ = std.os.linux.close(pipefd[0]);
-        _ = std.os.linux.dup2(pipefd[1], 1); // stdout -> write end
-        _ = std.os.linux.close(pipefd[1]);
+        childSetupOrExit(std.os.linux.close(pipefd[0]), "close of the capture read end");
+        childSetupOrExit(std.os.linux.dup2(pipefd[1], 1), "stdout redirect (dup2)"); // stdout -> write end
+        childSetupOrExit(std.os.linux.close(pipefd[1]), "close of the capture write end");
         const exec_path: [*:0]const u8 = blk: {
             if (executable) |ex| {
                 const e_buf = std.heap.page_allocator.allocSentinel(u8, ex.len, 0) catch std.os.linux.exit(127);
@@ -2843,7 +2978,7 @@ fn captureCommand(executable: ?[]const u8, argv: []const []const u8) ![]u8 {
         std.os.linux.exit(127);
     }
 
-    _ = std.os.linux.close(pipefd[1]);
+    _ = std.os.linux.close(pipefd[1]); // deliberate discard: parent closes the capture write end without writing to it
     // Static (NOT stack): the returned slice must outlive this call —
     // a stack-local buffer dangles on return and the caller parses
     // garbage (surfaced by `zag pkg add` embedding a corrupt SHA into
@@ -2852,15 +2987,35 @@ fn captureCommand(executable: ?[]const u8, argv: []const []const u8) ![]u8 {
     // captureCommand call (same discipline as exe_resolve_buf).
     var total: usize = 0;
     while (total < captureCommandStatic.len) {
-        const n = std.os.linux.read(pipefd[0], captureCommandStatic[total..].ptr, captureCommandStatic.len - total);
+        // sys.readSome retries EINTR and decodes the errno. The previous
+        // raw loop's `if (n < 0) break` was dead code (n is a `usize`),
+        // so an errno-encoded return fell through to `total +=` and
+        // pushed the cursor ~2^64 past the static buffer — the caller
+        // then sliced `captureCommandStatic[0..total]` out of bounds and
+        // parsed garbage (the corrupt-SHA failure `zag pkg add` used to
+        // hit). A real read failure is now an error, not a truncated
+        // result; the child is reaped first so it can't linger as a
+        // zombie.
+        const n = sys.readSome(pipefd[0], captureCommandStatic[total..]) catch |e| {
+            _ = std.os.linux.close(pipefd[0]); // deliberate discard: read end, already drained/failed
+            // Reap before returning so a failed capture cannot leave a
+            // zombie. The read error below is the report; a wait error
+            // adds nothing to it, hence the named ignore.
+            sys.waitPidOrIgnore(pid_fork);
+            return e;
+        };
         if (n == 0) break;
-        if (n < 0) break;
-        total += @intCast(n);
+        total += n;
     }
-    _ = std.os.linux.close(pipefd[0]);
+    _ = std.os.linux.close(pipefd[0]); // deliberate discard: read end, fully drained
 
-    var status: u32 = 0;
-    _ = std.os.linux.waitpid(pid_fork, &status, 0);
+    // An unreaped child must not read as a success: `status` at 0 passes
+    // both checks below, so a discarded wait used to report the captured
+    // command as having exited 0 with possibly-empty output.
+    const status = sys.waitPid(pid_fork) catch |e| {
+        std.debug.print("warning: waitpid after capture failed: {s} ({s})\n", .{ @errorName(e), sys.lastErrnoName() });
+        return error.WaitFailed;
+    };
     if (!std.os.linux.W.IFEXITED(status)) return error.CmdFailed;
     if (std.os.linux.W.EXITSTATUS(status) != 0) return error.CmdFailed;
     return captureCommandStatic[0..total];
@@ -2918,13 +3073,13 @@ test "remap walker: collects all .zag.map entries when 3 files present" {
     const pid = std.os.linux.getpid();
     const synth_root = std.fmt.bufPrint(&synth_root_buf, "/tmp/zag_remap_walker_test_{d}", .{pid}) catch unreachable;
 
-    mkPath(synth_root);
-    mkPath(synth_root ++ "/build");
-    mkPath(synth_root ++ "/build/gen");
+    try mkPath(synth_root);
+    try mkPath(synth_root ++ "/build");
+    try mkPath(synth_root ++ "/build/gen");
 
-    writeSyntheticZagMap(synth_root ++ "/build/gen/main.zag.map", "src/main.zag");
-    writeSyntheticZagMap(synth_root ++ "/build/gen/math.zag.map", "src/math.zag");
-    writeSyntheticZagMap(synth_root ++ "/build/gen/db.zag.map", "src/db.zag");
+    try writeSyntheticZagMap(synth_root ++ "/build/gen/main.zag.map", "src/main.zag");
+    try writeSyntheticZagMap(synth_root ++ "/build/gen/math.zag.map", "src/math.zag");
+    try writeSyntheticZagMap(synth_root ++ "/build/gen/db.zag.map", "src/db.zag");
 
     const mappings = collectRemapMappings(synth_root ++ "/build/gen");
 
@@ -2941,33 +3096,25 @@ test "remap walker: collects all .zag.map entries when 3 files present" {
     try std.testing.expect(remapMappingsContainsZig(mappings, synth_root ++ "/build/gen/db.zig"));
 }
 
-/// `mkdir -p`-ish for `path`. Ignores EEXIST (already present).
-/// Mirrors the same shape used by `src/project.zig::createProject`:
-/// copies path into a stack buffer with a trailing NUL, then
-/// `std.os.linux.mkdirat(AT_FDCWD, ptr, 0o755)` (which takes a
-/// `[*:0]const u8` -- not a slice).
-fn mkPath(path: []const u8) void {
-    var buf: [512]u8 = undefined;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&buf), 0o755);
+/// `mkdir -p`-ish for `path`. EEXIST is success; every other errno is a
+/// real error. Delegates to sys.mkdirPath, which also bounds-checks the
+/// sentinel copy — the previous inline version did an unchecked @memcpy
+/// into a [512]u8 and threw the mkdirat result away, so it could neither
+/// overflow-safely handle a long path nor tell "already exists" from
+/// "permission denied".
+fn mkPath(path: []const u8) !void {
+    return sys.mkdirPath(path);
 }
 
 /// Write a tiny `.zag.map` file at `path` containing one
 /// tab-separated line whose 5th field is `zag_source` -- the
-/// shape `readFirstMapEntry` expects. POSIX openat with
-/// CREAT+TRUNC + raw write loop, no std.fs.
-fn writeSyntheticZagMap(path: []const u8, zag_source: []const u8) void {
+/// shape `readFirstMapEntry` expects. Only used by the remap-walker
+/// test below; `!void` so a failed setup fails the test instead of
+/// leaving it to report a confusing count mismatch.
+fn writeSyntheticZagMap(path: []const u8, zag_source: []const u8) !void {
     var line: [256]u8 = undefined;
-    const line_z = std.fmt.bufPrint(&line, "1\t1\t1\tsym\t{s}\n", .{zag_source}) catch return;
-    const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return;
-    defer _ = std.os.linux.close(fd);
-    var written: usize = 0;
-    while (written < line_z.len) {
-        const n = std.os.linux.write(fd, line_z[written..].ptr, line_z.len - written);
-        if (n == 0) return;
-        written += n;
-    }
+    const line_z = try std.fmt.bufPrint(&line, "1\t1\t1\tsym\t{s}\n", .{zag_source});
+    return sys.writeFile(path, line_z, .report_only);
 }
 
 /// Linear scan of `mappings.zag[0..count]` for an exact-match on
