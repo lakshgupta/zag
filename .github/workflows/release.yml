@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
       # Also runs the discarded-result audit (`zig build audit`, wired into
@@ -129,7 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Cross-compile ${{ matrix.target }}
