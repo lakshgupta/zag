@@ -7,6 +7,16 @@ const TokenTag = lexer.TokenTag;
 const Stmt = ast.Stmt;
 const Expr = ast.Expr;
 
+/// Test-case naming convention for `test_file` mode: a top-level fun
+/// whose name starts with `test_` is a test case. `main` can never
+/// match (no prefix), so entry points stay plain functions even in
+/// test files. File-scope free fn (not a Parser method) so both the
+/// free-function `parse()` driver and any future method callers use
+/// one spelling.
+fn isTestCaseName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "test_");
+}
+
 
 pub fn init(tokens: []const Token, arena: *ast.Arena) Parser {
         return .{
@@ -155,7 +165,7 @@ pub fn parse(self: *Parser) ast.Program {
                         },
                         .fun => {
                             var fd = self.parseFunDecl();
-                            fd.is_test = is_test;
+                            fd.is_test = is_test or (self.test_file and isTestCaseName(fd.name));
                             fd.doc = doc;
                             functions_buf[fun_count] = fd;
                             fun_count += 1;
@@ -298,7 +308,7 @@ pub fn parse(self: *Parser) ast.Program {
                 continue;
             }
             var fd = self.parseFunDecl();
-            fd.is_test = is_test;
+            fd.is_test = is_test or (self.test_file and isTestCaseName(fd.name));
             fd.doc = doc;
             functions_buf[fun_count] = fd;
             fun_count += 1;
@@ -593,6 +603,16 @@ pub const Parser = struct {
     /// expand. Injectable rather than hardwired so parser tests can
     /// run hermetically without a stdlib tree on disk.
     read_source_file: ?*const fn (path: []const u8) ?[]const u8 = null,
+    /// Test-file convention (project `tests/` + file-mode `tests/` paths):
+    /// a top-level `fun test_*` is a test case WITHOUT needing the
+    /// `@[test]` annotation — location implies suite membership, so
+    /// per-fn annotation is redundant. Explicit `@[test]` keeps
+    /// working everywhere (OR-ed in at the assignment sites), and
+    /// non-`test_` funs (helpers, `main`) stay plain functions.
+    /// False by default: `src/` files and the stdlib never opt in,
+    /// so existing code is byte-identical. Set by transpileEx from
+    /// the source path (see isTestFilePath in src/main.zig).
+    test_file: bool = false,
     /// Parse-context flag for struct-literal disambiguation in
     /// `parsePrimary`. True (default) in every expression position
     /// EXCEPT those where `{` MUST mean block-start: if-condition,

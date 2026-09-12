@@ -1,12 +1,27 @@
-## tests/parse.zag — placeholder for the fixture's test block.
+## tests/parse.zag — cfgtool test suite (docs/34 §8).
 ##
-## The worked example references real `test "..."` blocks here,
-## but the v0.1 compiler does not yet expose a `zag test` subcommand
-## (it's part of the upcoming v0.1 dep-CLI work). The fixture ships
-## with a `fun main()` so `examples/run_all.sh` runs it today without
-## harness changes; once `zag test` lands, replace the body with the
-## real test blocks.
+## Location implies membership: every `fun test_*` below is a test
+## case with NO @[test] annotation (see Parser.test_file in
+## src/parser/core.zig). Plain helpers and `main` stay ordinary
+## functions. `import lib.{...}` resolves the sibling src module:
+## codegen emits `@import("lib")` and the generated build.zig
+## registers every src module under its dotted name for both the
+## exe root and each test root.
+##
+## Run from the project root: `zag test`.
+## (`examples/run_all.sh` skips tests/ directories — suites only
+## run through `zag test`, never `zag run <file>`.)
+
+import lib.{lib_marker}
 
 fun main() {
-    print("cfgtool tests placeholder\n");
+    print("cfgtool tests — run `zag test` from the project root\n");
+}
+
+fun test_lib_marker() {
+    assert(lib_marker() == 7);
+}
+
+fun test_lib_marker_positive() {
+    assert(lib_marker() > 0);
 }

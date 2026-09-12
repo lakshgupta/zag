@@ -261,7 +261,11 @@ else
     EXAMPLES_DIR="$SCRIPT_DIR"
 fi
 
-mapfile -t FILES < <(find "$EXAMPLES_DIR" -name '*.zag' -type f | sort)
+# `tests/` directories hold suites, not programs: their files import
+# sibling src modules (unresolvable in file mode) and their entry
+# points are `test_*` cases. They run through `zag test` from the
+# project root — never `zag run <file>` — so exclude them here.
+mapfile -t FILES < <(find "$EXAMPLES_DIR" -name '*.zag' -type f -not -path '*/tests/*' | sort)
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
     echo -e "${RED}No .zag files found under $EXAMPLES_DIR${NC}"

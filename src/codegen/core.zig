@@ -44,6 +44,23 @@ const BindingTypeInfo = struct {
     is_var: bool = false,
 };
 
+/// Project sibling-module entry: one discovered `src/` module for
+/// dotted non-std import resolution (`import lib.{x}` → entry
+/// "lib"). `pub` so main.zig's projectCmd can build the table from
+/// discoverModules results and hand it to Codegen.project_modules.
+pub const ProjectModule = struct {
+    /// Dotted module name ("lib", "db.schema") — the lookup key.
+    /// The emitted import is the flat output filename derived from
+    /// it ("<name>.zig", same-dir — see the sibling branch in the
+    /// imports loop); projectCmd always emits flat, so the two can
+    /// never diverge.
+    name: []const u8,
+    /// Source path ("src/lib.zag") — informational (error messages,
+    /// future whole-module-expansion support); the emit never reads
+    /// the file.
+    path: []const u8,
+};
+
 /// Comptime-empty Program default for freshly-`init()`ed Codegen
 /// instances that never went through `generate()` (the template-
 /// literal placeholder codegen in primary.zig's genTemplateLit builds
@@ -147,6 +164,17 @@ pub const Codegen = struct {
     /// `@import("string.zig")` (same-dir relative) instead of a
     /// `std/`-prefixed path that would double-nest.
     import_std_base: []const u8 = "std/",
+    /// Project sibling-module table for dotted non-std imports
+    /// (`import lib.{x}` in a project file). Populated by main.zig's
+    /// projectCmd from discoverModules — one entry per src module
+    /// (name = dotted module name, e.g. "lib" or "db.schema").
+    /// Empty by default: file mode and the stdlib materialisation
+    /// pass have no project context, so sibling imports there keep
+    /// the legacy bind-nothing behavior. The import loop emits
+    /// same-dir path imports from this table (never module names —
+    /// zig 0.16 rejects one file in two modules, so named sibling
+    /// modules sharing the std mirror cannot compile).
+    project_modules: []const ProjectModule = &.{},
     /// Per-function counter for destructuring temps. Reset to 0 by `genFun`
     /// so each `pub fn` body has its own `__destruct_0`, `__destruct_1`,
     /// ... sequence. Multiple destructurings in the same body produce
@@ -1117,31 +1145,55 @@ pub const MapEntry = struct {
             // parse returns std.json.Result(...) which mismatches the
             // caller's main.Result(...) annotation (per-module preamble
             // duplication surfaced by the json batch).
+            //
+            // The hybrid canonicals are SMART forwarders, not plain
+            // definitions: under file-mode `zag test` the compilation
+            // root is zag_test_runner.zig (see zag_test_runner_src in
+            // src/main.zig), NOT the user module — so a plain local
+            // definition here would be a DIFFERENT type from the std
+            // modules' root-forwarded one, and any test passing a
+            // Result/Option across the user/std boundary would fail to
+            // compile. The `@hasDecl(root, "__zag_test_runner")` marker
+            // check (comptime-known, so only the taken branch is ever
+            // analyzed — the self-referential untaken branch is never
+            // instantiated) routes test-mode lookups to the runner's
+            // canonicals, preserving single-type identity in every
+            // mode. Run/build/project roots carry no marker, so those
+            // modes take the local canonical — byte-identical semantics
+            // to the old plain definition.
             if (self.use_hybrid_stdlib) {
                 self.write(
                             \\pub fn Result(comptime T: type, comptime E: type) type {
-                            \\    return union(enum) {
-                            \\        Ok: T,
-                            \\        Err: E,
-                            \\        pub fn unwrap(self: @This()) T {
-                            \\            return switch (self) {
-                            \\                .Ok => |v| v,
-                            \\                .Err => @panic("unwrap on Err"),
-                            \\            };
-                            \\        }
-                            \\    };
+                            \\    if (@hasDecl(@import("root"), "__zag_test_runner")) {
+                            \\        return @import("root").Result(T, E);
+                            \\    } else {
+                            \\        return union(enum) {
+                            \\            Ok: T,
+                            \\            Err: E,
+                            \\            pub fn unwrap(self: @This()) T {
+                            \\                return switch (self) {
+                            \\                    .Ok => |v| v,
+                            \\                    .Err => @panic("unwrap on Err"),
+                            \\                };
+                            \\            }
+                            \\        };
+                            \\    }
                             \\}
                             \\pub fn Option(comptime T: type) type {
-                            \\    return union(enum) {
-                            \\        Some: T,
-                            \\        None: void,
-                            \\        pub fn unwrap(self: @This()) T {
-                            \\            return switch (self) {
-                            \\                .Some => |v| v,
-                            \\                .None => @panic("unwrap on None"),
-                            \\            };
-                            \\        }
-                            \\    };
+                            \\    if (@hasDecl(@import("root"), "__zag_test_runner")) {
+                            \\        return @import("root").Option(T);
+                            \\    } else {
+                            \\        return union(enum) {
+                            \\            Some: T,
+                            \\            None: void,
+                            \\            pub fn unwrap(self: @This()) T {
+                            \\                return switch (self) {
+                            \\                    .Some => |v| v,
+                            \\                    .None => @panic("unwrap on None"),
+                            \\                };
+                            \\            }
+                            \\        };
+                            \\    }
                             \\}
                 );
             } else {
@@ -1433,6 +1485,60 @@ pub const MapEntry = struct {
             while (import_i < prog.imports.len) : (import_i += 1) {
                 const imp = prog.imports[import_i];
                 const dotted = parser.Parser.joinDottedPath(&import_scratch, imp.path_nodes);
+            // Sibling check runs only on std misses (stdlib keeps exact
+            // priority; the table scan is O(small) either way).
+            if (parser.Parser.resolveStdImport(dotted) == null) {
+                // Project sibling imports (`import lib.{x}` in a
+                // project src/ or tests/ file). Look the dotted name
+                // up in the project table (populated by main.zig's
+                // projectCmd; empty in file mode and the stdlib pass,
+                // which keep the legacy bind-nothing behavior) and
+                // emit a SAME-DIR path import (`@import("lib.zig")`).
+                // Same-dir is always correct: projectCmd emits every
+                // module flat into build/gen/ (<dotted>.zig), so no
+                // depth computation is ever needed.
+                //
+                // Path — NOT module-name — imports are load-bearing:
+                // zig 0.16 rejects one file living in two modules, so
+                // a named `@import("lib")` (separate module) sharing
+                // the std mirror by path with the importer is a
+                // compile error. Path imports merge everything into
+                // the single root-module tree (deduped by path, the
+                // same shape file mode already uses), which compiles.
+                // Bare `import lib` (no selectors) is skipped: the
+                // @import line would be an unused decl (zig rejects
+                // it), and parse-time whole-module expansion only
+                // serves lib/std paths — selective imports are the
+                // v1 surface for siblings.
+                var sibling_name: ?[]const u8 = null;
+                for (self.project_modules) |pm| {
+                    if (std.mem.eql(u8, pm.name, dotted)) {
+                        sibling_name = pm.name;
+                        break;
+                    }
+                }
+                if (sibling_name) |mod_name| {
+                    if (imp.selectors.len == 0) continue;
+                    self.write("const __zag_imported_");
+                    var sib_idx_buf: [16]u8 = undefined;
+                    const sib_idx_str = std.fmt.bufPrint(&sib_idx_buf, "{d}", .{import_i}) catch "X";
+                    self.write(sib_idx_str);
+                    self.write(" = @import(\"");
+                    self.write(mod_name);
+                    self.write(".zig\");\n");
+                    for (imp.selectors) |sel| {
+                        const user_name = sel.alias orelse sel.name;
+                        if (imp.is_pub) self.write("pub ");
+                        self.write("const ");
+                        self.write(user_name);
+                        self.write(" = __zag_imported_");
+                        self.write(sib_idx_str);
+                        self.write(".");
+                        self.write(sel.name);
+                        self.write(";\n");
+                    }
+                }
+            }
                 if (parser.Parser.resolveStdImport(dotted)) |resolved_path| {
                     // Stdlib imports: types that ARE in the preamble
                     // (e.g. __zag_String, __zag_Writer, __zag_Error)

@@ -57,3 +57,28 @@ fun main() {
         print("bool: {s3.as_str()}\n");
     }
 }
+
+# Cross-module Result regression tests: parse returns the STD
+# module's Result<Json, str>; the annotations + matches below
+# instantiate the USER module's Result. Both must resolve to one
+# identical type — under file-mode `zag test` that means the hybrid
+# smart-forwarder (src/codegen/core.zig) routing to the test
+# runner's canonicals. Without it these fail to compile with
+# "expected main.Result(...) found zag_test_runner.Result(...)".
+@[test]
+fun test_json_ok_cross_module() {
+    let v: Result<Json, str> = parse("{\"a\": 1}");
+    match v {
+        Ok(j) => assert(true),
+        Err(e) => assert(false),
+    }
+}
+
+@[test]
+fun test_json_err_cross_module() {
+    let v: Result<Json, str> = parse("{invalid");
+    match v {
+        Ok(j) => assert(false),
+        Err(e) => assert(true),
+    }
+}

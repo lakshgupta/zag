@@ -28,8 +28,12 @@ metafiles (`zag.toml`, `zag.lock`):
 | `tests/parse.zag` | `tests/parse.zag` | Conventional tests/ root |
 | `internal-tls` (path-dep) | [`../sibling-tls/`](../sibling-tls/) | Local sibling, `path = "../sibling-tls"` |
 
-`tests/parse.zag` ships with a stub `fun main()`. Replace it with real
-`test "..."` blocks once `zag test` ships.
+`tests/parse.zag` is the conventional tests/ root: `fun test_*`
+cases (no `@[test]` annotation needed — location implies suite
+membership) testing the sibling `src/lib.zag` via
+`import lib.{lib_marker}`. Run it with `zag test` from the project
+root; `examples/run_all.sh` skips `tests/` dirs (suites aren't
+runnable programs).
 
 ## How to use this as a template
 
@@ -37,7 +41,7 @@ metafiles (`zag.toml`, `zag.lock`):
 cp -R examples/project_layout ~/work/my_new_project
 cd ~/work/my_new_project
 # edit [package].name, [package].version, [[bin]].name, deps...
-zag test       # once `zag test` ships
+zag test       # discovers tests/, builds one binary per file, runs
 ```
 
 ## Companion: the sibling path-dep

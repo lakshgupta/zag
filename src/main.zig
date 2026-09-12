@@ -441,6 +441,20 @@ fn cmdGenerate(args: []const []const u8) !void {
     std.process.exit(1);
 }
 
+/// Build the sibling-import table from discoverModules results.
+/// `buf` must outlive every transpile call using the table (a
+/// function-local array in projectCmd qualifies — the name/path
+/// slices point into project.zig's discovery statics, not buf).
+fn buildProjectModuleTable(modules: []const project_mod.ModuleEntry, buf: []codegen_mod.ProjectModule) []codegen_mod.ProjectModule {
+    var n: usize = 0;
+    for (modules) |m| {
+        if (n >= buf.len) break;
+        buf[n] = .{ .name = m.module_name, .path = m.path };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []const []const u8, generate: bool, build_mode: BuildMode) !void {
     _ = extra_args;
 
@@ -467,13 +481,21 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
         std.process.exit(1);
     }
 
+    // Project sibling-module table for dotted non-std imports
+    // (`import lib.{x}` — see Codegen.project_modules). Slices point
+    // into discoverModules' statics, which stay live for the whole
+    // command (discoverTests below uses SEPARATE buffers, so the
+    // table survives test discovery).
+    var pm_buf: [128]codegen_mod.ProjectModule = undefined;
+    const project_modules = buildProjectModuleTable(modules, pm_buf[0..]);
+
     // Transpile and write each module
     for (modules) |mod| {
         const source = readFile(mod.path) catch {
             std.debug.print("error: could not read {s}\n", .{mod.path});
             std.process.exit(1);
         };
-        const result = transpile(mod.path, source, true) catch |e| {
+        const result = transpileEx(mod.path, source, true, "std/", project_modules) catch |e| {
             std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
             std.process.exit(1);
         };
@@ -489,8 +511,59 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
         if (result.map.len > 0) try writeMapFile(out_path, result.map);
     }
 
+    // Project tests (`zag test` only — every other mode ignores
+    // tests/ entirely). Each tests/<name>.zag transpiles to the FLAT
+    // path build/gen/tests.<dotted>.zig (flat like every other gen
+    // file, so the "std/" mirror base resolves in-subtree — a
+    // tests/ SUBDIR would force "../std/" file-relative imports,
+    // which zig's module hermeticity rejects). Sibling imports use
+    // the SAME table as src (`import lib.{x}` works from tests);
+    // the `test_*` naming convention (no @[test] needed) is applied
+    // by the parser from the source path (see isTestFilePath) — no
+    // flag threading.
+    var test_entries: []const project_mod.TestEntry = &.{};
+    if (std.mem.eql(u8, mode, "test")) {
+        test_entries = project_mod.discoverTests();
+        if (test_entries.len == 0) {
+            std.debug.print("no tests found in tests/\n", .{});
+            std.process.exit(0);
+        }
+        for (test_entries) |t| {
+            const tsource = readFile(t.path) catch {
+                std.debug.print("error: could not read {s}\n", .{t.path});
+                std.process.exit(1);
+            };
+            const tresult = transpileEx(t.path, tsource, true, "std/", project_modules) catch |e| {
+                std.debug.print("error: transpile failed for {s}: {s}\n", .{ t.path, @errorName(e) });
+                std.process.exit(1);
+            };
+            // Collision guard: a src module like src/tests.zag or
+            // src/tests/parse.zag would emit the same flat output
+            // path — fail loudly instead of silently overwriting.
+            var tout_buf: [512]u8 = undefined;
+            const tout_path = std.fmt.bufPrint(&tout_buf, "build/gen/tests.{s}.zig", .{t.test_name}) catch "build/gen/tests.test.zig";
+            if (std.mem.eql(u8, tout_path, "build/gen/main.zig")) {
+                std.debug.print("error: test output {s} collides with src main module (rename src/tests.zag or tests/{s}.zag)\n", .{ tout_path, t.test_name });
+                std.process.exit(1);
+            }
+            for (modules) |mod| {
+                var mout_buf: [512]u8 = undefined;
+                const mout_path = if (std.mem.eql(u8, mod.module_name, "main"))
+                    std.fmt.bufPrint(&mout_buf, "build/gen/main.zig", .{}) catch "build/gen/main.zig"
+                else
+                    std.fmt.bufPrint(&mout_buf, "build/gen/{s}.zig", .{mod.module_name}) catch "build/gen/module.zig";
+                if (std.mem.eql(u8, tout_path, mout_path)) {
+                    std.debug.print("error: test output {s} collides with src module {s} (rename one)\n", .{ tout_path, mod.path });
+                    std.process.exit(1);
+                }
+            }
+            try writeFile(tout_path, tresult.zig);
+            if (tresult.map.len > 0) try writeMapFile(tout_path, tresult.map);
+        }
+    }
+
     // Generate build.zig for the project
-    try generateBuildZig(modules, cfg.name);
+    try generateBuildZig(modules, test_entries, cfg.name);
 
     if (generate) {
         std.debug.print("generated zig project at build/gen/\n", .{});
@@ -520,6 +593,26 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
         }
     } else {
         loadRemapTables("build/gen");
+        // `zag test` runs the generated "test" step (one test binary
+        // per tests/*.zag, wired by generateBuildZig) instead of the
+        // default install step — the old fall-through built only the
+        // exe and never executed a test.
+        if (std.mem.eql(u8, mode, "test")) {
+            // `--summary all`: bare `zig build test` is silent on
+            // success (results flow back over the --listen IPC, not
+            // stdout) — the summary surfaces per-suite pass counts
+            // on stderr, which remapStderrCapture passes through.
+            const test_code = if (build_mode != .debug)
+                runCommandCaptured(null, &.{ zig_install_path, "build", "test", "--build-file", "build/gen/build.zig", opt_flag, "--summary", "all" })
+            else
+                runCommandCaptured(null, &.{ zig_install_path, "build", "test", "--build-file", "build/gen/build.zig", "--summary", "all" });
+            if (test_code.stderr_len > 0) remapStderrCapture(capture_buf[0..test_code.stderr_len]);
+            if (test_code.code != 0) {
+                std.debug.print("error: zig build failed (exit {d})\n", .{test_code.code});
+                std.process.exit(test_code.code);
+            }
+            return;
+        }
         const build_code = if (build_mode != .debug)
             runCommandCaptured(null, &.{ zig_install_path, "build", "--build-file", "build/gen/build.zig", opt_flag })
         else
@@ -546,8 +639,11 @@ fn projectCmd(mode: []const u8, cfg: project_mod.ProjectConfig, extra_args: []co
 }
 
 /// Generate a build.zig for the multi-module zag project.
-fn generateBuildZig(modules: []const project_mod.ModuleEntry, project_name: []const u8) !void {
-    var buf: [4096]u8 = undefined;
+/// `tests` is empty except in `zag test` mode (projectCmd only
+/// discovers tests/ then) — non-test modes emit byte-identical
+/// output to before: exe + run step only.
+fn generateBuildZig(modules: []const project_mod.ModuleEntry, tests: []const project_mod.TestEntry, project_name: []const u8) !void {
+    var buf: [16384]u8 = undefined;
     var pos: usize = 0;
 
     const header_prefix = "const std = @import(\"std\");\n\npub fn build(b: *std.Build) !void {\n    const target = b.resolveTargetQuery(.{});\n    const optimize = b.standardOptimizeOption(.{});\n    const exe = b.addExecutable(.{\n        .name = \"";
@@ -581,9 +677,59 @@ fn generateBuildZig(modules: []const project_mod.ModuleEntry, project_name: []co
         pos += line3.len;
     }
 
-    const footer = "    b.installArtifact(exe);\n\n    const run_cmd = b.addRunArtifact(exe);\n    if (b.args) |args| run_cmd.addArgs(args);\n    const run_step = b.step(\"run\", \"Run the app\");\n    run_step.dependOn(&run_cmd.step);\n}\n";
+    const footer = "    b.installArtifact(exe);\n\n    const run_cmd = b.addRunArtifact(exe);\n    if (b.args) |args| run_cmd.addArgs(args);\n    const run_step = b.step(\"run\", \"Run the app\");\n    run_step.dependOn(&run_cmd.step);\n";
     @memcpy(buf[pos..][0..footer.len], footer);
     pos += footer.len;
+
+    // Test wiring (`zag test` only — `tests` is empty otherwise).
+    // One `b.addTest` per tests/<name>.zag, each registered as its
+    // own run artifact under a single top-level "test" step (file
+    // granularity mirrors `cargo test` / pytest file collection).
+    // Sibling imports need NO build.zig wiring: codegen emits
+    // same-dir path imports (`@import("lib.zig")`), which merge the
+    // sibling into the test root's single module tree. Named-module
+    // wiring (addImport) would put the shared std mirror in two
+    // modules — a hard error under zig 0.16's one-file-one-module
+    // rule. `@import("root")` inside test builds resolves to the
+    // test file's own module (proper build-system wiring, unlike
+    // the `zig test` CLI which roots at the test runner), so bench
+    // counters and the Result/Option smart-forwarder behave exactly
+    // as in exe builds.
+    if (tests.len > 0) {
+        const test_head = "    const test_step = b.step(\"test\", \"Run tests\");\n";
+        @memcpy(buf[pos..][0..test_head.len], test_head);
+        pos += test_head.len;
+        for (tests) |t| {
+            // Zig identifier for this suite: `test_` is a keyword
+            // and dotted names ("a.b") aren't identifiers, so use
+            // `suite_` + dots-rewritten-to-underscores.
+            var ident_buf: [128]u8 = undefined;
+            var ident_len: usize = 0;
+            const prefix = "suite_";
+            @memcpy(ident_buf[0..prefix.len], prefix);
+            ident_len = prefix.len;
+            for (t.test_name) |c| {
+                if (ident_len >= ident_buf.len) break;
+                ident_buf[ident_len] = if (c == '.') '_' else c;
+                ident_len += 1;
+            }
+            const ident = ident_buf[0..ident_len];
+            var tline_buf: [1024]u8 = undefined;
+            const tline = std.fmt.bufPrint(&tline_buf, "    const {s} = b.addTest(.{{ .root_module = b.createModule(.{{ .root_source_file = b.path(\"tests.{s}.zig\"), .target = target, .optimize = optimize }}) }});\n", .{ ident, t.test_name }) catch continue;
+            if (pos + tline.len > buf.len) break;
+            @memcpy(buf[pos..][0..tline.len], tline);
+            pos += tline.len;
+            var rline_buf: [512]u8 = undefined;
+            const rline = std.fmt.bufPrint(&rline_buf, "    test_step.dependOn(&b.addRunArtifact({s}).step);\n", .{ident}) catch continue;
+            if (pos + rline.len > buf.len) break;
+            @memcpy(buf[pos..][0..rline.len], rline);
+            pos += rline.len;
+        }
+    }
+
+    const fn_close = "}\n";
+    @memcpy(buf[pos..][0..fn_close.len], fn_close);
+    pos += fn_close.len;
 
     try writeFile("build/gen/build.zig", buf[0..pos]);
 }
@@ -609,12 +755,15 @@ fn generateProjectFiles() !void {
         std.process.exit(1);
     }
 
+    var gpm_buf: [128]codegen_mod.ProjectModule = undefined;
+    const gpm_table = buildProjectModuleTable(modules, gpm_buf[0..]);
+
     for (modules) |mod| {
         const source = readFile(mod.path) catch {
             std.debug.print("error: could not read {s}\n", .{mod.path});
             std.process.exit(1);
         };
-        const result = transpile(mod.path, source, true) catch |e| {
+        const result = transpileEx(mod.path, source, true, "std/", gpm_table) catch |e| {
             std.debug.print("error: transpile failed for {s}: {s}\n", .{ mod.path, @errorName(e) });
             std.process.exit(1);
         };
@@ -629,7 +778,7 @@ fn generateProjectFiles() !void {
         if (result.map.len > 0) try writeMapFile(out_path, result.map);
     }
 
-    try generateBuildZig(modules, "main");
+    try generateBuildZig(modules, &.{}, "main");
 }
 
 /// Resolve the zig compiler binary path that the current
@@ -753,17 +902,21 @@ fn usage() void {
 /// Result/Option are DEFINED here (not re-exported — the user module
 /// is unreachable by import, see above), mirroring the canonical
 /// hybrid emit in src/codegen/core.zig — keep the two in sync. The
-/// one asymmetry this leaves: a test that passes a Result/Option
-/// value ACROSS the user/std boundary mixes the runner's canonical
-/// with the user module's own canonical and fails to compile. No
-/// example suite does this today (their Results are same-module);
-/// closing it needs the hybrid emit to forward under test (a
-/// `@hasDecl(root, marker)` smart-forwarder), which is recorded as
-/// follow-up work, not done here.
+/// hybrid emit is a SMART forwarder: it checks for the
+/// `__zag_test_runner` marker below and, under test, resolves to
+/// THESE canonicals — so a Result crossing the user/std boundary
+/// inside a test is one identical type on both sides, exactly as in
+/// run mode.
 const zag_test_runner_src: []const u8 =
     \\//! zag file-mode test root (see zag_test_runner_src in src/main.zig).
     \\const builtin = @import("builtin");
     \\const std = @import("std");
+    \\
+    \\/// Marker the hybrid Result/Option smart-forwarder
+    \\/// (src/codegen/core.zig) probes for: presence means "the
+    \\/// compilation root is the test runner — resolve fundamental
+    \\/// types here, not locally".
+    \\pub const __zag_test_runner = true;
     \\
     \\pub fn Result(comptime T: type, comptime E: type) type {
     \\    return union(enum) {
@@ -1929,10 +2082,21 @@ fn readSourceForExpansion(path: []const u8) ?[]const u8 {
 }
 
 fn transpile(path: []const u8, source: []const u8, use_hybrid: bool) !TranspileResult {
-    return transpileEx(path, source, use_hybrid, "std/");
+    return transpileEx(path, source, use_hybrid, "std/", &.{});
 }
 
-fn transpileEx(path: []const u8, source: []const u8, use_hybrid: bool, import_std_base: []const u8) !TranspileResult {
+/// Test-file path sniff (single decision point for the `test_*`
+/// convention): true when `path` names a file inside a `tests/`
+/// directory — `tests/foo.zag` (project mode) or any path containing
+/// a `/tests/` segment (file mode, e.g. `examples/x/tests/y.zag`).
+/// A bare `tests.zag` filename does NOT match (segment, not stem),
+/// and `src/` + `lib/std/` paths never match (no such segments).
+fn isTestFilePath(path: []const u8) bool {
+    if (std.mem.startsWith(u8, path, "tests/")) return true;
+    return std.mem.indexOf(u8, path, "/tests/") != null;
+}
+
+fn transpileEx(path: []const u8, source: []const u8, use_hybrid: bool, import_std_base: []const u8, project_modules: []const codegen_mod.ProjectModule) !TranspileResult {
     var l = lexer_mod.Lexer.init(source);
     const tokens = l.tokenize();
 
@@ -1947,6 +2111,10 @@ fn transpileEx(path: []const u8, source: []const u8, use_hybrid: bool, import_st
     // the synthesized selectors). Disabled in parser tests (null
     // reader = hermetic), see Parser.read_source_file.
     p.read_source_file = readSourceForExpansion;
+    // Test-file convention (see Parser.test_file): the path decides,
+    // so file-mode `zag test tests/foo.zag` and project-mode
+    // `tests/*.zag` transpiles both opt in with zero flag threading.
+    p.test_file = isTestFilePath(path);
     const prog = p.parse();
 
     var cg = codegen_mod.Codegen.init();
@@ -1970,6 +2138,11 @@ fn transpileEx(path: []const u8, source: []const u8, use_hybrid: bool, import_st
     // stdlib files themselves pass "" so sibling modules import as
     // same-dir "string.zig" instead of double-nested "std/string.zig".
     cg.import_std_base = import_std_base;
+    // Project sibling-module table for dotted non-std imports
+    // (`import lib.{x}` — see Codegen.project_modules). projectCmd
+    // populates it from discoverModules; every other caller passes
+    // empty (file mode + stdlib pass keep bind-nothing).
+    cg.project_modules = project_modules;
     const zig = cg.generate(prog);
     cg.buildMapText();
     return .{ .zig = zig, .map = cg.getMapText() };

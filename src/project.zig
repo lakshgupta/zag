@@ -268,6 +268,141 @@ fn addModuleEntry(path: []const u8, mod_name: []const u8) !void {
     module_count += 1;
 }
 
+/// One discovered test file in a zag project.
+pub const TestEntry = struct {
+    /// Path relative to the project root, e.g. "tests/parse.zag"
+    path: []const u8,
+    /// Dotted test name derived from the path, e.g. "parse" or
+    /// "a.b" for "tests/a/b.zag" (mirrors module-name derivation;
+    /// the emitted file is the flat `build/gen/tests.<dotted>.zig`
+    /// — flat so the "std/" mirror base resolves in-subtree).
+    test_name: []const u8,
+};
+
+// SEPARATE statics from the module discovery above: projectCmd
+// discovers tests AFTER transpiling src modules but BEFORE
+// generateBuildZig consumes the module slice — sharing buffers
+// would clobber module paths/names mid-build.
+var test_buf: [64]TestEntry = undefined;
+var test_count: usize = 0;
+
+var test_paths_buf: [64 * 128]u8 = undefined;
+var test_paths_pos: usize = 0;
+var test_names_buf: [64 * 64]u8 = undefined;
+var test_names_pos: usize = 0;
+
+/// Walk `tests/` and discover all `.zag` test files (recursive).
+/// Missing/empty `tests/` → empty slice (plain `zag build`/`run`
+/// projects simply have no tests; `zag test` reports "no tests"
+/// and exits 0). Same skip rules as the src walker (hidden
+/// entries, `build/`); sorted by path for determinism.
+pub fn discoverTests() []const TestEntry {
+    test_count = 0;
+    test_paths_pos = 0;
+    test_names_pos = 0;
+
+    const tests_fd = posix.openat(posix.AT.FDCWD, "tests", .{ .ACCMODE = .RDONLY }, 0) catch return &[_]TestEntry{};
+    defer _ = std.os.linux.close(tests_fd);
+
+    walkTestsTree(tests_fd, "");
+    sortTestsByPath();
+
+    return test_buf[0..test_count];
+}
+
+/// Recursive walker for `tests/` — mirrors walkSrcTree with the
+/// `tests/` root prefix and dotted test-name derivation
+/// ("a/b.zag" under tests/a/ → "a.b").
+fn walkTestsTree(dir_fd: i32, rel_to_tests: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.os.linux.getdents64(dir_fd, &buf, buf.len);
+        if (n == 0) break;
+        if (n > std.math.maxInt(isize)) break;
+
+        var pos: usize = 0;
+        while (pos < n) {
+            const entry: *const std.os.linux.dirent64 = @ptrCast(@alignCast(&buf[pos]));
+            pos += entry.reclen;
+
+            const name_z = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.name)));
+            const name = name_z[0..name_z.len];
+
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (name[0] == '.') continue;
+
+            if (entry.type == std.os.linux.DT.DIR) {
+                if (std.mem.eql(u8, name, "build")) continue;
+                var new_rel_buf: [512]u8 = undefined;
+                const new_rel: []const u8 = if (rel_to_tests.len == 0)
+                    std.fmt.bufPrint(&new_rel_buf, "{s}", .{name}) catch continue
+                else
+                    std.fmt.bufPrint(&new_rel_buf, "{s}/{s}", .{ rel_to_tests, name }) catch continue;
+
+                var child_path_buf: [1024]u8 = undefined;
+                const child_path = std.fmt.bufPrint(&child_path_buf, "tests/{s}", .{new_rel}) catch continue;
+                const child_fd = posix.openat(posix.AT.FDCWD, child_path, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+                walkTestsTree(child_fd, new_rel);
+                _ = std.os.linux.close(child_fd);
+            } else if (entry.type == std.os.linux.DT.REG and std.mem.endsWith(u8, name, ".zag")) {
+                var path_buf: [1024]u8 = undefined;
+                const abs_path: []const u8 = if (rel_to_tests.len == 0)
+                    std.fmt.bufPrint(&path_buf, "tests/{s}", .{name}) catch continue
+                else
+                    std.fmt.bufPrint(&path_buf, "tests/{s}/{s}", .{ rel_to_tests, name }) catch continue;
+
+                const stem_len = name.len - ".zag".len;
+                const dotted_len: usize = if (rel_to_tests.len == 0)
+                    stem_len
+                else
+                    rel_to_tests.len + 1 + stem_len;
+
+                if (test_count >= test_buf.len) continue;
+                if (test_names_pos + dotted_len > test_names_buf.len) continue;
+                if (test_paths_pos + abs_path.len > test_paths_buf.len) continue;
+
+                var di: usize = test_names_pos;
+                if (rel_to_tests.len > 0) {
+                    @memcpy(test_names_buf[di..][0..rel_to_tests.len], rel_to_tests);
+                    var j: usize = 0;
+                    while (j < rel_to_tests.len) : (j += 1) {
+                        if (test_names_buf[di + j] == '/') test_names_buf[di + j] = '.';
+                    }
+                    di += rel_to_tests.len;
+                    test_names_buf[di] = '.';
+                    di += 1;
+                }
+                @memcpy(test_names_buf[di..][0..stem_len], name[0..stem_len]);
+                const tname = test_names_buf[test_names_pos..][0..dotted_len];
+                test_names_pos += dotted_len;
+
+                @memcpy(test_paths_buf[test_paths_pos .. test_paths_pos + abs_path.len], abs_path);
+                const tpath = test_paths_buf[test_paths_pos .. test_paths_pos + abs_path.len];
+                test_paths_pos += abs_path.len;
+
+                test_buf[test_count] = .{ .path = tpath, .test_name = tname };
+                test_count += 1;
+            }
+        }
+    }
+}
+
+/// Insertion sort test_buf[0..test_count] in place by `path`
+/// (byte-wise lexicographic), mirroring sortByPath.
+fn sortTestsByPath() void {
+    var i: usize = 1;
+    while (i < test_count) : (i += 1) {
+        const cur = test_buf[i];
+        var j: usize = i;
+        while (j > 0 and std.mem.lessThan(u8, test_buf[j - 1].path, cur.path)) {
+            test_buf[j] = test_buf[j - 1];
+            j -= 1;
+        }
+        test_buf[j] = cur;
+    }
+}
+
 /// Backing buffer for `ProjectConfig.name`. Module-private so that
 /// the parser can mirror its contents (avoids lifetime annotations
 /// on returned slices — the slice points into this global, which

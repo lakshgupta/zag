@@ -101,7 +101,7 @@ root = "examples/bench_main.zag"
 |---------|--------|
 | `zag init` | Scaffold a new project tree (`zag.toml`, `.gitignore`, `src/main.zag`) |
 | `zag build` | Compile per `[build]` settings to `./zig-out/` |
-| `zag test` | Discover + run `test "..."` blocks under `tests/` |
+| `zag test` | Discover + run tests under `tests/` (one binary per file) |
 | `zag bench` | Discover + run benchmarks under `benches/` |
 | `zag run <file.zag>` | Compile then execute in one pass |
 | `zag check` | Type-check + import resolve only; no codegen |
@@ -282,7 +282,7 @@ The on-disk counterpart of this example lives at [`examples/project_layout/`](..
 | Question | Answer |
 |----------|--------|
 | Where does my project declare itself? | `zag.toml` (`[package]`) |
-| Where do tests go? | `tests/<name>.zag` (each file contains `test "..." { ... }` blocks) |
+| Where do tests go? | `tests/<name>.zag` mirroring `src/` (`tests/parse.zag` tests `src/lib.zag`); each `fun test_*` is a case — no `@[test]` needed |
 | Where do benchmarks go? | `benches/<name>.zag` |
 | Where do deps live after `zag add`? | `deps/<name>/` |
 | Where do deps live for offline builds? | `vendor/<name>/` |
@@ -472,7 +472,15 @@ Notice what's NOT here: the local sibling `internal-tls` (`path = "..."`) never 
 zag test
 ```
 
-walks `tests/` for `test "..."` blocks, builds against the dev-dep DAG (including `zig-assert`), and reports results. The `[scripts.test].filter` regex is applied to test names — for example, `zag test --filter=parse` runs only `test "parse: ..."` blocks.
+walks `tests/` (mirroring `src/` — `tests/parse.zag` tests
+`src/lib.zag`), transpiles each file to `build/gen/tests.<name>.zig`,
+and builds one test binary per file. Location implies suite
+membership: every top-level `fun test_*` is a test case with NO
+`@[test]` annotation (explicit `@[test]` still works); other funs
+are plain helpers and `main` never runs. Test files import sibling
+src modules with selective imports (`import lib.{lib_marker}`),
+resolved through the same module registration as the exe build.
+The `[scripts.test].filter` regex is applied to test names — for example, `zag test --filter=parse` runs only `test "parse: ..."` blocks.
 
 ### 9. Update
 
