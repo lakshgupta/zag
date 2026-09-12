@@ -492,75 +492,140 @@ fn readDepManifest(path: []const u8, buf: []u8) ?[]const u8 {
 ///     key is absent); the whole `src/` tree is walked so the dep's
 ///     internal sibling imports keep resolving.
 ///   - Missing roots / missing manifests / missing lib-root files
-///     skip silently (the importing file then binds nothing and zig
-///     reports the use site loudly).
+/// Transitive closure: a dep's own `[dependencies]` /
+/// `[dev-dependencies]` are discovered too (BFS, deduped by dep
+/// name). Entry ordering doesn't matter for compilation (imports
+/// resolve by name), so the flat first-wins dedup is safe; a
+/// diamond pulling two different SHAs of one lib resolves to
+/// whichever was seen first (v1 has no version negotiation).
 ///
-/// Transitive deps (a dep's own `[dependencies]`) are NOT followed
-/// in v1 — only main-manifest entries resolve. Out of scope by
-/// design; document, don't silently half-support.
+/// Git deps always resolve to the flat `deps/<name>/` dir wherever
+/// they appear in the graph. `path` deps resolve RELATIVE TO THE
+/// DECLARING MANIFEST's directory, so a nested dep's
+/// `path = "../helper"` means `<depdir>/../helper`, not cwd-relative.
 pub fn discoverDepModules() []const DepModuleEntry {
     depmod_count = 0;
     depmod_paths_pos = 0;
     depmod_names_pos = 0;
+    visited_count = 0;
+    depdirs_pos = 0;
+
+    // Roots to process: (dep entry, directory the declaring manifest
+    // lives in — "" for the top-level project).
+    var queue: [96]DepRoot = undefined;
+    var q_len: usize = 0;
 
     var manifest_buf: [16384]u8 = undefined;
     const manifest = readDepManifest("zag.toml", &manifest_buf) orelse return &[_]DepModuleEntry{};
     const fields = parseToml(manifest) orelse return &[_]DepModuleEntry{};
+    enqueueManifestDeps(fields, "", &queue, &q_len);
 
-    // Copy dep entries up-front: the per-dep manifest parses below
-    // reuse the same parseToml statics and would clobber these
-    // slices (whose storage in dep_field_buf stays valid — only the
-    // counts reset — but the ENTRY structs themselves live in the
-    // shared dep_entry_buf).
-    var want_buf: [96]DepEntry = undefined;
-    var want_count: usize = 0;
-    for (fields.deps) |d| {
-        if (want_count >= want_buf.len) break;
-        if (d.git == null and d.path == null) continue;
-        want_buf[want_count] = d;
-        want_count += 1;
-    }
-    for (fields.dev_deps) |d| {
-        if (want_count >= want_buf.len) break;
-        if (d.git == null and d.path == null) continue;
-        want_buf[want_count] = d;
-        want_count += 1;
-    }
-    if (want_count == 0) return &[_]DepModuleEntry{};
-
-    var wi: usize = 0;
-    while (wi < want_count) : (wi += 1) {
-        discoverOneDep(want_buf[wi]);
+    var head: usize = 0;
+    while (head < q_len) : (head += 1) {
+        const root = queue[head];
+        discoverOneDep(root.dep, root.owner_dir, &queue, &q_len);
     }
     sortDepModsByPath();
     return depmod_buf[0..depmod_count];
 }
 
-/// Discover one dependency's modules into depmod_buf.
-fn discoverOneDep(dep: DepEntry) void {
+/// A dep to process: the entry plus the directory its declaring
+/// manifest lives in (for `path =` resolution).
+const DepRoot = struct {
+    dep: DepEntry,
+    owner_dir: []const u8,
+};
+
+/// Copy a manifest's dep entries (both sections) onto the BFS queue,
+/// skipping already-visited names. Returns with `q_len` updated.
+fn enqueueManifestDeps(fields: TomlFields, owner_dir: []const u8, queue: []DepRoot, q_len: *usize) void {
+    for (fields.deps) |d| {
+        if (d.git == null and d.path == null) continue;
+        enqueueDep(d, owner_dir, queue, q_len);
+    }
+    for (fields.dev_deps) |d| {
+        if (d.git == null and d.path == null) continue;
+        enqueueDep(d, owner_dir, queue, q_len);
+    }
+}
+
+fn enqueueDep(d: DepEntry, owner_dir: []const u8, queue: []DepRoot, q_len: *usize) void {
+    if (q_len.* >= queue.len) return;
+    if (markVisited(d.name)) return; // cycle / diamond guard
+    queue[q_len.*] = .{ .dep = d, .owner_dir = owner_dir };
+    q_len.* += 1;
+}
+
+/// Persistent storage for `owner_dir` strings: the queue outlives
+/// the `discoverOneDep` frame that computed each directory, so the
+/// slice must be copied out of that frame's stack buffer (a
+/// dangling owner_dir would corrupt path resolution for every
+/// transitive dep).
+var depdirs_buf: [96][600]u8 = undefined;
+var depdirs_pos: usize = 0;
+
+/// Copy `dir` into persistent storage and return the stable slice.
+fn persistDir(dir: []const u8) []const u8 {
+    if (depdirs_pos >= depdirs_buf.len) return "";
+    if (dir.len > depdirs_buf[depdirs_pos].len) return "";
+    @memcpy(depdirs_buf[depdirs_pos][0..dir.len], dir);
+    const out = depdirs_buf[depdirs_pos][0..dir.len];
+    depdirs_pos += 1;
+    return out;
+}
+
+/// Visited-name set for the BFS (dedup + cycle guard). Names are the
+/// dep keys from whichever manifest declared them.
+var visited_buf: [96][]const u8 = undefined;
+var visited_count: usize = 0;
+
+/// Returns true if `name` was ALREADY present (caller should skip);
+/// records it otherwise.
+fn markVisited(name: []const u8) bool {
+    var i: usize = 0;
+    while (i < visited_count) : (i += 1) {
+        if (std.mem.eql(u8, visited_buf[i], name)) return true;
+    }
+    if (visited_count >= visited_buf.len) return true; // full: skip
+    visited_buf[visited_count] = name;
+    visited_count += 1;
+    return false;
+}
+
+/// Discover one dependency's modules into depmod_buf, then enqueue
+/// its own dependencies (transitive closure).
+fn discoverOneDep(dep: DepEntry, owner_dir: []const u8, queue: []DepRoot, q_len: *usize) void {
     var clean_buf: [64]u8 = undefined;
     const clean = cleanDepName(dep.name, &clean_buf);
 
-    // Root dir: `path` dep → the literal dir; git dep → deps/<name>/.
-    var root_buf: [512]u8 = undefined;
+    // Root dir: `path` dep → resolved RELATIVE TO owner_dir (the
+    // declaring manifest's dir); git dep → the flat deps/<name>/.
+    var root_buf: [600]u8 = undefined;
     const root_dir: []const u8 = if (dep.path) |p|
-        p
+        (std.fmt.bufPrint(&root_buf, "{s}{s}{s}", .{
+            if (owner_dir.len == 0) "" else owner_dir,
+            if (owner_dir.len == 0) "" else "/",
+            p,
+        }) catch return)
     else blk: {
-        const w = std.fmt.bufPrint(&root_buf, "deps/{s}", .{dep.name}) catch return;
-        // Copy out of root_buf is unnecessary — root_dir is consumed
-        // below before root_buf is reused (single-threaded, no
-        // interleaving parses between here and the walk call... EXCEPT
-        // the manifest read below doesn't touch root_buf. Safe.)
-        break :blk w;
+        break :blk (std.fmt.bufPrint(&root_buf, "deps/{s}", .{dep.name}) catch return);
     };
 
-    // Entry point: the dep's own [lib].root, else src/lib.zag.
+    // Entry point: the dep's own [lib].root, else src/lib.zag. The
+    // parse also yields this dep's own dependency list — enqueue it
+    // (transitive closure) BEFORE any deeper parse clobbers the
+    // shared parseToml statics.
     var man_buf: [4096]u8 = undefined;
     var man_path_buf: [1024]u8 = undefined;
     const man_path = std.fmt.bufPrint(&man_path_buf, "{s}/zag.toml", .{root_dir}) catch return;
     const lib_rel: []const u8 = if (readDepManifest(man_path, &man_buf)) |mcontent|
-        if (parseToml(mcontent)) |fields| fields.lib_root orelse "src/lib.zag"
-        else "src/lib.zag"
+        blk: {
+            if (parseToml(mcontent)) |dep_fields| {
+                enqueueManifestDeps(dep_fields, persistDir(root_dir), queue, q_len);
+                break :blk dep_fields.lib_root orelse "src/lib.zag";
+            }
+            break :blk "src/lib.zag";
+        }
     else
         "src/lib.zag";
 
@@ -2178,4 +2243,25 @@ test "writeLockfileFromToml: git-only dep round-trips without panic" {
     try std.testing.expect(std.mem.indexOf(u8, out, "[deps]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "fakelib") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "0c81c5cca14317b6eb7abaf05a5d384cc3c0637b") != null);
+}
+
+test "markVisited: dedups by name (transitive cycle/diamond guard)" {
+    visited_count = 0;
+    try std.testing.expect(!markVisited("shared"));
+    try std.testing.expect(!markVisited("p1"));
+    try std.testing.expect(markVisited("shared")); // already seen
+    try std.testing.expect(markVisited("p1"));
+    try std.testing.expect(!markVisited("p2"));
+    try std.testing.expectEqual(@as(usize, 3), visited_count);
+}
+
+test "cleanDepName + markVisited: transitive graph dedup composes" {
+    // The two pieces the BFS relies on: dashed names normalize to
+    // import namespaces, and revisiting a name is rejected (both a
+    // diamond and a cycle terminate).
+    var buf: [64]u8 = undefined;
+    const c = cleanDepName("zag-dep-c", &buf);
+    visited_count = 0;
+    try std.testing.expect(!markVisited(c));
+    try std.testing.expect(markVisited(cleanDepName("zag-dep-c", &buf)));
 }

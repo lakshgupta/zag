@@ -2535,79 +2535,182 @@ fn cmdInstall(args: []const []const u8) !void {
 
     var installed: usize = 0;
     var skipped: usize = 0;
+    // BFS queue for transitive deps: after each install, the dep's
+    // own manifest is read and its git deps are fetched into the
+    // SAME flat deps/ namespace (first-wins dedup, matching
+    // discoverDepModules' resolution model).
+    install_visited_count = 0;
+    var queue: [64]project_mod.DepEntry = undefined;
+    var q_len: usize = 0;
     for (lockfile.deps) |entry| {
-        const git = entry.git orelse {
-            std.debug.print("skip: {s} (path dep, no git)\n", .{entry.name});
-            skipped += 1;
-            continue;
-        };
-        const sha = entry.sha orelse {
-            std.debug.print("skip: {s} (no SHA pinned)\n", .{entry.name});
-            skipped += 1;
-            continue;
-        };
-
-        var target_buf: [512]u8 = undefined;
-        const target = std.fmt.bufPrint(&target_buf, "deps/{s}", .{entry.name}) catch {
-            std.debug.print("error: dep name too long: {s}\n", .{entry.name});
-            std.process.exit(1);
-        };
-
-        // If deps/<name> exists AND points at the pinned SHA, skip.
-        const dir_exists = posix.openat(posix.AT.FDCWD, target, .{ .ACCMODE = .RDONLY }, 0) catch null;
-        if (dir_exists) |fd| {
-            _ = std.os.linux.close(fd);
-            var sha_cmt_buf: [128]u8 = undefined;
-            const sha_cmt = std.fmt.bufPrint(&sha_cmt_buf, "{s}^{{commit}}", .{sha}) catch sha;
-            const rev_argv = [_][]const u8{
-                "git", "-C", target, "rev-parse", "--verify", sha_cmt,
-            };
-            const head_code = runCommand(null, &rev_argv) catch 255;
-            if (head_code == 0) {
-                std.debug.print("ok: {s} already at {s}\n", .{entry.name, sha});
-                skipped += 1;
-                continue;
-            }
+        if (entry.git == null) continue;
+        enqueueInstallDep(.{
+            .name = entry.name,
+            .git = entry.git,
+            .sha = entry.sha,
+            .rev = null,
+            .branch = null,
+            .version = null,
+            .path = null,
+            .optional = false,
+        }, &queue, &q_len);
+    }
+    var head: usize = 0;
+    while (head < q_len) : (head += 1) {
+        const dep = queue[head];
+        const outcome = installOneDep(dep);
+        if (outcome == .installed) installed += 1;
+        if (outcome == .skipped) skipped += 1;
+        if (outcome == .installed or outcome == .skipped) {
+            enqueueTransitiveDeps(dep.name, &queue, &q_len);
         }
-
-        // `git clone --depth 1 <git> <target>` (shallow clone of the
-        // default branch's HEAD; we fetch + checkout the pinned SHA
-        // below to land at the user's pinned commit).
-        const clone_code = runCommand(null, &.{ "git", "clone", "--depth", "1", git, target }) catch {
-            std.debug.print("error: failed to spawn git clone for {s}\n", .{entry.name});
-            std.process.exit(1);
-        };
-        if (clone_code != 0) {
-            std.debug.print("error: git clone failed for {s} (exit {d})\n", .{entry.name, clone_code});
-            std.process.exit(clone_code);
-        }
-
-        // A `--depth 1` clone only has a single commit. Fetch the pinned
-        // SHA explicitly so `git checkout FETCH_HEAD` lands on it.
-        const fetch_code = runCommand(null, &.{ "git", "-C", target, "fetch", "--depth", "1", "origin", sha }) catch {
-            std.debug.print("error: failed to spawn git fetch for {s}\n", .{entry.name});
-            std.process.exit(1);
-        };
-        if (fetch_code != 0) {
-            std.debug.print("error: git fetch failed for {s} @ {s} (exit {d})\n", .{entry.name, sha, fetch_code});
-            std.process.exit(fetch_code);
-        }
-
-        // `git -C <target> checkout FETCH_HEAD` -- FETCH_HEAD == <sha>
-        // because we just fetched origin <sha> into FETCH_HEAD.
-        const checkout_code = runCommand(null, &.{ "git", "-C", target, "checkout", "FETCH_HEAD" }) catch {
-            std.debug.print("error: failed to spawn git checkout for {s}\n", .{entry.name});
-            std.process.exit(1);
-        };
-        if (checkout_code != 0) {
-            std.debug.print("error: git checkout failed for {s} @ {s} (exit {d})\n", .{entry.name, sha, checkout_code});
-            std.process.exit(checkout_code);
-        }
-
-        installed += 1;
-        std.debug.print("ok: cloned {s} @ {s}\n", .{entry.name, sha});
     }
     std.debug.print("installed {d} deps (skipped {d} already-up-to-date)\n", .{installed, skipped});
+}
+
+const InstallOutcome = enum { installed, skipped, failed };
+
+/// Visited-name set for the install BFS (dedup + cycle guard,
+/// mirroring project.zig's discovery-side set).
+var install_visited_buf: [64][]const u8 = undefined;
+var install_visited_count: usize = 0;
+
+fn enqueueInstallDep(dep: project_mod.DepEntry, queue: []project_mod.DepEntry, q_len: *usize) void {
+    if (q_len.* >= queue.len) return;
+    var i: usize = 0;
+    while (i < install_visited_count) : (i += 1) {
+        if (std.mem.eql(u8, install_visited_buf[i], dep.name)) return;
+    }
+    if (install_visited_count >= install_visited_buf.len) return;
+    install_visited_buf[install_visited_count] = dep.name;
+    install_visited_count += 1;
+    queue[q_len.*] = dep;
+    q_len.* += 1;
+}
+
+/// Read `deps/<name>/zag.toml` and enqueue its git deps (transitive
+/// closure). Missing/unparseable manifests are skipped silently —
+/// a dep with no manifest simply has no deps.
+fn enqueueTransitiveDeps(name: []const u8, queue: []project_mod.DepEntry, q_len: *usize) void {
+    var man_buf: [16384]u8 = undefined;
+    var path_buf: [600]u8 = undefined;
+    const man_path = std.fmt.bufPrint(&path_buf, "deps/{s}/zag.toml", .{name}) catch return;
+    const content = readFile(man_path) catch return;
+    if (content.len > man_buf.len) return;
+    @memcpy(man_buf[0..content.len], content);
+    const fields = project_mod.parseToml(man_buf[0..content.len]) orelse return;
+    for (fields.deps) |d| {
+        if (d.git == null) continue;
+        enqueueInstallDep(d, queue, q_len);
+    }
+    for (fields.dev_deps) |d| {
+        if (d.git == null) continue;
+        enqueueInstallDep(d, queue, q_len);
+    }
+}
+
+/// Clone + pin one dep (git) into `deps/<name>`. Resolves a SHA via
+/// `git ls-remote` when the entry carries only a rev/branch/version
+/// (the shape a transitive manifest declares).
+fn installOneDep(dep: project_mod.DepEntry) InstallOutcome {
+    const git = dep.git orelse {
+        std.debug.print("skip: {s} (path dep, no git)\n", .{dep.name});
+        return .skipped;
+    };
+    var sha_buf: [64]u8 = undefined;
+    const sha: []const u8 = if (dep.sha) |s|
+        s
+    else if (resolveDepSha(dep, &sha_buf)) |s|
+        s
+    else {
+        std.debug.print("skip: {s} (no SHA pinned and ref unresolved)\n", .{dep.name});
+        return .skipped;
+    };
+
+    var target_buf: [512]u8 = undefined;
+    const target = std.fmt.bufPrint(&target_buf, "deps/{s}", .{dep.name}) catch {
+        std.debug.print("error: dep name too long: {s}\n", .{dep.name});
+        std.process.exit(1);
+    };
+
+    // If deps/<name> exists AND points at the pinned SHA, skip.
+    const dir_exists = posix.openat(posix.AT.FDCWD, target, .{ .ACCMODE = .RDONLY }, 0) catch null;
+    if (dir_exists) |fd| {
+        _ = std.os.linux.close(fd);
+        var sha_cmt_buf: [128]u8 = undefined;
+        const sha_cmt = std.fmt.bufPrint(&sha_cmt_buf, "{s}^{{commit}}", .{sha}) catch sha;
+        const rev_argv = [_][]const u8{
+            "git", "-C", target, "rev-parse", "--verify", sha_cmt,
+        };
+        const head_code = runCommand(null, &rev_argv) catch 255;
+        if (head_code == 0) {
+            std.debug.print("ok: {s} already at {s}\n", .{dep.name, sha});
+            return .skipped;
+        }
+    }
+
+    // `git clone --depth 1 <git> <target>` (shallow clone of the
+    // default branch's HEAD; we fetch + checkout the pinned SHA
+    // below to land at the user's pinned commit).
+    const clone_code = runCommand(null, &.{ "git", "clone", "--depth", "1", git, target }) catch {
+        std.debug.print("error: failed to spawn git clone for {s}\n", .{dep.name});
+        std.process.exit(1);
+    };
+    if (clone_code != 0) {
+        std.debug.print("error: git clone failed for {s} (exit {d})\n", .{dep.name, clone_code});
+        std.process.exit(clone_code);
+    }
+
+    // A `--depth 1` clone only has a single commit. Fetch the pinned
+    // SHA explicitly so `git checkout FETCH_HEAD` lands on it.
+    const fetch_code = runCommand(null, &.{ "git", "-C", target, "fetch", "--depth", "1", "origin", sha }) catch {
+        std.debug.print("error: failed to spawn git fetch for {s}\n", .{dep.name});
+        std.process.exit(1);
+    };
+    if (fetch_code != 0) {
+        std.debug.print("error: git fetch failed for {s} @ {s} (exit {d})\n", .{ dep.name, sha, fetch_code });
+        std.process.exit(fetch_code);
+    }
+
+    // `git -C <target> checkout FETCH_HEAD` -- FETCH_HEAD == <sha>
+    // because we just fetched origin <sha> into FETCH_HEAD.
+    const checkout_code = runCommand(null, &.{ "git", "-C", target, "checkout", "FETCH_HEAD" }) catch {
+        std.debug.print("error: failed to spawn git checkout for {s}\n", .{dep.name});
+        std.process.exit(1);
+    };
+    if (checkout_code != 0) {
+        std.debug.print("error: git checkout failed for {s} @ {s} (exit {d})\n", .{ dep.name, sha, checkout_code });
+        std.process.exit(checkout_code);
+    }
+
+    std.debug.print("ok: cloned {s} @ {s}\n", .{dep.name, sha});
+    return .installed;
+}
+
+/// Resolve a dep's ref (rev / branch / version / HEAD) to a 40-char
+/// SHA via `git ls-remote`. Shared by `zag pkg add` (which pins the
+/// top-level manifest) and `zag install` (which resolves transitive
+/// manifests that carry no SHA). Returns null on any failure.
+fn resolveDepSha(dep: project_mod.DepEntry, out: []u8) ?[]const u8 {
+    const git = dep.git orelse return null;
+    var ref_buf: [128]u8 = undefined;
+    const ref_label: []const u8 = blk: {
+        if (dep.rev) |r| break :blk r;
+        if (dep.branch) |b| break :blk b;
+        if (dep.version) |v| {
+            break :blk std.fmt.bufPrint(&ref_buf, "v{s}", .{v}) catch "HEAD";
+        }
+        break :blk "HEAD";
+    };
+    const ls_output = captureCommand(null, &.{ "git", "ls-remote", git, ref_label }) catch return null;
+    const nl = std.mem.indexOfScalar(u8, ls_output, '\n') orelse ls_output.len;
+    const first_line = ls_output[0..nl];
+    const tab = std.mem.indexOfScalar(u8, first_line, '\t') orelse first_line.len;
+    const sha = std.mem.trim(u8, first_line[0..tab], " \t\r");
+    if (sha.len != 40) return null;
+    if (sha.len > out.len) return null;
+    @memcpy(out[0..sha.len], sha);
+    return out[0..sha.len];
 }
 
 /// `zag update`. Re-runs `git ls-remote` for each git-sourced dep to

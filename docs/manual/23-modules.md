@@ -98,7 +98,10 @@ zag remove <name>     # drop from zag.toml + zag.lock
 dep into `[dependencies]` (or `[dev-dependencies]` with
 `--save-dev`), and re-derives `zag.lock`. `zag install` clones each
 git dep to `deps/<name>/` and checks it out at the pinned SHA
-(skipping ones already there).
+(skipping ones already there) — and it **recurses**: each dep's own
+manifest is read and its git deps are fetched into the same flat
+`deps/` namespace, so a transitive dep needs no top-level
+declaration to be fetched or imported.
 
 To **use** a dependency:
 
@@ -117,9 +120,15 @@ import internal_tls.{tls_marker}        # path dep (../sibling-tls)
 - Local sibling packages use `path = "../sibling-tls"` and are
   compiled from that directory directly — no fetch needed.
 
-Transitive dependencies (a dependency's own `[dependencies]`) are
-**not** resolved in v1 — only the main manifest's entries are.
-Declare anything you import directly.
+Transitive dependencies (a dependency's own `[dependencies]`) ARE
+resolved: `zag install` fetches them and `import` reaches them
+directly. Deduplication is by dep name — one flat `deps/<name>` per
+name, first-wins, so a diamond resolves to a single copy and cycles
+terminate. There is no version negotiation in v1: if two packages
+want different SHAs of one lib, whichever is seen first wins.
+A dep's `path = "..."` resolves relative to the **declaring**
+manifest's directory (a nested dep's `"../helper"` is
+`<depdir>/../helper`).
 
 Packages are resolved from **Git URLs** declared in `zag.toml` — today the protocol is **git-only**, no central registry yet. `zag add` / `zag fetch` populate `deps/` from a remote git rev, and local sibling packages use `path = "..."`. The lock file (`zag.lock`) pins every dependency to an exact git SHA + content hash. A central `zagpm.dev` registry is deferred to v2+ and will be an alias layer over the git protocol. For the full operational guide, see [Project Layout](34-project-layout.md); for the manifest format, see [`zag.toml` Schema](35-zag-toml-schema.md).
 

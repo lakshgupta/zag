@@ -31,7 +31,7 @@ import lib.{lib_marker}
 The dep's entry point is its own `[lib].root` (default
 `src/lib.zag`); other modules in the dep are reachable as
 `<dep>.<module path>`. Transitive deps (a dep's own manifest
-entries) are not resolved in v1.
+entries) are fetched and resolved too, deduped by name.
 
 ## What's intentionally simplified
 
