@@ -14,6 +14,10 @@
 
 const std = @import("std");
 const posix = std.posix;
+/// Comptime OS gate for posix-only bodies (see env_path.zig). The
+/// payload-probe block below reads /proc-style fds via std.posix, which
+/// hard-errors on windows targets.
+const native_os = @import("builtin").target.os.tag;
 const sys = @import("sys.zig");
 const lexer_mod = @import("lexer.zig");
 const parser_mod = @import("parser.zig");
@@ -123,13 +127,17 @@ pub fn main() !void {
         sub_buf[sl] = 0;
         _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, @ptrCast(&sub_buf), 0o755);
         toolchain.materializeZigToCache(dest_buf[0..dl]) catch {};
-        const fd = posix.openat(posix.AT.FDCWD, dest_buf[0..dl], .{ .ACCMODE = .RDONLY }, 0) catch null;
-        if (fd) |f| {
-            defer _ = std.os.linux.close(f); // deliberate discard: read-only ELF-magic probe on the materialised payload
-            var magic: [4]u8 = undefined;
-            const n = sys.readFull(f, magic[0..]) catch 0;
-            if (n == 4 and magic[0] == 0x7f and magic[1] == 'E' and magic[2] == 'L' and magic[3] == 'F') {
-                embedded_zig_path = dest_buf[0..dl];
+        // ELF-magic probe of the materialised payload — posix-only fd
+        // surface; windows builds never have a payload to probe.
+        if (native_os != .windows) {
+            const fd = posix.openat(posix.AT.FDCWD, dest_buf[0..dl], .{ .ACCMODE = .RDONLY }, 0) catch null;
+            if (fd) |f| {
+                defer _ = std.os.linux.close(f); // deliberate discard: read-only ELF-magic probe on the materialised payload
+                var magic: [4]u8 = undefined;
+                const n = sys.readFull(f, magic[0..]) catch 0;
+                if (n == 4 and magic[0] == 0x7f and magic[1] == 'E' and magic[2] == 'L' and magic[3] == 'F') {
+                    embedded_zig_path = dest_buf[0..dl];
+                }
             }
         }
     }

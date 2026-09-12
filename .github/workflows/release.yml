@@ -3,7 +3,7 @@ name: release
 # ──────────────────────────────────────────────────────────────────────────
 # Build + publish zag release artifacts on every v* tag push.
 #
-# The 6 (OS, arch) pairs in the build matrix below MUST mirror:
+# The 4 (OS, arch) pairs in the build matrix below MUST mirror:
 #   - scripts/package.sh `TARGETS` array (the staging filenames it
 #     archives from)
 #   - scripts/install.sh's detect_platform `PLATFORM_FILE`
@@ -65,7 +65,7 @@ jobs:
   # ── Quick smoke gate ─────────────────────────────────────────────────
   # A couple of minutes on ubuntu-latest (the unit suite is ~1 min; the
   # example suite adds ~1 min of parallel `zag test` subprocesses).
-  # Catches obvious build breakage before burning 6 cross-compile targets
+  # Catches obvious build breakage before burning 4 cross-compile targets
   # (which run sequentially to a single runner + take ~5-8 minutes total).
   test:
     name: Unit tests
@@ -91,16 +91,25 @@ jobs:
       - name: zig build example_tests
         run: zig build example_tests
 
-  # ── Cross-compile all 6 (OS, arch) targets ───────────────────────────
-  # Single ubuntu-latest runner + zig 0.16's bundled LLVM / MinGW /
-  # Apple-SDK cross-compile backend → produces darwin + windows
-  # binaries from a linux host, no 3-host runner matrix needed. The
+  # ── Cross-compile all 4 (OS, arch) targets ───────────────────────────
+  # Single ubuntu-latest runner + zig 0.16's bundled LLVM /
+  # Apple-SDK cross-compile backend → produces darwin binaries from a
+  # linux host, no 2-host runner matrix needed. The
   # `bare_target` field on each matrix row is the user-facing
   # `<os>-<arch>` slug (e.g. `darwin-x86_64`) that
   # scripts/package.sh / `zag-install.sh` / `scripts/install.sh` also
   # use — keeping a single canonical name across the 4 sites is the
   # only way a `bash zag-install.sh --version v0.1.0` install on a
   # fresh machine actually finds the right archive.
+  #
+  # WINDOWS: dropped from the matrix for v0.1.0. The compiler runtime is
+  # posix-deep (argv via /proc/self/cmdline, fork+execve subprocesses,
+  # ~26 std.posix.openat call sites that @compileError on windows-gnu),
+  # so windows legs cannot build — let alone run — until a real port of
+  # the IO/argv/spawn surface to windows APIs lands. scripts/package.sh
+  # TARGETS + zag-install.sh/download paths were trimmed to match. When
+  # the port happens, re-add x86_64/aarch64-windows-gnu here, restore
+  # package.sh's zip rows, and revisit the installer docs.
   build:
     name: Build ${{ matrix.target }}
     needs: test
@@ -120,12 +129,6 @@ jobs:
           - target: aarch64-macos-none
             bare: darwin-arm64
             suffix: ''
-          - target: x86_64-windows-gnu
-            bare: windows-x86_64
-            suffix: '.exe'
-          - target: aarch64-windows-gnu
-            bare: windows-arm64
-            suffix: '.exe'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,16 +143,20 @@ jobs:
           --prefix ${{ runner.temp }}/stage/${{ matrix.target }}
       - name: Restage into scripts/package.sh layout
         shell: bash
-        # Re-emit the staged binary at the path scripts/install.sh's
+        # build.zig names the executable `zag-<os>-<arch>{.exe}`
+        # (b.fmt("zag-{s}-{s}") via targetOsString/targetArchString, e.g.
+        # `zag-darwin-arm64`, `zag-windows-x86_64.exe`) — NOT `bin/zag`.
+        # This step re-emits it at the path scripts/install.sh's
         # detect_platform + zag-install.sh's detect_platform build:
-        # `zag-<os>-<arch>{.exe}`. Mirror the filename transform from
+        # `zag-<os>-<arch>{.exe}`. `bare` mirrors the same
+        # targetOsString/targetArchString transform as
         # scripts/package.sh's TARGETS array so a local
         # `./scripts/package.sh 0.1.0 --bin-dir zig-out/bin/`
         # reproduces the exact same on-disk layout as this CI step.
         run: |
           set -euo pipefail
           mkdir -p "${{ runner.temp }}/bins"
-          src="${{ runner.temp }}/stage/${{ matrix.target }}/bin/zag${{ matrix.suffix }}"
+          src="${{ runner.temp }}/stage/${{ matrix.target }}/bin/zag-${{ matrix.bare }}${{ matrix.suffix }}"
           dst="${{ runner.temp }}/bins/zag-${{ matrix.bare }}${{ matrix.suffix }}"
           cp "$src" "$dst"
           chmod +x "$dst"
@@ -163,7 +170,7 @@ jobs:
           if-no-files-found: error
 
   # ── Aggregate + archive + checksum ───────────────────────────────────
-  # Download all 6 binaries, lay them out under `dist/<version>/` with
+  # Download all 4 binaries, lay them out under `dist/<version>/` with
   # the same archive filenames scripts/package.sh writes locally, and
   # emit SHA256 checksums so users can verify their `zag-install.sh`
   # download. We do NOT shell out to scripts/package.sh here because
@@ -191,7 +198,7 @@ jobs:
           version="${tag#v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Computed version: $version"
-      - name: Download all 6 binary artifacts
+      - name: Download all 4 binary artifacts
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/bins

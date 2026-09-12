@@ -1,7 +1,7 @@
 # Zag Release Process
 
 Cutting a release is a three-action job: **bump the version, commit, push a tag**.
-Everything else — running the test suites, cross-compiling all 6 (OS, arch)
+Everything else — running the test suites, cross-compiling all 4 (OS, arch)
 targets, packaging the archives, writing SHA256 checksums, and publishing the
 GitHub Release with all assets — is done by the CI workflow at
 `.github/workflows/release.yml`, which triggers on every `v*` tag push.
@@ -13,18 +13,20 @@ jobs in sequence on the **tagged commit**:
 
 1. **`test`** — `zig build test` (unit suite + the discarded-result audit) and
    `zig build example_tests` on ubuntu-latest. A failure here aborts the
-   release before any binary is built.
-2. **`build`** — cross-compiles all 6 targets (`x86_64`/`aarch64` ×
-   `linux-gnu` / `macos-none` / `windows-gnu`) with `zig build install
+   release before any binary is built.2. **`build`** — cross-compiles all 4 targets (`x86_64`/`aarch64` ×
+   `linux-gnu` / `macos-none`) with `zig build install
    -Doptimize=ReleaseFast`, restages each binary under the canonical
-   `zag-<os>-<arch>{.exe}` name, and sanity-runs `<binary> version` per leg.
+   `zag-<os>-<arch>` name, and sanity-runs `<binary> version` per leg.
+   Windows targets are **not** built: the compiler runtime is posix-deep
+   and cannot build on windows-gnu yet (see the WINDOWS note in the
+   workflow).
 3. **`package`** — aggregates the binaries into `dist/<version>/`, archives
-   each one (`tar.gz` for linux/darwin, `zip` for windows) with a `VERSION`
-   file plus the two installers bundled inside, copies `zag-install.sh` and
-   `install.ps1` in as standalone assets, and writes `checksums.txt`.
+   each one (`tar.gz`) with a `VERSION` file plus the two installers bundled
+   inside, copies `zag-install.sh` and `install.ps1` in as standalone assets,
+   and writes `checksums.txt`.
 4. **`publish`** — creates the GitHub Release `Zag v<version>` (with
-auto-generated notes) and attaches 9 assets: 6 archives + `checksums.txt` +
-the 2 standalone installers.
+   auto-generated notes) and attaches 7 assets: 4 archives + `checksums.txt` +
+   the 2 standalone installers.
 
 There is deliberately no `workflow_dispatch`: the tag itself is the single
 canonical trigger, and CI always builds exactly the commit you tagged.
@@ -124,12 +126,13 @@ gh run watch   # or: gh run watch <run-id>
 Rough timing: the `test` job is a few minutes; the 6-target `build` matrix
 adds ~5–8 more; `package` + `publish` are fast. When the run goes green, the
 release exists at
-`https://github.com/lakshgupta/zag/releases/tag/${TAG}` with 9 assets:
+`https://github.com/lakshgupta/zag/releases/tag/${TAG}` with 7 assets:
 
 ```
-zag-${VERSION}-linux-x86_64.tar.gz    zag-${VERSION}-windows-x86_64.zip
-zag-${VERSION}-linux-arm64.tar.gz     zag-${VERSION}-windows-arm64.zip
-zag-${VERSION}-darwin-x86_64.tar.gz   zag-${VERSION}-darwin-arm64.tar.gz
+zag-${VERSION}-linux-x86_64.tar.gz
+zag-${VERSION}-linux-arm64.tar.gz
+zag-${VERSION}-darwin-x86_64.tar.gz
+zag-${VERSION}-darwin-arm64.tar.gz
 checksums.txt                         zag-install.sh    install.ps1
 ```
 

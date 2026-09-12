@@ -21,8 +21,11 @@
 ##   zag-0.2.0-linux-arm64.tar.gz
 ##   zag-0.2.0-darwin-x86_64.tar.gz
 ##   zag-0.2.0-darwin-arm64.tar.gz
-##   zag-0.2.0-windows-x86_64.zip
-##   zag-0.2.0-windows-arm64.zip
+##
+##   (no Windows artifacts for v0.1.0 — the compiler runtime is
+##   posix-deep and cannot build on windows yet; see the WINDOWS note
+##   in .github/workflows/release.yml. This script refuses cleanly on
+##   Windows instead of downloading a 404.)
 ##
 ## Usage:
 ##   bash zag-install.sh                 # interactive, defaults
@@ -139,7 +142,16 @@ detect_platform() {
         Linux)   OS="linux"   ;;
         Darwin)  OS="darwin"  ;;
         MINGW*|MSYS*|CYGWIN*)
-            OS="windows" ;;
+            # No Windows release artifacts exist (v0.1.0): the compiler
+            # runtime is posix-deep (see the WINDOWS note in
+            # .github/workflows/release.yml). Refuse cleanly rather than
+            # constructing a `zag-<ver>-windows-*.zip` URL that 404s.
+            error "Zag does not ship Windows builds yet (posix-deep runtime)."
+            echo ""
+            echo "  v0.1.0 artifacts cover Linux and macOS only. See:"
+            echo "    https://github.com/lakshgupta/zag/releases"
+            exit 1
+            ;;
         "")
             # No uname — could be a stripped Windows shell that's
             # not MSYS-tagged. Tell the user to use the PowerShell
@@ -156,7 +168,7 @@ detect_platform() {
         *)
             error "Unsupported OS: $kernel"
             echo ""
-            echo "  Zag currently supports Linux, macOS, and Windows (Git Bash / MSYS / WSL)."
+            echo "  Zag currently ships Linux and macOS builds only."
             echo "  For native Windows PowerShell, see scripts/install.ps1."
             exit 1
             ;;

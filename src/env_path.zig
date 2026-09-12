@@ -73,6 +73,14 @@
 // -------------------------------------------------------------------
 
 const std = @import("std");
+/// Comptime OS gate. The compiler binary is Linux-first; the env pass and
+/// cache-dir resolution below read `/proc/self/environ` via raw posix
+/// calls, which have no windows equivalent (std.posix.openat hard-errors
+/// with @compileError on windows). Bodies that touch them are gated out of
+/// the windows compile graph so cross-compiles (release.yml's
+/// x86_64/aarch64-windows-gnu legs) succeed; see CI before the gate:
+/// `error: struct 'c.AT__struct_1869' has no member named 'FDCWD'`.
+const native_os = @import("builtin").target.os.tag;
 
 /// Raw byte buffer holding `/proc/self/environ`'s NUL-separated
 /// entries at startup. Sized for 131 KB / ~512 entries' worst
@@ -129,6 +137,9 @@ pub var environ_count: usize = 0;
 /// (`environ_buf[n]`) is BSS-junk and the last entry's `:0`
 /// sentinel would be a lie. Paint 0 here as a safety net.
 pub fn readEnviron() void {
+    // /proc/self/environ is a Linux/POSIX procfs surface with no windows
+    // equivalent; gate the body out of windows builds entirely.
+    if (native_os == .windows) return;
     const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
     const n = std.os.linux.read(fd, &environ_buf, environ_buf.len);
     _ = std.os.linux.close(fd); // deliberate discard: read-only /proc/self/environ fd

@@ -14,13 +14,13 @@
 ## Expected binary names in the bin directory:
 ##   zag-linux-x86_64        zag-linux-arm64
 ##   zag-darwin-x86_64       zag-darwin-arm64
-##   zag-windows-x86_64.exe  zag-windows-arm64.exe
+##   (windows binaries are NOT packaged for v0.1.0 — see the WINDOWS
+##   note at the TARGETS array below)
 ##
 ## Output:
 ##   dist/<version>/
 ##     zag-<version>-linux-x86_64.tar.gz    zag-<version>-linux-arm64.tar.gz
 ##     zag-<version>-darwin-x86_64.tar.gz   zag-<version>-darwin-arm64.tar.gz
-##     zag-<version>-windows-x86_64.zip     zag-<version>-windows-arm64.zip
 ##     checksums.txt
 ##     zag-install.sh                       # standalone installer (release asset)
 ##     install.ps1                          # standalone PowerShell installer
@@ -104,9 +104,11 @@ TARGETS=(
     "linux   arm64   tar.gz  "
     "darwin  x86_64  tar.gz  "
     "darwin  arm64   tar.gz  "
-    "windows x86_64  zip     .exe"
-    "windows arm64   zip     .exe"
 )
+# WINDOWS (x86_64/arm64 zip rows) removed for v0.1.0: the compiler runtime
+# is posix-deep and cannot build on windows-gnu yet (see the WINDOWS note in
+# .github/workflows/release.yml). Keep this array in lockstep with the CI
+# build matrix — re-add the rows together when the windows port lands.
 
 # ── Package each target ──────────────────────────────────────────────────────
 

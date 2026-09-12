@@ -18,6 +18,11 @@
 // -------------------------------------------------------------------
 
 const std = @import("std");
+/// Comptime OS gate — see the sibling gate in env_path.zig. The
+/// materialize path is POSIX-only by design (raw fd + fchmod semantics);
+/// windows release builds ship an empty payload so the gate below is
+/// never taken there.
+const native_os = @import("builtin").target.os.tag;
 const posix = std.posix;
 const build_options = @import("build_options");
 const sys = @import("sys.zig");
@@ -78,6 +83,10 @@ pub fn has_payload() bool {
 /// function does not check, so an empty payload would truncate
 /// `dest_path` to 0 bytes.
 pub fn materializeZigToCache(dest_path: []const u8) !void {
+    // POSIX-only by design (see doc comment above). Gate the posix-body
+    // out of windows builds; windows release archives ship an empty
+    // payload (has_payload() == false), so callers never reach here.
+    if (native_os == .windows) return error.NoSpaceLeft;
     // Open with O_WRONLY | O_CREAT | O_TRUNC, mode 0o755. The mode
     // applies on creation; umask may trim group/other bits. fchmodat
     // below normalizes after the write so the materialize result is

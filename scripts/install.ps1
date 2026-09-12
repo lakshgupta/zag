@@ -1,6 +1,11 @@
 ##
 ## install.ps1 — Zag Language Installer for Windows (PowerShell)
 ##
+## NOTE (v0.1.0): Zag does not ship Windows builds yet — the compiler
+## runtime is posix-deep and cannot build on windows (see the WINDOWS
+## note in .github/workflows/release.yml). This script exits cleanly
+## with a pointer to the release page instead of downloading a 404.
+##
 ## One-command install: fetch the installer from this repo on GitHub raw:
 ##
 ##   powershell -c "irm https://raw.githubusercontent.com/lakshgupta/zag/main/scripts/install.ps1 | iex"
@@ -31,6 +36,16 @@ $ZagBinDir = Join-Path $ZagHome "bin"
 # Overridable via $env:ZAG_REPO for forks / mirrors.
 $Repo = if ($env:ZAG_REPO) { $env:ZAG_REPO } else { "lakshgupta/zag" }
 $BaseUrl = "https://github.com/$Repo/releases"
+
+# ── v0.1.0: no Windows artifacts ───────────────────────────────────────
+# Refuse before any GitHub API call / download attempt: the windows
+# archive rows were removed from the release matrix (posix-deep runtime;
+# see the WINDOWS note in .github/workflows/release.yml).
+Write-Host "  ✗ Zag does not ship Windows builds yet (posix-deep runtime)." -ForegroundColor Red
+Write-Host ""
+Write-Host "  v0.1.0 artifacts cover Linux and macOS only. See:"
+Write-Host "    $BaseUrl"
+exit 1
 
 if (-not $Version) { $Version = "latest" }
 
