@@ -710,6 +710,21 @@ const Codegen = core.Codegen;
                     // matching vtable registration. Regular-type-method
                     // path (c) emits nested here.
                     if (self.resolveTraitBinding(&impl, m) != null) continue;
+                    // Field/method name collision: zig's container
+                    // namespace holds fields and methods together, so
+                    // `struct Cursor { pos: usize }` plus
+                    // `fun pos(self)` is a hard zig error ("duplicate
+                    // struct member"). Flattening (orphan free fn +
+                    // call-site rewrite) is the real fix and isn't
+                    // wired yet, so surface a zag-level diagnostic
+                    // naming the struct, method, and field instead of
+                    // leaking a raw zig error that points into
+                    // generated code.
+                    if (structHasFieldNamed(sd, m.name)) {
+                        std.debug.print("error:{d}:{d}: method '{s}' collides with a field of the same name on struct '{s}'\n", .{ m.loc.line, m.loc.col, m.name, sd.name });
+                        std.debug.print("  hint: rename the method (e.g. 'tell' / 'get_{s}') or the field -- zig cannot host both in one container.\n", .{m.name});
+                        std.process.exit(1);
+                    }
                     // v1.6 byte-slice widening: set receiver-struct
                     // before emitting the nested method body so
                     // `print(self.byte_slice_field)` widens correctly.
@@ -734,7 +749,24 @@ const Codegen = core.Codegen;
         }
     }
 
+
+/// True when `sd` declares a field named `name` (the collision check
+/// for nested impl methods — see the call site in genStructDecl).
+fn structHasFieldNamed(sd: ast.StructDecl, name: []const u8) bool {
+    for (sd.fields) |f| {
+        switch (f.kind) {
+            .named => |nf| if (std.mem.eql(u8, nf.name, name)) return true,
+            // Embedded fields contribute no name of their own.
+            .embed => {},
+        }
+    }
+    return false;
+}
+
     pub     fn genMethod(self: *Codegen, m: ast.MethodDecl, impl_type_params: []const ast.TypeParam) void {
+        // Doc comment on the method (`## ...` before it in the impl
+        // body) — emitted as zig `///` lines, same as genFun.
+        if (m.doc) |d| self.genDocComment(d);
         // Receiver tracking for nested method bodies (genStructDecl
         // sets it before calling, but a direct genMethod call — e.g.
         // the resolver-body path — may arrive without it). Only set
@@ -2316,8 +2348,13 @@ const Codegen = core.Codegen;
         // buffer). Both emit through the same shape — only the leading
         // keyword differs.
         if (cd.is_var) {
+            // `pub var` — module state visible to importers (same
+            // rationale as `pub const`; zig requires the `pub` marker
+            // for cross-module reads).
+            if (cd.is_pub) self.write("pub ");
             self.write("var ");
         } else {
+            if (cd.is_pub) self.write("pub ");
             self.write("const ");
         }
         self.write(cd.name);

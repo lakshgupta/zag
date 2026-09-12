@@ -10,6 +10,20 @@ const MASK: u32 = 0xFF;
 
 **Memory:** Embedded in the binary as static constants. No stack or heap allocation.
 
+A module-level `const` is private to its module. Write `pub const` to
+export it, so importers can bind it by name (`import std.fs.{PAGE_SIZE}`)
+and use it where a compile-time value is required — including array
+lengths:
+
+```zag
+# lib.zag
+pub const PAGE_SIZE: usize = 4096;
+
+# main.zag
+import lib.{PAGE_SIZE}
+var page: [PAGE_SIZE]u8 = undefined;
+```
+
 ## `const` Blocks
 
 Arbitrary code evaluated at compile time:

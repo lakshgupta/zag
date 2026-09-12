@@ -1116,3 +1116,65 @@ test "codegen: catch with block handler emits break :blk for handler body" {
     try std.testing.expect(std.mem.indexOf(u8, zig, ".Err => |msg| break :__blk_") != null);
 }
 
+
+test "codegen: narrowing cast on a member access emits the truncating @intCast" {
+    // `buf.len as u32` previously emitted a bare `@as(u32, ...)`,
+    // which zig 0.16 rejects ("cannot represent all possible
+    // values") because @as never truncates. Member-access operands
+    // now take the same @as(T, @intCast(x)) route as idents.
+    const src =
+        \\fun f(buf: []const u8) -> u32 {
+        \\    let n: u32 = buf.len as u32;
+        \\    return n;
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "@as(u32, @intCast(") != null);
+}
+
+test "codegen: `pub const` emits zig pub const (import-visible binding)" {
+    const src =
+        \\pub const PAGE: usize = 4096;
+        \\
+        \\fun f() -> usize {
+        \\    return PAGE;
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "pub const PAGE") != null);
+}
+
+test "codegen: impl method doc comment is emitted as zig ///" {
+    const src =
+        \\struct Counter {
+        \\    value: i32,
+        \\}
+        \\
+        \\impl Counter {
+        \\    ## Bump it.
+        \\    pub fun bump(self: *Counter) {
+        \\        self.value = self.value + 1;
+        \\    }
+        \\}
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    var cg = codegen_mod.Codegen.init();
+    const zig = cg.generate(prog);
+    try std.testing.expect(std.mem.indexOf(u8, zig, "/// Bump it.") != null);
+}

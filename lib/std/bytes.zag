@@ -181,18 +181,13 @@ pub fun read_varint(buf: []const u8, off: usize, next: *usize) -> u64 {
     var v: u64 = 0;
     var shift: u64 = 0;
     var pos: usize = off;
-    # Out-param write: a pointer is indexed (`w[0] = ...`), not
-    # deref-written — zag has no `p.* = ...` assignment form (same
-    # constraint lib/std/concurrent/thread.zag documents for its
-    # futex word reads).
-    var next_slot: [*]usize = next as [*]usize;
     while (true) {
         if (pos >= buf.len) { __zag_panic("std.bytes.read_varint: truncated varint"); }
         let b: u8 = buf[pos];
         pos = pos + 1;
         v = v | (((b & 0x7F) as u64) << (shift as u6));
         if ((b & 0x80) == 0) {
-            next_slot[0] = pos;
+            next.* = pos;
             return v;
         }
         shift = shift + 7;

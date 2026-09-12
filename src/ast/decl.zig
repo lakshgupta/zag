@@ -230,6 +230,14 @@ pub const MethodDecl = struct {
     /// ident is consumed as `trait_name` and the post-dot ident
     /// becomes `name`.
     trait_name: ?[]const u8 = null,
+    /// Optional doc comment `## ...` attached BEFORE the method (the
+    /// impl-block sibling of `FunDecl.doc` / `StructDecl.doc`).
+    /// Historically the impl-block loop did not accept doc comments
+    /// (a `##` line before an impl method was a parse error), so
+    /// stdlib modules had to fall back to plain `#` comments there.
+    /// Codegen emits it as zig `///` lines via genDocComment; null
+    /// means the source omitted a doc.
+    doc: ?[]const u8 = null,
 };
 
 /// One `impl NAME { … }` block. The methods are flattened to zig free
@@ -499,6 +507,11 @@ pub const ConstDecl = struct {
     type_text: ?[]const u8,
     init: *Expr,
     is_var: bool = false,
+    /// `pub const` — makes the binding visible to importing modules
+    /// (zig emits `pub const`). Plain `const` / `var` stay private to
+    /// the module, which is what forced stdlib constants to be
+    /// exposed through `pub fun` accessors instead.
+    is_pub: bool = false,
     loc: Loc,
 };
 

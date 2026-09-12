@@ -1245,3 +1245,119 @@ test "parser: selective import never triggers expansion" {
     try std.testing.expectEqual(@as(usize, 1), prog.imports[0].selectors.len);
     try std.testing.expectEqualStrings("load", prog.imports[0].selectors[0].name);
 }
+
+test "parser: doc comment on an impl-block method is attached (not a parse error)" {
+    // `## ...` before an impl method used to be rejected ("expected
+    // fun") because the impl-body loop went straight to parseMethod.
+    // It now attaches to MethodDecl.doc like the top-level path.
+    const src =
+        \\struct Counter {
+        \\    value: i32,
+        \\}
+        \\
+        \\impl Counter {
+        \\    ## Bump the counter.
+        \\    pub fun bump(self: *Counter) {
+        \\        self.value = self.value + 1;
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expectEqual(@as(usize, 1), prog.impls.len);
+    try std.testing.expectEqualStrings("bump", prog.impls[0].methods[0].name);
+    try std.testing.expect(prog.impls[0].methods[0].doc != null);
+    try std.testing.expect(std.mem.indexOf(u8, prog.impls[0].methods[0].doc.?, "Bump the counter") != null);
+}
+
+test "parser: impl method without a doc comment has doc == null" {
+    const src =
+        \\struct Counter {
+        \\    value: i32,
+        \\}
+        \\
+        \\impl Counter {
+        \\    pub fun bump(self: *Counter) {
+        \\        self.value = self.value + 1;
+        \\    }
+        \\}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.impls[0].methods[0].doc == null);
+}
+
+test "parser: postfix deref-write `p.* = v` parses as deref_assign" {
+    // The zig-shaped spelling of the existing prefix `*p = v`; both
+    // lower to the same .deref_assign slot.
+    const src = "fun bump(p: *i32) {\n    p.* = 7;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    const body = prog.functions[0].body;
+    try std.testing.expectEqual(@as(usize, 1), body.len);
+    try std.testing.expect(body[0].payload == .deref_assign);
+    try std.testing.expectEqualStrings("p", body[0].payload.deref_assign.name);
+}
+
+test "parser: prefix `*p = v` still parses as deref_assign" {
+    const src = "fun bump(p: *i32) {\n    *p = 7;\n}\n";
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expect(prog.functions[0].body[0].payload == .deref_assign);
+}
+
+test "parser: `pub const` / `pub var` set is_pub (cross-module constants)" {
+    const src =
+        \\pub const PAGE: usize = 4096;
+        \\pub var state: i32 = 0;
+        \\const PRIVATE: i32 = 1;
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expectEqual(@as(usize, 3), prog.consts.len);
+    try std.testing.expectEqualStrings("PAGE", prog.consts[0].name);
+    try std.testing.expect(prog.consts[0].is_pub);
+    try std.testing.expect(!prog.consts[0].is_var);
+    try std.testing.expectEqualStrings("state", prog.consts[1].name);
+    try std.testing.expect(prog.consts[1].is_pub);
+    try std.testing.expect(prog.consts[1].is_var);
+    try std.testing.expectEqualStrings("PRIVATE", prog.consts[2].name);
+    try std.testing.expect(!prog.consts[2].is_pub);
+}
+
+test "parser: multi-line import selector list parses" {
+    const src =
+        \\import std.bytes.{
+        \\    put_u32_le, get_u32_le,
+        \\    varint_len,
+        \\}
+        \\
+        \\fun main() {}
+        \\
+    ;
+    var l = lexer_mod.Lexer.init(src);
+    const tokens = l.tokenize();
+    var arena = ast.Arena.init();
+    var p = parser_mod.Parser.init(tokens, &arena);
+    const prog = p.parse();
+    try std.testing.expectEqual(@as(usize, 1), prog.imports.len);
+    try std.testing.expectEqual(@as(usize, 3), prog.imports[0].selectors.len);
+}

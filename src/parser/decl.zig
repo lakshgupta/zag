@@ -873,7 +873,24 @@ pub fn parseImplBlock(self: *Parser) ast.ImplBlock {
                 self.advance();
                 continue;
             }
-            methods_buf[method_count] = self.parseMethod();
+            // Doc comment (`## ...`) before an impl method — the
+            // top-level decl dispatcher has always accepted these,
+            // but the impl-body loop skipped straight to
+            // parseMethod, so a `##` line here was a parse error
+            // ("expected fun"). Consume the run exactly like the
+            // top-level path does (last line wins, matching
+            // parseFunDecl's doc threading) and carry it on the
+            // MethodDecl so codegen emits zig `///`.
+            var method_doc: ?[]const u8 = null;
+            while (self.peek().tag == .doc_comment) {
+                method_doc = self.peek().text;
+                self.advance();
+                while (self.peek().tag == .newline) self.advance();
+            }
+            if (self.peek().tag == .rbrace or self.eof()) break;
+            var mdecl = self.parseMethod();
+            mdecl.doc = method_doc;
+            methods_buf[method_count] = mdecl;
             method_count += 1;
         }
         self.expect(.rbrace);

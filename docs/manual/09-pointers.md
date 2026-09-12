@@ -54,10 +54,11 @@ Binary `&` is bitwise AND and not affected by the address-of addition; the parse
 
 ```
 let v: i32 = *p;        # read
-*p = 100;                # write
+*p = 100;                # write (prefix form)
+p.* = 100;               # write (postfix form — same thing)
 ```
 
-The dereferenced type is the pointee's type — `*i32` dereferences to `i32`. The compiler emits `<pointer>.*` in zig (postfix deref), so the AST shape round-trips directly. `*p = expr` is the canonical way to mutate state through a borrowed pointer without naming the underlying variable.
+The dereferenced type is the pointee's type — `*i32` dereferences to `i32`. The compiler emits `<pointer>.*` in zig (postfix deref), so the AST shape round-trips directly. Both write spellings lower to the same deref-write; `p.* = expr` is accepted for parity with zig. Either form is the canonical way to mutate state through a borrowed pointer without naming the underlying variable.
 
 ## Slicing: `arr[a..b]`
 

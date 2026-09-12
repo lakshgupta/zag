@@ -834,6 +834,17 @@ const zagTypeToZig = @import("decl.zig").zagTypeToZig;
                             break :blk false;
                         },
                         .binary, .unary, .index, .call, .method_call => true,
+                        // Member access (`payload.len`, `node.count`):
+                        // int-typed in the overwhelming majority of
+                        // cases, and a narrowing cast on one previously
+                        // emitted a bare `@as(T, x)` that zig 0.16
+                        // rejects ("cannot represent all possible
+                        // values") because @as never truncates -- the
+                        // failure mode that forced callers to route
+                        // every narrowing through a local first. A
+                        // non-int member (e.g. an f64 field) is a zig
+                        // error either way, so no case regresses.
+                        .member_access => true,
                         else => false,
                     };
                     if (is_ident_int) {

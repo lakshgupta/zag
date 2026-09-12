@@ -972,7 +972,28 @@ pub fn parseStmt(self: *Parser) Stmt {
                             return Stmt{ .payload = .{ .field_assign = self.parseFieldAssign() }, .loc = tok.loc };
                         }
                     }
+                    // Postfix deref-write `name.* = value` (the zig-shaped
+                    // spelling of the prefix `*name = value` form below).
+                    // Both lower to the SAME `.deref_assign` AST slot, so
+                    // codegen and escape analysis need no change — this
+                    // arm just accepts the postfix spelling users reach
+                    // for (zig's own deref-write is postfix-only).
+                    // Pattern: ident (current) . dot . star . equals.
+                    if (next == .dot and
+                        self.pos + 2 < self.tokens.len and
+                        self.tokens[self.pos + 2].tag == .star and
+                        self.pos + 3 < self.tokens.len and
+                        self.tokens[self.pos + 3].tag == .equals)
+                    {
+                        const name = self.expectIdent();
+                        self.expect(.dot);
+                        self.expect(.star);
+                        self.expect(.equals);
+                        const value = self.parseExpr();
+                        return Stmt{ .payload = .{ .deref_assign = .{ .name = name, .value = value } }, .loc = tok.loc };
+                    }
                     // 4-token lookahead for `name . ident [ expr ] =` — the
+                    // field-index-write form used by lib/std/string.zag's
                     // field-index-write form used by lib/std/string.zag's
                     // push_ch / insert_ch (`self.ptr[self.len] = ch;`). The
                     // target is a member_access (`self.ptr`) so it cannot

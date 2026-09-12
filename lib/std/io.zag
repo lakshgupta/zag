@@ -32,7 +32,7 @@ impl ByteWriter {
         return ByteWriter { buf: buf, pos: 0 };
     }
 
-    # Bytes written so far (the prefix to persist).
+    ## Bytes written so far (the prefix to persist).
     pub fun buffered(self: *ByteWriter) -> []const u8 {
         return self.buf[0..self.pos];
     }
@@ -45,7 +45,7 @@ impl ByteWriter {
         return self.buf.len - self.pos;
     }
 
-    # Rewind to the start (reuse one page buffer for the next page).
+    ## Rewind to the start (reuse one page buffer for the next page).
     pub fun reset(self: *ByteWriter) {
         self.pos = 0;
     }
@@ -61,8 +61,8 @@ impl ByteWriter {
         self.pos = self.pos + 1;
     }
 
-    # Append a slice — the length-prefixed body of a record, or a
-    # key/value payload. Zones the whole thing in one go.
+    ## Append a slice — the length-prefixed body of a record, or a
+    ## key/value payload. Zones the whole thing in one go.
     pub fun write_all(self: *ByteWriter, bytes: []const u8) {
         if (self.pos + bytes.len > self.buf.len) {
             __zag_panic("std.io.Writer.write_all: does not fit in page");
@@ -75,8 +75,8 @@ impl ByteWriter {
         self.pos = self.pos + bytes.len;
     }
 
-    # Fixed-width little-endian fields (page-local metadata:
-    # counts, offsets, page ids).
+    ## Fixed-width little-endian fields (page-local metadata:
+    ## counts, offsets, page ids).
     pub fun write_u16(self: *ByteWriter, v: u16) {
         self.pos = put_u16_le(self.buf, self.pos, v);
     }
@@ -89,8 +89,8 @@ impl ByteWriter {
         self.pos = put_u64_le(self.buf, self.pos, v);
     }
 
-    # Big-endian: for on-disk KEYS, where byte-wise order must
-    # match numeric order (a B-tree compares encoded bytes).
+    ## Big-endian: for on-disk KEYS, where byte-wise order must
+    ## match numeric order (a B-tree compares encoded bytes).
     pub fun write_u32_be(self: *ByteWriter, v: u32) {
         self.pos = put_u32_be(self.buf, self.pos, v);
     }
@@ -99,8 +99,8 @@ impl ByteWriter {
         self.pos = put_u64_be(self.buf, self.pos, v);
     }
 
-    # Length prefix + body: the encoding that makes a record
-    # skippable and immune to delimiter-in-value corruption.
+    ## Length prefix + body: the encoding that makes a record
+    ## skippable and immune to delimiter-in-value corruption.
     pub fun write_varint(self: *ByteWriter, v: u64) {
         self.pos = put_varint(self.buf, self.pos, v);
     }
@@ -151,8 +151,8 @@ impl ByteReader {
         return b;
     }
 
-    # Copy `out.len` bytes into `out`; false (and no advance) when
-    # fewer remain — lets a scanner stop cleanly on a torn tail.
+    ## Copy `out.len` bytes into `out`; false (and no advance) when
+    ## fewer remain — lets a scanner stop cleanly on a torn tail.
     pub fun read_exact(self: *ByteReader, out: []u8) -> bool {
         if (self.remaining() < out.len) { return false; }
         var i: usize = 0;
@@ -164,8 +164,8 @@ impl ByteReader {
         return true;
     }
 
-    # Slice out `n` bytes WITHOUT copying (the bytes live in the
-    # reader's buffer — valid while it is).
+    ## Slice out `n` bytes WITHOUT copying (the bytes live in the
+    ## reader's buffer — valid while it is).
     pub fun take(self: *ByteReader, n: usize) -> []const u8 {
         if (self.remaining() < n) { __zag_panic("std.io.Reader.take: EOF"); }
         let out: []const u8 = self.bytes[self.pos..self.pos + n];
@@ -210,7 +210,7 @@ impl ByteReader {
         return v;
     }
 
-    # Read a varint length prefix, then slice that many bytes.
+    ## Read a varint length prefix, then slice that many bytes.
     pub fun read_bytes_prefixed(self: *ByteReader) -> []const u8 {
         let n: u64 = self.read_varint();
         return self.take(n as usize);
@@ -253,7 +253,7 @@ impl FileWriter {
         }
     }
 
-    # Push the buffer to the fd (loops: write(2) may be partial).
+    ## Push the buffer to the fd (loops: write(2) may be partial).
     pub fun flush(self: *FileWriter) {
         var pos: usize = 0;
         while (pos < self.len) {
@@ -265,8 +265,8 @@ impl FileWriter {
         self.len = 0;
     }
 
-    # Total bytes handed to the kernel so far (logical file offset
-    # after a flush — what an append-only log calls its end).
+    ## Total bytes handed to the kernel so far (logical file offset
+    ## after a flush — what an append-only log calls its end).
     pub fun written(self: *FileWriter) -> usize {
         return self.flushed + self.len;
     }
@@ -294,8 +294,8 @@ impl FileReader {
         return !self.fill();
     }
 
-    # Read the next `out.len` bytes; returns the count actually read
-    # (0 at EOF). Short reads are normal at the end of a file.
+    ## Read the next `out.len` bytes; returns the count actually read
+    ## (0 at EOF). Short reads are normal at the end of a file.
     pub fun read(self: *FileReader, out: []u8) -> usize {
         var done: usize = 0;
         while (done < out.len) {
@@ -316,7 +316,7 @@ impl FileReader {
         return done;
     }
 
-    # Refill the buffer from the fd. Returns false at EOF.
+    ## Refill the buffer from the fd. Returns false at EOF.
     pub fun fill(self: *FileReader) -> bool {
         let n: isize = fd_read(self.fd, self.buf, self.buf.len);
         if (n <= 0) { return false; }

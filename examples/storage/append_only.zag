@@ -51,8 +51,7 @@ fun append_record(w: *FileWriter, op: u8, key: []const u8, value: []const u8) {
 fun lookup(log: []const u8, key: []const u8, out: []u8, out_len: *usize) -> bool {
     var r: ByteReader = ByteReader.fixed(log);
     var found: bool = false;
-    var out_slot: [*]usize = out_len as [*]usize;
-    out_slot[0] = 0;
+    out_len.* = 0;
     while (!r.eof()) {
         let op: u8 = r.read_byte();
         let k: []const u8 = r.read_bytes_prefixed();
@@ -60,7 +59,7 @@ fun lookup(log: []const u8, key: []const u8, out: []u8, out_len: *usize) -> bool
         if (!bytes_eq(k, key)) { continue; }
         if (op == OP_DEL) {
             found = false;
-            out_slot[0] = 0;
+            out_len.* = 0;
         } else {
             found = true;
             var i: usize = 0;
@@ -68,7 +67,7 @@ fun lookup(log: []const u8, key: []const u8, out: []u8, out_len: *usize) -> bool
                 out[i] = v[i];
                 i = i + 1;
             }
-            out_slot[0] = v.len;
+            out_len.* = v.len;
         }
     }
     return found;

@@ -1,7 +1,7 @@
 ## Storage: a page-oriented block store — the layer an index/B-tree
 ## would sit on.
 ##
-##   import std.fs.{File, page_size}
+##   import std.fs.{File, PAGE_SIZE}
 ##   import std.io.{ByteWriter, ByteReader}
 ##
 ## The append-only log (see append_only.zag) can only scan. A query
@@ -27,7 +27,7 @@
 ##
 ## Run: zag run page_file.zag
 
-import std.fs.{File, page_size}
+import std.fs.{File, PAGE_SIZE}
 import std.io.{ByteWriter, ByteReader}
 import std.bytes.{eq as bytes_eq, get_u32_le as read_u32_at}
 import std.hash.{crc32}
@@ -44,7 +44,6 @@ import std.hash.{crc32}
 const DIR_BASE: usize = 4;
 const SLOT_SIZE: usize = 8;
 const CRC_SIZE: usize = 4;
-const PAGE_SIZE: usize = 4096;
 const DATA_END: usize = PAGE_SIZE - CRC_SIZE;
 
 fun slot_dir_len(count: u32) -> usize {
@@ -126,9 +125,6 @@ fun page_verify(page: []const u8) -> bool {
 }
 
 fun main() {
-    # The example sizes its own page buffers; assert the size the
-    # page methods actually work in matches.
-    assert(page_size() == PAGE_SIZE);
     let path: str = "/tmp/zag_page_file.pages";
     var f: File = File.create(path);
 

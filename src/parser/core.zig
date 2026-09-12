@@ -97,6 +97,12 @@ pub fn parse(self: *Parser) ast.Program {
                 self.advance();
                 while (self.peek().tag == .newline) self.advance();
             }
+            // `pub` marker for the decl about to be parsed. Consumed by
+            // the `.pub_kw` dispatcher below and read by the decl arms
+            // that carry an `is_pub` AST slot (`const` / `var` — so
+            // `pub const NAME = ...` emits zig's `pub const` and the
+            // binding is reachable from importing modules).
+            var is_pub = false;
             // Top-level dispatch: structs and impl blocks live alongside
             // top-level functions. The dispatch is order-independent at
             // codegen time (codegen re-walks and interleaves struct fields
@@ -127,9 +133,11 @@ pub fn parse(self: *Parser) ast.Program {
                 const after_pub = self.peekAhead(1);
                 if (after_pub == .struct_kw or after_pub == .impl_kw or
                     after_pub == .enum_kw or after_pub == .union_kw or
-                    after_pub == .trait_kw or after_pub == .fun)
+                    after_pub == .trait_kw or after_pub == .fun or
+                    after_pub == .const_kw or after_pub == .var_kw)
                 {
                     self.advance(); // consume pub
+                    is_pub = true;
                     switch (after_pub) {
                         .struct_kw => {
                             structs_buf[struct_count] = self.parseStructDecl();
@@ -169,6 +177,19 @@ pub fn parse(self: *Parser) ast.Program {
                             fd.doc = doc;
                             functions_buf[fun_count] = fd;
                             fun_count += 1;
+                        },
+                        .const_kw => {
+                            var cd = self.parseConstDecl();
+                            cd.is_pub = true;
+                            consts_buf[const_count] = cd;
+                            const_count += 1;
+                        },
+                        .var_kw => {
+                            var vd = self.parseVarDecl();
+                            vd.is_var = true;
+                            vd.is_pub = true;
+                            consts_buf[const_count] = vd;
+                            const_count += 1;
                         },
                         else => unreachable,
                     }
@@ -276,7 +297,9 @@ pub fn parse(self: *Parser) ast.Program {
                 continue;
             }
             if (lead == .const_kw) {
-                consts_buf[const_count] = self.parseConstDecl();
+                var cd = self.parseConstDecl();
+                cd.is_pub = is_pub;
+                consts_buf[const_count] = cd;
                 const_count += 1;
                 continue;
             }
