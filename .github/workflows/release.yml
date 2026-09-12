@@ -174,7 +174,11 @@ jobs:
   # release shape identical, which is the audit trail maintainers
   # need when reproducing a release locally.
   package:
-    name: Aggregate dist/${{ steps.version.outputs.version }}/
+    # NOTE: job-level `name:` is validated at workflow-parse time, where the
+    # `steps` context does not exist — using `${{ steps.version.outputs.* }}`
+    # here is a startup_failure that kills the whole workflow (0s, no jobs).
+    # The versioned directory name is computed inside the job's steps.
+    name: Package archives
     needs: build
     runs-on: ubuntu-latest
     steps:
